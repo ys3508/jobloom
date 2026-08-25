@@ -20,13 +20,13 @@ User approval is required to enter `approved`. Use atomic acquisition to enter `
 
 Entering `ready_to_fill` requires an active material lock for the application's bound, approved ResumeVersion. The lock must match the registered resume hash and the current snapshot bytes. Acquisition repeats these checks; a missing, revoked, rebound, or modified resume cannot enter the fill queue.
 
-Reset the pre-submit check whenever the application returns to materials, filling, user-answer, failed, or takeover states.
+Generate and obtain user approval for the persisted summary in `pre-submission-review.md` before entering `pre_submit_ready`. A caller Boolean is not a check result. Reset and invalidate the review whenever the application returns to materials, filling, user-answer, failed, or takeover states.
 
 ## Submission gates
 
 Entering `submitting` requires:
 
-- a passed pre-submit check
+- a hash-valid, user-approved pre-submit summary bound to the current inventory, material lock, and authorization
 - an active, hash-valid material lock matching the bound approved resume
 - a real active, unrevoked, unexpired authorization in the shared local database
 - satisfaction of the selected submission policy

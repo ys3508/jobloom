@@ -14,9 +14,10 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
+- For form inventory, mandatory pauses, pre-submission summaries, or final user approval, read `references/pre-submission-review.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
 - For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
-- For form filling or submission preparation, read all eight references. Default to Fill-Only and stop before the final submission action.
+- For form filling or submission preparation, read all nine references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -92,6 +93,16 @@ Store the database in `.jobloom/`. It contains plaintext local answers protected
 5. Preserve `submission_failed` and `submission_uncertain` as distinct states. Never enqueue uncertain submissions for retry.
 6. Record success evidence before marking an application submitted.
 7. Use stable reason and failure codes. Do not place job descriptions, answers, secrets, or personal data in event metadata.
+
+## Pre-submission review
+
+1. During filling, register a complete form inventory from `assets/form-inventory.template.json`. Include required field IDs, observed job identity, legal items, restricted requests, and exact upload version IDs; include no field values.
+2. Record every filled field in the protected application-field store before finishing the fill lease.
+3. After entering `waiting_for_submission_approval`, generate the deterministic review. Backend job identity and application scope override caller context.
+4. Pause on missing fields, stale or changed answers, unlocked facts, wrong materials, expired/scoped-out authorization, duplicates, unknown forms under a known-form policy, special legal terms, or any mandatory-pause request.
+5. Show the value-free summary to the user. Approval requires actor `user` and the exact displayed SHA-256.
+6. Enter `pre_submit_ready` with the approved review ID. Never accept a Boolean assertion as a substitute.
+7. Revalidate the review, material lock, and same authorization at submission. Any return to an editable or failed state invalidates the review.
 
 ## Submission archive
 

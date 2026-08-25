@@ -1,0 +1,17 @@
+{
+  "inventory_id": "inventory-example-1",
+  "application_id": "app-example-1",
+  "form_url": "https://example.com/jobs/1/apply",
+  "observed_employer": "Example",
+  "observed_role": "Backend Engineer",
+  "known_form": false,
+  "required_field_ids": ["candidate_name", "work_authorization"],
+  "legal_items": ["standard_attestation"],
+  "restricted_requests": [],
+  "uploads": [
+    {
+      "kind": "resume",
+      "version_id": "resume-example-1"
+    }
+  ]
+}

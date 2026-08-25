@@ -151,6 +151,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             cover_letter_version_id TEXT,
             authorization_id TEXT,
             pre_submit_check_passed INTEGER NOT NULL DEFAULT 0,
+            pre_submit_review_id TEXT,
             attempts INTEGER NOT NULL DEFAULT 0,
             max_attempts INTEGER NOT NULL DEFAULT 3,
             worker_id TEXT,
@@ -186,6 +187,9 @@ def initialize(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (application_id) REFERENCES applications(application_id)
         );
     """)
+    application_columns = {row[1] for row in connection.execute("PRAGMA table_info(applications)")}
+    if "pre_submit_review_id" not in application_columns:
+        connection.execute("ALTER TABLE applications ADD COLUMN pre_submit_review_id TEXT")
     connection.commit()
 
 
@@ -233,6 +237,87 @@ def require_active_material_lock(connection: sqlite3.Connection, application_id:
     if not manifest.is_file() or _hash_file(str(manifest)) != row["claims_manifest_sha256"]:
         raise ValueError("locked resume claims manifest hash mismatch")
     return row
+
+
+def require_approved_pre_submit_review(
+    connection: sqlite3.Connection,
+    application_id: str,
+    review_id: str | None = None,
+    at: datetime | None = None,
+) -> sqlite3.Row:
+    if not _table_exists(connection, "pre_submit_reviews") or not _table_exists(connection, "form_inventories"):
+        raise ValueError("pre-submit review store is unavailable")
+    application = connection.execute(
+        "SELECT pre_submit_review_id FROM applications WHERE application_id=?", (application_id,)
+    ).fetchone()
+    actual_review_id = review_id or (application["pre_submit_review_id"] if application else None)
+    if not actual_review_id:
+        raise ValueError("approved pre-submit review is required")
+    review = connection.execute("""
+        SELECT psr.*, fi.status AS inventory_status, fi.known_form
+        FROM pre_submit_reviews psr JOIN form_inventories fi ON fi.inventory_id=psr.inventory_id
+        WHERE psr.review_id=? AND psr.application_id=?
+    """, (actual_review_id, application_id)).fetchone()
+    if not review or review["status"] != "approved" or review["approved_by"] != "user":
+        raise ValueError("pre-submit review is not user-approved")
+    if review["inventory_status"] != "active" or review["invalidated_at"]:
+        raise ValueError("pre-submit review is stale")
+    summary = json.loads(review["summary_json"])
+    summary_hash = hashlib.sha256(
+        json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if summary_hash != review["summary_sha256"]:
+        raise ValueError("pre-submit review summary hash mismatch")
+    summary_context = summary.get("context", {})
+    for field in summary.get("fields", []):
+        stored_field = connection.execute(
+            "SELECT * FROM application_fields WHERE application_id=? AND field_id=?",
+            (application_id, field.get("field_id")),
+        ).fetchone()
+        if not stored_field or stored_field["source_kind"] != field.get("source_kind") or stored_field["source_id"] != field.get("source_id"):
+            raise ValueError("pre-submit review field source is stale")
+        value_hash = hashlib.sha256(stored_field["value_json"].encode("utf-8")).hexdigest()
+        if value_hash != field.get("value_sha256"):
+            raise ValueError("pre-submit review field value changed")
+        if stored_field["source_kind"] == "fact":
+            if stored_field["source_status"] != "locked":
+                raise ValueError("pre-submit review fact is no longer locked")
+        elif stored_field["source_kind"] == "answer":
+            answer = connection.execute("SELECT * FROM answers WHERE answer_id=?", (stored_field["source_id"],)).fetchone()
+            if not answer or answer["status"] != "active" or answer["confirmation_status"] != "confirmed":
+                raise ValueError("pre-submit review answer is no longer active")
+            current_time = at or now_utc()
+            effective = parse_time(answer["effective_from"])
+            expires = parse_time(answer["expires_at"])
+            review_after = parse_time(answer["review_after"])
+            if effective and current_time < effective:
+                raise ValueError("pre-submit review answer is not effective")
+            if expires and current_time >= expires:
+                raise ValueError("pre-submit review answer is expired")
+            if review_after and current_time >= review_after:
+                raise ValueError("pre-submit review answer is due for review")
+            if answer["answer_json"] != stored_field["value_json"]:
+                raise ValueError("pre-submit review answer value changed")
+            for key, expected in json.loads(answer["scope_json"]).items():
+                actual = summary_context.get(key)
+                if (isinstance(expected, list) and actual not in expected) or (not isinstance(expected, list) and actual != expected):
+                    raise ValueError("pre-submit review answer scope is stale")
+            if answer["answer_type"] == "legal_commitment":
+                raise ValueError("pre-submit review contains a legal commitment")
+        else:
+            raise ValueError("pre-submit review contains an unknown field source")
+    material = require_active_material_lock(connection, application_id)
+    if material["lock_id"] != review["material_lock_id"]:
+        raise ValueError("pre-submit review material lock is stale")
+    authorization = connection.execute(
+        "SELECT * FROM authorizations WHERE authorization_id=?", (review["authorization_id"],)
+    ).fetchone()
+    current_time = at or now_utc()
+    if not authorization or authorization["status"] != "active" or authorization["revoked_at"]:
+        raise ValueError("pre-submit review authorization is not active")
+    if current_time >= parse_time(authorization["expires_at"]):
+        raise ValueError("pre-submit review authorization is expired")
+    return review
 
 
 def _event(
@@ -407,14 +492,19 @@ def transition(
         raise ValueError("use acquire_next to enter the filling state")
     if to_state in {"ready_to_fill", "pre_submit_ready", "submitting"}:
         require_active_material_lock(connection, application_id)
-    if to_state == "pre_submit_ready" and not metadata.get("pre_submit_check_passed"):
-        raise ValueError("pre-submit readiness requires a passed check")
+    if to_state == "pre_submit_ready":
+        pre_submit_review = require_approved_pre_submit_review(
+            connection, application_id, metadata.get("pre_submit_review_id"), at
+        )
     if to_state == "submitting":
         if not row["pre_submit_check_passed"]:
             raise ValueError("cannot submit before the pre-submit check passes")
+        pre_submit_review = require_approved_pre_submit_review(connection, application_id, at=at)
         authorization_id = metadata.get("authorization_id") or row["authorization_id"]
         if not authorization_id:
             raise ValueError("cannot submit without an authorization ID")
+        if authorization_id != pre_submit_review["authorization_id"]:
+            raise ValueError("submission authorization does not match the approved pre-submit review")
         authorization_table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='authorizations'"
         ).fetchone()
@@ -431,9 +521,7 @@ def transition(
         policy = row["submission_policy"]
         if policy in {"never_submit", "stop_before_submit"}:
             raise ValueError(f"submission policy {policy} blocks submission")
-        if policy == "approved_after_summary" and not metadata.get("final_summary_approved"):
-            raise ValueError("submission requires final summary approval")
-        if policy == "known_forms_only" and not metadata.get("known_form"):
+        if policy == "known_forms_only" and not pre_submit_review["known_form"]:
             raise ValueError("submission policy requires a known form")
         if policy == "approved_queue" and not metadata.get("approved_queue"):
             raise ValueError("submission policy requires an approved queue")
@@ -460,8 +548,11 @@ def transition(
         "waiting_for_submission_approval", "submission_failed", "waiting_for_user_takeover",
     }:
         fields.append("pre_submit_check_passed=0")
+        fields.append("pre_submit_review_id=NULL")
     if to_state == "pre_submit_ready":
         fields.append("pre_submit_check_passed=1")
+        fields.append("pre_submit_review_id=?")
+        values.append(pre_submit_review["review_id"])
     if to_state == "submitting":
         fields.append("authorization_id=?")
         values.append(metadata.get("authorization_id") or row["authorization_id"])
@@ -476,6 +567,15 @@ def transition(
             values.append(evidence["confirmation_id"])
     values.append(application_id)
     connection.execute(f"UPDATE applications SET {', '.join(fields)} WHERE application_id=?", values)
+    if to_state in {
+        "materials_in_progress", "ready_to_fill", "filling", "waiting_for_user_answer",
+        "waiting_for_submission_approval", "submission_failed", "waiting_for_user_takeover",
+        "withdrawn", "closed",
+    } and _table_exists(connection, "pre_submit_reviews"):
+        connection.execute("""
+            UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, invalidation_reason=?
+            WHERE application_id=? AND status IN ('generated','approved')
+        """, (timestamp, f"application_entered_{to_state}", application_id))
     if to_state == "submitted" and _table_exists(connection, "resume_usage"):
         connection.execute("""
             INSERT OR IGNORE INTO resume_usage (
@@ -487,7 +587,7 @@ def transition(
         ))
     event_metadata = {
         key: metadata[key] for key in (
-            "authorization_id", "error_code", "manual_resolution", "final_summary_approved", "known_form", "approved_queue"
+            "authorization_id", "error_code", "manual_resolution", "pre_submit_review_id", "approved_queue"
         ) if key in metadata
     }
     _event(connection, application_id, actor, current, to_state, reason_code, event_metadata, at)

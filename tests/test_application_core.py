@@ -22,6 +22,8 @@ def load_script(name):
 CORE = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
+ARCHIVE = load_script("archive_core")
+PRE_SUBMIT = load_script("pre_submit_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -43,6 +45,8 @@ class ApplicationCoreTests(unittest.TestCase):
         CORE.initialize(self.db)
         ANSWERS.initialize(self.db)
         RESUMES.initialize(self.db)
+        ARCHIVE.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(self.db.close)
@@ -85,15 +89,33 @@ class ApplicationCoreTests(unittest.TestCase):
     def move_to_pre_submit(self, application_id="app-1"):
         self.move_to_ready(application_id)
         CORE.acquire_next(self.db, "worker-1", at=AT)
+        ARCHIVE.record_field(
+            self.db, application_id, "candidate_name", "Candidate name", "Verified Candidate",
+            "fact", "fact-name", "locked", "normal", AT,
+        )
+        PRE_SUBMIT.register_inventory(
+            self.db, f"inventory-{application_id}", application_id, "https://example.com/jobs/1/apply",
+            "Example Corp", "Backend Engineer", True, ["candidate_name"],
+            ["standard_attestation"], [],
+            [{"kind": "resume", "version_id": f"resume-{application_id}"}], AT,
+        )
         CORE.release_lease(
             self.db, application_id, "worker-1", "waiting_for_submission_approval", "form_filled", at=AT
         )
+        self.add_authorization()
+        review = PRE_SUBMIT.create_review(
+            self.db, f"review-{application_id}", f"inventory-{application_id}", "auth-1",
+            {"country": "US", "queue_id": "queue-1"}, AT,
+        )
+        PRE_SUBMIT.approve_review(self.db, review["review_id"], "user", review["summary_sha256"], AT)
         CORE.transition(
             self.db, application_id, "pre_submit_ready", "system", "pre_submit_passed",
-            {"pre_submit_check_passed": True}, AT,
+            {"pre_submit_review_id": review["review_id"]}, AT,
         )
 
     def add_authorization(self, authorization_id="auth-1"):
+        if self.db.execute("SELECT 1 FROM authorizations WHERE authorization_id=?", (authorization_id,)).fetchone():
+            return
         ANSWERS.add_authorization(self.db, {
             "authorization_id": authorization_id,
             "confirmed_at": AT.isoformat(),
@@ -207,7 +229,7 @@ class ApplicationCoreTests(unittest.TestCase):
     def test_submission_requires_real_current_authorization(self):
         self.add_job_and_application(policy="approved_queue")
         self.move_to_pre_submit()
-        with self.assertRaisesRegex(ValueError, "not active"):
+        with self.assertRaisesRegex(ValueError, "does not match"):
             CORE.transition(
                 self.db, "app-1", "submitting", "system", "submit_requested",
                 {"authorization_id": "missing", "approved_queue": True}, AT,
@@ -216,37 +238,32 @@ class ApplicationCoreTests(unittest.TestCase):
     def test_expired_submission_authorization_is_rejected(self):
         self.add_job_and_application(policy="approved_queue")
         self.move_to_pre_submit()
-        ANSWERS.add_authorization(self.db, {
-            "authorization_id": "auth-expired",
-            "confirmed_at": (AT - timedelta(days=8)).isoformat(),
-            "expires_at": (AT - timedelta(days=1)).isoformat(),
-            "scope": {"country": "US", "queue_id": "queue-1"},
-        })
+        self.db.execute("UPDATE authorizations SET expires_at=? WHERE authorization_id='auth-1'",
+                        ((AT - timedelta(days=1)).isoformat(),))
+        self.db.commit()
         with self.assertRaisesRegex(ValueError, "expired"):
             CORE.transition(
                 self.db, "app-1", "submitting", "system", "submit_requested",
-                {"authorization_id": "auth-expired", "approved_queue": True}, AT,
+                {"authorization_id": "auth-1", "approved_queue": True}, AT,
             )
 
-    def test_summary_policy_requires_summary_approval(self):
+    def test_summary_policy_uses_persisted_user_approved_review(self):
         self.add_job_and_application(policy="approved_after_summary")
         self.move_to_pre_submit()
-        self.add_authorization()
-        with self.assertRaisesRegex(ValueError, "summary approval"):
-            CORE.transition(
-                self.db, "app-1", "submitting", "system", "submit_requested",
-                {"authorization_id": "auth-1"}, AT,
-            )
+        result = CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1"}, AT,
+        )
+        self.assertEqual(result["state"], "submitting")
 
-    def test_known_form_policy_requires_known_form(self):
+    def test_known_form_policy_uses_reviewed_inventory(self):
         self.add_job_and_application(policy="known_forms_only")
         self.move_to_pre_submit()
-        self.add_authorization()
-        with self.assertRaisesRegex(ValueError, "known form"):
-            CORE.transition(
-                self.db, "app-1", "submitting", "system", "submit_requested",
-                {"authorization_id": "auth-1"}, AT,
-            )
+        result = CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1"}, AT,
+        )
+        self.assertEqual(result["state"], "submitting")
 
     def test_submitted_requires_positive_evidence(self):
         self.add_job_and_application(policy="approved_queue")

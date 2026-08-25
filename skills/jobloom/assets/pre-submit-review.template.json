@@ -1,0 +1,8 @@
+{
+  "review_id": "review-example-1",
+  "inventory_id": "inventory-example-1",
+  "authorization_id": "authorization-example-1",
+  "authorization_context": {
+    "queue_id": "approved-queue-1"
+  }
+}

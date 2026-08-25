@@ -308,6 +308,12 @@ def create_archive(
     """, (application_id,)).fetchone()
     if not evidence:
         raise ValueError("submission archive requires positive submission evidence")
+    review = connection.execute("""
+        SELECT review_id, summary_sha256, authorization_id, status, approved_by
+        FROM pre_submit_reviews WHERE review_id=? AND application_id=?
+    """, (row["pre_submit_review_id"], application_id)).fetchone()
+    if not review or review["status"] != "approved" or review["approved_by"] != "user":
+        raise ValueError("submission archive requires its user-approved pre-submit review")
     if not connection.execute(
         "SELECT 1 FROM application_fields WHERE application_id=? LIMIT 1", (application_id,)
     ).fetchone():
@@ -374,6 +380,9 @@ def create_archive(
                 "resume_version_id": row["resume_version_id"],
                 "cover_letter_version_id": row["cover_letter_version_id"],
                 "submission_policy": row["submission_policy"],
+                "pre_submit_review_id": review["review_id"],
+                "pre_submit_summary_sha256": review["summary_sha256"],
+                "authorization_id": review["authorization_id"],
                 "confirmation_id": row["confirmation_id"] or evidence["confirmation_id"],
                 "success_evidence_type": evidence["evidence_type"],
                 "unresolved_uncertainty": False,

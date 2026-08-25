@@ -24,6 +24,7 @@ APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 OUTCOMES = load_script("outcome_core")
+PRE_SUBMIT = load_script("pre_submit_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -40,6 +41,7 @@ class ArchiveCoreTests(unittest.TestCase):
         RESUMES.initialize(self.db)
         ARCHIVE.initialize(self.db)
         OUTCOMES.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
         self.addCleanup(self.db.close)
         self.prepare_application()
 
@@ -102,20 +104,31 @@ class ArchiveCoreTests(unittest.TestCase):
             self.db, "app-1", "birth_date", "Date of birth", "2000-01-01",
             "fact", "fact-birth-date", "locked", "date_of_birth", AT,
         )
+        PRE_SUBMIT.register_inventory(
+            self.db, "inventory-1", "app-1", "https://example.com/jobs/1/apply",
+            "Example Corp", "Backend Engineer", True,
+            ["work_auth", "home_address", "birth_date"], ["standard_attestation"], [],
+            [{"kind": "resume", "version_id": "resume-1"}], AT,
+        )
 
     def submit(self, evidence_reference=None):
         APPLICATIONS.release_lease(
             self.db, "app-1", "worker-1", "waiting_for_submission_approval", "filled", at=AT
-        )
-        APPLICATIONS.transition(
-            self.db, "app-1", "pre_submit_ready", "system", "checked",
-            {"pre_submit_check_passed": True}, AT,
         )
         ANSWERS.add_authorization(self.db, {
             "authorization_id": "auth-1", "confirmed_at": AT.isoformat(),
             "expires_at": (AT + timedelta(days=7)).isoformat(),
             "scope": {"country": "US", "queue_id": "queue-1"},
         })
+        review = PRE_SUBMIT.create_review(
+            self.db, "review-1", "inventory-1", "auth-1",
+            {"country": "US", "queue_id": "queue-1"}, AT,
+        )
+        PRE_SUBMIT.approve_review(self.db, "review-1", "user", review["summary_sha256"], AT)
+        APPLICATIONS.transition(
+            self.db, "app-1", "pre_submit_ready", "system", "checked",
+            {"pre_submit_review_id": "review-1"}, AT,
+        )
         APPLICATIONS.transition(
             self.db, "app-1", "submitting", "system", "submit_requested",
             {"authorization_id": "auth-1", "approved_queue": True}, AT,

@@ -160,6 +160,16 @@ python3 skills/jobloom/scripts/outcome_core.py \
 
 Outcome records require the matching guarded application-state history. Model-usage records contain token/cost metadata but never prompts or responses. Reports show explicit denominators and warn against causal conclusions, especially below thirty submitted applications.
 
+Initialize the mandatory pre-submission review store:
+
+```bash
+python3 skills/jobloom/scripts/pre_submit_core.py \
+  --db .jobloom/jobloom.db \
+  init
+```
+
+During filling, register a value-free form inventory and record all filled fields. After filling, generate a deterministic summary, show it to the user, and approve its exact SHA-256. `application_core.py` now rejects `pre_submit_ready` when given only a caller Boolean; it requires that persisted user-approved review and revalidates its material lock and authorization before submission.
+
 Run the current test suite:
 
 ```bash

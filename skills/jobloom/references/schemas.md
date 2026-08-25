@@ -11,9 +11,10 @@
 7. Standing authorization
 8. Application core
 9. Resume version
-10. Submission archive
-11. Outcomes and usage
-12. Future core entities
+10. Pre-submission review
+11. Submission archive
+12. Outcomes and usage
+13. Future core entities
 
 ## Candidate profile
 
@@ -147,6 +148,12 @@ A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, 
 The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
 
 A material lock records the exact approved resume version and file hash selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
+
+## Pre-submission review
+
+FormInventory stores the form URL, observed job identity, known-form status, required field IDs, allowlisted legal items, mandatory-pause requests, upload version IDs, a deterministic hash, status, and invalidation metadata. It contains no field values.
+
+PreSubmitReview stores one application and inventory, authorization and material-lock IDs, value-free summary JSON and SHA-256, generated/approved/invalidated status, timestamps, approver, and invalidation reason. Only the user may approve the exact summary hash. The application stores the active review ID while `pre_submit_ready` and submission revalidates it.
 
 ## Submission archive
 
