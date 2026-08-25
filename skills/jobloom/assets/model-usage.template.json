@@ -1,0 +1,15 @@
+{
+  "usage_id": "usage-example-1",
+  "workflow": "job_evaluation",
+  "operation": "evidence_review",
+  "model_tier": "low_cost",
+  "model_name": "model-name",
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "cached_tokens": 0,
+  "cost_microusd": null,
+  "latency_ms": null,
+  "cache_hit": false,
+  "application_id": null,
+  "job_id": null
+}

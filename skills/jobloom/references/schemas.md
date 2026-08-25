@@ -12,7 +12,8 @@
 8. Application core
 9. Resume version
 10. Submission archive
-11. Future core entities
+11. Outcomes and usage
+12. Future core entities
 
 ## Candidate profile
 
@@ -155,6 +156,14 @@ A SubmissionArchive stores a stable archive ID, one application ID, immutable di
 
 The master tracker is generated from archive, application, and job backend records. It contains no answer values and does not become a separately editable source of truth.
 
+## Outcomes and usage
+
+OutcomeRecord stores an outcome ID, application ID, allowed outcome type, timezone-aware occurrence time, source type, optional source-reference SHA-256, user-verification flag, ResumeVersion ID, application category, and creation time. It can be created only after the corresponding guarded application state exists.
+
+ModelUsageEvent stores workflow, operation, model tier and name, token counts, optional micro-USD cost and latency, cache status, and optional application/job attribution. It never stores prompts or responses. UserTimeEvent stores a bounded activity, duration, source type, and optional application/job attribution.
+
+Conversion reports contain backend-derived funnel counts, numerator/denominator/rate triples, basic dimensions, usage totals, and an explicit statistical-caution status.
+
 ## Future core entities
 
-Add separate outcome records next. Do not collapse them into the job or application records.
+Future entities may extend cover-letter versioning, browser form execution, cache management, and richer evaluation telemetry. Do not collapse them into existing records.

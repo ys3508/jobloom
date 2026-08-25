@@ -15,7 +15,8 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
-- For form filling or submission preparation, read all seven references. Default to Fill-Only and stop before the final submission action.
+- For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
+- For form filling or submission preparation, read all eight references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -102,6 +103,15 @@ Store the database in `.jobloom/`. It contains plaintext local answers protected
 6. Verify every archived file against `archive_manifest.json` and reject untracked files. Archive creation is idempotent per application.
 7. Generate `applications.xlsx` only from deterministic tracker-source JSON. Keep answers out of the workbook and leave unavailable metrics blank.
 8. Keep all archives and tracker artifacts private under `.jobloom/`; never feed archived contents into a model context.
+
+## Outcomes and usage
+
+1. Move the application through its guarded outcome state before creating an OutcomeRecord. Never let an outcome record bypass application state validation.
+2. Require user confirmation or a hashed external source reference. Store no email, recruiter-message, or ATS-record contents.
+3. Record model usage from `assets/model-usage.template.json`; keep prompts and responses out of usage and audit tables.
+4. Record user time only from a timer or user report. Do not infer it from model or browser latency.
+5. Generate the funnel from persistent backend state and distinct transitions. Emit numerator, denominator, and nullable rate for every metric.
+6. Treat samples below thirty submissions as insufficient. At every sample size, report descriptive trends only and require user approval for strategy changes.
 
 ## Output discipline
 

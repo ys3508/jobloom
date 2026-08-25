@@ -1,0 +1,9 @@
+{
+  "outcome_id": "outcome-example-1",
+  "application_id": "app-example-1",
+  "outcome_type": "recruiter_response",
+  "occurred_at": "2026-08-25T12:00:00Z",
+  "source_type": "user_confirmation",
+  "actor": "user",
+  "source_reference": null
+}

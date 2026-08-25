@@ -145,6 +145,21 @@ node skills/jobloom/scripts/build_application_tracker.mjs \
 
 The workbook is a generated view, not a hand-edited source of truth, and never contains application answer values.
 
+Initialize outcome and usage tracking, then generate a private conversion report:
+
+```bash
+python3 skills/jobloom/scripts/outcome_core.py \
+  --db .jobloom/jobloom.db \
+  init
+
+python3 skills/jobloom/scripts/outcome_core.py \
+  --db .jobloom/jobloom.db \
+  report \
+  --output .jobloom/outcomes.json
+```
+
+Outcome records require the matching guarded application-state history. Model-usage records contain token/cost metadata but never prompts or responses. Reports show explicit denominators and warn against causal conclusions, especially below thirty submitted applications.
+
 Run the current test suite:
 
 ```bash

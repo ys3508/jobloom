@@ -462,6 +462,17 @@ def tracker_source(connection: sqlite3.Connection) -> dict[str, Any]:
         JOIN jobs j ON j.job_id=a.job_id
         ORDER BY a.submitted_at, a.application_id
     """).fetchall()
+    usage_by_application: dict[str, int] = {}
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_usage_events'"
+    ).fetchone():
+        usage_by_application = {
+            usage["application_id"]: usage["tokens"]
+            for usage in connection.execute("""
+                SELECT application_id, SUM(input_tokens + output_tokens) AS tokens
+                FROM model_usage_events WHERE application_id IS NOT NULL GROUP BY application_id
+            """)
+        }
     output = []
     for row in rows:
         card = json.loads(row["job_card_json"])
@@ -480,7 +491,7 @@ def tracker_source(connection: sqlite3.Connection) -> dict[str, Any]:
             "current_status": row["state"],
             "confirmation_id": row["confirmation_id"],
             "follow_up_date": None,
-            "model_usage": None,
+            "model_usage": usage_by_application.get(row["application_id"]),
             "archive_id": row["archive_id"],
             "archive_path": row["archive_path"],
         })

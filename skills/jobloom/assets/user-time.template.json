@@ -1,0 +1,8 @@
+{
+  "time_event_id": "time-example-1",
+  "activity": "job_review",
+  "duration_seconds": 300,
+  "source_type": "user_reported",
+  "application_id": null,
+  "job_id": null
+}

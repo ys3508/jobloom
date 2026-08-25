@@ -23,6 +23,7 @@ ARCHIVE = load_script("archive_core")
 APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
+OUTCOMES = load_script("outcome_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -38,6 +39,7 @@ class ArchiveCoreTests(unittest.TestCase):
         ANSWERS.initialize(self.db)
         RESUMES.initialize(self.db)
         ARCHIVE.initialize(self.db)
+        OUTCOMES.initialize(self.db)
         self.addCleanup(self.db.close)
         self.prepare_application()
 
@@ -204,6 +206,10 @@ class ArchiveCoreTests(unittest.TestCase):
 
     def test_tracker_source_is_derived_from_backend_state(self):
         self.submit()
+        OUTCOMES.record_model_usage(
+            self.db, "usage-1", "form_filling", "fill_known_fields", "low_cost",
+            100, 20, 0, "model-small", application_id="app-1", job_id="job-1", at=AT,
+        )
         self.assertEqual(ARCHIVE.status(self.db)["pending_submissions"], 1)
         ARCHIVE.create_archive(self.db, self.root / "archive", "app-1", "archive-1", AT)
         self.assertEqual(ARCHIVE.status(self.db)["pending_submissions"], 0)
@@ -213,6 +219,7 @@ class ArchiveCoreTests(unittest.TestCase):
         self.assertEqual(row["employer"], "Example Corp")
         self.assertEqual(row["resume_version"], "resume-1")
         self.assertEqual(row["current_status"], "submitted")
+        self.assertEqual(row["model_usage"], 120)
         self.assertNotIn("work_auth", json.dumps(source))
 
 
