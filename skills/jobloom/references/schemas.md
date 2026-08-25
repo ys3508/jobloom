@@ -92,17 +92,42 @@ Allowed evidence strengths: `direct`, `strongly_related`, `transferable`, `menti
   "citizenship_required": null,
   "security_clearance_required": null,
   "required_certifications": [],
+  "preferred_certifications": [],
   "required_skills": ["Python", "SQL"],
   "preferred_skills": ["AWS"],
+  "summary": null,
+  "responsibilities": [],
+  "compensation_structure": [],
+  "sponsorship_statements": [],
+  "seniority": "unknown",
+  "experience": null,
   "already_applied": false,
   "high_value": false,
   "requirements_reviewed": false,
   "description_sha256": "...",
-  "extraction": {"strategy": "json_ld", "needs_user_review": true}
+  "extraction": {"strategy": "json_ld", "needs_user_review": true,
+                 "sponsorship_scan": {"scanned": true, "segments_found": 0, "truncated": false}}
 }
 ```
 
 Allowed sponsorship values: `supports`, `does_not_support`, `historical_support`, `unknown`, `conflicting`.
+
+Direction routing reads only the structured fields above. `description`, `description_sha256`,
+`extraction`, `canonical_url`, `employer`, `location`, `country`, `salary` and `status` are never
+keyword-matched; `employer` is compared only for exact excluded/target-company equality and for
+domain context. Wrong-typed routing fields are rejected, never coerced into match text.
+
+`summary` is reviewer-authored and is never auto-filled from `description`. `sponsorship_statements`
+holds at most ten verbatim segments, at most 500 characters each, extracted once at ingestion; it is
+the only channel by which posting prose about sponsorship reaches a routing decision.
+
+`experience` is `null` or `{min_years, max_years, basis, strictness}` where `basis` is one of
+`range`, `minimum`, `exact`, `unstated` and `strictness` is `required` or `preferred`. A malformed
+value is treated as unstated and surfaced for review; it never raises and never hard-fails.
+
+`required_licenses` is not a JobCard field. Licences are certifications: they belong in
+`required_certifications` / `preferred_certifications` and are compared against
+`candidate["certifications"]`.
 
 An extracted JobCard always begins with `requirements_reviewed: false`. A user or reviewer must compare required skills and hard eligibility fields with the complete JD before changing it to `true`. The evaluator treats an unreviewed card as uncertain.
 

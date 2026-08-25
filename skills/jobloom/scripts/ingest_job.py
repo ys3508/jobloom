@@ -89,6 +89,25 @@ def nested_text(value: Any, *keys: str) -> str | None:
     return str(current).strip() if current not in (None, "") else None
 
 
+SPONSORSHIP_SEGMENT_MARKERS = ("sponsor", "sponsorship", "visa", "h-1b", "h1b", "work authorization")
+MAX_SPONSORSHIP_SEGMENTS = 10
+
+
+def sponsorship_statements(description: str) -> tuple[list[str], dict[str, Any]]:
+    """Extract bounded verbatim segments that mention sponsorship.
+
+    This is the single, deliberate place where the raw JD is read for sponsorship. The
+    segments become a structured, reviewable JobCard field; routing never reads the JD
+    itself. The card still ships with requirements_reviewed false.
+    """
+    segments = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", description or "") if part.strip()]
+    found = [part[:500] for part in segments
+             if any(marker in part.casefold() for marker in SPONSORSHIP_SEGMENT_MARKERS)]
+    truncated = len(found) > MAX_SPONSORSHIP_SEGMENTS
+    scan = {"scanned": True, "segments_found": len(found), "truncated": truncated}
+    return found[:MAX_SPONSORSHIP_SEGMENTS], scan
+
+
 def normalize_country(value: str | None) -> str:
     if not value:
         return "unknown"
@@ -144,9 +163,10 @@ def card_from_posting(posting: dict[str, Any], source_url: str, fallback_text: s
     skills = posting.get("skills", [])
     if isinstance(skills, str):
         skills = [item.strip() for item in re.split(r"[,;]", skills) if item.strip()]
+    statements, sponsorship_scan = sponsorship_statements(description)
     job_id_seed = f"{employer}|{title}|{source_url}".encode("utf-8")
     return {
-        "schema_version": "0.2.0",
+        "schema_version": "0.3.0",
         "job_id": f"job-{hashlib.sha256(job_id_seed).hexdigest()[:12]}",
         "canonical_url": urljoin(source_url, str(posting.get("url") or source_url)),
         "employer": employer,
@@ -161,14 +181,22 @@ def card_from_posting(posting: dict[str, Any], source_url: str, fallback_text: s
         "citizenship_required": None,
         "security_clearance_required": None,
         "required_certifications": [],
+        "preferred_certifications": [],
         "required_skills": skills,
         "preferred_skills": [],
+        "summary": None,
+        "responsibilities": [],
+        "compensation_structure": [],
+        "sponsorship_statements": statements,
+        "seniority": "unknown",
+        "experience": None,
         "already_applied": False,
         "high_value": False,
         "requirements_reviewed": False,
         "description": description,
         "description_sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
-        "extraction": {"strategy": "json_ld", "needs_user_review": True},
+        "extraction": {"strategy": "json_ld", "needs_user_review": True,
+                       "sponsorship_scan": sponsorship_scan},
     }
 
 
@@ -186,16 +214,21 @@ def build_card(content: str, source_url: str, content_type: str = "html") -> dic
             return card_from_posting(posting, source_url, fallback)
         content = fallback
     description = re.sub(r"\s+", " ", content).strip()
+    statements, sponsorship_scan = sponsorship_statements(description)
     seed = f"unknown|unknown|{source_url}|{description[:200]}".encode("utf-8")
     return {
-        "schema_version": "0.2.0", "job_id": f"job-{hashlib.sha256(seed).hexdigest()[:12]}",
+        "schema_version": "0.3.0", "job_id": f"job-{hashlib.sha256(seed).hexdigest()[:12]}",
         "canonical_url": source_url, "employer": "unknown", "title": "unknown", "country": "unknown",
         "location": "unknown", "work_arrangement": "unknown", "employment_type": "unknown", "salary": None,
         "status": "unknown", "sponsorship": "unknown", "citizenship_required": None,
-        "security_clearance_required": None, "required_certifications": [], "required_skills": [],
-        "preferred_skills": [], "already_applied": False, "high_value": False, "requirements_reviewed": False,
+        "security_clearance_required": None, "required_certifications": [],
+        "preferred_certifications": [], "required_skills": [], "preferred_skills": [],
+        "summary": None, "responsibilities": [], "compensation_structure": [],
+        "sponsorship_statements": statements, "seniority": "unknown", "experience": None,
+        "already_applied": False, "high_value": False, "requirements_reviewed": False,
         "description": description, "description_sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
-        "extraction": {"strategy": "plain_text", "needs_user_review": True},
+        "extraction": {"strategy": "plain_text", "needs_user_review": True,
+                       "sponsorship_scan": sponsorship_scan},
     }
 
 

@@ -186,18 +186,25 @@ class DirectionCoreTests(unittest.TestCase):
             profile, candidate, self.job_card(summary="commercial sales analytics")
         )
         self.assertNotEqual(soft["decision"], "fail")
-        hard = DIRECTIONS.route_job(
+        prose = DIRECTIONS.route_job(
             profile, candidate, self.job_card(summary="This is a commission-only role")
         )
-        self.assertEqual(hard["decision"], "fail")
-        self.assertEqual(hard["field_hits"]["hard_exclusion_keywords"][0]["field"], "summary")
+        self.assertEqual(prose["decision"], "review")
+        self.assertIn("direction_hard_exclusion_context_only", prose["review_reasons"])
+        self.assertEqual(prose["field_hits"]["hard_exclusion_keywords"][0]["field"], "summary")
+        structured = DIRECTIONS.route_job(
+            profile, candidate,
+            self.job_card(compensation_structure=["Compensation is commission only"]),
+        )
+        self.assertEqual(structured["decision"], "fail")
+        self.assertIn("direction_hard_exclusion", structured["hard_failures"])
 
     def test_sponsorship_and_rolling_portfolio_are_ranking_signals(self):
         profile = self.profile()
         candidate = json.loads(self.candidate_path.read_text())
         candidate["work_authorization"]["sponsorship_future"] = True
         result = DIRECTIONS.route_job(profile, candidate, self.job_card(sponsorship="supports"))
-        self.assertEqual(result["sponsorship_priority"], 3)
+        self.assertEqual(result["sponsorship_priority"], 4)
         targets = DIRECTIONS.rolling_allocation_targets([
             {"direction_id": "consulting", "weight_percent": 35},
             {"direction_id": "clinical", "weight_percent": 30},

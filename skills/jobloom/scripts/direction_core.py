@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -482,77 +483,771 @@ def _direction_in_active_portfolio(connection: sqlite3.Connection, direction_id:
     """, (direction_id, profile_sha256)).fetchone() is not None
 
 
-def _title_in_direction(profile: dict[str, Any], title: str) -> bool:
-    actual = " ".join(title.casefold().split())
-    return any(
-        (target := " ".join(item.casefold().split())) in actual or actual in target
-        for item in profile["target_titles"]
+
+
+# --- Routing surface -------------------------------------------------------
+# Field scope belongs to code; term lists belong to the user-approved profile.
+# GROUP_FIELDS is deliberately not derivable from profile JSON: adding a keyword
+# group to the profile must never be able to grant itself a wider field scope.
+ROUTING_FIELDS = (
+    "title", "summary", "responsibilities", "required_skills", "preferred_skills",
+    "required_certifications", "preferred_certifications", "employment_type",
+    "compensation_structure",
+)
+# Read for exact-value comparison and domain context only; never keyword-matched,
+# so an employer named "Salesforce" can never trip a "sales" term.
+CONTEXT_FIELDS = ("employer",)
+# The raw JD and its derivatives never reach a routing decision.
+ROUTING_DENYLIST = frozenset({
+    "description", "description_sha256", "extraction", "canonical_url", "location",
+    "country", "salary", "status", "job_id", "employer",
+})
+assert not set(ROUTING_FIELDS) & ROUTING_DENYLIST
+
+_CONTENT_FIELDS = frozenset({"title", "summary", "responsibilities", "required_skills", "preferred_skills"})
+GROUP_FIELDS: dict[str, frozenset[str]] = {
+    "target_titles": frozenset({"title"}),
+    "auxiliary_titles": frozenset({"title"}),
+    "positive_keywords": _CONTENT_FIELDS,
+    "precision_keywords": _CONTENT_FIELDS,
+    "discovery_keywords": _CONTENT_FIELDS,
+    "negative_keywords": _CONTENT_FIELDS,
+    # A pay structure is never a "skill", so skills stay out of the only hard path.
+    "hard_exclusion_keywords": frozenset({
+        "title", "employment_type", "compensation_structure", "required_certifications",
+        "summary", "responsibilities",
+    }),
+}
+# Prose carries negation the matcher cannot see ("we do not offer commission-only
+# compensation"), so a prose hit is surfaced for triage instead of silently discarding.
+HARD_EXCLUSION_DECISIVE_FIELDS = frozenset({
+    "title", "employment_type", "compensation_structure", "required_certifications",
+})
+
+JOB_FIELD_SHAPES: dict[str, tuple[str, int, int]] = {
+    "title": ("str", 300, 0),
+    "summary": ("str_or_none", 2000, 0),
+    "employment_type": ("str", 100, 0),
+    "responsibilities": ("list", 500, 50),
+    "required_skills": ("list", 500, 200),
+    "preferred_skills": ("list", 500, 200),
+    "required_certifications": ("list", 500, 200),
+    "preferred_certifications": ("list", 500, 200),
+    "compensation_structure": ("list", 300, 20),
+    "sponsorship_statements": ("list", 500, 10),
+}
+FIELD_HIT_CAP = 50
+
+# --- Seniority -------------------------------------------------------------
+# Exactly the tokens the user named. Widening this forces guard lists against
+# registered target titles, so it stays a deliberate, separate decision.
+BLOCKED_SENIORITY_TOKENS = frozenset({"senior", "sr", "snr", "lead", "principal", "staff"})
+# A blocked token immediately followed by one of these is domain vocabulary, not rank.
+SENIORITY_GUARD_FOLLOWERS = {
+    "senior": frozenset({"care", "living", "housing", "services", "health", "citizen", "citizens"}),
+    "lead": frozenset({"generation", "optimization", "compound", "scoring", "qualification"}),
+    "principal": frozenset({"component", "components", "investigator", "diagnosis"}),
+    "staff": frozenset({"nurse", "nurses", "pharmacist", "physician", "augmentation"}),
+}
+REQUIRE_EXPERIENCE_FOR_UNSPECIFIED_SENIORITY = False
+CANDIDATE_MAX_YEARS = 3.0
+
+# --- Duty detection --------------------------------------------------------
+# Deliberately excludes bare "sales", "commercial", "business development",
+# "commission", "territory", "pipeline", "revenue", "account", "client".
+SALES_ROLE_TITLES = (
+    "account executive", "sales representative", "sales rep", "territory manager",
+    "district sales manager", "inside sales", "outside sales", "field sales",
+    "door to door sales", "insurance agent", "sales consultant",
+)
+SALES_OWNERSHIP_SIGNALS = (
+    "carry a quota", "carrying a quota", "quota carrying", "sales quota", "quota attainment",
+    "book of business", "cold calling", "cold call", "close deals", "closing deals",
+    "on target earnings", "ote", "commission only", "commission based compensation",
+    "generate new business", "prospecting new clients", "hunt for new logos",
+)
+ANALYTICS_COUNTER_SIGNALS = (
+    "analysis", "analytics", "analyze", "insights", "dashboard", "reporting", "sql",
+    "statistical", "statistics", "modeling", "forecasting", "research", "data quality",
+    "study design", "process improvement", "strategy",
+)
+ERP_CONFIG_SIGNALS = (
+    "sap modules", "oracle ebs", "workday configuration", "netsuite configuration",
+    "system configuration", "user provisioning", "license administration",
+    "erp implementation", "module configuration",
+)
+IMPLEMENTATION_SIGNALS = ("go live", "go-live", "uat", "user acceptance testing", "cutover", "deployment plan")
+ADVANCED_METHOD_TERMS = (
+    "pharmacoepidemiology", "propensity score", "causal inference", "survival analysis",
+    "health economics", "heor", "cost effectiveness", "markov model", "budget impact model",
+)
+ADVANCED_DATA_ASSET_TERMS = ("claims data", "administrative claims", "ehr data", "real world data", "rwd")
+CAREER_GROWTH_DEMOTION_TITLES = ("clinical data coordinator", "data entry coordinator")
+DOMAIN_CONTEXT_TERMS = (
+    "healthcare", "health care", "clinical", "pharma", "pharmaceutical", "biotech",
+    "life sciences", "hospital", "provider", "payer", "patient", "medical", "cro",
+    "health system", "public health", "epidemiology",
+)
+QUANT_RESEARCH_TRANSFER_TERMS = (
+    "conjoint", "maxdiff", "spss", "regression", "survey design", "sampling",
+    "experimental design", "segmentation",
+)
+CONTEXT_REVIEW_MIN_DISTINCT_TERMS = 2
+
+# --- Sponsorship -----------------------------------------------------------
+SPONSORSHIP_REFUSAL_PATTERNS = (
+    "unable to sponsor", "not able to sponsor", "cannot sponsor", "can not sponsor",
+    "do not sponsor", "does not sponsor", "will not sponsor", "no visa sponsorship",
+    "not provide sponsorship", "not offer sponsorship", "without sponsorship now or in the future",
+    "not take over sponsorship", "take over sponsorship of", "unable to provide sponsorship",
+)
+SPONSORSHIP_SUPPORT_PATTERNS = (
+    "visa sponsorship available", "we sponsor", "will sponsor", "able to sponsor",
+    "sponsorship is available", "offer visa sponsorship", "h 1b sponsorship available",
+)
+# "Sponsor" in this portfolio usually means the trial sponsor, not immigration.
+SPONSORSHIP_NON_VISA_MARKERS = (
+    "sponsor cro", "trial sponsor", "study sponsor", "sponsor site", "investigator initiated",
+    "sponsor relationship", "sponsor audits", "clinical sponsor",
+)
+# Must not be read as refusal.
+SPONSORSHIP_NOT_A_REFUSAL = ("no sponsorship required", "sponsorship is not required", "without requiring sponsorship")
+SPONSORSHIP_PRIORITY = {
+    "supports": 4, "historical_support": 3, "unknown": 2, "conflicting": 1, "does_not_support": 0,
+}
+
+# --- Ranking ---------------------------------------------------------------
+RANKING_BASE = 100
+RANKING_WEIGHTS = {
+    "sponsorship": 10, "positive_keyword": 2, "analytics_duty": 1,
+    "negative_keyword": -3, "career_growth": -15, "duty_demotion": -10, "stretch": -5,
+}
+
+
+def _tokens(value: str) -> list[str]:
+    return re.findall(r"[^\W_]+", value.casefold())
+
+
+def _token_run(needle: list[str], haystack: list[str]) -> int:
+    """Index of the first contiguous occurrence of needle in haystack, else -1."""
+    if not needle or len(needle) > len(haystack):
+        return -1
+    first = needle[0]
+    for start in range(len(haystack) - len(needle) + 1):
+        if haystack[start] == first and haystack[start:start + len(needle)] == needle:
+            return start
+    return -1
+
+
+def _phrase_hits(phrases: tuple[str, ...], tokens_by_field: dict[str, list[str]],
+                 fields: frozenset[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+    hits = []
+    for phrase in phrases:
+        needle = _tokens(phrase)
+        for field in fields:
+            start = _token_run(needle, tokens_by_field.get(field, []))
+            if start >= 0:
+                hits.append({"term": phrase, "field": field})
+                break
+    return hits
+
+
+def _validate_job_shape(job: dict[str, Any]) -> None:
+    """Reject a wrong-typed routing field; never coerce it into match text."""
+    for field, (kind, max_len, max_items) in JOB_FIELD_SHAPES.items():
+        if field not in job or job[field] is None:
+            if kind == "str" and field in job and job[field] is None:
+                raise ValueError(f"malformed job card field: {field}")
+            continue
+        value = job[field]
+        if kind in {"str", "str_or_none"}:
+            if not isinstance(value, str) or len(value) > max_len:
+                raise ValueError(f"malformed job card field: {field}")
+        else:
+            if not isinstance(value, list) or len(value) > max_items:
+                raise ValueError(f"malformed job card field: {field}")
+            if any(not isinstance(item, str) or len(item) > max_len for item in value):
+                raise ValueError(f"malformed job card field: {field}")
+
+
+def _field_tokens(job: dict[str, Any]) -> dict[str, list[str]]:
+    tokens: dict[str, list[str]] = {}
+    for field in ROUTING_FIELDS:
+        value = job.get(field)
+        text = " ".join(value) if isinstance(value, list) else (value or "")
+        tokens[field] = _tokens(str(text))[:4000]
+    return tokens
+
+
+def _seniority(tokens_by_field, job):
+    """Token-level seniority read with domain guards; never a substring scan."""
+    title = tokens_by_field.get("title", [])
+    markers, suppressed = [], []
+    for index, token in enumerate(title):
+        if token not in BLOCKED_SENIORITY_TOKENS:
+            continue
+        follower = title[index + 1] if index + 1 < len(title) else None
+        guard = SENIORITY_GUARD_FOLLOWERS.get(token, frozenset())
+        if follower in guard:
+            suppressed.append({"term": token, "field": "title", "guard": follower})
+        else:
+            markers.append({"term": token, "field": "title"})
+    declared = job.get("seniority") if job.get("requirements_reviewed") else None
+    return {
+        "band": None,
+        "title_derived_band": "blocked" if markers else "unspecified",
+        "declared_band": declared if isinstance(declared, str) and declared != "unknown" else None,
+        "blocked_tokens": sorted({item["term"] for item in markers}),
+        "title_markers": markers,
+        "suppressed_markers": suppressed,
+        "experience": _experience(job),
+    }
+
+
+def _experience(job):
+    raw = job.get("experience")
+    if raw is None:
+        return {"min_years": None, "max_years": None, "basis": None, "strictness": None,
+                "state": "unreviewed" if not job.get("requirements_reviewed") else "unstated"}
+    if not isinstance(raw, dict) or set(raw) - {"min_years", "max_years", "basis", "strictness"}:
+        return {"min_years": None, "max_years": None, "basis": None, "strictness": None, "state": "malformed"}
+    def years(key):
+        value = raw.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return "invalid"
+        return float(value)
+    minimum, maximum = years("min_years"), years("max_years")
+    basis, strictness = raw.get("basis"), raw.get("strictness", "required")
+    if "invalid" in (minimum, maximum) or basis not in {"range", "minimum", "exact", "unstated", None} \
+            or strictness not in {"required", "preferred"}:
+        return {"min_years": None, "max_years": None, "basis": None, "strictness": None, "state": "malformed"}
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return {"min_years": None, "max_years": None, "basis": None, "strictness": None, "state": "malformed"}
+    state = "unstated" if minimum is None else (
+        "above_range" if minimum > CANDIDATE_MAX_YEARS else "within_reach")
+    return {"min_years": minimum, "max_years": maximum, "basis": basis,
+            "strictness": strictness, "state": state}
+
+
+def _normalize_credential(value):
+    """Return a stable comparison code, or None when the item is not a credential slug."""
+    tokens = _tokens(value)
+    if not tokens or len(tokens) > 8:
+        return None
+    placeholders = ({"none"}, {"n", "a"}, {"na"}, {"not", "applicable"}, {"tbd"})
+    if any(set(tokens) == placeholder for placeholder in placeholders):
+        return None
+    dropped = {"preferred", "or", "equivalent", "active", "current", "license", "licensure",
+               "certification", "certified", "a", "an", "the", "in", "state", "of"}
+    core = [token for token in tokens if token not in dropped]
+    # A single leftover character is punctuation debris, not a credential.
+    if not core or "".join(core) == "" or len("".join(core)) < 2:
+        return None
+    return "".join(core)
+
+
+CREDENTIAL_ALIASES = {
+    "registerednurse": "rn", "rn": "rn",
+    "doctorofmedicine": "md", "md": "md",
+    "doctorofpharmacy": "pharmd", "pharmd": "pharmd",
+    "licensedpracticalnurse": "lpn", "lpn": "lpn",
+}
+
+
+def _credential_code(value):
+    slug = _normalize_credential(value)
+    if slug is None:
+        return None
+    return CREDENTIAL_ALIASES.get(slug, slug)
+
+
+def _credentials(job, candidate):
+    """Generalized credential check. No hardcoded license list, and holdings are honored."""
+    held_raw = [item for item in candidate.get("certifications", []) if isinstance(item, str)]
+    held_exact = {item.casefold() for item in held_raw}
+    held_codes = {code for code in (_credential_code(item) for item in held_raw) if code}
+    findings, failures, review = [], [], []
+    for field, required in (("required_certifications", True), ("preferred_certifications", False)):
+        items = job.get(field) or []
+        for index, item in enumerate(items):
+            code = _credential_code(item)
+            if code is None:
+                if _tokens(item) and len(_tokens(item)) > 8:
+                    status = "unparsed"
+                    if required:
+                        review.append(f"required_credential_unparsed:{field}.{index}")
+                else:
+                    continue
+                findings.append({"term": item, "field": field, "index": index,
+                                 "code": None, "status": status})
+                continue
+            if "preferred" in _tokens(item) and required:
+                findings.append({"term": item, "field": field, "index": index,
+                                 "code": code, "status": "preferred_not_held"
+                                 if code not in held_codes else "preferred_held"})
+                continue
+            holds = code in held_codes
+            if not required:
+                findings.append({"term": item, "field": field, "index": index, "code": code,
+                                 "status": "preferred_held" if holds else "preferred_not_held"})
+            elif holds:
+                # Surface a divergence rather than silently passing what evaluate_job would fail.
+                status = "held" if item.casefold() in held_exact else "alias_only"
+                if status == "alias_only":
+                    review.append(f"credential_alias_not_in_candidate_profile:{code}")
+                findings.append({"term": item, "field": field, "index": index,
+                                 "code": code, "status": status})
+            else:
+                failures.append(f"required_credential_not_held:{code}")
+                findings.append({"term": item, "field": field, "index": index,
+                                 "code": code, "status": "not_held"})
+    findings.sort(key=lambda item: (item["field"], item["index"]))
+    return findings, failures, review
+
+
+def _sponsorship(job, candidate):
+    """Never substitute one work-authorization answer for another (parent spec 8.1)."""
+    statements = job.get("sponsorship_statements") or []
+    evidence, refusal, support, non_visa = [], False, False, False
+    for index, segment in enumerate(statements):
+        segment_tokens = _tokens(segment)
+        def present(patterns):
+            return [phrase for phrase in patterns if _token_run(_tokens(phrase), segment_tokens) >= 0]
+        benign = present(SPONSORSHIP_NOT_A_REFUSAL)
+        marks = present(SPONSORSHIP_NON_VISA_MARKERS)
+        if marks:
+            non_visa = True
+            evidence.append({"field": "sponsorship_statements", "segment_index": index,
+                             "pattern_id": "non_visa_sense", "matched_text": segment[:120]})
+            continue
+        if benign:
+            evidence.append({"field": "sponsorship_statements", "segment_index": index,
+                             "pattern_id": "not_a_refusal", "matched_text": segment[:120]})
+            continue
+        found_refusal = present(SPONSORSHIP_REFUSAL_PATTERNS)
+        found_support = present(SPONSORSHIP_SUPPORT_PATTERNS)
+        # "unable to sponsor" contains "able to sponsor": the longer refusal wins.
+        if found_refusal:
+            refusal = True
+            evidence.append({"field": "sponsorship_statements", "segment_index": index,
+                             "pattern_id": found_refusal[0], "matched_text": segment[:120]})
+        elif found_support:
+            support = True
+            evidence.append({"field": "sponsorship_statements", "segment_index": index,
+                             "pattern_id": found_support[0], "matched_text": segment[:120]})
+    detected = ("conflicting" if refusal and support else
+                "does_not_support" if refusal else
+                "supports" if support else "unknown")
+    declared = job.get("sponsorship", "unknown")
+    if declared not in SPONSORSHIP_PRIORITY:
+        declared = "unknown"
+    if detected == "unknown":
+        effective = declared
+    elif declared == "unknown" or declared == detected:
+        effective = detected
+    else:
+        effective = "conflicting"
+    state = {"supports": "explicit_support", "historical_support": "historical_support",
+             "unknown": "unknown", "conflicting": "conflicting",
+             "does_not_support": "explicit_refusal"}[effective]
+    authorization = candidate.get("work_authorization") or {}
+    need = {key: bool(authorization.get(key)) for key in
+            ("sponsorship_now", "sponsorship_future", "employer_action_required")}
+    return {
+        "declared": declared, "detected": detected, "effective": effective, "state": state,
+        "priority": SPONSORSHIP_PRIORITY[effective], "evidence": evidence,
+        "candidate_need": need, "authorized_now": bool(authorization.get("authorized_now")),
+        "confirmed": bool(authorization.get("confirmed")),
+        "scanned_fields": ["sponsorship_statements"], "non_visa_sense": non_visa,
+    }
+
+
+def _narrow_set(direction_values, candidate_values):
+    """A direction may narrow the CandidateProfile, never widen it."""
+    direction = {str(item).casefold() for item in direction_values or []}
+    candidate = {str(item).casefold() for item in candidate_values or []}
+    if not direction:
+        return None, False
+    if not candidate:
+        return direction, False
+    return direction & candidate, bool(direction - candidate)
+
+
+def _criteria(profile, candidate, job, sponsorship_state):
+    criteria = profile.get("criteria") or {}
+    search = candidate.get("search") or {}
+    evaluated = {key: "not_configured" for key in CRITERIA_KEYS}
+    failures, review, conflicts = [], [], []
+    remote = str(job.get("work_arrangement") or "").casefold() == "remote"
+
+    simple = (
+        ("countries", "countries", "country", "direction_country_outside_scope"),
+        ("work_arrangements", "work_arrangements", "work_arrangement", "direction_work_arrangement_outside_scope"),
+        ("employment_types", "employment_types", "employment_type", "direction_employment_type_outside_scope"),
     )
+    for key, search_key, job_key, code in simple:
+        effective, widens = _narrow_set(criteria.get(key), search.get(search_key))
+        if widens:
+            conflicts.append(f"direction_criteria_widens_candidate_profile:{key}")
+        if effective is None:
+            continue
+        if not effective:
+            evaluated[key] = "unsatisfiable"
+            failures.append(f"direction_criteria_unsatisfiable:{key}")
+            continue
+        value = str(job.get(job_key) or "unknown").casefold()
+        if value == "unknown":
+            evaluated[key] = "job_value_unknown"
+            continue
+        evaluated[key] = "applied"
+        if value not in effective:
+            failures.append(code)
 
+    effective, widens = _narrow_set(criteria.get("locations"), search.get("locations"))
+    if widens:
+        conflicts.append("direction_criteria_widens_candidate_profile:locations")
+    if effective is not None:
+        if not effective:
+            evaluated["locations"] = "unsatisfiable"
+            failures.append("direction_criteria_unsatisfiable:locations")
+        elif remote:
+            evaluated["locations"] = "not_applicable_remote"
+        else:
+            location = str(job.get("location") or "unknown").casefold()
+            if location == "unknown":
+                evaluated["locations"] = "job_value_unknown"
+                review.append("direction_location_unknown")
+            else:
+                evaluated["locations"] = "applied"
+                # Bidirectional containment mirrors evaluate_job for free-text locations.
+                if not any(item in location or location in item for item in effective):
+                    failures.append("direction_location_outside_scope")
 
-def _field_text(job: dict[str, Any]) -> dict[str, str]:
-    fields = {"title": str(job.get("title") or "")}
-    for key in ("summary", "responsibilities", "required_skills", "preferred_skills", "required_licenses"):
-        value = job.get(key, [])
-        fields[key] = " ".join(map(str, value)) if isinstance(value, list) else str(value or "")
-    return {key: " ".join(value.casefold().split()) for key, value in fields.items()}
+    excluded = {str(item).casefold() for item in criteria.get("excluded_companies") or []}
+    if excluded:
+        employer = str(job.get("employer") or "unknown").casefold()
+        if employer == "unknown":
+            evaluated["excluded_companies"] = "job_value_unknown"
+        else:
+            evaluated["excluded_companies"] = "applied"
+            if employer in excluded:
+                failures.append("direction_excluded_company")
+
+    floor = criteria.get("salary_floor")
+    if floor is not None:
+        candidate_floor = search.get("salary_floor")
+        if candidate_floor is not None and floor < candidate_floor:
+            conflicts.append("direction_criteria_widens_candidate_profile:salary_floor")
+            evaluated["salary_floor"] = "deferred_to_candidate_profile"
+        else:
+            salary = job.get("salary") or {}
+            currency = criteria.get("salary_currency")
+            if currency and salary.get("currency") and str(salary["currency"]).upper() != str(currency).upper():
+                evaluated["salary_floor"] = "currency_conflict"
+            elif salary.get("max") is None or str(salary.get("unit", "YEAR")).upper() != "YEAR":
+                evaluated["salary_floor"] = "job_value_unknown"
+            else:
+                evaluated["salary_floor"] = "applied"
+                if salary["max"] < floor:
+                    failures.append("direction_salary_below_floor")
+
+    travel = criteria.get("travel_limit")
+    evaluated["travel_limit"] = "not_configured" if travel is None else "no_jobcard_field"
+    for key in ("industries", "company_sizes", "target_companies"):
+        if criteria.get(key):
+            evaluated[key] = "no_jobcard_field"
+    if criteria.get("seniority"):
+        # Job families, not bands: inert until a JobCard carries a structured seniority.
+        evaluated["seniority"] = "title_token_gate_only"
+    if criteria.get("salary_currency"):
+        evaluated["salary_currency"] = evaluated.get("salary_floor", "not_configured")
+    return evaluated, failures, review, conflicts
 
 
 def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
-    """Route one structured JobCard without allowing a direction to widen CandidateProfile."""
-    profile = validate_profile(profile)
-    fields = _field_text(job)
-    all_text = " ".join(fields.values())
-    hits: dict[str, list[dict[str, str]]] = {
-        "target_titles": [], "auxiliary_titles": [], "positive_keywords": [],
-        "negative_keywords": [], "hard_exclusion_keywords": [], "discovery_keywords": [],
-    }
-    for group in hits:
-        for term in profile[group]:
-            needle = " ".join(term.casefold().split())
-            for field, text in fields.items():
-                if needle and needle in text:
-                    hits[group].append({"term": term, "field": field})
+    """Route one structured JobCard. A direction may narrow CandidateProfile, never widen it.
 
+    Stage A validates, Stage B derives, Stage C runs every predicate independently, and
+    Stage D reduces. Nothing in Stage C short-circuits, so the outcome is order-independent.
+    """
+    # --- Stage A: validate --------------------------------------------------
+    profile = validate_profile(profile)
+    _validate_job_shape(job)
+
+    # --- Stage B: derive ----------------------------------------------------
+    tokens_by_field = _field_tokens(job)
     failures: list[str] = []
     review: list[str] = []
-    if hits["hard_exclusion_keywords"]:
+    notes: list[str] = []
+
+    authorization = candidate.get("work_authorization")
+    required_auth = ("country", "authorized_now", "sponsorship_now", "sponsorship_future",
+                     "employer_action_required", "confirmed")
+    if not isinstance(authorization, dict) or any(key not in authorization for key in required_auth):
+        failures.append("work_authorization_incomplete")
+        authorization = {}
+    elif not authorization.get("confirmed"):
+        review.append("work_authorization_unconfirmed_or_stale")
+
+    field_hits: dict[str, list[dict[str, Any]]] = {group: [] for group in GROUP_FIELDS}
+    truncated: dict[str, bool] = {group: False for group in GROUP_FIELDS}
+    for group, allowed in GROUP_FIELDS.items():
+        for term in profile.get(group) or []:
+            needle = _tokens(term)
+            if not needle:
+                continue
+            for field in ROUTING_FIELDS:
+                if field not in allowed:
+                    continue
+                start = _token_run(needle, tokens_by_field.get(field, []))
+                if start < 0:
+                    continue
+                if len(field_hits[group]) >= FIELD_HIT_CAP:
+                    truncated[group] = True
+                    break
+                field_hits[group].append({
+                    "term": term, "term_tokens": needle, "field": field,
+                    "field_tier": "identity" if field == "title" else (
+                        "structure" if field in {"employment_type", "compensation_structure",
+                                                 "required_certifications", "preferred_certifications"}
+                        else "content"),
+                    "match_kind": "title_token_sequence" if field == "title" else "token_sequence",
+                    "token_start": start, "token_end": start + len(needle),
+                    "decisive": field in HARD_EXCLUSION_DECISIVE_FIELDS,
+                })
+
+    signal_hits = {
+        "sales_role_title": _phrase_hits(SALES_ROLE_TITLES, tokens_by_field, ("title",)),
+        "sales_ownership": _phrase_hits(SALES_OWNERSHIP_SIGNALS, tokens_by_field,
+                                        ("summary", "responsibilities", "compensation_structure")),
+        "analytics_counter": _phrase_hits(ANALYTICS_COUNTER_SIGNALS, tokens_by_field,
+                                          ("summary", "responsibilities", "required_skills")),
+        "erp_configuration": _phrase_hits(ERP_CONFIG_SIGNALS, tokens_by_field,
+                                          ("summary", "responsibilities", "required_skills")),
+        "implementation_consulting": _phrase_hits(IMPLEMENTATION_SIGNALS, tokens_by_field,
+                                                  ("summary", "responsibilities")),
+        "advanced_requirement": [],
+        "career_growth_demotion": _phrase_hits(CAREER_GROWTH_DEMOTION_TITLES, tokens_by_field, ("title",)),
+        "domain_context": _phrase_hits(DOMAIN_CONTEXT_TERMS, tokens_by_field,
+                                       ("title", "summary", "responsibilities", "required_skills")),
+        "quantitative_transfer": _phrase_hits(QUANT_RESEARCH_TRANSFER_TERMS, tokens_by_field,
+                                              ("summary", "responsibilities", "required_skills")),
+    }
+    # The title is excluded from the advanced scan or every HEOR target title self-demotes.
+    fact_terms = {token for fact in candidate.get("facts") or []
+                  for token in _tokens(str(fact.get("value", "")) + " " + " ".join(fact.get("keywords") or []))}
+    for obligation, field in (("required", "required_skills"), ("preferred", "preferred_skills")):
+        for phrase in ADVANCED_METHOD_TERMS + ADVANCED_DATA_ASSET_TERMS:
+            needle = _tokens(phrase)
+            if _token_run(needle, tokens_by_field.get(field, [])) >= 0:
+                signal_hits["advanced_requirement"].append({
+                    "term": phrase, "field": field, "obligation": obligation,
+                    "covered_by_candidate_fact": all(token in fact_terms for token in needle),
+                })
+
+    seniority_assessment = _seniority(tokens_by_field, job)
+    credential_findings, credential_failures, credential_review = _credentials(job, candidate)
+    sponsorship_assessment = _sponsorship(job, candidate)
+    criteria_evaluated, criteria_failures, criteria_review, criteria_conflicts = _criteria(
+        profile, candidate, job, sponsorship_assessment)
+    analytics_body_hits = len({hit["term"] for hit in signal_hits["analytics_counter"]})
+
+    # --- Stage C: predicates (independent, accumulating) --------------------
+    decisive_exclusions = [hit for hit in field_hits["hard_exclusion_keywords"] if hit["decisive"]]
+    if decisive_exclusions:
         failures.append("direction_hard_exclusion")
-    title = fields["title"]
-    if any(token in title.split() for token in ("senior", "lead", "principal", "staff")):
+    elif field_hits["hard_exclusion_keywords"]:
+        review.append("direction_hard_exclusion_context_only")
+
+    if seniority_assessment["title_markers"]:
         failures.append("seniority_outside_portfolio")
-    required_licenses = {item.casefold() for item in job.get("required_licenses", [])}
-    if required_licenses & {"rn", "md", "pharmd"}:
-        failures.append("required_clinical_license_missing")
-    if not hits["target_titles"]:
-        if hits["auxiliary_titles"] or hits["positive_keywords"]:
-            review.append("auxiliary_or_contextual_title")
+    if seniority_assessment["suppressed_markers"]:
+        notes.append("seniority_token_context_suppressed")
+    if not tokens_by_field.get("title"):
+        review.append("job_title_unknown")
+
+    failures.extend(credential_failures)
+    review.extend(credential_review)
+
+    experience = seniority_assessment["experience"]
+    if experience["state"] == "malformed":
+        review.append("experience_field_malformed")
+    elif experience["state"] == "above_range":
+        if experience["strictness"] == "required":
+            failures.append("experience_requirement_above_candidate_range")
+        else:
+            review.append("experience_preference_above_candidate_range")
+    elif experience["state"] == "unreviewed":
+        notes.append("experience_deferred_pending_job_card_review")
+    elif experience["state"] == "unstated" and REQUIRE_EXPERIENCE_FOR_UNSPECIFIED_SENIORITY \
+            and not seniority_assessment["declared_band"]:
+        review.append("experience_unstated_for_unspecified_seniority")
+
+    if signal_hits["sales_role_title"]:
+        failures.append("quota_carrying_sales_title")
+    ownership = len({hit["term"] for hit in signal_hits["sales_ownership"]})
+    decisive_ownership = len({hit["term"] for hit in signal_hits["sales_ownership"]
+                              if hit["field"] == "compensation_structure"})
+    if decisive_ownership or ownership >= 2:
+        failures.append("quota_carrying_sales_duties")
+    elif ownership == 1:
+        review.append("sales_duty_signal_requires_review")
+
+    erp = len({hit["term"] for hit in signal_hits["erp_configuration"]})
+    if erp >= 2 and analytics_body_hits == 0:
+        failures.append("pure_erp_it_configuration")
+    elif erp >= 2:
+        review.append("erp_configuration_duties_without_analytics")
+    elif erp == 1:
+        notes.append("erp_configuration_minor_component")
+    if signal_hits["implementation_consulting"]:
+        notes.append("implementation_consulting_component")
+        if analytics_body_hits < 2:
+            review.append("implementation_consulting_requires_review")
+
+    mandatory_advanced = [hit for hit in signal_hits["advanced_requirement"]
+                          if hit["obligation"] == "required" and not hit["covered_by_candidate_fact"]]
+    if mandatory_advanced:
+        review.append("advanced_requirement_mandatory")
+    elif signal_hits["advanced_requirement"]:
+        notes.append("advanced_requirement_preferred_only")
+
+    title_hits = field_hits["target_titles"]
+    auxiliary_hits = field_hits["auxiliary_titles"]
+    contextual = [hit for group in ("positive_keywords", "precision_keywords", "discovery_keywords")
+                  for hit in field_hits[group]]
+    distinct_context = len({hit["term"] for hit in contextual})
+    has_domain = bool(signal_hits["domain_context"]) or any(
+        str(job.get("employer") or "").casefold().find(term) >= 0 for term in DOMAIN_CONTEXT_TERMS)
+    if title_hits:
+        pass
+    elif auxiliary_hits:
+        if has_domain:
+            review.append("auxiliary_title_with_direction_context")
+        else:
+            review.append("auxiliary_title_without_direction_context")
+            if signal_hits["quantitative_transfer"]:
+                notes.append("auxiliary_title_transferable_quantitative_only")
+    else:
+        title_tokens = tokens_by_field.get("title", [])
+        order_variant = any(
+            set(_tokens(term)) == set(title_tokens) and _tokens(term) != title_tokens
+            for term in profile.get("target_titles") or [])
+        elsewhere = [hit for group in ("target_titles",) for hit in field_hits[group]]
+        contextual_title = any(
+            _token_run(_tokens(term), tokens_by_field.get(field, [])) >= 0
+            for term in profile.get("target_titles") or []
+            for field in ("summary", "responsibilities", "required_skills", "preferred_skills"))
+        if order_variant:
+            review.append("target_title_order_variant")
+        elif contextual_title:
+            review.append("contextual_title_reference_only")
+        elif distinct_context >= CONTEXT_REVIEW_MIN_DISTINCT_TERMS:
+            review.append("direction_context_without_title_match")
         else:
             failures.append("outside_direction_title_scope")
-    if hits["negative_keywords"]:
+
+    if field_hits["negative_keywords"]:
         review.append("direction_soft_negative_keyword")
 
-    sponsorship = job.get("sponsorship", "unknown")
-    sponsorship_priority = {
-        "supports": 3, "historical_support": 2, "unknown": 1,
-        "conflicting": 1, "does_not_support": 0,
-    }.get(sponsorship, 1)
-    needs_future = bool(candidate.get("work_authorization", {}).get("sponsorship_future"))
-    if needs_future and sponsorship == "does_not_support":
+    failures.extend(criteria_failures)
+    review.extend(criteria_review)
+
+    effective_sponsorship = sponsorship_assessment["effective"]
+    need = sponsorship_assessment["candidate_need"]
+    needs_employer_support = any(need.values())
+    same_country = str(job.get("country") or "").casefold() == str(authorization.get("country") or "").casefold()
+    if same_country and needs_employer_support and effective_sponsorship == "does_not_support":
         failures.append("required_sponsorship_not_supported")
-    elif needs_future and sponsorship in {"unknown", "conflicting"}:
+        for key, value in need.items():
+            if value:
+                notes.append(f"sponsorship_required_by:{key}")
+    elif needs_employer_support and effective_sponsorship == "unknown":
         review.append("employer_sponsorship_history_investigation_required")
+    elif needs_employer_support and effective_sponsorship == "historical_support":
+        review.append("sponsorship_historical_only_requires_confirmation")
+    if effective_sponsorship == "conflicting":
+        review.append("employer_sponsorship_conflict_requires_user_resolution")
+        notes.append("sponsorship_signal_conflicting")
+    if sponsorship_assessment["declared"] != "unknown" and \
+            sponsorship_assessment["detected"] not in {"unknown", sponsorship_assessment["declared"]}:
+        review.append("sponsorship_declared_field_conflicts_with_posting_text")
+    if sponsorship_assessment.get("non_visa_sense"):
+        review.append("sponsorship_statement_non_visa_sense")
+
+    if signal_hits["career_growth_demotion"]:
+        notes.append("career_growth_ceiling_coordinator_role")
+    missing_surface = [field for field in ("responsibilities", "compensation_structure") if field not in job]
+    if missing_surface:
+        notes.append("routing_surface_incomplete")
+
+    # --- Stage D: reduce ----------------------------------------------------
+    decision = "fail" if failures else ("review" if review else "match")
+    if decision == "match" and not job.get("requirements_reviewed"):
+        decision = "review"
+        review.append("job_card_unreviewed")
+
+    positive_terms = len({hit["term"] for hit in field_hits["positive_keywords"]})
+    negative_terms = len({hit["term"] for hit in field_hits["negative_keywords"]})
+    career_penalty = 1 if signal_hits["career_growth_demotion"] else 0
+    duty_penalty = min(2, erp + (1 if ownership else 0))
+    stretch_penalty = 1 if mandatory_advanced else 0
+    weights = RANKING_WEIGHTS
+    ranking_score = (
+        RANKING_BASE
+        + weights["sponsorship"] * sponsorship_assessment["priority"]
+        + weights["positive_keyword"] * min(positive_terms, 5)
+        + weights["analytics_duty"] * min(analytics_body_hits, 5)
+        + weights["negative_keyword"] * min(negative_terms, 5)
+        + weights["career_growth"] * career_penalty
+        + weights["duty_demotion"] * duty_penalty
+        + weights["stretch"] * stretch_penalty
+    )
+    penalties = [{"code": code, "weight": weight} for code, weight in (
+        ("career_growth_ceiling_coordinator_role", 15 * career_penalty),
+        ("duty_demotion", 10 * duty_penalty),
+        ("advanced_requirement_mandatory", 5 * stretch_penalty),
+    ) if weight]
 
     return {
-        "decision": "fail" if failures else ("review" if review else "match"),
-        "hard_failures": sorted(set(failures)), "review_reasons": sorted(set(review)),
-        "field_hits": hits, "sponsorship_priority": sponsorship_priority,
+        "decision": decision,
+        "hard_failures": sorted(set(failures)),
+        "review_reasons": sorted(set(review)),
+        "notes": sorted(set(notes)),
+        "field_hits": field_hits,
+        "field_hits_truncated": truncated,
+        "field_hit_totals": {group: len(hits) for group, hits in field_hits.items()},
+        "signal_hits": signal_hits,
+        "criteria_evaluated": criteria_evaluated,
+        "criteria_conflicts": sorted(set(criteria_conflicts)),
+        "seniority_assessment": seniority_assessment,
+        "sponsorship_assessment": sponsorship_assessment,
+        "credential_findings": credential_findings,
         "ranking_signals": {
-            "positive_keyword_hits": len(hits["positive_keywords"]),
-            "negative_keyword_hits": len(hits["negative_keywords"]),
-            "sponsorship_priority": sponsorship_priority,
+            "positive_keyword_hits": positive_terms,
+            "positive_keyword_field_hits": len(field_hits["positive_keywords"]),
+            "negative_keyword_hits": negative_terms,
+            "precision_keyword_terms": sorted({hit["term"] for hit in field_hits["precision_keywords"]}),
+            "analytics_duty_hits": analytics_body_hits,
+            "sales_ownership_hits": ownership,
+            "preferred_credential_hits": sum(
+                1 for item in credential_findings if item["status"] == "preferred_held"),
+            "career_growth_penalty": career_penalty,
+            "duty_demotion_penalty": duty_penalty,
+            "stretch_penalty": stretch_penalty,
+            "sponsorship_priority": sponsorship_assessment["priority"],
+            "direction_industry_match": None,
+            "direction_company_size_match": None,
+            "direction_target_company": None,
+            "direction_travel_within_limit": None,
         },
+        "ranking_penalties": penalties,
+        "ranking_score": ranking_score,
+        "sponsorship_priority": sponsorship_assessment["priority"],
     }
+
 
 
 def rolling_allocation_targets(allocations: list[dict[str, Any]], reviewed_direction_ids: list[str],
@@ -619,7 +1314,9 @@ def generate_plan(
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
     routing = route_job(profile, candidate, job)
     if routing["decision"] != "match":
-        raise ValueError("job title is outside the approved search direction")
+        blockers = routing["hard_failures"] or routing["review_reasons"]
+        raise ValueError(
+            "job is outside the approved search direction: " + ", ".join(blockers))
     evaluation = evaluate_job.evaluate(candidate, job)
     if evaluation["eligibility"] != "pass" or evaluation["action"] not in {"broad", "precision"}:
         raise ValueError("resume adaptation is blocked until job eligibility and evidence are resolved")
