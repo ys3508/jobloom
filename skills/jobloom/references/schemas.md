@@ -171,7 +171,7 @@ Application events contain no answer values or full JobCards. Submission evidenc
 
 ## Resume version
 
-A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, parent version, optional adaptation-plan ID and direction-profile hash, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
+A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, provenance `source_mode`, parent version, optional adaptation-plan ID and direction-profile hash, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`; source modes are `generated` and `user_provided`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
 
 The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
 

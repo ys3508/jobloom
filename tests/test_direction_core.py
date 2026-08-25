@@ -371,6 +371,52 @@ class DirectionCoreTests(unittest.TestCase):
         self.assertEqual(selected["version_id"], "direction-1")
         self.assertEqual(generated["plan"]["base_resume_version_id"], "master-1")
 
+    def test_user_provided_direction_resume_skips_plan_but_not_direction_or_user_approval(self):
+        self.approve_direction()
+        source = self.root / "uploaded-direction.txt"
+        source.write_text("Python\n", encoding="utf-8")
+        registered = RESUMES.register_version(
+            self.db, self.root / "resumes", source, "uploaded-direction-1",
+            "direction", "backend", source_mode="user_provided", at=AT,
+        )
+        self.assertEqual(registered["source_mode"], "user_provided")
+        row = self.db.execute(
+            "SELECT parent_version_id, adaptation_plan_id, source_mode FROM resume_versions "
+            "WHERE version_id='uploaded-direction-1'"
+        ).fetchone()
+        self.assertIsNone(row["parent_version_id"])
+        self.assertIsNone(row["adaptation_plan_id"])
+        with self.assertRaisesRegex(ValueError, "user actor"):
+            RESUMES.approve_version(
+                self.db, "uploaded-direction-1", self.candidate_path,
+                self.manifest_path, "system", AT,
+            )
+        approved = RESUMES.approve_version(
+            self.db, "uploaded-direction-1", self.candidate_path,
+            self.manifest_path, "user", AT,
+        )
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(
+            RESUMES.select_approved(self.db, "backend", "direction")["version_id"],
+            "uploaded-direction-1",
+        )
+
+    def test_user_provided_mode_cannot_bypass_direction_scope_or_bind_a_plan(self):
+        source = self.root / "uploaded-direction.txt"
+        source.write_text("Python\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "not user-approved"):
+            RESUMES.register_version(
+                self.db, self.root / "resumes", source, "outside-direction",
+                "direction", "backend", source_mode="user_provided", at=AT,
+            )
+        self.approve_direction()
+        with self.assertRaisesRegex(ValueError, "must not bind an adaptation plan"):
+            RESUMES.register_version(
+                self.db, self.root / "resumes", source, "uploaded-with-plan",
+                "direction", "backend", source_mode="user_provided",
+                adaptation_plan_id="plan-1", at=AT,
+            )
+
     def test_resume_approval_rejects_candidate_changed_after_plan(self):
         self.approve_direction()
         self.generate_and_approve_plan()

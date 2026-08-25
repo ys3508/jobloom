@@ -6,18 +6,25 @@ A ResumeVersion is an immutable local file snapshot, not a mutable filename or a
 
 ## Version kinds
 
-- `master_source`: the unedited source resume. It has no parent.
+- `master_source`: the complete candidate archive. It may be longer than one page and its layout is reference material, not an application template. It has no parent.
 - `direction`: a reusable resume for one role direction. Its parent is an approved master or earlier direction version.
 - `lightweight`: a small, evidence-preserving adaptation within one direction.
 - `precision`: a high-value job adaptation within one direction.
 
-Except for `master_source`, every version requires an approved parent. A child cannot silently switch directions within a version chain.
+Every application-facing `direction` resume must be one page. There are two explicit source modes:
 
-When the SearchDirection registry is initialized, every non-master version also requires the approved adaptation plan described in `search-directions.md`. Its recommended kind, direction, and base resume must match registration exactly. Master sources remain provenance and cannot be used directly for an application after this enforcement is active.
+- `generated`: Jobloom derives the file from an approved parent and an approved adaptation plan tied to a real, user-reviewed JobCard.
+- `user_provided`: the user supplies an already targeted direction resume. It has no generated parent and no adaptation plan, because claiming either would create false provenance.
+
+`lightweight` and `precision` versions are always generated and require an approved parent. A generated child cannot silently switch directions within a version chain.
+
+When the SearchDirection registry is initialized, every application-facing version must belong to the active approved portfolio. Generated versions also require the approved adaptation plan described in `search-directions.md`; its recommended kind, direction, and base resume must match registration exactly. A user-provided direction version skips only plan generation. It does not skip direction scope, CandidateFact evidence, immutable hashing, rendered one-page review, or explicit user approval. Master sources remain provenance and cannot be used directly for an application after this enforcement is active.
 
 ## Registration and immutability
 
-Registration copies PDF, DOCX, TXT, or Markdown bytes into the private resume store. It records SHA-256, size, format, parent, kind, and direction, then makes the snapshot read-only. Registration always creates a `draft`; it never implies approval.
+Registration copies PDF, DOCX, TXT, or Markdown bytes into the private resume store. It records SHA-256, size, format, provenance mode, parent, kind, and direction, then makes the snapshot read-only. Registration always creates a `draft`; it never implies approval.
+
+For DOCX or PDF direction resumes, render the entire file before approval and confirm the output contains exactly one page. Registration records provenance; it does not make a page-count claim.
 
 Never overwrite a snapshot directory or reuse a version ID. If a file changes, register a new child version.
 

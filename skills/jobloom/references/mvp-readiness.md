@@ -38,7 +38,7 @@ The report always sets `submission_authorized: false`. Readiness does not replac
 | Candidate fact extraction | traceable review packet with source/excerpt hashes |
 | User confirmation and locking | `finalize_candidate.py`, `candidate_core.py` |
 | Weighted search strategy | one user-approved SearchPortfolio containing one or more exact SearchDirection hashes whose weights total 100 |
-| One approved direction resume | approved adaptation plan + immutable ResumeVersion + claims manifest |
+| One approved direction resume | generated: approved adaptation plan + immutable ResumeVersion + claims manifest; user-provided: approved direction scope + immutable one-page ResumeVersion + claims manifest |
 | Work authorization and preferences | CandidateProfile plus independent answer meanings |
 | Answer reuse | AnswerLibrary exact/user-reviewed semantic forms and two-channel freshness |
 | Job URL ingestion | `ingest_job.py`, review-required JobCard |

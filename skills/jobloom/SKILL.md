@@ -73,7 +73,7 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 1. Initialize the shared private database and register the source file with `resume_core.py`. Registration copies exact bytes into the private store and always creates a draft.
 2. Build a claims manifest from `assets/claims-manifest.template.json`. Map every resume claim to confirmed or locked CandidateFact IDs.
 3. Approve only after the user reviews the actual file. Approval requires actor `user`, the active user-registered CandidateSnapshot, a matching hash-valid `candidate.json`, a valid claims manifest, and an unchanged snapshot.
-4. Derive direction, lightweight, and precision versions only from approved parents. Never overwrite or reuse a version ID.
+4. Treat the master as a complete fact archive, not an application template. Generated direction, lightweight, and precision versions derive from approved parents. A user may instead provide a one-page direction resume with `source_mode=user_provided`; it has no generated parent or adaptation plan, but still requires approved direction scope, factual claims, rendered review, and user approval. Never overwrite or reuse a version ID.
 5. Bind an approved version during application material preparation, then create the material lock before moving to `ready_to_fill`.
 6. Recheck the active lock and physical file hash at fill acquisition, pre-submit readiness, and submission. Revocation or rebinding invalidates the old lock.
 7. Keep snapshots and manifests under `.jobloom/`; never commit personal resume content by default.
@@ -86,7 +86,7 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 4. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside a direction belonging to the active approved portfolio and whose deterministic evaluation is eligible for `broad` or `precision` action.
 5. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
 6. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged portfolio direction, unchanged JobCard, and an approved unchanged base resume.
-7. `direct_reuse` creates no file. For `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent.
+7. `direct_reuse` creates no file. For generated `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent. A user-provided direction resume uses `--source-mode user_provided` and must not claim a plan or parent.
 8. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
 9. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
 10. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.

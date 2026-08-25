@@ -24,6 +24,7 @@ from _common import require_table  # noqa: E402
 
 RESUME_KINDS = {"master_source", "direction", "lightweight", "precision"}
 RESUME_STATUSES = {"draft", "approved", "revoked", "superseded"}
+SOURCE_MODES = {"generated", "user_provided"}
 EVIDENCE_RANK = {
     "none": 0,
     "mention_only": 1,
@@ -85,6 +86,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             status_reason TEXT,
             adaptation_plan_id TEXT,
             direction_profile_sha256 TEXT,
+            source_mode TEXT NOT NULL DEFAULT 'generated',
             FOREIGN KEY (parent_version_id) REFERENCES resume_versions(version_id)
         );
         CREATE INDEX IF NOT EXISTS resume_versions_selection_idx
@@ -141,6 +143,10 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE resume_versions ADD COLUMN adaptation_plan_id TEXT")
     if "direction_profile_sha256" not in version_columns:
         connection.execute("ALTER TABLE resume_versions ADD COLUMN direction_profile_sha256 TEXT")
+    if "source_mode" not in version_columns:
+        connection.execute(
+            "ALTER TABLE resume_versions ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'generated'"
+        )
     connection.commit()
 
 
@@ -228,10 +234,11 @@ def _require_resume_authorized_for_application(
     direction = _active_direction(connection, version["direction"])
     if version["direction_profile_sha256"] != direction["profile_sha256"]:
         raise ValueError("resume direction profile is stale")
-    _approved_adaptation_plan(
-        connection, version["adaptation_plan_id"], version["direction"], version["kind"],
-        require_fresh_job=False,
-    )
+    if version["source_mode"] == "generated":
+        _approved_adaptation_plan(
+            connection, version["adaptation_plan_id"], version["direction"], version["kind"],
+            require_fresh_job=False,
+        )
 
 
 def _event(
@@ -258,10 +265,22 @@ def _event(
     )
 
 
-def _validate_parent(connection: sqlite3.Connection, kind: str, direction: str, parent_version_id: str | None) -> None:
+def _validate_parent(
+    connection: sqlite3.Connection,
+    kind: str,
+    direction: str,
+    parent_version_id: str | None,
+    source_mode: str,
+) -> None:
     if kind == "master_source":
         if parent_version_id:
             raise ValueError("master_source must not have a parent")
+        return
+    if source_mode == "user_provided":
+        if kind != "direction":
+            raise ValueError("only direction resumes may use user_provided source mode")
+        if parent_version_id:
+            raise ValueError("user-provided direction resume must not claim a generated parent")
         return
     if not parent_version_id:
         raise ValueError(f"{kind} requires an approved parent version")
@@ -289,24 +308,33 @@ def register_version(
     actor: str = "system",
     at: datetime | None = None,
     adaptation_plan_id: str | None = None,
+    source_mode: str | None = None,
 ) -> dict[str, Any]:
     _require_safe_id(version_id, "version_id")
     if kind not in RESUME_KINDS:
         raise ValueError("invalid resume kind")
+    actual_source_mode = source_mode or ("user_provided" if kind == "master_source" else "generated")
+    if actual_source_mode not in SOURCE_MODES:
+        raise ValueError("invalid resume source mode")
+    if kind == "master_source" and actual_source_mode != "user_provided":
+        raise ValueError("master_source must use user_provided source mode")
     if not direction.strip():
         raise ValueError("direction is required")
     if not source_file.is_file():
         raise ValueError("resume source file not found")
     if connection.execute("SELECT 1 FROM resume_versions WHERE version_id=?", (version_id,)).fetchone():
         raise ValueError("resume version already exists")
-    _validate_parent(connection, kind, direction, parent_version_id)
+    _validate_parent(connection, kind, direction, parent_version_id, actual_source_mode)
     direction_row = None
     plan = None
     if kind != "master_source":
         direction_row = _active_direction(connection, direction)
-        plan = _approved_adaptation_plan(connection, adaptation_plan_id, direction, kind)
-        if plan and plan["base_resume_version_id"] != parent_version_id:
-            raise ValueError("resume parent does not match the approved adaptation plan")
+        if actual_source_mode == "generated":
+            plan = _approved_adaptation_plan(connection, adaptation_plan_id, direction, kind)
+            if plan and plan["base_resume_version_id"] != parent_version_id:
+                raise ValueError("resume parent does not match the approved adaptation plan")
+        elif adaptation_plan_id:
+            raise ValueError("user-provided direction resume must not bind an adaptation plan")
     suffix = source_file.suffix.casefold()
     if suffix not in {".pdf", ".docx", ".txt", ".md"}:
         raise ValueError("resume format must be PDF, DOCX, TXT, or Markdown")
@@ -328,12 +356,15 @@ def register_version(
             INSERT INTO resume_versions (
                 version_id, parent_version_id, kind, direction, status, snapshot_path,
                 file_sha256, file_size, file_format, created_at, adaptation_plan_id,
-                direction_profile_sha256
-            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)
+                direction_profile_sha256, source_mode
+            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)
         """, (version_id, parent_version_id, kind, direction, str(snapshot), digest, size,
               suffix[1:], timestamp, adaptation_plan_id,
-              direction_row["profile_sha256"] if direction_row else None))
-        _event(connection, version_id, actor, "registered", "immutable_snapshot_created", at=at)
+              direction_row["profile_sha256"] if direction_row else None, actual_source_mode))
+        _event(
+            connection, version_id, actor, "registered", "immutable_snapshot_created",
+            metadata={"source_mode": actual_source_mode}, at=at,
+        )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -351,6 +382,7 @@ def register_version(
         "file_size": size,
         "snapshot_path": str(snapshot),
         "adaptation_plan_id": adaptation_plan_id,
+        "source_mode": actual_source_mode,
     }
 
 
@@ -447,11 +479,12 @@ def approve_version(
         direction_row = _active_direction(connection, row["direction"])
         if row["direction_profile_sha256"] != direction_row["profile_sha256"]:
             raise ValueError("resume direction profile changed after registration")
-        plan = _approved_adaptation_plan(
-            connection, row["adaptation_plan_id"], row["direction"], row["kind"]
-        )
-        if not plan or plan["candidate_profile_sha256"] != candidate_hash:
-            raise ValueError("adaptation plan candidate profile is stale")
+        if row["source_mode"] == "generated":
+            plan = _approved_adaptation_plan(
+                connection, row["adaptation_plan_id"], row["direction"], row["kind"]
+            )
+            if not plan or plan["candidate_profile_sha256"] != candidate_hash:
+                raise ValueError("adaptation plan candidate profile is stale")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_claims_manifest(manifest, candidate)
     manifest_snapshot = Path(row["snapshot_path"]).parent / "claims-manifest.json"
@@ -660,6 +693,7 @@ def main() -> None:
     register.add_argument("--direction", required=True)
     register.add_argument("--parent")
     register.add_argument("--adaptation-plan-id")
+    register.add_argument("--source-mode", choices=sorted(SOURCE_MODES))
     approve = commands.add_parser("approve")
     approve.add_argument("--version-id", required=True)
     approve.add_argument("--candidate", required=True, type=Path)
@@ -690,7 +724,7 @@ def main() -> None:
     elif args.command == "register":
         result = register_version(
             connection, store, args.file, args.version_id, args.kind, args.direction,
-            args.parent, adaptation_plan_id=args.adaptation_plan_id,
+            args.parent, adaptation_plan_id=args.adaptation_plan_id, source_mode=args.source_mode,
         )
     elif args.command == "approve":
         result = approve_version(connection, args.version_id, args.candidate, args.manifest, args.actor)
