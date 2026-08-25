@@ -21,6 +21,17 @@ Keep these meanings separate:
 
 Never use one as a proxy for another.
 
+Use these canonical IDs for the four immigration meanings:
+
+- `work_authorized_now`
+- `sponsorship_now`
+- `sponsorship_future`
+- `employer_action_required`
+
+Exact matching uses normalized text only. Semantic matching is not an open-ended similarity search: store a paraphrase as a verified question form only after the user confirms equivalence. A question form mapped to multiple meanings is a conflict.
+
+Resolve multiple applicable answers by scope specificity. A more specific applicable scope overrides a global answer. Two equally specific active answers with different values are a conflict and must pause.
+
 ## Two-channel freshness
 
 Both channels must pass:
@@ -30,11 +41,15 @@ Both channels must pass:
 
 Channel A never extends or overrides Channel B. Immigration answers bind to real-world expiration dates and are rechecked whenever used.
 
+Standing authorization expires no later than fourteen days after confirmation in the MVP. Revocation takes effect immediately. Authorization scope may include country, jurisdiction, company, role family, employment type, application, or approved queue.
+
 ## Attestation gate
 
 Auto-check a standard truthfulness attestation only when Channel A is current and every covered field is a fresh locked fact or active answer. One stale, unknown, expired, or conflicting field returns the attestation to the user.
 
 Always pause for arbitration, non-compete, IP assignment, special background-check terms, or signatures outside a standard application attestation.
+
+The gate must query stored answer state by answer ID. Do not accept a browser or caller assertion that an answer is active. An empty covered-field set cannot pass the gate.
 
 ## Mandatory pauses
 

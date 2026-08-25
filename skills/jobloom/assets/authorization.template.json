@@ -1,0 +1,9 @@
+{
+  "authorization_id": "replace-with-stable-id",
+  "confirmed_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "expires_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "scope": {
+    "country": "US",
+    "queue_id": "replace-with-approved-queue-id"
+  }
+}

@@ -79,6 +79,16 @@ python3 skills/jobloom/scripts/ingest_job.py \
 
 `.jobloom/` is intentionally ignored so candidate facts and application data are not committed.
 
+Initialize the local answer library:
+
+```bash
+python3 skills/jobloom/scripts/answer_library.py \
+  --db .jobloom/jobloom.db \
+  init
+```
+
+The answer library supports confirmed entries, exact and reviewed-semantic question forms, scoped matching, expiration, event invalidation, standing authorization, revocation, and the standard-attestation freshness gate. Templates live in `skills/jobloom/assets/`.
+
 Run the current test suite:
 
 ```bash

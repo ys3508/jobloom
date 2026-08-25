@@ -7,7 +7,9 @@
 3. Candidate fact
 4. Job input
 5. Evaluation output
-6. Future core entities
+6. Answer entry
+7. Standing authorization
+8. Future core entities
 
 ## Candidate profile
 
@@ -115,6 +117,18 @@ The deterministic evaluator emits the normalized job card plus:
 ```
 
 Never interpret `uncertain` as `pass`.
+
+## Answer entry
+
+An AnswerEntry stores a stable answer ID, canonical question ID and meaning, JSON answer value, answer type, valid source, confirmation timestamp, effective/expiration/review dates, validity class, scope, preconditions, exclusions, automatic-fill and automatic-submit permissions, sensitivity, invalidation triggers, dependent fact IDs, supersession, status, and ambiguity notes.
+
+Valid sources are user confirmation, a verified candidate fact, an approved resume, a user-defined rule, or deterministic derivation. Model inference alone is invalid. Legal commitments and voluntary disclosures cannot enable automatic submission in the MVP.
+
+Question forms live separately from answers. Each exact or user-verified semantic form maps normalized text to one canonical meaning.
+
+## Standing authorization
+
+A StandingAuthorization contains an ID, confirmation and expiration timestamps, scope, revocation timestamp, and status. It may last at most fourteen days. It controls Channel A only and cannot alter an AnswerEntry's Channel B status.
 
 ## Future core entities
 
