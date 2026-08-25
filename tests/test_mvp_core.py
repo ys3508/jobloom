@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sqlite3
 import tempfile
@@ -70,6 +71,73 @@ class MvpCoreTests(unittest.TestCase):
         result = MVP.status(self.db)
         self.assertFalse(result["initialized"])
         self.assertIn("candidate_snapshots", result["missing_tables"])
+
+    def test_user_provided_direction_resume_satisfies_onboarding_readiness(self):
+        MVP.initialize(self.db, self.root, self.database)
+
+        candidate = {
+            "schema_version": "0.2.0",
+            "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": True, "employer_action_required": False,
+                "confirmed": True,
+            },
+            "search": {},
+            "facts": [{
+                "id": "fact-1", "type": "skill", "value": "Python",
+                "status": "confirmed", "locked": False, "evidence_strength": "direct",
+            }],
+        }
+        candidate["content_sha256"] = MVP.resume_core.canonical_hash(candidate)
+        candidate_path = self.root / "candidate.json"
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        MVP.candidate_core.register_snapshot(
+            self.db, self.root / "candidates", candidate_path, "user", AT
+        )
+
+        profile = {
+            "schema_version": "0.1.0", "direction_id": "backend",
+            "name": "Backend Engineering", "role_family": "engineering.backend",
+            "target_titles": ["Backend Engineer"], "positive_keywords": ["Python"],
+            "negative_keywords": [], "precision_keywords": [],
+            "criteria": {"countries": ["US"]}, "parent_direction_id": None,
+        }
+        direction = MVP.direction_core.register_direction(self.db, profile, AT)
+        portfolio = MVP.direction_core.register_portfolio(self.db, {
+            "schema_version": "0.1.0", "portfolio_id": "portfolio-1",
+            "name": "Primary portfolio", "allocations": [{
+                "direction_id": "backend", "profile_sha256": direction["profile_sha256"],
+                "weight_percent": 100,
+            }],
+        }, AT)
+        MVP.direction_core.approve_portfolio(
+            self.db, "portfolio-1", "user", portfolio["portfolio_sha256"], AT
+        )
+
+        resume_path = self.root / "backend-resume.txt"
+        resume_path.write_text("Python\n", encoding="utf-8")
+        MVP.resume_core.register_version(
+            self.db, self.root / "resumes", resume_path, "backend-upload-1",
+            "direction", "backend", source_mode="user_provided", at=AT,
+        )
+        manifest_path = self.root / "claims-manifest.json"
+        manifest_path.write_text(json.dumps({
+            "schema_version": "0.1.0", "claims": [{
+                "claim_id": "claim-1", "claim_text": "Python", "fact_ids": ["fact-1"],
+                "evidence_strength": "direct", "exact_locked_value_preserved": False,
+            }],
+        }), encoding="utf-8")
+        MVP.resume_core.approve_version(
+            self.db, "backend-upload-1", candidate_path, manifest_path, "user", AT
+        )
+
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 1)
+        report = MVP.readiness(self.db, self.root, AT)
+        self.assertTrue(report["onboarding"]["ready"])
+        self.assertNotIn(
+            "user_approved_direction_resume_required", report["onboarding"]["blockers"]
+        )
 
 
 if __name__ == "__main__":

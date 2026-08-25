@@ -119,16 +119,27 @@ def _approved_direction_resumes(connection: sqlite3.Connection) -> int:
           ON spd.direction_id=sd.direction_id AND spd.profile_sha256=sd.profile_sha256
         JOIN search_portfolios sp
           ON sp.portfolio_id=spd.portfolio_id AND sp.status='approved' AND sp.approved_by='user'
-        JOIN resume_adaptation_plans rap ON rap.plan_id=rv.adaptation_plan_id AND rap.status='approved'
+        LEFT JOIN resume_adaptation_plans rap ON rap.plan_id=rv.adaptation_plan_id
         JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256 AND cs.status='active'
         WHERE rv.status='approved' AND rv.kind='direction'
-          AND rv.approved_by='user' AND sd.approved_by='user' AND rap.approved_by='user'
+          AND rv.approved_by='user' AND sd.approved_by='user'
           AND cs.registered_by='user'
           AND rv.direction_profile_sha256=sd.profile_sha256
-          AND rap.direction_id=rv.direction AND rap.recommended_kind='direction'
-          AND rap.candidate_profile_sha256=rv.candidate_profile_sha256
-          AND rap.direction_profile_sha256=sd.profile_sha256
-          AND rap.base_resume_version_id=rv.parent_version_id
+          AND (
+            (
+              rv.source_mode='generated'
+              AND rap.status='approved' AND rap.approved_by='user'
+              AND rap.direction_id=rv.direction AND rap.recommended_kind='direction'
+              AND rap.candidate_profile_sha256=rv.candidate_profile_sha256
+              AND rap.direction_profile_sha256=sd.profile_sha256
+              AND rap.base_resume_version_id=rv.parent_version_id
+            )
+            OR
+            (
+              rv.source_mode='user_provided'
+              AND rv.adaptation_plan_id IS NULL AND rv.parent_version_id IS NULL
+            )
+          )
     """).fetchall()
     valid = 0
     for row in rows:
