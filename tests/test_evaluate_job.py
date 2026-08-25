@@ -56,6 +56,7 @@ def job():
         "required_skills": ["Python", "SQL"],
         "required_certifications": [],
         "already_applied": False,
+        "requirements_reviewed": True,
     }
 
 
@@ -102,6 +103,45 @@ class EvaluateJobTests(unittest.TestCase):
         result = MODULE.evaluate(candidate(), posting)
         self.assertEqual(result["eligibility"], "uncertain")
         self.assertIn("salary_currency_requires_review", result["uncertainties"])
+
+    def test_unreviewed_requirements_are_uncertain(self):
+        posting = job()
+        posting["requirements_reviewed"] = False
+        result = MODULE.evaluate(candidate(), posting)
+        self.assertEqual(result["eligibility"], "uncertain")
+        self.assertIn("job_requirements_unreviewed", result["uncertainties"])
+
+    def test_unknown_normalized_fields_require_review(self):
+        posting = job()
+        posting["country"] = "unknown"
+        posting["work_arrangement"] = "unknown"
+        result = MODULE.evaluate(candidate(), posting)
+        self.assertEqual(result["eligibility"], "uncertain")
+        self.assertNotIn("country_outside_search_scope", result["hard_filter_failures"])
+
+    def test_hourly_salary_is_not_compared_to_annual_floor(self):
+        posting = job()
+        posting["salary"] = {"currency": "USD", "min": 60, "max": 80, "unit": "HOUR"}
+        result = MODULE.evaluate(candidate(), posting)
+        self.assertEqual(result["eligibility"], "uncertain")
+        self.assertIn("salary_unit_requires_review", result["uncertainties"])
+        self.assertNotIn("salary_below_floor", result["hard_filter_failures"])
+
+    def test_non_remote_location_outside_scope_fails(self):
+        profile = candidate()
+        profile["search"]["locations"] = ["New York, NY"]
+        posting = job()
+        posting["location"] = "Boston, MA"
+        result = MODULE.evaluate(profile, posting)
+        self.assertEqual(result["eligibility"], "fail")
+        self.assertIn("location_outside_search_scope", result["hard_filter_failures"])
+
+    def test_conflicting_relevant_evidence_requires_review(self):
+        profile = candidate()
+        profile["facts"][0]["status"] = "conflicting"
+        result = MODULE.evaluate(profile, job())
+        self.assertEqual(result["eligibility"], "uncertain")
+        self.assertIn("candidate_evidence_conflict:Python", result["uncertainties"])
 
 
 if __name__ == "__main__":

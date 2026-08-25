@@ -3,10 +3,11 @@
 ## Contents
 
 1. Candidate profile
-2. Candidate fact
-3. Job input
-4. Evaluation output
-5. Future core entities
+2. Candidate review packet
+3. Candidate fact
+4. Job input
+5. Evaluation output
+6. Future core entities
 
 ## Candidate profile
 
@@ -40,6 +41,10 @@
 
 Dates use ISO 8601. Country values use a consistent code chosen by the implementation. Salary values in the MVP are normalized annual amounts. If a posting's currency differs from `search.salary_currency`, require review instead of comparing the amounts.
 
+## Candidate review packet
+
+Resume extraction produces proposed facts, never immediately reusable facts. Each proposed fact contains a document SHA-256, line locator, excerpt SHA-256, evidence strength, and a `pending` decision. Every decision must become `confirmed` or `rejected` before finalization. Confirmed protected facts become locked; rejected facts are excluded. The final `candidate.json` includes a deterministic content hash.
+
 ## Candidate fact
 
 ```json
@@ -71,7 +76,7 @@ Allowed evidence strengths: `direct`, `strongly_related`, `transferable`, `menti
   "location": "New York, NY",
   "work_arrangement": "hybrid",
   "employment_type": "full_time",
-  "salary": {"currency": "USD", "min": 120000, "max": 150000},
+  "salary": {"currency": "USD", "min": 120000, "max": 150000, "unit": "YEAR"},
   "status": "open",
   "sponsorship": "unknown",
   "citizenship_required": null,
@@ -80,11 +85,16 @@ Allowed evidence strengths: `direct`, `strongly_related`, `transferable`, `menti
   "required_skills": ["Python", "SQL"],
   "preferred_skills": ["AWS"],
   "already_applied": false,
-  "high_value": false
+  "high_value": false,
+  "requirements_reviewed": false,
+  "description_sha256": "...",
+  "extraction": {"strategy": "json_ld", "needs_user_review": true}
 }
 ```
 
 Allowed sponsorship values: `supports`, `does_not_support`, `historical_support`, `unknown`, `conflicting`.
+
+An extracted JobCard always begins with `requirements_reviewed: false`. A user or reviewer must compare required skills and hard eligibility fields with the complete JD before changing it to `true`. The evaluator treats an unreviewed card as uncertain.
 
 ## Evaluation output
 

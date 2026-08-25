@@ -54,6 +54,31 @@ python3 skills/jobloom/scripts/evaluate_job.py \
   --job job.json
 ```
 
+Build a private candidate profile from a real master resume:
+
+```bash
+mkdir -p .jobloom
+python3 skills/jobloom/scripts/extract_candidate_facts.py \
+  --resume /path/to/master-resume.docx \
+  --output .jobloom/candidate-review.json
+
+# Review every proposed fact and complete a private copy of the settings template.
+python3 skills/jobloom/scripts/finalize_candidate.py \
+  --review .jobloom/candidate-review.json \
+  --settings .jobloom/profile-settings.json \
+  --output .jobloom/candidate.json
+```
+
+Build a reviewable JobCard from a real posting:
+
+```bash
+python3 skills/jobloom/scripts/ingest_job.py \
+  --url https://example.com/real-job \
+  --output .jobloom/job-card.json
+```
+
+`.jobloom/` is intentionally ignored so candidate facts and application data are not committed.
+
 Run the current test suite:
 
 ```bash

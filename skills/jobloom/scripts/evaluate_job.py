@@ -34,7 +34,7 @@ def validate_inputs(candidate: dict[str, Any], job: dict[str, Any]) -> None:
     )
     _require(
         job,
-        ["job_id", "canonical_url", "employer", "title", "country", "work_arrangement", "employment_type", "status", "sponsorship", "required_skills"],
+        ["job_id", "canonical_url", "employer", "title", "country", "work_arrangement", "employment_type", "status", "sponsorship", "required_skills", "requirements_reviewed"],
         "job",
     )
     for fact in candidate["facts"]:
@@ -68,6 +68,16 @@ def _match_skill(skill: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
     return {"requirement": skill, "strength": best_strength, "fact_ids": fact_ids}
 
 
+def _fact_issue(skill: str, facts: list[dict[str, Any]]) -> str | None:
+    wanted = skill.strip().casefold()
+    related = [fact for fact in facts if wanted in _fact_terms(fact)]
+    if any(fact.get("status") == "conflicting" for fact in related):
+        return f"candidate_evidence_conflict:{skill}"
+    if any(fact.get("status") == "stale" or _expired(fact.get("expires_at")) for fact in related):
+        return f"candidate_evidence_stale:{skill}"
+    return None
+
+
 def evaluate(candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     validate_inputs(candidate, job)
     failures: list[str] = []
@@ -76,13 +86,22 @@ def evaluate(candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     search = candidate["search"]
     auth = candidate["work_authorization"]
 
-    if job["status"] != "open":
+    if not job["requirements_reviewed"]:
+        uncertainties.append("job_requirements_unreviewed")
+
+    if job["status"] == "closed":
         failures.append("job_not_open")
+    elif job["status"] != "open":
+        uncertainties.append("job_status_unknown")
     if job.get("already_applied"):
         failures.append("duplicate_application")
-    if job["employer"].casefold() in {x.casefold() for x in search.get("excluded_employers", [])}:
+    if job["employer"] == "unknown":
+        uncertainties.append("employer_unknown")
+    elif job["employer"].casefold() in {x.casefold() for x in search.get("excluded_employers", [])}:
         failures.append("excluded_employer")
-    if search.get("countries") and job["country"] not in search["countries"]:
+    if job["country"] == "unknown":
+        uncertainties.append("job_country_unknown")
+    elif search.get("countries") and job["country"] not in search["countries"]:
         failures.append("country_outside_search_scope")
     if job["country"] == auth["country"]:
         if not auth["confirmed"] or _expired(auth.get("expires_at")):
@@ -94,22 +113,38 @@ def evaluate(candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
             failures.append("required_sponsorship_not_supported")
         elif needs_employer_support and job["sponsorship"] in {"unknown", "historical_support", "conflicting"}:
             uncertainties.append("sponsorship_requires_review")
-    else:
+    elif job["country"] != "unknown":
         uncertainties.append("work_authorization_country_mismatch")
 
-    if search.get("work_arrangements") and job["work_arrangement"] not in search["work_arrangements"]:
+    if job["work_arrangement"] == "unknown":
+        uncertainties.append("work_arrangement_unknown")
+    elif search.get("work_arrangements") and job["work_arrangement"] not in search["work_arrangements"]:
         failures.append("incompatible_work_arrangement")
-    if search.get("employment_types") and job["employment_type"] not in search["employment_types"]:
+    if job["work_arrangement"] != "remote" and search.get("locations"):
+        if job.get("location") in (None, "unknown"):
+            uncertainties.append("job_location_unknown")
+        elif not any(location.casefold() in job["location"].casefold() or job["location"].casefold() in location.casefold() for location in search["locations"]):
+            failures.append("location_outside_search_scope")
+    if job["employment_type"] == "unknown":
+        uncertainties.append("employment_type_unknown")
+    elif search.get("employment_types") and job["employment_type"] not in search["employment_types"]:
         failures.append("incompatible_employment_type")
 
     salary = job.get("salary")
     floor = search.get("salary_floor")
     salary_currency = search.get("salary_currency")
     if salary and floor is not None and salary.get("max") is not None:
-        if salary_currency and salary.get("currency") != salary_currency:
+        unit = str(salary.get("unit", "YEAR")).upper()
+        if unit not in {"YEAR", "ANNUAL"}:
+            uncertainties.append("salary_unit_requires_review")
+        elif salary_currency and salary.get("currency") != salary_currency:
             uncertainties.append("salary_currency_requires_review")
-        elif salary["max"] < floor:
-            failures.append("salary_below_floor")
+        else:
+            try:
+                if float(salary["max"]) < float(floor):
+                    failures.append("salary_below_floor")
+            except (TypeError, ValueError):
+                uncertainties.append("salary_value_requires_review")
 
     citizenship = job.get("citizenship_required")
     if citizenship and citizenship not in candidate.get("citizenships", []):
@@ -123,6 +158,8 @@ def evaluate(candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
         failures.append("required_certification_missing")
 
     evidence = [_match_skill(skill, candidate["facts"]) for skill in job["required_skills"]]
+    evidence_issues = [issue for skill in job["required_skills"] if (issue := _fact_issue(skill, candidate["facts"]))]
+    uncertainties.extend(evidence_issues)
     missing = [item["requirement"] for item in evidence if item["strength"] in {"none", "mention_only"}]
     direct = sum(item["strength"] == "direct" for item in evidence)
     supported = sum(EVIDENCE_ORDER[item["strength"]] >= EVIDENCE_ORDER["strongly_related"] for item in evidence)

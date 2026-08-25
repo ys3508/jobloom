@@ -1,0 +1,25 @@
+{
+  "profile_id": "replace-with-local-profile-id",
+  "work_authorization": {
+    "country": "US",
+    "authorized_now": null,
+    "sponsorship_now": null,
+    "sponsorship_future": null,
+    "employer_action_required": null,
+    "confirmed": false,
+    "confirmed_at": null,
+    "expires_at": null
+  },
+  "search": {
+    "countries": [],
+    "locations": [],
+    "work_arrangements": [],
+    "employment_types": [],
+    "salary_floor": null,
+    "salary_currency": null,
+    "excluded_employers": []
+  },
+  "citizenships": [],
+  "security_clearances": [],
+  "certifications": []
+}

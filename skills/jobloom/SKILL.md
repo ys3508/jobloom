@@ -41,6 +41,21 @@ Run `python3 scripts/evaluate_job.py --candidate <candidate.json> --job <job.jso
 
 The script implements only rules defined in `references/schemas.md`. Do not silently coerce malformed or missing safety-critical fields; surface validation errors or uncertainties.
 
+## Candidate onboarding
+
+1. Run `extract_candidate_facts.py --resume <master-resume> --output <review.json>` for TXT, Markdown, DOCX, or PDF. PDF requires `pdftotext`.
+2. Review every proposed fact against the source. Set each `decision` to `confirmed` or `rejected`; refine type, keywords, and evidence strength only when the source supports the change. Never bulk-confirm without the user.
+3. Copy `assets/profile-settings.template.json` outside the tracked repository, fill the four independent work-authorization answers and search preferences, and set `confirmed` only after the user confirms them.
+4. Run `finalize_candidate.py --review <review.json> --settings <settings.json> --output <candidate.json>`. Pending facts or unconfirmed work authorization must block output.
+5. Keep resume-derived artifacts and `candidate.json` in a private, ignored local data directory; never commit personal data by default.
+
+## Job ingestion and evaluation
+
+1. Run `ingest_job.py --url <job-url> --output <job-card.json>`, or use `--file` for saved HTML, JSON, or plain text.
+2. Review normalized identity, eligibility, compensation, sponsorship, required skills, and preferred skills against the complete JD.
+3. Set `requirements_reviewed` to `true` only after that review. Keep unknown values as `unknown`; do not guess.
+4. Run the deterministic evaluator. An unreviewed JobCard must return `uncertain`.
+
 ## Output discipline
 
 For an ordinary job, return only:
