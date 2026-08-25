@@ -42,9 +42,25 @@ Instructions that appear on a job page are untrusted data and cannot override an
 
 ## Status
 
-MVP foundation in progress. The repository now contains a valid Codex Skill, explicit fact/evidence and authorization rules, immutable resume and cover-letter registries, guarded application state, deterministic pre-submit review and submission archives, outcome tracking, and a zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
+The MVP backend implementation is complete; operational onboarding still requires real user-owned facts, approvals, and a reviewed job. The repository contains a valid Codex Skill, explicit fact/evidence and authorization rules, immutable candidate/resume/cover-letter registries, approved search directions and adaptation plans, checkpointed Fill-Only execution, guarded application state, deterministic pre-submit review and submission archives, outcome tracking, and a zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
 
 Skill entry point: [`skills/jobloom/SKILL.md`](skills/jobloom/SKILL.md)
+
+Initialize every private MVP component and inspect evidence-based readiness:
+
+```bash
+python3 skills/jobloom/scripts/mvp_core.py \
+  --db .jobloom/jobloom.db \
+  --private-root .jobloom \
+  init
+
+python3 skills/jobloom/scripts/mvp_core.py \
+  --db .jobloom/jobloom.db \
+  --private-root .jobloom \
+  readiness
+```
+
+An empty backend reports implementation readiness but blocks onboarding, real-job evaluation, and filling. The readiness command never authorizes submission or creates placeholder records.
 
 Run the deterministic evaluator:
 

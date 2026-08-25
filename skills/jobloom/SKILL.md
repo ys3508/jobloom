@@ -10,6 +10,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 ## Choose the workflow
 
 - For candidate onboarding, read `references/facts-and-evidence.md`.
+- For private backend initialization, component status, MVP readiness, or remaining user steps, read `references/mvp-readiness.md` and `references/schemas.md`.
 - For search-direction configuration, resume adaptation planning, or change review, read `references/search-directions.md`, `references/job-evaluation.md`, `references/facts-and-evidence.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For cover-letter registration, approval, application scoping, or binding, read `references/cover-letter-versions.md`, `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
@@ -20,7 +21,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For form inventory, mandatory pauses, pre-submission summaries, or final user approval, read `references/pre-submission-review.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
 - For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
-- For form filling or submission preparation, read all twelve references. Default to Fill-Only and stop before the final submission action.
+- For form filling or submission preparation, read all thirteen references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -33,6 +34,14 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 7. Explain the evidence IDs supporting material claims and the exact reason for every hard-filter failure or pause.
 8. Before filling, verify the approved resume version and map every field to a locked fact or active answer.
 9. Before submission, require a fresh authorization, a fully fresh attestation field set, no mandatory pause, and positive submission evidence handling. Never treat a click or a dry run as a confirmed submission.
+
+## MVP initialization and readiness
+
+1. Run `mvp_core.py --db .jobloom/jobloom.db --private-root .jobloom init` to initialize all private stores in dependency order and enforce restrictive permissions.
+2. Use `status` for value-free component counts. Use `readiness` for implementation, onboarding, live-job, and fill-queue gates.
+3. Treat `implementation.ready` only as a software/schema health result. It is not evidence of real candidate data, user approval, a real job, application approval, or submission permission.
+4. Never create placeholder records to clear readiness blockers. Candidate registration, direction/resume approval, JobCard review, authorization, and application approval remain user-owned actions.
+5. Readiness never grants submission authorization. The application-specific pre-submit review and state machine remain mandatory.
 
 ## Non-negotiable rules
 
