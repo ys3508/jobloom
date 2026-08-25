@@ -1,11 +1,14 @@
 {
-  "schema_version": "0.1.0",
+  "schema_version": "0.2.0",
   "direction_id": "backend-engineering",
   "name": "Backend Engineering",
   "role_family": "engineering.backend",
   "target_titles": ["Backend Engineer", "Backend Developer"],
   "positive_keywords": ["Python", "SQL", "APIs"],
   "negative_keywords": ["commission only"],
+  "hard_exclusion_keywords": ["commission-only", "unpaid internship"],
+  "discovery_keywords": [],
+  "auxiliary_titles": [],
   "precision_keywords": ["distributed systems"],
   "criteria": {
     "countries": ["US"],

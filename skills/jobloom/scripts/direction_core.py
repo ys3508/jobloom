@@ -23,8 +23,9 @@ import resume_core  # noqa: E402
 PROFILE_KEYS = {
     "schema_version", "direction_id", "name", "role_family", "target_titles",
     "positive_keywords", "negative_keywords", "precision_keywords", "criteria",
-    "parent_direction_id",
+    "parent_direction_id", "hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles",
 }
+LEGACY_PROFILE_KEYS = PROFILE_KEYS - {"hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles"}
 CRITERIA_KEYS = {
     "countries", "locations", "work_arrangements", "employment_types", "industries",
     "target_companies", "excluded_companies", "salary_floor", "salary_currency",
@@ -207,10 +208,10 @@ def _bounded_strings(value: Any, label: str, *, required: bool = False) -> list[
 
 
 def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(profile, dict) or set(profile) != PROFILE_KEYS:
+    if not isinstance(profile, dict) or set(profile) not in {frozenset(PROFILE_KEYS), frozenset(LEGACY_PROFILE_KEYS)}:
         raise ValueError("direction profile has missing or unknown fields")
     resume_core._require_safe_id(profile["direction_id"], "direction_id")
-    if profile["schema_version"] != "0.1.0":
+    if profile["schema_version"] not in {"0.1.0", "0.2.0"}:
         raise ValueError("unsupported direction profile schema_version")
     for field in ("name", "role_family"):
         if not isinstance(profile[field], str) or not profile[field].strip() or len(profile[field]) > 200:
@@ -236,10 +237,16 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("criteria.salary_currency must be a short string or null")
             normalized_criteria[key] = item.strip().upper() if isinstance(item, str) else None
     normalized = dict(profile)
+    normalized.setdefault("hard_exclusion_keywords", [])
+    normalized.setdefault("discovery_keywords", [])
+    normalized.setdefault("auxiliary_titles", [])
     normalized["name"] = profile["name"].strip()
     normalized["role_family"] = profile["role_family"].strip()
-    for field in ("target_titles", "positive_keywords", "negative_keywords", "precision_keywords"):
-        normalized[field] = _bounded_strings(profile[field], field, required=field == "target_titles")
+    for field in (
+        "target_titles", "positive_keywords", "negative_keywords", "precision_keywords",
+        "hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles",
+    ):
+        normalized[field] = _bounded_strings(normalized[field], field, required=field == "target_titles")
     normalized["criteria"] = normalized_criteria
     return normalized
 
@@ -480,6 +487,85 @@ def _title_in_direction(profile: dict[str, Any], title: str) -> bool:
     )
 
 
+def _field_text(job: dict[str, Any]) -> dict[str, str]:
+    fields = {"title": str(job.get("title") or "")}
+    for key in ("summary", "responsibilities", "required_skills", "preferred_skills", "required_licenses"):
+        value = job.get(key, [])
+        fields[key] = " ".join(map(str, value)) if isinstance(value, list) else str(value or "")
+    return {key: " ".join(value.casefold().split()) for key, value in fields.items()}
+
+
+def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    """Route one structured JobCard without allowing a direction to widen CandidateProfile."""
+    profile = validate_profile(profile)
+    fields = _field_text(job)
+    all_text = " ".join(fields.values())
+    hits: dict[str, list[dict[str, str]]] = {
+        "target_titles": [], "auxiliary_titles": [], "positive_keywords": [],
+        "negative_keywords": [], "hard_exclusion_keywords": [], "discovery_keywords": [],
+    }
+    for group in hits:
+        for term in profile[group]:
+            needle = " ".join(term.casefold().split())
+            for field, text in fields.items():
+                if needle and needle in text:
+                    hits[group].append({"term": term, "field": field})
+
+    failures: list[str] = []
+    review: list[str] = []
+    if hits["hard_exclusion_keywords"]:
+        failures.append("direction_hard_exclusion")
+    title = fields["title"]
+    if any(token in title.split() for token in ("senior", "lead", "principal", "staff")):
+        failures.append("seniority_outside_portfolio")
+    required_licenses = {item.casefold() for item in job.get("required_licenses", [])}
+    if required_licenses & {"rn", "md", "pharmd"}:
+        failures.append("required_clinical_license_missing")
+    if not hits["target_titles"]:
+        if hits["auxiliary_titles"] or hits["positive_keywords"]:
+            review.append("auxiliary_or_contextual_title")
+        else:
+            failures.append("outside_direction_title_scope")
+    if hits["negative_keywords"]:
+        review.append("direction_soft_negative_keyword")
+
+    sponsorship = job.get("sponsorship", "unknown")
+    sponsorship_priority = {
+        "supports": 3, "historical_support": 2, "unknown": 1,
+        "conflicting": 1, "does_not_support": 0,
+    }.get(sponsorship, 1)
+    needs_future = bool(candidate.get("work_authorization", {}).get("sponsorship_future"))
+    if needs_future and sponsorship == "does_not_support":
+        failures.append("required_sponsorship_not_supported")
+    elif needs_future and sponsorship in {"unknown", "conflicting"}:
+        review.append("employer_sponsorship_history_investigation_required")
+
+    return {
+        "decision": "fail" if failures else ("review" if review else "match"),
+        "hard_failures": sorted(set(failures)), "review_reasons": sorted(set(review)),
+        "field_hits": hits, "sponsorship_priority": sponsorship_priority,
+        "ranking_signals": {
+            "positive_keyword_hits": len(hits["positive_keywords"]),
+            "negative_keyword_hits": len(hits["negative_keywords"]),
+            "sponsorship_priority": sponsorship_priority,
+        },
+    }
+
+
+def rolling_allocation_targets(allocations: list[dict[str, Any]], reviewed_direction_ids: list[str],
+                               window_size: int = 20) -> list[dict[str, Any]]:
+    """Return current deficits for a rolling review pool; weights are never daily quotas."""
+    recent = reviewed_direction_ids[-window_size:]
+    counts = {item["direction_id"]: recent.count(item["direction_id"]) for item in allocations}
+    result = []
+    for item in allocations:
+        target = window_size * item["weight_percent"] / 100
+        result.append({"direction_id": item["direction_id"], "weight_percent": item["weight_percent"],
+                       "reviewed_count": counts[item["direction_id"]],
+                       "target_count": target, "deficit": target - counts[item["direction_id"]]})
+    return sorted(result, key=lambda item: (-item["deficit"], item["direction_id"]))
+
+
 def _base_resume(connection: sqlite3.Connection, direction_id: str) -> sqlite3.Row:
     row = connection.execute("""
         SELECT * FROM resume_versions
@@ -527,9 +613,10 @@ def generate_plan(
     if not job.get("requirements_reviewed"):
         raise ValueError("resume planning requires a user-reviewed JobCard")
     profile = json.loads(direction["profile_json"])
-    if not _title_in_direction(profile, job["title"]):
-        raise ValueError("job title is outside the approved search direction")
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
+    routing = route_job(profile, candidate, job)
+    if routing["decision"] != "match":
+        raise ValueError("job title is outside the approved search direction")
     evaluation = evaluate_job.evaluate(candidate, job)
     if evaluation["eligibility"] != "pass" or evaluation["action"] not in {"broad", "precision"}:
         raise ValueError("resume adaptation is blocked until job eligibility and evidence are resolved")

@@ -164,6 +164,41 @@ class DirectionCoreTests(unittest.TestCase):
                 self.db, self.profile("platform", parent="missing"), AT
             )
 
+    def test_structured_routing_separates_hard_and_soft_keywords(self):
+        profile = self.profile()
+        profile.update({
+            "schema_version": "0.2.0",
+            "hard_exclusion_keywords": ["commission-only", "unpaid internship"],
+            "discovery_keywords": ["survival analysis"],
+            "auxiliary_titles": ["AI Product Analyst"],
+        })
+        candidate = json.loads(self.candidate_path.read_text())
+        soft = DIRECTIONS.route_job(
+            profile, candidate, self.job_card(summary="commercial sales analytics")
+        )
+        self.assertNotEqual(soft["decision"], "fail")
+        hard = DIRECTIONS.route_job(
+            profile, candidate, self.job_card(summary="This is a commission-only role")
+        )
+        self.assertEqual(hard["decision"], "fail")
+        self.assertEqual(hard["field_hits"]["hard_exclusion_keywords"][0]["field"], "summary")
+
+    def test_sponsorship_and_rolling_portfolio_are_ranking_signals(self):
+        profile = self.profile()
+        candidate = json.loads(self.candidate_path.read_text())
+        candidate["work_authorization"]["sponsorship_future"] = True
+        result = DIRECTIONS.route_job(profile, candidate, self.job_card(sponsorship="supports"))
+        self.assertEqual(result["sponsorship_priority"], 3)
+        targets = DIRECTIONS.rolling_allocation_targets([
+            {"direction_id": "consulting", "weight_percent": 35},
+            {"direction_id": "clinical", "weight_percent": 30},
+            {"direction_id": "pharma", "weight_percent": 20},
+            {"direction_id": "biostats", "weight_percent": 10},
+            {"direction_id": "stretch", "weight_percent": 5},
+        ], ["consulting"] * 7 + ["clinical"] * 6)
+        self.assertEqual(targets[0]["direction_id"], "pharma")
+        self.assertEqual(targets[0]["target_count"], 4)
+
     def test_portfolio_atomically_approves_weighted_directions(self):
         backend = DIRECTIONS.register_direction(self.db, self.profile("backend"), AT)
         data = DIRECTIONS.register_direction(

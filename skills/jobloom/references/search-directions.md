@@ -22,7 +22,11 @@ Create each private profile from `assets/search-direction.template.json`. It con
 
 Registration creates an immutable draft and deterministic profile SHA-256. Only actor `user` may approve that exact hash. A parent must already be approved. Use a new direction ID for a material change; never mutate an approved profile in place.
 
-Direction criteria organize one portfolio member. They do not override portfolio allocation, CandidateProfile hard filters, work authorization, AnswerLibrary scope, or application safety gates.
+Direction criteria organize one portfolio member. They may narrow but never widen CandidateProfile hard filters, work authorization, AnswerLibrary scope, or application safety gates. Seniority is hard; industry and company size are ranking signals unless separately encoded as a hard CandidateProfile boundary. A null travel limit means travel does not automatically reject a job.
+
+`hard_exclusion_keywords` are exact hard-stop phrases checked only against structured JobCard fields, with field-level hits recorded. `negative_keywords` are soft demotion/review signals. `discovery_keywords` find jobs and expose skill gaps but never create CandidateFacts. `auxiliary_titles` route a job to review when its responsibilities supply the required industry context.
+
+Apply routing before portfolio allocation. Use the portfolio weights over a rolling pool of about twenty jobs entering review, not as a daily quota. Sponsorship is a core ranking signal: explicit support is strongest, historical support is next, unknown remains eligible for investigation, and explicit non-support fails when the candidate will require sponsorship.
 
 ## Deterministic adaptation plan
 
