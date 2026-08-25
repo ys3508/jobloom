@@ -1,0 +1,14 @@
+{
+  "session_id": "fill-session-example-1",
+  "application_id": "app-example-1",
+  "worker_id": "browser-worker-example-1",
+  "form_url": "https://example.com/jobs/1/apply",
+  "observed_employer": "Example",
+  "observed_role": "Backend Engineer",
+  "known_form": false,
+  "authorization_id": "authorization-example-1",
+  "authorization_context": {
+    "country": "US",
+    "application_id": "app-example-1"
+  }
+}

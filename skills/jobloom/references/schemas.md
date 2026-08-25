@@ -12,10 +12,11 @@
 8. Application core
 9. Resume version
 10. Cover-letter version
-11. Pre-submission review
-12. Submission archive
-13. Outcomes and usage
-14. Future core entities
+11. Fill-only execution
+12. Pre-submission review
+13. Submission archive
+14. Outcomes and usage
+15. Future core entities
 
 ## Candidate profile
 
@@ -157,6 +158,16 @@ A CoverLetterVersion stores an immutable snapshot path, file SHA-256 and size, k
 Registration always creates `draft`. Only actor `user` may approve or revoke a version. An application-specific letter may be registered only during material preparation and may be bound only to its exact application and job. Claims obey the same CandidateFact evidence ceiling and locked-value preservation rules as resumes.
 
 Cover-letter usage records preserve `prepared`, `locked`, and `submitted` use with the file hash. When bound, its exact version and hash become part of the application material lock and pre-submit summary. Rebinding or revocation invalidates affected locks and reviews.
+
+## Fill-only execution
+
+FillSession stores one application, worker, immutable `fill_only` mode, initial form URL and observed identity, known-form status, authorization ID and allowlisted context, current page, submit-control observation, status, pause reason codes, and timestamps.
+
+FillPage stores a unique session/page ID and index, same-origin page URL, value-free observation JSON and hash, legal items, restricted requests, status, and completion time. Browser selectors and text remain untrusted data.
+
+FillStep stores one field operation, verified source kind and ID, source status, sensitivity, protected local value JSON, expected value/file SHA-256, and completion state. Event metadata never stores the value. File steps resolve only the locked resume or optional cover letter. Submit controls never create steps.
+
+FillCheckpoint stores a stable checkpoint ID and deterministic hash of the verified steps for one page. A paused session preserves completed pages. Completion deterministically creates FormInventory and stops before submission.
 
 ## Pre-submission review
 

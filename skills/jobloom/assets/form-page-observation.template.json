@@ -1,0 +1,36 @@
+{
+  "page_id": "page-example-1",
+  "page_index": 0,
+  "page_url": "https://example.com/jobs/1/apply",
+  "fields": [
+    {
+      "field_id": "candidate_name",
+      "question": "Full name",
+      "selector": "#candidate-name",
+      "control": "text",
+      "required": true,
+      "sensitivity": "normal",
+      "source_kind": "fact",
+      "source_id": "fact-name-1"
+    },
+    {
+      "field_id": "resume_upload",
+      "question": "Resume",
+      "selector": "#resume-upload",
+      "control": "file",
+      "required": true,
+      "sensitivity": "normal",
+      "upload_kind": "resume"
+    },
+    {
+      "field_id": "submit",
+      "question": "Submit application",
+      "selector": "button[type=submit]",
+      "control": "submit",
+      "required": true,
+      "sensitivity": "normal"
+    }
+  ],
+  "legal_items": [],
+  "restricted_requests": []
+}

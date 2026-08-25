@@ -6,7 +6,7 @@ A caller-supplied `check_passed: true` is not evidence. Jobloom requires a persi
 
 ## Form inventory
 
-Register the inventory only while a fill lease is active. It records:
+Register the inventory only while a fill lease is active. `fill_core.py` creates it deterministically after all observed pages are checkpointed and before releasing the application from `filling`. It records:
 
 - form URL and observed employer/role
 - whether the workflow is known
@@ -15,7 +15,7 @@ Register the inventory only while a fill lease is active. It records:
 - mandatory-pause requests encountered
 - exact ResumeVersion and cover-letter version selected for upload
 
-The inventory contains no field values. Registering a newer inventory invalidates the older one. Unsupported legal items are rejected immediately. Known mandatory-pause types remain recorded so review creation can explain the pause.
+The inventory contains no field values. Registering a newer inventory invalidates the older one. Unsupported legal items are rejected immediately. A fill session with any unresolved mandatory pause cannot finish; known pause types remain in incomplete session history for recovery and explanation.
 
 ## Deterministic review checks
 

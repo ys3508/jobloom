@@ -190,6 +190,16 @@ python3 skills/jobloom/scripts/pre_submit_core.py \
 
 During filling, register a value-free form inventory and record all filled fields. After filling, generate a deterministic summary, show it to the user, and approve its exact SHA-256. `application_core.py` now rejects `pre_submit_ready` when given only a caller Boolean; it requires that persisted user-approved review and revalidates its material lock and authorization before submission.
 
+Initialize the checkpointed Fill-Only execution store:
+
+```bash
+python3 skills/jobloom/scripts/fill_core.py \
+  --db .jobloom/jobloom.db \
+  init
+```
+
+After `application_core.py acquire` grants a live worker lease, start a fill session from `assets/fill-session.template.json`, observe each page with `assets/form-page-observation.template.json`, and export pending actions to a new private file under `.jobloom/`. The package contains exact local values for the browser worker but never contains a submit action and should never be printed, committed, or used as telemetry. Browser results return only hashes; mismatches pause without recording the field. Completed pages are checkpointed and survive user-answer or takeover pauses. Finishing builds the value-free FormInventory and stops in `waiting_for_submission_approval`.
+
 Run the current test suite:
 
 ```bash
