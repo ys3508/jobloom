@@ -1,0 +1,25 @@
+{
+  "schema_version": "0.1.0",
+  "direction_id": "backend-engineering",
+  "name": "Backend Engineering",
+  "role_family": "engineering.backend",
+  "target_titles": ["Backend Engineer", "Backend Developer"],
+  "positive_keywords": ["Python", "SQL", "APIs"],
+  "negative_keywords": ["commission only"],
+  "precision_keywords": ["distributed systems"],
+  "criteria": {
+    "countries": ["US"],
+    "locations": ["New York, NY"],
+    "work_arrangements": ["remote", "hybrid"],
+    "employment_types": ["full_time"],
+    "industries": [],
+    "target_companies": [],
+    "excluded_companies": [],
+    "salary_floor": null,
+    "salary_currency": "USD",
+    "seniority": [],
+    "travel_limit": null,
+    "company_sizes": []
+  },
+  "parent_direction_id": null
+}

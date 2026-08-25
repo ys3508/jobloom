@@ -77,6 +77,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             approved_by TEXT,
             revoked_at TEXT,
             status_reason TEXT,
+            adaptation_plan_id TEXT,
+            direction_profile_sha256 TEXT,
             FOREIGN KEY (parent_version_id) REFERENCES resume_versions(version_id)
         );
         CREATE INDEX IF NOT EXISTS resume_versions_selection_idx
@@ -128,12 +130,75 @@ def initialize(connection: sqlite3.Connection) -> None:
     lock_columns = {row[1] for row in connection.execute("PRAGMA table_info(material_locks)")}
     if "cover_letter_file_sha256" not in lock_columns:
         connection.execute("ALTER TABLE material_locks ADD COLUMN cover_letter_file_sha256 TEXT")
+    version_columns = {row[1] for row in connection.execute("PRAGMA table_info(resume_versions)")}
+    if "adaptation_plan_id" not in version_columns:
+        connection.execute("ALTER TABLE resume_versions ADD COLUMN adaptation_plan_id TEXT")
+    if "direction_profile_sha256" not in version_columns:
+        connection.execute("ALTER TABLE resume_versions ADD COLUMN direction_profile_sha256 TEXT")
     connection.commit()
 
 
 def _require_safe_id(value: str, label: str) -> None:
     if not SAFE_ID.fullmatch(value):
         raise ValueError(f"{label} must use only letters, numbers, dot, underscore, and hyphen")
+
+
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _active_direction(connection: sqlite3.Connection, direction: str) -> sqlite3.Row | None:
+    if not _table_exists(connection, "search_directions"):
+        return None
+    row = connection.execute(
+        "SELECT * FROM search_directions WHERE direction_id=?", (direction,)
+    ).fetchone()
+    if not row or row["status"] != "approved":
+        raise ValueError("resume direction is not user-approved")
+    return row
+
+
+def _approved_adaptation_plan(
+    connection: sqlite3.Connection,
+    plan_id: str | None,
+    direction: str,
+    kind: str,
+    require_fresh_job: bool = True,
+) -> sqlite3.Row | None:
+    if not _table_exists(connection, "resume_adaptation_plans"):
+        return None
+    if not plan_id:
+        raise ValueError("derived resume requires an approved adaptation plan")
+    plan = connection.execute(
+        "SELECT * FROM resume_adaptation_plans WHERE plan_id=?", (plan_id,)
+    ).fetchone()
+    if not plan or plan["status"] != "approved" or plan["direction_id"] != direction:
+        raise ValueError("approved adaptation plan not found for this direction")
+    if plan["recommended_kind"] != kind:
+        raise ValueError("resume kind does not match the approved adaptation plan")
+    if require_fresh_job:
+        job = connection.execute("SELECT job_card_json FROM jobs WHERE job_id=?", (plan["job_id"],)).fetchone()
+        if not job or canonical_hash(json.loads(job["job_card_json"])) != plan["job_card_sha256"]:
+            raise ValueError("adaptation plan job card is stale")
+    return plan
+
+
+def _require_resume_authorized_for_application(
+    connection: sqlite3.Connection, version: sqlite3.Row
+) -> None:
+    if not _table_exists(connection, "search_directions"):
+        return
+    if version["kind"] == "master_source":
+        raise ValueError("master-source resume cannot be used after direction enforcement is initialized")
+    direction = _active_direction(connection, version["direction"])
+    if version["direction_profile_sha256"] != direction["profile_sha256"]:
+        raise ValueError("resume direction profile is stale")
+    _approved_adaptation_plan(
+        connection, version["adaptation_plan_id"], version["direction"], version["kind"],
+        require_fresh_job=False,
+    )
 
 
 def _event(
@@ -190,6 +255,7 @@ def register_version(
     parent_version_id: str | None = None,
     actor: str = "system",
     at: datetime | None = None,
+    adaptation_plan_id: str | None = None,
 ) -> dict[str, Any]:
     _require_safe_id(version_id, "version_id")
     if kind not in RESUME_KINDS:
@@ -201,6 +267,13 @@ def register_version(
     if connection.execute("SELECT 1 FROM resume_versions WHERE version_id=?", (version_id,)).fetchone():
         raise ValueError("resume version already exists")
     _validate_parent(connection, kind, direction, parent_version_id)
+    direction_row = None
+    plan = None
+    if kind != "master_source":
+        direction_row = _active_direction(connection, direction)
+        plan = _approved_adaptation_plan(connection, adaptation_plan_id, direction, kind)
+        if plan and plan["base_resume_version_id"] != parent_version_id:
+            raise ValueError("resume parent does not match the approved adaptation plan")
     suffix = source_file.suffix.casefold()
     if suffix not in {".pdf", ".docx", ".txt", ".md"}:
         raise ValueError("resume format must be PDF, DOCX, TXT, or Markdown")
@@ -221,9 +294,12 @@ def register_version(
         connection.execute("""
             INSERT INTO resume_versions (
                 version_id, parent_version_id, kind, direction, status, snapshot_path,
-                file_sha256, file_size, file_format, created_at
-            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)
-        """, (version_id, parent_version_id, kind, direction, str(snapshot), digest, size, suffix[1:], timestamp))
+                file_sha256, file_size, file_format, created_at, adaptation_plan_id,
+                direction_profile_sha256
+            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)
+        """, (version_id, parent_version_id, kind, direction, str(snapshot), digest, size,
+              suffix[1:], timestamp, adaptation_plan_id,
+              direction_row["profile_sha256"] if direction_row else None))
         _event(connection, version_id, actor, "registered", "immutable_snapshot_created", at=at)
         connection.commit()
     except Exception:
@@ -241,6 +317,7 @@ def register_version(
         "file_sha256": digest,
         "file_size": size,
         "snapshot_path": str(snapshot),
+        "adaptation_plan_id": adaptation_plan_id,
     }
 
 
@@ -322,6 +399,15 @@ def approve_version(
         raise ValueError("only a draft resume can be approved")
     verify_version_file(row)
     candidate, candidate_hash = load_valid_candidate(candidate_path)
+    if row["kind"] != "master_source" and _table_exists(connection, "search_directions"):
+        direction_row = _active_direction(connection, row["direction"])
+        if row["direction_profile_sha256"] != direction_row["profile_sha256"]:
+            raise ValueError("resume direction profile changed after registration")
+        plan = _approved_adaptation_plan(
+            connection, row["adaptation_plan_id"], row["direction"], row["kind"]
+        )
+        if not plan or plan["candidate_profile_sha256"] != candidate_hash:
+            raise ValueError("adaptation plan candidate profile is stale")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_claims_manifest(manifest, candidate)
     manifest_snapshot = Path(row["snapshot_path"]).parent / "claims-manifest.json"
@@ -374,6 +460,8 @@ def revoke_version(
 
 
 def select_approved(connection: sqlite3.Connection, direction: str, kind: str | None = None) -> dict[str, Any] | None:
+    if _table_exists(connection, "search_directions"):
+        _active_direction(connection, direction)
     parameters: list[Any] = [direction]
     kind_filter = ""
     if kind:
@@ -387,6 +475,7 @@ def select_approved(connection: sqlite3.Connection, direction: str, kind: str | 
     ).fetchone()
     if not row:
         return None
+    _require_resume_authorized_for_application(connection, row)
     verify_version_file(row)
     return {key: row[key] for key in (
         "version_id", "parent_version_id", "kind", "direction", "status", "snapshot_path",
@@ -409,6 +498,7 @@ def bind_version(
     version = connection.execute("SELECT * FROM resume_versions WHERE version_id=?", (version_id,)).fetchone()
     if not version or version["status"] != "approved":
         raise ValueError("application requires an approved resume version")
+    _require_resume_authorized_for_application(connection, version)
     verify_version_file(version)
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
@@ -447,6 +537,7 @@ def lock_materials(
     ).fetchone()
     if not version or version["status"] != "approved":
         raise ValueError("bound resume version is not approved")
+    _require_resume_authorized_for_application(connection, version)
     verify_version_file(version)
     cover_letter = None
     if application["cover_letter_version_id"]:
@@ -527,6 +618,7 @@ def main() -> None:
     register.add_argument("--kind", required=True, choices=sorted(RESUME_KINDS))
     register.add_argument("--direction", required=True)
     register.add_argument("--parent")
+    register.add_argument("--adaptation-plan-id")
     approve = commands.add_parser("approve")
     approve.add_argument("--version-id", required=True)
     approve.add_argument("--candidate", required=True, type=Path)
@@ -555,7 +647,10 @@ def main() -> None:
     if args.command == "init":
         result = {"status": "initialized", "db": str(args.db), "store": str(store)}
     elif args.command == "register":
-        result = register_version(connection, store, args.file, args.version_id, args.kind, args.direction, args.parent)
+        result = register_version(
+            connection, store, args.file, args.version_id, args.kind, args.direction,
+            args.parent, adaptation_plan_id=args.adaptation_plan_id,
+        )
     elif args.command == "approve":
         result = approve_version(connection, args.version_id, args.candidate, args.manifest, args.actor)
     elif args.command == "revoke":

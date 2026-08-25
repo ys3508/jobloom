@@ -29,6 +29,8 @@ Use `uncertain` and require review when a safety-critical condition is missing o
 
 Match required skills and responsibilities to evidence IDs, not raw resume keyword presence. Preserve the strength of every match. Missing preferred skills lower ranking; missing truly mandatory skills create a main gap and normally lead to review or skip depending on the posting.
 
+Only a user-reviewed JobCard with passing eligibility and a `broad` or `precision` recommendation may enter the deterministic resume-adaptation planning flow in `search-directions.md`. A deadline, high-value flag, or requested keyword cannot bypass eligibility, evidence strength, or approved direction scope.
+
 ## Recommendation
 
 - `precision`: hard filters pass, core responsibilities have direct evidence, and user value is high.

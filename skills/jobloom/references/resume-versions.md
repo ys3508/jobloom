@@ -13,6 +13,8 @@ A ResumeVersion is an immutable local file snapshot, not a mutable filename or a
 
 Except for `master_source`, every version requires an approved parent. A child cannot silently switch directions within a version chain.
 
+When the SearchDirection registry is initialized, every non-master version also requires the approved adaptation plan described in `search-directions.md`. Its recommended kind, direction, and base resume must match registration exactly. Master sources remain provenance and cannot be used directly for an application after this enforcement is active.
+
 ## Registration and immutability
 
 Registration copies PDF, DOCX, TXT, or Markdown bytes into the private resume store. It records SHA-256, size, format, parent, kind, and direction, then makes the snapshot read-only. Registration always creates a `draft`; it never implies approval.
@@ -42,6 +44,8 @@ Only the `user` actor may approve or revoke a resume. Approval verifies:
 5. locked values have an explicit exact-preservation assertion
 
 Approval snapshots the claims manifest beside the resume and records both candidate and manifest hashes. Revocation invalidates every active material lock using that version.
+
+For a planned derived version, approval also rechecks the exact approved adaptation plan, CandidateProfile hash, SearchDirection hash, and JobCard hash. Plan approval does not approve the file: the user must still review the rendered immutable snapshot and its material changes.
 
 ## Application binding and material lock
 

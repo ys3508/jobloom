@@ -11,12 +11,13 @@
 7. Standing authorization
 8. Application core
 9. Resume version
-10. Cover-letter version
-11. Fill-only execution
-12. Pre-submission review
-13. Submission archive
-14. Outcomes and usage
-15. Future core entities
+10. Search direction and adaptation plan
+11. Cover-letter version
+12. Fill-only execution
+13. Pre-submission review
+14. Submission archive
+15. Outcomes and usage
+16. Future core entities
 
 ## Candidate profile
 
@@ -145,11 +146,19 @@ Application events contain no answer values or full JobCards. Submission evidenc
 
 ## Resume version
 
-A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, parent version, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
+A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, parent version, optional adaptation-plan ID and direction-profile hash, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
 
 The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
 
 A material lock records the exact approved resume version and file hash, plus the optional approved cover-letter version and file hash, selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
+
+## Search direction and adaptation plan
+
+SearchDirection stores an immutable structured profile, optional approved parent, deterministic profile SHA-256, status, user approval metadata, and revocation metadata. The profile contains target titles, role family, keyword groups, and bounded direction criteria. Registration creates `draft`; only actor `user` may approve or revoke it.
+
+ResumeAdaptationPlan stores one approved direction, reviewed JobCard, approved base ResumeVersion, candidate/profile/job hashes, deterministic value-free plan JSON and SHA-256, recommended kind, status, user approval metadata, and invalidation metadata. Its evidence records preserve original strength and CandidateFact IDs without values.
+
+After direction enforcement is initialized, every non-master ResumeVersion requires an approved plan whose direction, recommended kind, base parent, candidate hash, JobCard hash, and direction-profile hash match. Plan approval and physical ResumeVersion approval remain separate.
 
 ## Cover-letter version
 

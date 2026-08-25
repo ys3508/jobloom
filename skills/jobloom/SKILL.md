@@ -10,6 +10,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 ## Choose the workflow
 
 - For candidate onboarding, read `references/facts-and-evidence.md`.
+- For search-direction configuration, resume adaptation planning, or change review, read `references/search-directions.md`, `references/job-evaluation.md`, `references/facts-and-evidence.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For cover-letter registration, approval, application scoping, or binding, read `references/cover-letter-versions.md`, `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
@@ -19,7 +20,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For form inventory, mandatory pauses, pre-submission summaries, or final user approval, read `references/pre-submission-review.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
 - For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
-- For form filling or submission preparation, read all eleven references. Default to Fill-Only and stop before the final submission action.
+- For form filling or submission preparation, read all twelve references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -65,6 +66,16 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 5. Bind an approved version during application material preparation, then create the material lock before moving to `ready_to_fill`.
 6. Recheck the active lock and physical file hash at fill acquisition, pre-submit readiness, and submission. Revocation or rebinding invalidates the old lock.
 7. Keep snapshots and manifests under `.jobloom/`; never commit personal resume content by default.
+
+## Search directions and adaptation plans
+
+1. Register a structured direction from `assets/search-direction.template.json`. A draft is inert until the user approves the exact profile SHA-256.
+2. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside the approved direction and whose deterministic evaluation is eligible for `broad` or `precision` action.
+3. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
+4. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged direction, unchanged JobCard, and an approved unchanged base resume.
+5. `direct_reuse` creates no file. For `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent.
+6. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
+7. Revoking a direction invalidates its plans and active material locks. Do not select, bind, or lock a master resume once direction enforcement is initialized.
 
 ## Cover-letter versions
 

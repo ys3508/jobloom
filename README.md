@@ -118,6 +118,16 @@ python3 skills/jobloom/scripts/resume_core.py \
 
 Registration never approves a resume. Approval requires a user-reviewed claims manifest, a finalized hash-valid `candidate.json`, and the `user` actor. Approved resumes can then be bound to applications and material-locked before `ready_to_fill`. Fill acquisition and pre-submit transitions recheck both approval state and physical file hash.
 
+Initialize the user-approved search-direction and resume-adaptation planner:
+
+```bash
+python3 skills/jobloom/scripts/direction_core.py \
+  --db .jobloom/jobloom.db \
+  init
+```
+
+Create a private direction profile from `skills/jobloom/assets/search-direction.template.json`, register it, show its SHA-256 to the user, and approve only that exact hash. For a reviewed eligible JobCard, `direction_core.py generate-plan` produces a value-free evidence plan that distinguishes direct/related, transferable, and unsupported requirements. The user approves the plan separately from the actual file. New `direction`, `lightweight`, and `precision` ResumeVersions must name the matching approved plan with `resume_core.py register --adaptation-plan-id ...`; the rendered immutable file and claims manifest still require their own user approval. `direct_reuse` creates no new file.
+
 Initialize the cover-letter registry and register a private draft when a letter is justified:
 
 ```bash
