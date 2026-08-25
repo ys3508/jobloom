@@ -9,7 +9,8 @@
 5. Evaluation output
 6. Answer entry
 7. Standing authorization
-8. Future core entities
+8. Application core
+9. Future core entities
 
 ## Candidate profile
 
@@ -130,6 +131,12 @@ Question forms live separately from answers. Each exact or user-verified semanti
 
 A StandingAuthorization contains an ID, confirmation and expiration timestamps, scope, revocation timestamp, and status. It may last at most fourteen days. It controls Channel A only and cannot alter an AnswerEntry's Channel B status.
 
+## Application core
+
+Keep jobs, job sources, applications, application events, and submission evidence in separate tables. Job records contain normalized identity and the reusable JobCard. Application records contain current state, category, submission policy, material version IDs, authorization ID, pre-submit status, attempt/lease data, failure code, and submission confirmation metadata.
+
+Application events contain no answer values or full JobCards. Submission evidence is recorded separately and is required before the `submitted` state. The complete state and transition rules live in `application-state.md`.
+
 ## Future core entities
 
-Keep separate records for `AnswerEntry`, `ResumeVersion`, `Authorization`, `Application`, `ApplicationEvent`, and `SubmissionEvidence`. Do not collapse them into the job record. Every application must preserve the exact resume/cover-letter snapshots and material answer snapshot used at submission time.
+Add separate `ResumeVersion`, archive-manifest, and outcome records next. Do not collapse them into the job or application records. Every submitted application must eventually preserve exact resume/cover-letter snapshots and a redacted material-answer snapshot.

@@ -12,7 +12,8 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For candidate onboarding or resume work, read `references/facts-and-evidence.md`.
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
-- For form filling or submission preparation, read all four references. Default to Fill-Only and stop before the final submission action.
+- For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
+- For form filling or submission preparation, read all five references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -68,6 +69,16 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 8. Use `invalidate --trigger <event>` immediately after a declared change. Never let current standing authorization reactivate stale answers.
 
 Store the database in `.jobloom/`. It contains plaintext local answers protected by restrictive file permissions; do not store passwords, API keys, identity-document numbers, tax identifiers, or banking data in it.
+
+## Application state core
+
+1. Initialize the shared local database with `application_core.py --db <private.db> init`.
+2. Ingest a reviewed JobCard before creating an application. Respect definite and possible duplicate results.
+3. Create at most one application per job identity. Never bypass related-job application history.
+4. Use guarded `transition` commands for analysis and user decisions. Use `acquire` and `release` for fill workers; never enter `filling` by direct transition.
+5. Preserve `submission_failed` and `submission_uncertain` as distinct states. Never enqueue uncertain submissions for retry.
+6. Record success evidence before marking an application submitted.
+7. Use stable reason and failure codes. Do not place job descriptions, answers, secrets, or personal data in event metadata.
 
 ## Output discipline
 

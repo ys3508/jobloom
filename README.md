@@ -89,6 +89,20 @@ python3 skills/jobloom/scripts/answer_library.py \
 
 The answer library supports confirmed entries, exact and reviewed-semantic question forms, scoped matching, expiration, event invalidation, standing authorization, revocation, and the standard-attestation freshness gate. Templates live in `skills/jobloom/assets/`.
 
+Initialize and inspect the application state core in the same private database:
+
+```bash
+python3 skills/jobloom/scripts/application_core.py \
+  --db .jobloom/jobloom.db \
+  init
+
+python3 skills/jobloom/scripts/application_core.py \
+  --db .jobloom/jobloom.db \
+  status
+```
+
+The application core provides persistent multi-key job deduplication, duplicate-application prevention, guarded state transitions, atomic fill-worker leases, bounded retry attempts, submission-policy enforcement, and positive submission evidence requirements.
+
 Run the current test suite:
 
 ```bash

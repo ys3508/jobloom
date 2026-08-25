@@ -37,3 +37,5 @@ Match required skills and responsibilities to evidence IDs, not raw resume keywo
 - `skip`: verified hard-filter failure or clearly insufficient mandatory evidence.
 
 Use user-facing match labels rather than numeric interview probabilities.
+
+Use `application_core.py` for persistent deduplication. Treat canonical URL, employer plus requisition ID, and same-employer/title description fingerprint matches as definite duplicates. Treat normalized employer/title/location alone as a possible duplicate requiring review. See `application-state.md` for the state contract.

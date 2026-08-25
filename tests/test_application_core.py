@@ -1,0 +1,289 @@
+import importlib.util
+import sqlite3
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def load_script(name):
+    path = ROOT / "skills" / "jobloom" / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"app_core_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+CORE = load_script("application_core")
+ANSWERS = load_script("answer_library")
+AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+
+
+def card(job_id="job-1", url="https://example.com/jobs/1", **updates):
+    value = {
+        "job_id": job_id, "canonical_url": url, "employer": "Example Corp",
+        "title": "Backend Engineer", "location": "New York, NY", "status": "open",
+        "description_sha256": "description-hash-1", "requisition_id": "REQ-1",
+    }
+    value.update(updates)
+    return value
+
+
+class ApplicationCoreTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        CORE.initialize(self.db)
+        ANSWERS.initialize(self.db)
+        self.addCleanup(self.db.close)
+
+    def add_job_and_application(self, application_id="app-1", policy="stop_before_submit", category="broad"):
+        CORE.ingest_job(self.db, card(), at=AT)
+        return CORE.create_application(self.db, application_id, "job-1", category, policy, AT)
+
+    def move_to_ready(self, application_id="app-1"):
+        CORE.transition(self.db, application_id, "pending_analysis", "system", "analysis_started", at=AT)
+        CORE.transition(self.db, application_id, "broad_recommended", "system", "broad_match", at=AT)
+        CORE.transition(self.db, application_id, "approved", "user", "user_approved", at=AT)
+        CORE.transition(self.db, application_id, "materials_in_progress", "system", "materials_started", at=AT)
+        CORE.transition(self.db, application_id, "ready_to_fill", "system", "materials_ready", at=AT)
+
+    def move_to_pre_submit(self, application_id="app-1"):
+        self.move_to_ready(application_id)
+        CORE.acquire_next(self.db, "worker-1", at=AT)
+        CORE.release_lease(
+            self.db, application_id, "worker-1", "waiting_for_submission_approval", "form_filled", at=AT
+        )
+        CORE.transition(
+            self.db, application_id, "pre_submit_ready", "system", "pre_submit_passed",
+            {"pre_submit_check_passed": True}, AT,
+        )
+
+    def add_authorization(self, authorization_id="auth-1"):
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": authorization_id,
+            "confirmed_at": AT.isoformat(),
+            "expires_at": (AT + timedelta(days=7)).isoformat(),
+            "scope": {"country": "US", "queue_id": "queue-1"},
+        })
+
+    def test_tracking_parameters_deduplicate_to_canonical_url(self):
+        first = CORE.ingest_job(self.db, card(), at=AT)
+        second = CORE.ingest_job(
+            self.db,
+            card(job_id="job-2", url="https://EXAMPLE.com/jobs/1/?utm_source=board#apply", requisition_id="REQ-2", description_sha256="different"),
+            at=AT,
+        )
+        self.assertEqual(first["decision"], "inserted")
+        self.assertEqual(second["decision"], "duplicate")
+        self.assertEqual(second["reason"], "canonical_url")
+
+    def test_employer_and_requisition_deduplicate_cross_board(self):
+        CORE.ingest_job(self.db, card(), at=AT)
+        result = CORE.ingest_job(
+            self.db, card(job_id="job-2", url="https://board.test/j/2", description_sha256="different"), at=AT
+        )
+        self.assertEqual(result["reason"], "employer_requisition")
+
+    def test_same_identity_without_strong_key_requires_review(self):
+        CORE.ingest_job(self.db, card(requisition_id=None, description_sha256="hash-a"), at=AT)
+        result = CORE.ingest_job(
+            self.db, card(job_id="job-2", url="https://board.test/j/2", requisition_id=None, description_sha256="hash-b"), at=AT
+        )
+        self.assertEqual(result["decision"], "review")
+        self.assertEqual(result["reason"], "normalized_identity")
+
+    def test_description_hash_does_not_cross_employers(self):
+        CORE.ingest_job(self.db, card(requisition_id=None), at=AT)
+        result = CORE.ingest_job(self.db, card(
+            job_id="job-2", url="https://other.test/jobs/2", employer="Other Corp", requisition_id=None,
+        ), at=AT)
+        self.assertEqual(result["decision"], "inserted")
+
+    def test_duplicate_application_is_blocked(self):
+        self.add_job_and_application()
+        result = CORE.create_application(self.db, "app-2", "job-1", at=AT)
+        self.assertEqual(result["decision"], "duplicate_application")
+        self.assertEqual(result["application_id"], "app-1")
+
+    def test_imported_application_history_is_blocked(self):
+        CORE.ingest_job(self.db, card(already_applied=True), at=AT)
+        result = CORE.create_application(self.db, "app-1", "job-1", at=AT)
+        self.assertEqual(result["decision"], "duplicate_application")
+        self.assertEqual(result["state"], "external_history")
+
+    def test_possible_duplicate_checks_related_application_history(self):
+        self.add_job_and_application()
+        second_card = card(
+            job_id="job-2", url="https://board.test/jobs/2", requisition_id=None,
+            description_sha256="different-hash",
+        )
+        self.db.execute("UPDATE jobs SET requisition_id=NULL WHERE job_id='job-1'")
+        self.db.commit()
+        inserted = CORE.ingest_job(self.db, second_card, allow_possible_duplicate=True, at=AT)
+        self.assertEqual(inserted["decision"], "inserted_with_review")
+        result = CORE.create_application(self.db, "app-2", "job-2", at=AT)
+        self.assertEqual(result["decision"], "duplicate_application")
+
+    def test_invalid_transition_is_rejected(self):
+        self.add_job_and_application()
+        with self.assertRaisesRegex(ValueError, "invalid transition"):
+            CORE.transition(self.db, "app-1", "submitted", "system", "skip", at=AT)
+
+    def test_approval_requires_user(self):
+        self.add_job_and_application()
+        CORE.transition(self.db, "app-1", "pending_analysis", "system", "analysis_started", at=AT)
+        CORE.transition(self.db, "app-1", "broad_recommended", "system", "recommended", at=AT)
+        with self.assertRaisesRegex(ValueError, "user actor"):
+            CORE.transition(self.db, "app-1", "approved", "system", "auto_approved", at=AT)
+
+    def test_atomic_acquire_only_leases_one_application(self):
+        self.add_job_and_application()
+        self.move_to_ready()
+        first = CORE.acquire_next(self.db, "worker-1", at=AT)
+        second = CORE.acquire_next(self.db, "worker-2", at=AT)
+        self.assertEqual(first["application_id"], "app-1")
+        self.assertIsNone(second)
+
+    def test_expired_lease_can_be_reacquired(self):
+        self.add_job_and_application()
+        self.move_to_ready()
+        CORE.acquire_next(self.db, "worker-1", lease_seconds=30, at=AT)
+        reacquired = CORE.acquire_next(self.db, "worker-2", at=AT + timedelta(seconds=31))
+        self.assertEqual(reacquired["worker_id"], "worker-2")
+        self.assertEqual(reacquired["attempt"], 2)
+
+    def test_wrong_worker_cannot_release_lease(self):
+        self.add_job_and_application()
+        self.move_to_ready()
+        CORE.acquire_next(self.db, "worker-1", at=AT)
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            CORE.release_lease(self.db, "app-1", "worker-2", "waiting_for_user_answer", "new_question", at=AT)
+
+    def test_stop_before_submit_policy_cannot_be_overridden(self):
+        self.add_job_and_application()
+        self.move_to_pre_submit()
+        self.add_authorization()
+        with self.assertRaisesRegex(ValueError, "blocks submission"):
+            CORE.transition(
+                self.db, "app-1", "submitting", "system", "submit_requested",
+                {"authorization_id": "auth-1"}, AT,
+            )
+
+    def test_submission_requires_real_current_authorization(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        with self.assertRaisesRegex(ValueError, "not active"):
+            CORE.transition(
+                self.db, "app-1", "submitting", "system", "submit_requested",
+                {"authorization_id": "missing", "approved_queue": True}, AT,
+            )
+
+    def test_expired_submission_authorization_is_rejected(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": "auth-expired",
+            "confirmed_at": (AT - timedelta(days=8)).isoformat(),
+            "expires_at": (AT - timedelta(days=1)).isoformat(),
+            "scope": {"country": "US", "queue_id": "queue-1"},
+        })
+        with self.assertRaisesRegex(ValueError, "expired"):
+            CORE.transition(
+                self.db, "app-1", "submitting", "system", "submit_requested",
+                {"authorization_id": "auth-expired", "approved_queue": True}, AT,
+            )
+
+    def test_summary_policy_requires_summary_approval(self):
+        self.add_job_and_application(policy="approved_after_summary")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        with self.assertRaisesRegex(ValueError, "summary approval"):
+            CORE.transition(
+                self.db, "app-1", "submitting", "system", "submit_requested",
+                {"authorization_id": "auth-1"}, AT,
+            )
+
+    def test_known_form_policy_requires_known_form(self):
+        self.add_job_and_application(policy="known_forms_only")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        with self.assertRaisesRegex(ValueError, "known form"):
+            CORE.transition(
+                self.db, "app-1", "submitting", "system", "submit_requested",
+                {"authorization_id": "auth-1"}, AT,
+            )
+
+    def test_submitted_requires_positive_evidence(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1", "approved_queue": True}, AT,
+        )
+        with self.assertRaisesRegex(ValueError, "positive submission evidence"):
+            CORE.transition(self.db, "app-1", "submitted", "system", "submit_clicked", at=AT)
+
+    def test_success_evidence_allows_submitted_state(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1", "approved_queue": True}, AT,
+        )
+        CORE.record_evidence(self.db, "ev-1", "app-1", "confirmation_id", confirmation_id="ABC-123", at=AT)
+        result = CORE.transition(self.db, "app-1", "submitted", "system", "confirmation_received", at=AT)
+        self.assertEqual(result["state"], "submitted")
+        row = self.db.execute("SELECT confirmation_id FROM applications WHERE application_id='app-1'").fetchone()
+        self.assertEqual(row["confirmation_id"], "ABC-123")
+
+    def test_evidence_cannot_be_recorded_before_submission_attempt(self):
+        self.add_job_and_application()
+        with self.assertRaisesRegex(ValueError, "submission attempt"):
+            CORE.record_evidence(self.db, "ev-early", "app-1", "success_page", reference="confirmation.png", at=AT)
+
+    def test_returning_to_fill_invalidates_pre_submit_check(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        CORE.transition(self.db, "app-1", "waiting_for_user_answer", "system", "new_question", at=AT)
+        CORE.transition(self.db, "app-1", "ready_to_fill", "system", "answer_received", at=AT)
+        CORE.acquire_next(self.db, "worker-2", at=AT)
+        row = self.db.execute("SELECT pre_submit_check_passed FROM applications WHERE application_id='app-1'").fetchone()
+        self.assertEqual(row["pre_submit_check_passed"], 0)
+
+    def test_uncertain_submission_requires_manual_resolution(self):
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1", "approved_queue": True}, AT,
+        )
+        CORE.transition(self.db, "app-1", "submission_uncertain", "system", "result_uncertain", at=AT)
+        with self.assertRaisesRegex(ValueError, "explicit user resolution"):
+            CORE.transition(
+                self.db, "app-1", "submission_failed", "system", "automatic_retry",
+                {"error_code": "website_failure"}, AT,
+            )
+        result = CORE.transition(
+            self.db, "app-1", "submission_failed", "user", "user_resolved_not_submitted",
+            {"error_code": "website_failure", "manual_resolution": True}, AT,
+        )
+        self.assertEqual(result["state"], "submission_failed")
+
+    def test_event_log_contains_state_metadata_not_job_card(self):
+        self.add_job_and_application()
+        self.move_to_ready()
+        logs = " ".join(row[0] for row in self.db.execute("SELECT metadata_json FROM application_events"))
+        self.assertNotIn("Backend Engineer", logs)
+        self.assertNotIn("description_sha256", logs)
+
+
+if __name__ == "__main__":
+    unittest.main()
