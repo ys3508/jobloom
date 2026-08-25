@@ -20,6 +20,7 @@ def load_script(name):
 
 
 CANDIDATES = load_script("candidate_core")
+PRE_SUBMIT = load_script("pre_submit_core")
 APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
@@ -39,6 +40,7 @@ class CandidateCoreTests(unittest.TestCase):
         ANSWERS.initialize(self.db)
         RESUMES.initialize(self.db)
         ARCHIVE.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
         CANDIDATES.initialize(self.db)
         self.addCleanup(self.db.close)
         self.candidate_path = self.write_candidate("Verified Candidate")

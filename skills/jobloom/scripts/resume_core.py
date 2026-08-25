@@ -10,10 +10,16 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from _common import require_table  # noqa: E402
 
 
 RESUME_KINDS = {"master_source", "direction", "lightweight", "precision"}
@@ -144,12 +150,17 @@ def _require_safe_id(value: str, label: str) -> None:
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    # Two distinct uses: fail-closed checks that raise on False, and bootstrap gates
+    # that legitimately skip enforcement before a store exists. Each call site says which.
     return connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
 
 
 def _active_direction(connection: sqlite3.Connection, direction: str) -> sqlite3.Row | None:
+    # Bootstrap gate, not a fail-open safety skip: before direction enforcement is
+    # initialized there is no portfolio to enforce, and master-source resumes are still
+    # legal. Once search_directions exists, every check below is mandatory.
     if not _table_exists(connection, "search_directions"):
         return None
     row = connection.execute(
@@ -157,6 +168,7 @@ def _active_direction(connection: sqlite3.Connection, direction: str) -> sqlite3
     ).fetchone()
     if not row or row["status"] != "approved":
         raise ValueError("resume direction is not user-approved")
+    # Bootstrap gate: portfolio enforcement begins with the first registered portfolio.
     if _table_exists(connection, "search_portfolios"):
         portfolio_count = connection.execute(
             "SELECT COUNT(*) FROM search_portfolios"
@@ -177,6 +189,7 @@ def _approved_adaptation_plan(
     kind: str,
     require_fresh_job: bool = True,
 ) -> sqlite3.Row | None:
+    # Bootstrap gate: adaptation-plan enforcement begins once direction_core is initialized.
     if not _table_exists(connection, "resume_adaptation_plans"):
         return None
     if not plan_id:
@@ -198,16 +211,16 @@ def _approved_adaptation_plan(
 def _require_resume_authorized_for_application(
     connection: sqlite3.Connection, version: sqlite3.Row
 ) -> None:
-    if _table_exists(connection, "candidate_snapshots"):
-        snapshot = connection.execute(
-            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
-            "AND registered_by='user'", (version["candidate_profile_sha256"],)
-        ).fetchone()
-        if not snapshot:
-            raise ValueError("resume candidate profile is not the active registered snapshot")
-        path = Path(snapshot["snapshot_path"])
-        if not path.is_file() or file_sha256(path) != snapshot["file_sha256"]:
-            raise ValueError("registered candidate snapshot hash mismatch")
+    require_table(connection, "candidate_snapshots")
+    snapshot = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+        "AND registered_by='user'", (version["candidate_profile_sha256"],)
+    ).fetchone()
+    if not snapshot:
+        raise ValueError("resume candidate profile is not the active registered snapshot")
+    path = Path(snapshot["snapshot_path"])
+    if not path.is_file() or file_sha256(path) != snapshot["file_sha256"]:
+        raise ValueError("registered candidate snapshot hash mismatch")
     if not _table_exists(connection, "search_directions"):
         return
     if version["kind"] == "master_source":
@@ -419,16 +432,17 @@ def approve_version(
         raise ValueError("only a draft resume can be approved")
     verify_version_file(row)
     candidate, candidate_hash = load_valid_candidate(candidate_path)
-    if _table_exists(connection, "candidate_snapshots"):
-        snapshot = connection.execute(
-            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
-            "AND registered_by='user'", (candidate_hash,)
-        ).fetchone()
-        if not snapshot:
-            raise ValueError("candidate profile is not the active user-registered snapshot")
-        snapshot_path = Path(snapshot["snapshot_path"])
-        if not snapshot_path.is_file() or file_sha256(snapshot_path) != snapshot["file_sha256"]:
-            raise ValueError("registered candidate snapshot hash mismatch")
+    require_table(connection, "candidate_snapshots")
+    snapshot = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+        "AND registered_by='user'", (candidate_hash,)
+    ).fetchone()
+    if not snapshot:
+        raise ValueError("candidate profile is not the active user-registered snapshot")
+    snapshot_path = Path(snapshot["snapshot_path"])
+    if not snapshot_path.is_file() or file_sha256(snapshot_path) != snapshot["file_sha256"]:
+        raise ValueError("registered candidate snapshot hash mismatch")
+    # Bootstrap gate on search_directions; every check inside is mandatory once it exists.
     if row["kind"] != "master_source" and _table_exists(connection, "search_directions"):
         direction_row = _active_direction(connection, row["direction"])
         if row["direction_profile_sha256"] != direction_row["profile_sha256"]:
@@ -490,6 +504,7 @@ def revoke_version(
 
 
 def select_approved(connection: sqlite3.Connection, direction: str, kind: str | None = None) -> dict[str, Any] | None:
+    # Bootstrap gate on search_directions; see _active_direction.
     if _table_exists(connection, "search_directions"):
         _active_direction(connection, direction)
     parameters: list[Any] = [direction]
@@ -571,11 +586,7 @@ def lock_materials(
     verify_version_file(version)
     cover_letter = None
     if application["cover_letter_version_id"]:
-        cover_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cover_letter_versions'"
-        ).fetchone()
-        if not cover_table:
-            raise ValueError("cover-letter version store is unavailable")
+        require_table(connection, "cover_letter_versions")
         cover_letter = connection.execute(
             "SELECT * FROM cover_letter_versions WHERE version_id=?",
             (application["cover_letter_version_id"],),

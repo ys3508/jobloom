@@ -21,6 +21,9 @@ def load_script(name):
 
 RESUMES = load_script("resume_core")
 APPLICATIONS = load_script("application_core")
+CANDIDATES = load_script("candidate_core")
+ANSWERS = load_script("answer_library")
+PRE_SUBMIT = load_script("pre_submit_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -37,6 +40,9 @@ class ResumeCoreTests(unittest.TestCase):
         self.db.execute("PRAGMA foreign_keys=ON")
         APPLICATIONS.initialize(self.db)
         RESUMES.initialize(self.db)
+        ANSWERS.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
+        CANDIDATES.initialize(self.db)
         self.addCleanup(self.db.close)
 
     def candidate_and_manifest(self, *, locked=False, fact_strength="direct", claim_strength="direct", exact=True):
@@ -44,7 +50,14 @@ class ResumeCoreTests(unittest.TestCase):
             "id": "fact-1", "type": "skill", "value": "Python", "status": "locked" if locked else "confirmed",
             "locked": locked, "evidence_strength": fact_strength,
         }
-        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": [fact]}
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": [fact],
+        }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = self.root / "candidate.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
@@ -63,7 +76,16 @@ class ResumeCoreTests(unittest.TestCase):
 
     def approve(self, version_id="resume-1", **manifest_options):
         candidate, manifest = self.candidate_and_manifest(**manifest_options)
+        self.register_snapshot(candidate)
         return RESUMES.approve_version(self.db, version_id, candidate, manifest, "user", AT)
+
+    def register_snapshot(self, candidate_path):
+        content_hash = RESUMES.load_valid_candidate(candidate_path)[1]
+        existing = self.db.execute(
+            "SELECT 1 FROM candidate_snapshots WHERE content_sha256=?", (content_hash,)
+        ).fetchone()
+        if not existing:
+            CANDIDATES.register_snapshot(self.db, self.root / "candidates", candidate_path, "user", AT)
 
     def add_application_in_materials(self, application_id="app-1"):
         card = {
@@ -108,12 +130,14 @@ class ResumeCoreTests(unittest.TestCase):
     def test_manifest_cannot_inflate_evidence(self):
         self.register()
         candidate, manifest = self.candidate_and_manifest(fact_strength="transferable", claim_strength="direct")
+        self.register_snapshot(candidate)
         with self.assertRaisesRegex(ValueError, "inflates"):
             RESUMES.approve_version(self.db, "resume-1", candidate, manifest, "user", AT)
 
     def test_locked_fact_requires_exact_preservation_attestation(self):
         self.register()
         candidate, manifest = self.candidate_and_manifest(locked=True, exact=False)
+        self.register_snapshot(candidate)
         with self.assertRaisesRegex(ValueError, "preserve exact locked"):
             RESUMES.approve_version(self.db, "resume-1", candidate, manifest, "user", AT)
 

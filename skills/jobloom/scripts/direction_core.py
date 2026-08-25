@@ -18,6 +18,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import evaluate_job  # noqa: E402
 import resume_core  # noqa: E402
+from _common import require_table  # noqa: E402
 
 
 PROFILE_KEYS = {
@@ -150,6 +151,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             metadata_json TEXT NOT NULL
         );
     """)
+    # Schema-migration guard, not a runtime safety dependency: resume_core owns
+    # resume_versions and may not have been initialized yet when this module is used alone.
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resume_versions'"
     ).fetchone():
@@ -762,10 +765,8 @@ def revoke_direction(connection: sqlite3.Connection, direction_id: str, actor: s
         "invalidation_reason='direction_revoked' WHERE direction_id=? AND status IN ('generated','approved')",
         (timestamp, direction_id),
     )
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
-    ).fetchone():
-        connection.execute("""
+    require_table(connection, "material_locks")
+    connection.execute("""
             UPDATE material_locks SET invalidated_at=?, invalidation_reason='direction_revoked'
             WHERE resume_version_id IN (
                 SELECT version_id FROM resume_versions WHERE direction=?
@@ -802,10 +803,8 @@ def revoke_portfolio(connection: sqlite3.Connection, portfolio_id: str, actor: s
             "invalidation_reason='portfolio_revoked' WHERE direction_id=? "
             "AND status IN ('generated','approved')", (timestamp, direction_id),
         )
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
-        ).fetchone():
-            connection.execute("""
+        require_table(connection, "material_locks")
+        connection.execute("""
                 UPDATE material_locks SET invalidated_at=?, invalidation_reason='portfolio_revoked'
                 WHERE resume_version_id IN (
                     SELECT version_id FROM resume_versions WHERE direction=?

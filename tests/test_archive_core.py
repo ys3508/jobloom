@@ -43,6 +43,7 @@ class ArchiveCoreTests(unittest.TestCase):
         ARCHIVE.initialize(self.db)
         OUTCOMES.initialize(self.db)
         PRE_SUBMIT.initialize(self.db)
+        CANDIDATE.initialize(self.db)
         self.addCleanup(self.db.close)
         self.prepare_application()
 
@@ -56,7 +57,20 @@ class ArchiveCoreTests(unittest.TestCase):
             "id": "fact-1", "type": "skill", "value": "Python", "status": "confirmed",
             "locked": False, "evidence_strength": "direct",
         }
-        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": [fact]}
+        locked_facts = [
+            {"id": "fact-address", "type": "address", "value": "123 Private Street",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-birth-date", "type": "date_of_birth", "value": "2000-01-01",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+        ]
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": [fact, *locked_facts],
+        }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = self.root / "candidate.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
@@ -65,6 +79,7 @@ class ArchiveCoreTests(unittest.TestCase):
             "claim_id": "claim-1", "claim_text": "Python", "fact_ids": ["fact-1"],
             "evidence_strength": "direct", "exact_locked_value_preserved": False,
         }]}), encoding="utf-8")
+        CANDIDATE.register_snapshot(self.db, self.root / "candidates", candidate_path, "user", AT)
         RESUMES.approve_version(self.db, "resume-1", candidate_path, manifest_path, "user", AT)
 
         card = {
@@ -106,22 +121,6 @@ class ArchiveCoreTests(unittest.TestCase):
             self.db, "app-1", "birth_date", "Date of birth", "2000-01-01",
             "fact", "fact-birth-date", "locked", "date_of_birth", AT,
         )
-        CANDIDATE.initialize(self.db)
-        content_sha = candidate["content_sha256"]
-        self.db.execute(
-            "INSERT INTO candidate_snapshots VALUES (?, 'candidate-1', ?, ?, 'active', ?, 'user', NULL, NULL)",
-            (content_sha, str(candidate_path), RESUMES.file_sha256(candidate_path), AT.isoformat()),
-        )
-        for fact_id, fact_type, value in (
-            ("fact-address", "address", "123 Private Street"),
-            ("fact-birth-date", "date_of_birth", "2000-01-01"),
-        ):
-            value_json = json.dumps(value, separators=(",", ":"))
-            self.db.execute(
-                "INSERT INTO candidate_facts VALUES (?, ?, ?, ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
-                (content_sha, fact_id, fact_type, value_json, AT.isoformat(),
-                 RESUMES.canonical_hash({"value": value})),
-            )
         self.db.commit()
         PRE_SUBMIT.register_inventory(
             self.db, "inventory-1", "app-1", "https://example.com/jobs/1/apply",

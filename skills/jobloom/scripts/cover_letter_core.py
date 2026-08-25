@@ -18,6 +18,7 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import resume_core  # noqa: E402
+from _common import require_table  # noqa: E402
 
 
 COVER_LETTER_KINDS = {"reusable_template", "application_specific"}
@@ -94,6 +95,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (version_id) REFERENCES cover_letter_versions(version_id)
         );
     """)
+    # Schema-migration guard, not a runtime safety dependency: application_core owns
+    # material_locks and may not have been initialized yet when this module is used alone.
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
     ).fetchone():
@@ -267,10 +270,7 @@ def bind_version(
         raise ValueError("application-specific cover letter is scoped to another application")
     verify_version_file(version)
     timestamp = (at or now_utc()).isoformat()
-    if not connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
-    ).fetchone():
-        raise ValueError("material lock store is unavailable")
+    require_table(connection, "material_locks")
     connection.execute(
         "UPDATE material_locks SET invalidated_at=?, invalidation_reason='cover_letter_rebound' WHERE application_id=? AND invalidated_at IS NULL",
         (timestamp, application_id),
@@ -279,15 +279,13 @@ def bind_version(
         "UPDATE applications SET cover_letter_version_id=?, pre_submit_check_passed=0, pre_submit_review_id=NULL, updated_at=? WHERE application_id=?",
         (version_id, timestamp, application_id),
     )
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pre_submit_reviews'"
-    ).fetchone():
-        connection.execute(
-            "UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, "
-            "invalidation_reason='cover_letter_rebound' WHERE application_id=? "
-            "AND status IN ('generated','approved') AND invalidated_at IS NULL",
-            (timestamp, application_id),
-        )
+    require_table(connection, "pre_submit_reviews")
+    connection.execute(
+        "UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, "
+        "invalidation_reason='cover_letter_rebound' WHERE application_id=? "
+        "AND status IN ('generated','approved') AND invalidated_at IS NULL",
+        (timestamp, application_id),
+    )
     connection.execute("""
         INSERT OR IGNORE INTO cover_letter_usage (
             version_id, application_id, job_id, use_type, file_sha256, recorded_at
@@ -318,20 +316,19 @@ def revoke_version(
         "UPDATE cover_letter_versions SET status='revoked', revoked_at=?, status_reason=? WHERE version_id=?",
         (timestamp, reason, version_id),
     )
+    require_table(connection, "material_locks")
     connection.execute(
         "UPDATE material_locks SET invalidated_at=?, invalidation_reason='cover_letter_revoked' WHERE cover_letter_version_id=? AND invalidated_at IS NULL",
         (timestamp, version_id),
     )
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pre_submit_reviews'"
-    ).fetchone():
-        connection.execute(
-            "UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, "
-            "invalidation_reason='cover_letter_revoked' WHERE application_id IN "
-            "(SELECT application_id FROM applications WHERE cover_letter_version_id=?) "
-            "AND status IN ('generated','approved') AND invalidated_at IS NULL",
-            (timestamp, version_id),
-        )
+    require_table(connection, "pre_submit_reviews")
+    connection.execute(
+        "UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, "
+        "invalidation_reason='cover_letter_revoked' WHERE application_id IN "
+        "(SELECT application_id FROM applications WHERE cover_letter_version_id=?) "
+        "AND status IN ('generated','approved') AND invalidated_at IS NULL",
+        (timestamp, version_id),
+    )
     _event(connection, version_id, actor, "revoked", reason, row["application_id"], at)
     connection.commit()
     return {"version_id": version_id, "status": "revoked"}

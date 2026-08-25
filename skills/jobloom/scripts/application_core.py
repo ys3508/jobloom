@@ -9,11 +9,17 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from _common import require_table  # noqa: E402
 
 
 TRACKING_PARAMETERS = {"source", "src", "ref", "referrer", "trackingid", "gh_src"}
@@ -194,6 +200,8 @@ def initialize(connection: sqlite3.Connection) -> None:
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    # Callers must fail closed on a False result; use it only where a domain-specific
+    # error message is clearer than the shared require_table message.
     return connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
@@ -306,18 +314,18 @@ def require_approved_pre_submit_review(
         if stored_field["source_kind"] == "fact":
             if stored_field["source_status"] != "locked":
                 raise ValueError("pre-submit review fact is no longer locked")
-            if _table_exists(connection, "candidate_facts"):
-                fact = connection.execute("""
-                    SELECT cf.value_json, cf.status, cf.locked
-                    FROM material_locks ml
-                    JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
-                    JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
-                    JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
-                    WHERE ml.application_id=? AND ml.invalidated_at IS NULL
-                      AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
-                """, (application_id, stored_field["source_id"])).fetchone()
-                if not fact or fact["status"] != "locked" or not fact["locked"]:
-                    raise ValueError("pre-submit review CandidateFact is no longer locked")
+            require_table(connection, "candidate_facts")
+            fact = connection.execute("""
+                SELECT cf.value_json, cf.status, cf.locked
+                FROM material_locks ml
+                JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+                JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+                JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+                WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+                  AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+            """, (application_id, stored_field["source_id"])).fetchone()
+            if not fact or fact["status"] != "locked" or not fact["locked"]:
+                raise ValueError("pre-submit review CandidateFact is no longer locked")
                 if fact["value_json"] != stored_field["value_json"]:
                     raise ValueError("pre-submit review CandidateFact value changed")
         elif stored_field["source_kind"] == "answer":
@@ -547,11 +555,7 @@ def transition(
             raise ValueError("cannot submit without an authorization ID")
         if authorization_id != pre_submit_review["authorization_id"]:
             raise ValueError("submission authorization does not match the approved pre-submit review")
-        authorization_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='authorizations'"
-        ).fetchone()
-        if not authorization_table:
-            raise ValueError("authorization store is unavailable")
+        require_table(connection, "authorizations")
         authorization = connection.execute(
             "SELECT * FROM authorizations WHERE authorization_id=?", (authorization_id,)
         ).fetchone()
@@ -613,12 +617,14 @@ def transition(
         "materials_in_progress", "ready_to_fill", "filling", "waiting_for_user_answer",
         "waiting_for_submission_approval", "submission_failed", "waiting_for_user_takeover",
         "withdrawn", "closed",
-    } and _table_exists(connection, "pre_submit_reviews"):
+    }:
+        require_table(connection, "pre_submit_reviews")
         connection.execute("""
             UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?, invalidation_reason=?
             WHERE application_id=? AND status IN ('generated','approved')
         """, (timestamp, f"application_entered_{to_state}", application_id))
-    if to_state == "submitted" and _table_exists(connection, "resume_usage"):
+    if to_state == "submitted":
+        require_table(connection, "resume_usage")
         connection.execute("""
             INSERT OR IGNORE INTO resume_usage (
                 version_id, application_id, job_id, use_type, file_sha256, recorded_at
@@ -627,8 +633,8 @@ def transition(
             material_lock["resume_version_id"], application_id, row["job_id"],
             material_lock["resume_file_sha256"], timestamp,
         ))
-    if (to_state == "submitted" and material_lock["cover_letter_version_id"]
-            and _table_exists(connection, "cover_letter_usage")):
+    if to_state == "submitted" and material_lock["cover_letter_version_id"]:
+        require_table(connection, "cover_letter_usage")
         connection.execute("""
             INSERT OR IGNORE INTO cover_letter_usage (
                 version_id, application_id, job_id, use_type, file_sha256, recorded_at

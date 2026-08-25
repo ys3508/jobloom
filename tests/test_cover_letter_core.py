@@ -46,15 +46,26 @@ class CoverLetterCoreTests(unittest.TestCase):
         COVERS.initialize(self.db)
         ARCHIVE.initialize(self.db)
         PRE_SUBMIT.initialize(self.db)
+        CANDIDATE.initialize(self.db)
         self.addCleanup(self.db.close)
         self.candidate_path, self.manifest_path = self.make_candidate_and_manifest()
+        CANDIDATE.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
 
     def make_candidate_and_manifest(self):
         fact = {
             "id": "fact-1", "type": "skill", "value": "Python", "status": "confirmed",
             "locked": False, "evidence_strength": "direct",
         }
-        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": [fact]}
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": [fact],
+        }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = self.root / "candidate.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")

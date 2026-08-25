@@ -18,6 +18,7 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import resume_core  # noqa: E402
+from _common import require_table  # noqa: E402
 
 
 FACT_STATUSES = {"confirmed", "locked"}
@@ -256,18 +257,16 @@ def register_snapshot(
                   canonical_json(fact.get("source") or {}), canonical_json(fact.get("keywords") or []),
                   fact.get("confirmed_at"), canonical_json(fact.get("invalidation_triggers") or []),
                   resume_core.canonical_hash(fact)))
-        if active and connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
-        ).fetchone():
+        require_table(connection, "material_locks")
+        if active:
             connection.execute("""
                 UPDATE material_locks SET invalidated_at=?, invalidation_reason='candidate_snapshot_changed'
                 WHERE resume_version_id IN (
                     SELECT version_id FROM resume_versions WHERE candidate_profile_sha256!=?
                 ) AND invalidated_at IS NULL
             """, (timestamp, content_hash))
-        if changed_ids and connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers'"
-        ).fetchone():
+        require_table(connection, "answers")
+        if changed_ids:
             for answer in connection.execute(
                 "SELECT answer_id, dependent_fact_ids_json FROM answers WHERE status='active'"
             ):
@@ -275,9 +274,8 @@ def register_snapshot(
                     connection.execute(
                         "UPDATE answers SET status='stale' WHERE answer_id=?", (answer["answer_id"],)
                     )
-        if active and connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pre_submit_reviews'"
-        ).fetchone():
+        require_table(connection, "pre_submit_reviews")
+        if active:
             connection.execute("""
                 UPDATE pre_submit_reviews SET status='invalidated', invalidated_at=?,
                     invalidation_reason='candidate_snapshot_changed'

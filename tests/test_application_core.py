@@ -48,6 +48,7 @@ class ApplicationCoreTests(unittest.TestCase):
         RESUMES.initialize(self.db)
         ARCHIVE.initialize(self.db)
         PRE_SUBMIT.initialize(self.db)
+        CANDIDATE.initialize(self.db)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(self.db.close)
@@ -74,7 +75,18 @@ class ApplicationCoreTests(unittest.TestCase):
             "id": "fact-1", "type": "skill", "value": "Verified resume claim",
             "evidence_strength": "direct", "status": "confirmed", "locked": False,
         }
-        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": [fact]}
+        name_fact = {
+            "id": "fact-name", "type": "identity", "value": "Verified Candidate",
+            "evidence_strength": "direct", "status": "locked", "locked": True,
+        }
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": [fact, name_fact],
+        }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = root / f"candidate-{application_id}.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
@@ -83,6 +95,13 @@ class ApplicationCoreTests(unittest.TestCase):
             "claim_id": "claim-1", "claim_text": "Verified resume claim", "fact_ids": ["fact-1"],
             "evidence_strength": "direct", "exact_locked_value_preserved": False,
         }]}), encoding="utf-8")
+        if not self.db.execute(
+            "SELECT 1 FROM candidate_snapshots WHERE content_sha256=?",
+            (candidate["content_sha256"],),
+        ).fetchone():
+            CANDIDATE.register_snapshot(
+                self.db, root / "candidates", candidate_path, "user", AT
+            )
         RESUMES.approve_version(self.db, version_id, candidate_path, manifest_path, "user", AT)
         RESUMES.bind_version(self.db, application_id, version_id, at=AT)
         RESUMES.lock_materials(self.db, application_id, lock_id=f"lock-{application_id}", at=AT)
@@ -94,22 +113,6 @@ class ApplicationCoreTests(unittest.TestCase):
             self.db, application_id, "candidate_name", "Candidate name", "Verified Candidate",
             "fact", "fact-name", "locked", "normal", AT,
         )
-        CANDIDATE.initialize(self.db)
-        candidate_path = Path(self.temp_dir.name) / f"candidate-{application_id}.json"
-        content_sha = self.db.execute(
-            "SELECT candidate_profile_sha256 FROM resume_versions WHERE version_id=?",
-            (f"resume-{application_id}",),
-        ).fetchone()[0]
-        self.db.execute(
-            "INSERT INTO candidate_snapshots VALUES (?, 'candidate-1', ?, ?, 'active', ?, 'user', NULL, NULL)",
-            (content_sha, str(candidate_path), RESUMES.file_sha256(candidate_path), AT.isoformat()),
-        )
-        value_json = json.dumps("Verified Candidate", separators=(",", ":"))
-        self.db.execute(
-            "INSERT INTO candidate_facts VALUES (?, 'fact-name', 'identity', ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
-            (content_sha, value_json, AT.isoformat(), RESUMES.canonical_hash({"value": "Verified Candidate"})),
-        )
-        self.db.commit()
         PRE_SUBMIT.register_inventory(
             self.db, f"inventory-{application_id}", application_id, "https://example.com/jobs/1/apply",
             "Example Corp", "Backend Engineer", True, ["candidate_name"],

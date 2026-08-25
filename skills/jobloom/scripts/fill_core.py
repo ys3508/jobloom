@@ -24,6 +24,7 @@ import application_core  # noqa: E402
 import archive_core  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
+from _common import require_table  # noqa: E402
 
 
 ALLOWED_CONTROLS = {"text", "textarea", "select", "radio", "checkbox", "file",
@@ -335,32 +336,30 @@ def _active_session(connection: sqlite3.Connection, session_id: str, worker_id: 
 def _candidate_facts(connection: sqlite3.Connection, application_id: str,
                      candidate_path: Path) -> dict[str, dict[str, Any]]:
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
-    if connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_snapshots'"
-    ).fetchone():
-        snapshot = connection.execute(
-            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
-            "AND registered_by='user'", (candidate_hash,)
-        ).fetchone()
-        if not snapshot:
-            raise ValueError("candidate profile is not the active registered snapshot")
-        snapshot_path = Path(snapshot["snapshot_path"])
-        if not snapshot_path.is_file() or resume_core.file_sha256(snapshot_path) != snapshot["file_sha256"]:
-            raise ValueError("registered candidate snapshot hash mismatch")
-        material = connection.execute("""
-            SELECT rv.candidate_profile_sha256
-            FROM material_locks ml JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
-            WHERE ml.application_id=? AND ml.invalidated_at IS NULL
-        """, (application_id,)).fetchone()
-        if not material or material["candidate_profile_sha256"] != candidate_hash:
-            raise ValueError("candidate profile does not match the active material lock")
-        stored = {row["fact_id"]: row for row in connection.execute(
-            "SELECT * FROM candidate_facts WHERE content_sha256=?", (candidate_hash,)
-        )}
-        for fact in candidate["facts"]:
-            row = stored.get(fact["id"])
-            if not row or row["fact_sha256"] != resume_core.canonical_hash(fact):
-                raise ValueError("candidate fact registry does not match candidate.json")
+    require_table(connection, "candidate_snapshots")
+    snapshot = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+        "AND registered_by='user'", (candidate_hash,)
+    ).fetchone()
+    if not snapshot:
+        raise ValueError("candidate profile is not the active registered snapshot")
+    snapshot_path = Path(snapshot["snapshot_path"])
+    if not snapshot_path.is_file() or resume_core.file_sha256(snapshot_path) != snapshot["file_sha256"]:
+        raise ValueError("registered candidate snapshot hash mismatch")
+    material = connection.execute("""
+        SELECT rv.candidate_profile_sha256
+        FROM material_locks ml JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+        WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+    """, (application_id,)).fetchone()
+    if not material or material["candidate_profile_sha256"] != candidate_hash:
+        raise ValueError("candidate profile does not match the active material lock")
+    stored = {row["fact_id"]: row for row in connection.execute(
+        "SELECT * FROM candidate_facts WHERE content_sha256=?", (candidate_hash,)
+    )}
+    for fact in candidate["facts"]:
+        row = stored.get(fact["id"])
+        if not row or row["fact_sha256"] != resume_core.canonical_hash(fact):
+            raise ValueError("candidate fact registry does not match candidate.json")
     return {fact["id"]: fact for fact in candidate["facts"]}
 
 

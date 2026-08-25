@@ -10,11 +10,17 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from _common import require_table  # noqa: E402
 
 
 ARCHIVABLE_STATES = {
@@ -157,11 +163,7 @@ def record_field(
     if application["state"] not in FIELD_RECORDING_STATES:
         raise ValueError("application fields may only be recorded during filling or submission preparation")
     if source_kind == "answer":
-        answer_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='answers'"
-        ).fetchone()
-        if not answer_table:
-            raise ValueError("answer library is unavailable")
+        require_table(connection, "answers")
         answer = connection.execute("SELECT status, answer_json FROM answers WHERE answer_id=?", (source_id,)).fetchone()
         if not answer or answer["status"] != "active" or source_status != "active":
             raise ValueError("answer source must be active when recorded")
@@ -170,22 +172,19 @@ def record_field(
     elif source_kind == "fact":
         if source_status != "locked":
             raise ValueError("fact source must be locked when recorded")
-        candidate_table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_facts'"
-        ).fetchone()
-        if candidate_table:
-            fact = connection.execute("""
-                SELECT cf.* FROM material_locks ml
-                JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
-                JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
-                JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
-                WHERE ml.application_id=? AND ml.invalidated_at IS NULL
-                  AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
-            """, (application_id, source_id)).fetchone()
-            if not fact or fact["status"] != "locked" or not fact["locked"]:
-                raise ValueError("fact source must exist as a locked active CandidateFact")
-            if canonical_json(value) != fact["value_json"]:
-                raise ValueError("recorded field value does not match its CandidateFact source")
+        require_table(connection, "candidate_facts")
+        fact = connection.execute("""
+            SELECT cf.* FROM material_locks ml
+            JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+            JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+            JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+            WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+              AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+        """, (application_id, source_id)).fetchone()
+        if not fact or fact["status"] != "locked" or not fact["locked"]:
+            raise ValueError("fact source must exist as a locked active CandidateFact")
+        if canonical_json(value) != fact["value_json"]:
+            raise ValueError("recorded field value does not match its CandidateFact source")
     else:
         raise ValueError("source_kind must be fact or answer")
     timestamp = (at or now_utc()).isoformat()
@@ -317,10 +316,7 @@ def create_archive(
         raise ValueError("only a positively confirmed submission can be archived")
     cover_letter = None
     if row["cover_letter_version_id"]:
-        if not connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cover_letter_versions'"
-        ).fetchone():
-            raise ValueError("cover-letter version store is unavailable")
+        require_table(connection, "cover_letter_versions")
         cover_letter = connection.execute("""
             SELECT cv.*, cu.file_sha256 AS submitted_file_sha256
             FROM cover_letter_versions cv JOIN cover_letter_usage cu
@@ -518,6 +514,8 @@ def tracker_source(connection: sqlite3.Connection) -> dict[str, Any]:
         ORDER BY a.submitted_at, a.application_id
     """).fetchall()
     usage_by_application: dict[str, int] = {}
+    # Reporting-only dependency, not a safety gate: the tracker leaves the model-usage
+    # column blank when outcome accounting has not been initialized.
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_usage_events'"
     ).fetchone():

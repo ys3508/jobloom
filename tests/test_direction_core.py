@@ -22,6 +22,9 @@ def load_script(name):
 DIRECTIONS = load_script("direction_core")
 APPLICATIONS = load_script("application_core")
 RESUMES = load_script("resume_core")
+CANDIDATES = load_script("candidate_core")
+ANSWERS = load_script("answer_library")
+PRE_SUBMIT = load_script("pre_submit_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -36,8 +39,14 @@ class DirectionCoreTests(unittest.TestCase):
         APPLICATIONS.initialize(self.db)
         RESUMES.initialize(self.db)
         DIRECTIONS.initialize(self.db)
+        ANSWERS.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
+        CANDIDATES.initialize(self.db)
         self.addCleanup(self.db.close)
         self.candidate_path, self.manifest_path = self.make_candidate()
+        CANDIDATES.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
         self.add_master_resume()
         self.add_job()
 
@@ -372,6 +381,11 @@ class DirectionCoreTests(unittest.TestCase):
         candidate.pop("content_sha256")
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         self.candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        # A real profile change is re-registered by the user; the approved plan must
+        # still be rejected as stale afterwards.
+        CANDIDATES.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
         with self.assertRaisesRegex(ValueError, "candidate profile is stale"):
             RESUMES.approve_version(
                 self.db, "direction-1", self.candidate_path, self.manifest_path, "user", AT
