@@ -694,13 +694,45 @@ def _validate_job_shape(job: dict[str, Any]) -> None:
                 raise ValueError(f"malformed job card field: {field}")
 
 
-def _field_tokens(job: dict[str, Any]) -> dict[str, list[str]]:
-    tokens: dict[str, list[str]] = {}
+MAX_EXCERPT_CHARS = 240
+
+
+def _field_text(job: dict[str, Any]) -> dict[str, str]:
+    values: dict[str, str] = {}
     for field in ROUTING_FIELDS:
         value = job.get(field)
-        text = " ".join(value) if isinstance(value, list) else (value or "")
-        tokens[field] = _tokens(str(text))[:4000]
-    return tokens
+        values[field] = " ".join(value) if isinstance(value, list) else str(value or "")
+    return values
+
+
+def _tokens_with_spans(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+    matches = list(re.finditer(r"[^\W_]+", text.casefold()))[:4000]
+    return [match.group(0) for match in matches], [match.span() for match in matches]
+
+
+def _field_tokens(job: dict[str, Any]) -> dict[str, list[str]]:
+    return {field: _tokens_with_spans(text)[0] for field, text in _field_text(job).items()}
+
+
+def _excerpt(text: str, spans: list[tuple[int, int]], token_start: int, token_end: int) -> str:
+    """The sentence carrying a hit, so a reviewer can see negation the matcher cannot.
+
+    Bounded and never written to an events table: this is untrusted posting prose.
+    """
+    if not spans or token_start >= len(spans):
+        return ""
+    start_char, end_char = spans[token_start][0], spans[min(token_end, len(spans)) - 1][1]
+    left = max((text.rfind(mark, 0, start_char) for mark in (". ", "! ", "? ", "\n", ";")), default=-1)
+    left = 0 if left < 0 else left + 1
+    right_candidates = [index for index in
+                        (text.find(mark, end_char) for mark in (". ", "! ", "? ", "\n", ";"))
+                        if index != -1]
+    right = min(right_candidates) + 1 if right_candidates else len(text)
+    sentence = text[left:right].strip()
+    if len(sentence) <= MAX_EXCERPT_CHARS:
+        return sentence
+    keep = MAX_EXCERPT_CHARS // 2
+    return (sentence[:keep] + " \u2026 " + sentence[-keep:]).strip()
 
 
 def _seniority(tokens_by_field, job):
@@ -1015,6 +1047,8 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     elif not authorization.get("confirmed"):
         review.append("work_authorization_unconfirmed_or_stale")
 
+    raw_text = _field_text(job)
+    spans_by_field = {field: _tokens_with_spans(text)[1] for field, text in raw_text.items()}
     field_hits: dict[str, list[dict[str, Any]]] = {group: [] for group in GROUP_FIELDS}
     truncated: dict[str, bool] = {group: False for group in GROUP_FIELDS}
     for group, allowed in GROUP_FIELDS.items():
@@ -1033,6 +1067,8 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
                     break
                 field_hits[group].append({
                     "term": term, "term_tokens": needle, "field": field,
+                    "matched_excerpt": _excerpt(raw_text[field], spans_by_field[field],
+                                                start, start + len(needle)),
                     "field_tier": "identity" if field == "title" else (
                         "structure" if field in {"employment_type", "compensation_structure",
                                                  "required_certifications", "preferred_certifications"}
@@ -1083,7 +1119,7 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     if decisive_exclusions:
         failures.append("direction_hard_exclusion")
     elif field_hits["hard_exclusion_keywords"]:
-        review.append("direction_hard_exclusion_context_only")
+        review.append("hard_exclusion_context_review")
 
     if seniority_assessment["title_markers"]:
         failures.append("seniority_outside_portfolio")
@@ -1143,10 +1179,31 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     contextual = [hit for group in ("positive_keywords", "precision_keywords", "discovery_keywords")
                   for hit in field_hits[group]]
     distinct_context = len({hit["term"] for hit in contextual})
-    has_domain = bool(signal_hits["domain_context"]) or any(
-        str(job.get("employer") or "").casefold().find(term) >= 0 for term in DOMAIN_CONTEXT_TERMS)
+    employer_tokens = _tokens(str(job.get("employer") or ""))
+    # Context is what the direction itself declares, not a fixed global vocabulary:
+    # criteria.industries plus its own positive keywords.
+    declared_industries = tuple(str(item) for item in (profile.get("criteria") or {}).get("industries") or [])
+    industry_hits = _phrase_hits(declared_industries, tokens_by_field,
+                                 ("title", "summary", "responsibilities", "required_skills"))
+    industry_hits.extend({"term": term, "field": "employer"} for term in declared_industries
+                         if _token_run(_tokens(term), employer_tokens) >= 0)
+    signal_hits["direction_context"] = industry_hits
+    signal_hits["domain_context"].extend(
+        {"term": term, "field": "employer"} for term in DOMAIN_CONTEXT_TERMS
+        if _token_run(_tokens(term), employer_tokens) >= 0)
+    has_domain = bool(signal_hits["domain_context"])
+    # Only a declared industry list imposes the requirement; a positive-keyword hit
+    # can satisfy it, but keywords alone never impose it.
+    context_configured = bool(declared_industries)
+    has_direction_context = bool(industry_hits) or bool(field_hits["positive_keywords"])
     if title_hits:
-        pass
+        # A target title carries its own context when the title itself names the
+        # industry ("Clinical Data Analyst"). A de-qualified bare title ("Sales
+        # Operations Analyst") does not, so it must find that context elsewhere
+        # before it can auto-match. This is what stops moving a qualifier out of a
+        # title from silently widening the direction.
+        if context_configured and not has_direction_context:
+            review.append("target_title_without_direction_context")
     elif auxiliary_hits:
         if has_domain:
             review.append("auxiliary_title_with_direction_context")

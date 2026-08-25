@@ -190,7 +190,7 @@ class DirectionCoreTests(unittest.TestCase):
             profile, candidate, self.job_card(summary="This is a commission-only role")
         )
         self.assertEqual(prose["decision"], "review")
-        self.assertIn("direction_hard_exclusion_context_only", prose["review_reasons"])
+        self.assertIn("hard_exclusion_context_review", prose["review_reasons"])
         self.assertEqual(prose["field_hits"]["hard_exclusion_keywords"][0]["field"], "summary")
         structured = DIRECTIONS.route_job(
             profile, candidate,
