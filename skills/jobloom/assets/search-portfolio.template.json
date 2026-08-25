@@ -1,0 +1,17 @@
+{
+  "schema_version": "0.1.0",
+  "portfolio_id": "candidate-search-portfolio-v1",
+  "name": "Primary job-search portfolio",
+  "allocations": [
+    {
+      "direction_id": "primary-direction",
+      "profile_sha256": "replace-with-registered-direction-profile-sha256",
+      "weight_percent": 70
+    },
+    {
+      "direction_id": "secondary-direction",
+      "profile_sha256": "replace-with-registered-direction-profile-sha256",
+      "weight_percent": 30
+    }
+  ]
+}

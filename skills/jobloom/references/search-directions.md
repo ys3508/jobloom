@@ -2,25 +2,33 @@
 
 ## Purpose
 
-A SearchDirection is a user-approved routing and strategy profile. A ResumeAdaptationPlan is a deterministic, value-free explanation of how verified evidence may be emphasized for one reviewed JobCard. Neither object is a resume, and neither approval authorizes unreviewed file bytes.
+A SearchPortfolio is the user-approved weighted strategy across multiple job families. Each SearchDirection remains an independent routing and resume boundary. A ResumeAdaptationPlan is a deterministic, value-free explanation of how verified evidence may be emphasized for one reviewed JobCard. None of these objects is a resume, and no approval authorizes unreviewed file bytes.
 
 This separation creates the required chain:
 
-`approved direction → reviewed eligible JobCard → evidence plan → user-approved plan hash → immutable ResumeVersion draft → claims manifest → user-approved file`
+`approved portfolio → member direction → reviewed eligible JobCard → evidence plan → user-approved plan hash → immutable ResumeVersion draft → claims manifest → user-approved file`
+
+## Weighted portfolio
+
+Register one to twenty immutable SearchDirections, then create a private portfolio from `assets/search-portfolio.template.json`. Every allocation names the exact registered direction ID and profile SHA-256. IDs must be unique, weights are positive integers, and the total must equal 100.
+
+The portfolio is the single user approval surface. Approval requires actor `user` and the exact displayed portfolio SHA-256; it atomically approves unchanged draft member directions. A newly approved portfolio supersedes the previous active portfolio. Individual directions stay separate so jobs and ResumeVersions cannot cross role-family boundaries.
+
+Portfolio registration and approval never invent a direction, alter a profile, approve resume bytes, or grant application/submission authorization. Revocation removes the active routing scope and invalidates affected plans and material locks.
 
 ## Direction profile
 
-Create a private profile from `assets/search-direction.template.json`. It contains a stable ID, name, role family, target titles, positive/negative/precision keywords, bounded criteria, and optional approved parent direction.
+Create each private profile from `assets/search-direction.template.json`. It contains a stable ID, name, role family, target titles, positive/negative/precision keywords, bounded criteria, and optional approved parent direction.
 
 Registration creates an immutable draft and deterministic profile SHA-256. Only actor `user` may approve that exact hash. A parent must already be approved. Use a new direction ID for a material change; never mutate an approved profile in place.
 
-Direction criteria organize one search direction. They do not override CandidateProfile hard filters, work authorization, AnswerLibrary scope, or application safety gates.
+Direction criteria organize one portfolio member. They do not override portfolio allocation, CandidateProfile hard filters, work authorization, AnswerLibrary scope, or application safety gates.
 
 ## Deterministic adaptation plan
 
 Generate a plan only when:
 
-- the SearchDirection is approved
+- the SearchDirection belongs to the active approved SearchPortfolio
 - the backend JobCard has `requirements_reviewed: true`
 - the job title matches an approved target title
 - deterministic hard filters and evidence evaluation yield `pass`
@@ -55,7 +63,7 @@ A changed candidate profile or JobCard blocks plan approval. A later JobCard cha
 
 After `direction_core.py init`, master-source resumes remain provenance artifacts and cannot be selected, bound, or locked for an application. Derived resumes require an approved matching plan and active approved direction.
 
-Revoking a direction invalidates generated/approved plans and every active material lock using its resume versions. Existing immutable files remain as local history but are no longer authorized for new application use.
+Revoking the active portfolio invalidates generated/approved plans and every active material lock using its member resume versions. Revoking an individual direction has the same effect for that member. Existing immutable files remain as local history but are no longer authorized for new application use.
 
 ## Privacy
 

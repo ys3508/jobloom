@@ -157,6 +157,16 @@ def _active_direction(connection: sqlite3.Connection, direction: str) -> sqlite3
     ).fetchone()
     if not row or row["status"] != "approved":
         raise ValueError("resume direction is not user-approved")
+    if _table_exists(connection, "search_portfolios"):
+        portfolio_count = connection.execute(
+            "SELECT COUNT(*) FROM search_portfolios"
+        ).fetchone()[0]
+        if portfolio_count and not connection.execute("""
+            SELECT 1 FROM search_portfolio_directions pd
+            JOIN search_portfolios p ON p.portfolio_id=pd.portfolio_id
+            WHERE p.status='approved' AND pd.direction_id=? AND pd.profile_sha256=?
+        """, (direction, row["profile_sha256"])).fetchone():
+            raise ValueError("resume direction is outside the active approved portfolio")
     return row
 
 

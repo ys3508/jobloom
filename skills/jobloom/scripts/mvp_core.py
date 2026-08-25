@@ -31,12 +31,16 @@ import resume_core  # noqa: E402
 REQUIRED_TABLES = {
     "answers", "authorizations", "applications", "application_events", "submission_evidence",
     "resume_versions", "material_locks", "candidate_snapshots", "candidate_facts",
-    "search_directions", "resume_adaptation_plans", "cover_letter_versions",
+    "search_directions", "search_portfolios", "search_portfolio_directions",
+    "portfolio_events", "resume_adaptation_plans", "cover_letter_versions",
     "application_fields", "submission_archives", "outcome_records", "model_usage_events",
     "user_time_events", "form_inventories", "pre_submit_reviews", "fill_sessions",
     "fill_steps", "fill_checkpoints",
 }
-PRIVATE_DIRECTORIES = ("candidates", "resumes", "cover-letters", "archive", "action-packages")
+PRIVATE_DIRECTORIES = (
+    "candidates", "resumes", "cover-letters", "search-directions", "archive",
+    "action-packages",
+)
 
 
 def now_utc() -> datetime:
@@ -111,6 +115,10 @@ def _approved_direction_resumes(connection: sqlite3.Connection) -> int:
                cs.file_sha256 AS candidate_file_sha256
         FROM resume_versions rv
         JOIN search_directions sd ON sd.direction_id=rv.direction AND sd.status='approved'
+        JOIN search_portfolio_directions spd
+          ON spd.direction_id=sd.direction_id AND spd.profile_sha256=sd.profile_sha256
+        JOIN search_portfolios sp
+          ON sp.portfolio_id=spd.portfolio_id AND sp.status='approved' AND sp.approved_by='user'
         JOIN resume_adaptation_plans rap ON rap.plan_id=rv.adaptation_plan_id AND rap.status='approved'
         JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256 AND cs.status='active'
         WHERE rv.status='approved' AND rv.kind='direction'
@@ -159,6 +167,22 @@ def _approved_directions(connection: sqlite3.Connection) -> int:
             if direction_core.canonical_hash(json.loads(row["profile_json"])) == row["profile_sha256"]:
                 valid += 1
         except (json.JSONDecodeError, TypeError):
+            continue
+    return valid
+
+
+def _approved_portfolios(connection: sqlite3.Connection) -> int:
+    valid = 0
+    for row in connection.execute(
+        "SELECT portfolio_json, portfolio_sha256 FROM search_portfolios "
+        "WHERE status='approved' AND approved_by='user'"
+    ):
+        try:
+            value = json.loads(row["portfolio_json"])
+            normalized = direction_core.validate_portfolio(value)
+            if direction_core.canonical_hash(normalized) == row["portfolio_sha256"]:
+                valid += 1
+        except (json.JSONDecodeError, TypeError, ValueError):
             continue
     return valid
 
@@ -215,6 +239,7 @@ def readiness(connection: sqlite3.Connection, private_root: Path,
     implementation_ready = not missing_tables and not directory_issues
     counts = {
         "active_candidate_snapshots": 0,
+        "approved_search_portfolios": 0,
         "approved_search_directions": 0,
         "approved_direction_resumes": 0,
         "active_standing_authorizations": 0,
@@ -224,6 +249,7 @@ def readiness(connection: sqlite3.Connection, private_root: Path,
     if not missing_tables:
         counts.update({
             "active_candidate_snapshots": _active_candidates(connection),
+            "approved_search_portfolios": _approved_portfolios(connection),
             "approved_search_directions": _approved_directions(connection),
             "approved_direction_resumes": _approved_direction_resumes(connection),
             "active_standing_authorizations": _current_authorizations(connection, current_time),
@@ -233,8 +259,8 @@ def readiness(connection: sqlite3.Connection, private_root: Path,
     onboarding_blockers = []
     if counts["active_candidate_snapshots"] != 1:
         onboarding_blockers.append("active_user_registered_candidate_required")
-    if counts["approved_search_directions"] < 1:
-        onboarding_blockers.append("user_approved_search_direction_required")
+    if counts["approved_search_portfolios"] != 1:
+        onboarding_blockers.append("user_approved_search_portfolio_required")
     if counts["approved_direction_resumes"] < 1:
         onboarding_blockers.append("user_approved_direction_resume_required")
     onboarding_ready = implementation_ready and not onboarding_blockers

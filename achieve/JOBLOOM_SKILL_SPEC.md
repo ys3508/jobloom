@@ -273,6 +273,12 @@ Conflicts require resolution before affected applications continue.
 
 ## 6. Resume System
 
+### 6.0 Weighted Search Portfolio
+
+Jobloom supports one active user-approved SearchPortfolio containing multiple distinct SearchDirections. Each allocation binds an exact direction-profile hash to a positive integer percentage, and all percentages must total 100.
+
+The portfolio is approved once as a complete strategy. Its member directions remain separate routing and resume boundaries so consulting, clinical-data, pharma, biostatistics, and stretch roles do not collapse into one generic resume. A new approved portfolio supersedes the prior portfolio; it never mutates an approved allocation in place.
+
 ### 6.1 Direction Resumes
 
 Jobloom creates reusable resumes for distinct job-search directions, such as:
@@ -1190,7 +1196,7 @@ The recommended MVP includes:
 1. Master resume ingestion
 2. Candidate fact extraction
 3. User confirmation and fact locking
-4. One job-search direction
+4. One weighted SearchPortfolio containing one or more independent job-search directions
 5. One approved direction resume
 6. Work-authorization, sponsorship, location, salary, and relocation profile
 7. Answer library with exact and reviewed semantic reuse

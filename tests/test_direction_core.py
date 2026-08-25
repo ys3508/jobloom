@@ -120,6 +120,12 @@ class DirectionCoreTests(unittest.TestCase):
             self.db, direction_id, "user", registered["profile_sha256"], AT
         )
 
+    def register_portfolio(self, allocations, portfolio_id="portfolio-1"):
+        return DIRECTIONS.register_portfolio(self.db, {
+            "schema_version": "0.1.0", "portfolio_id": portfolio_id,
+            "name": "Primary search portfolio", "allocations": allocations,
+        }, AT)
+
     def generate_and_approve_plan(self, plan_id="plan-1", direction_id="backend"):
         generated = DIRECTIONS.generate_plan(
             self.db, plan_id, direction_id, "job-1", self.candidate_path, AT
@@ -157,6 +163,93 @@ class DirectionCoreTests(unittest.TestCase):
             DIRECTIONS.register_direction(
                 self.db, self.profile("platform", parent="missing"), AT
             )
+
+    def test_portfolio_atomically_approves_weighted_directions(self):
+        backend = DIRECTIONS.register_direction(self.db, self.profile("backend"), AT)
+        data = DIRECTIONS.register_direction(
+            self.db, self.profile("data", name="Data", role_family="data.analytics"), AT
+        )
+        allocations = [
+            {"direction_id": "backend", "profile_sha256": backend["profile_sha256"],
+             "weight_percent": 60},
+            {"direction_id": "data", "profile_sha256": data["profile_sha256"],
+             "weight_percent": 40},
+        ]
+        registered = self.register_portfolio(allocations)
+        with self.assertRaisesRegex(ValueError, "user actor"):
+            DIRECTIONS.approve_portfolio(
+                self.db, "portfolio-1", "system", registered["portfolio_sha256"], AT
+            )
+        with self.assertRaisesRegex(ValueError, "hash"):
+            DIRECTIONS.approve_portfolio(self.db, "portfolio-1", "user", "wrong", AT)
+        approved = DIRECTIONS.approve_portfolio(
+            self.db, "portfolio-1", "user", registered["portfolio_sha256"], AT
+        )
+        self.assertEqual(approved["direction_count"], 2)
+        self.assertEqual(approved["total_weight_percent"], 100)
+        statuses = dict(self.db.execute(
+            "SELECT direction_id, status FROM search_directions"
+        ).fetchall())
+        self.assertEqual(statuses, {"backend": "approved", "data": "approved"})
+
+    def test_portfolio_rejects_invalid_weights_and_stale_direction_hash(self):
+        backend = DIRECTIONS.register_direction(self.db, self.profile("backend"), AT)
+        allocation = {"direction_id": "backend", "profile_sha256": backend["profile_sha256"],
+                      "weight_percent": 99}
+        with self.assertRaisesRegex(ValueError, "total exactly 100"):
+            self.register_portfolio([allocation])
+        allocation["weight_percent"] = 100
+        allocation["profile_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "hash does not match"):
+            self.register_portfolio([allocation])
+
+    def test_active_portfolio_bounds_plan_routing(self):
+        backend = DIRECTIONS.register_direction(self.db, self.profile("backend"), AT)
+        registered = self.register_portfolio([{
+            "direction_id": "backend", "profile_sha256": backend["profile_sha256"],
+            "weight_percent": 100,
+        }])
+        DIRECTIONS.approve_portfolio(
+            self.db, "portfolio-1", "user", registered["portfolio_sha256"], AT
+        )
+        outside = DIRECTIONS.register_direction(
+            self.db, self.profile("outside", name="Outside"), AT
+        )
+        DIRECTIONS.approve_direction(
+            self.db, "outside", "user", outside["profile_sha256"], AT
+        )
+        with self.assertRaisesRegex(ValueError, "outside the active approved portfolio"):
+            DIRECTIONS.generate_plan(
+                self.db, "plan-outside", "outside", "job-1", self.candidate_path, AT
+            )
+
+    def test_superseded_portfolio_blocks_old_direction_resume_selection(self):
+        backend = DIRECTIONS.register_direction(self.db, self.profile("backend"), AT)
+        portfolio = self.register_portfolio([{
+            "direction_id": "backend", "profile_sha256": backend["profile_sha256"],
+            "weight_percent": 100,
+        }])
+        DIRECTIONS.approve_portfolio(
+            self.db, "portfolio-1", "user", portfolio["portfolio_sha256"], AT
+        )
+        self.generate_and_approve_plan()
+        self.add_direction_resume()
+        self.assertEqual(
+            RESUMES.select_approved(self.db, "backend", "direction")["version_id"],
+            "direction-1",
+        )
+        data = DIRECTIONS.register_direction(
+            self.db, self.profile("data", name="Data", role_family="data.analytics"), AT
+        )
+        replacement = self.register_portfolio([{
+            "direction_id": "data", "profile_sha256": data["profile_sha256"],
+            "weight_percent": 100,
+        }], portfolio_id="portfolio-2")
+        DIRECTIONS.approve_portfolio(
+            self.db, "portfolio-2", "user", replacement["portfolio_sha256"], AT
+        )
+        with self.assertRaisesRegex(ValueError, "outside the active approved portfolio"):
+            RESUMES.select_approved(self.db, "backend", "direction")
 
     def test_plan_is_value_free_and_preserves_evidence_strength(self):
         self.approve_direction()

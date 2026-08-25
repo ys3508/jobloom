@@ -31,6 +31,8 @@ CRITERIA_KEYS = {
     "seniority", "travel_limit", "company_sizes",
 }
 LIST_CRITERIA = CRITERIA_KEYS - {"salary_floor", "salary_currency", "travel_limit"}
+PORTFOLIO_KEYS = {"schema_version", "portfolio_id", "name", "allocations"}
+ALLOCATION_KEYS = {"direction_id", "profile_sha256", "weight_percent"}
 
 
 def now_utc() -> datetime:
@@ -76,6 +78,41 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS search_direction_status_idx
             ON search_directions(status, approved_at);
+
+        CREATE TABLE IF NOT EXISTS search_portfolios (
+            portfolio_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            portfolio_json TEXT NOT NULL,
+            portfolio_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            revoked_at TEXT,
+            status_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS search_portfolio_status_idx
+            ON search_portfolios(status, approved_at);
+
+        CREATE TABLE IF NOT EXISTS search_portfolio_directions (
+            portfolio_id TEXT NOT NULL,
+            direction_id TEXT NOT NULL,
+            profile_sha256 TEXT NOT NULL,
+            weight_percent INTEGER NOT NULL,
+            PRIMARY KEY (portfolio_id, direction_id),
+            FOREIGN KEY (portfolio_id) REFERENCES search_portfolios(portfolio_id),
+            FOREIGN KEY (direction_id) REFERENCES search_directions(direction_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS portfolio_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            metadata_json TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS resume_adaptation_plans (
             plan_id TEXT PRIMARY KEY,
@@ -137,6 +174,23 @@ def _event(
         "INSERT INTO direction_events (direction_id, plan_id, created_at, actor, event_type, "
         "reason_code, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (direction_id, plan_id, (at or now_utc()).isoformat(), actor, event_type, reason_code,
+         canonical_json(metadata or {})),
+    )
+
+
+def _portfolio_event(
+    connection: sqlite3.Connection,
+    portfolio_id: str,
+    actor: str,
+    event_type: str,
+    reason_code: str,
+    metadata: dict[str, Any] | None = None,
+    at: datetime | None = None,
+) -> None:
+    connection.execute(
+        "INSERT INTO portfolio_events (portfolio_id, created_at, actor, event_type, "
+        "reason_code, metadata_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (portfolio_id, (at or now_utc()).isoformat(), actor, event_type, reason_code,
          canonical_json(metadata or {})),
     )
 
@@ -245,6 +299,179 @@ def approve_direction(connection: sqlite3.Connection, direction_id: str, actor: 
             "profile_sha256": row["profile_sha256"]}
 
 
+def validate_portfolio(portfolio: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(portfolio, dict) or set(portfolio) != PORTFOLIO_KEYS:
+        raise ValueError("search portfolio has missing or unknown fields")
+    if portfolio.get("schema_version") != "0.1.0":
+        raise ValueError("unsupported search portfolio schema_version")
+    portfolio_id = portfolio.get("portfolio_id")
+    resume_core._require_safe_id(portfolio_id, "portfolio_id")
+    name = portfolio.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name) > 200:
+        raise ValueError("search portfolio name is required and must be bounded")
+    allocations = portfolio.get("allocations")
+    if not isinstance(allocations, list) or not 1 <= len(allocations) <= 20:
+        raise ValueError("search portfolio requires between one and twenty allocations")
+    normalized_allocations = []
+    seen = set()
+    total = 0
+    for allocation in allocations:
+        if not isinstance(allocation, dict) or set(allocation) != ALLOCATION_KEYS:
+            raise ValueError("portfolio allocation has missing or unknown fields")
+        direction_id = allocation.get("direction_id")
+        resume_core._require_safe_id(direction_id, "direction_id")
+        if direction_id in seen:
+            raise ValueError("portfolio direction IDs must be unique")
+        seen.add(direction_id)
+        profile_sha256 = allocation.get("profile_sha256")
+        if (not isinstance(profile_sha256, str) or len(profile_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in profile_sha256)):
+            raise ValueError("portfolio allocation requires a lowercase SHA-256")
+        weight = allocation.get("weight_percent")
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 100:
+            raise ValueError("portfolio allocation weight_percent must be an integer from 1 to 100")
+        total += weight
+        normalized_allocations.append({
+            "direction_id": direction_id,
+            "profile_sha256": profile_sha256,
+            "weight_percent": weight,
+        })
+    if total != 100:
+        raise ValueError("search portfolio weights must total exactly 100")
+    return {
+        "schema_version": "0.1.0",
+        "portfolio_id": portfolio_id,
+        "name": name.strip(),
+        "allocations": normalized_allocations,
+    }
+
+
+def register_portfolio(connection: sqlite3.Connection, portfolio: dict[str, Any],
+                       at: datetime | None = None) -> dict[str, Any]:
+    value = validate_portfolio(portfolio)
+    portfolio_id = value["portfolio_id"]
+    if connection.execute(
+        "SELECT 1 FROM search_portfolios WHERE portfolio_id=?", (portfolio_id,)
+    ).fetchone():
+        raise ValueError("search portfolio already exists")
+    direction_rows = {}
+    for allocation in value["allocations"]:
+        row = connection.execute(
+            "SELECT * FROM search_directions WHERE direction_id=?",
+            (allocation["direction_id"],),
+        ).fetchone()
+        if not row or row["status"] not in {"draft", "approved"}:
+            raise ValueError("portfolio directions must exist as draft or approved profiles")
+        if row["profile_sha256"] != allocation["profile_sha256"]:
+            raise ValueError("portfolio direction hash does not match the registered profile")
+        if canonical_hash(json.loads(row["profile_json"])) != row["profile_sha256"]:
+            raise ValueError("portfolio direction profile hash is invalid")
+        direction_rows[allocation["direction_id"]] = row
+    digest = canonical_hash(value)
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "INSERT INTO search_portfolios (portfolio_id, name, portfolio_json, portfolio_sha256, "
+        "status, created_at) VALUES (?, ?, ?, ?, 'draft', ?)",
+        (portfolio_id, value["name"], canonical_json(value), digest, timestamp),
+    )
+    for allocation in value["allocations"]:
+        connection.execute(
+            "INSERT INTO search_portfolio_directions (portfolio_id, direction_id, "
+            "profile_sha256, weight_percent) VALUES (?, ?, ?, ?)",
+            (portfolio_id, allocation["direction_id"], allocation["profile_sha256"],
+             allocation["weight_percent"]),
+        )
+    _portfolio_event(
+        connection, portfolio_id, "system", "registered", "immutable_search_portfolio_created",
+        {"portfolio_sha256": digest, "direction_count": len(direction_rows)}, at,
+    )
+    connection.commit()
+    return {"portfolio_id": portfolio_id, "status": "draft", "portfolio_sha256": digest,
+            "direction_count": len(direction_rows), "total_weight_percent": 100}
+
+
+def approve_portfolio(connection: sqlite3.Connection, portfolio_id: str, actor: str,
+                      expected_portfolio_sha256: str,
+                      at: datetime | None = None) -> dict[str, Any]:
+    if actor != "user":
+        raise ValueError("search portfolio approval requires the user actor")
+    row = connection.execute(
+        "SELECT * FROM search_portfolios WHERE portfolio_id=?", (portfolio_id,)
+    ).fetchone()
+    if not row or row["status"] != "draft":
+        raise ValueError("draft search portfolio not found")
+    if row["portfolio_sha256"] != expected_portfolio_sha256:
+        raise ValueError("search portfolio hash does not match user-reviewed content")
+    value = json.loads(row["portfolio_json"])
+    if canonical_hash(value) != row["portfolio_sha256"]:
+        raise ValueError("stored search portfolio hash is invalid")
+    allocations = connection.execute(
+        "SELECT * FROM search_portfolio_directions WHERE portfolio_id=? ORDER BY direction_id",
+        (portfolio_id,),
+    ).fetchall()
+    expected = {item["direction_id"]: item for item in value["allocations"]}
+    if len(allocations) != len(expected):
+        raise ValueError("stored search portfolio allocations are incomplete")
+    direction_rows = []
+    for allocation in allocations:
+        item = expected.get(allocation["direction_id"])
+        if (not item or item["profile_sha256"] != allocation["profile_sha256"]
+                or item["weight_percent"] != allocation["weight_percent"]):
+            raise ValueError("stored search portfolio allocation does not match its hash")
+        direction = connection.execute(
+            "SELECT * FROM search_directions WHERE direction_id=?",
+            (allocation["direction_id"],),
+        ).fetchone()
+        if (not direction or direction["status"] not in {"draft", "approved"}
+                or direction["profile_sha256"] != allocation["profile_sha256"]
+                or canonical_hash(json.loads(direction["profile_json"])) != direction["profile_sha256"]):
+            raise ValueError("search portfolio contains a stale direction")
+        direction_rows.append(direction)
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE search_portfolios SET status='superseded', status_reason='new_portfolio_approved' "
+        "WHERE status='approved' AND portfolio_id<>?", (portfolio_id,),
+    )
+    for direction in direction_rows:
+        if direction["status"] == "draft":
+            connection.execute(
+                "UPDATE search_directions SET status='approved', approved_at=?, approved_by='user', "
+                "status_reason='user_approved_via_portfolio' WHERE direction_id=?",
+                (timestamp, direction["direction_id"]),
+            )
+            _event(
+                connection, direction["direction_id"], actor, "approved",
+                "user_approved_exact_profile_via_portfolio",
+                metadata={"profile_sha256": direction["profile_sha256"],
+                          "portfolio_id": portfolio_id}, at=at,
+            )
+    connection.execute(
+        "UPDATE search_portfolios SET status='approved', approved_at=?, approved_by='user', "
+        "status_reason='user_approved_exact_portfolio' WHERE portfolio_id=?",
+        (timestamp, portfolio_id),
+    )
+    _portfolio_event(
+        connection, portfolio_id, actor, "approved", "user_approved_exact_portfolio",
+        {"portfolio_sha256": row["portfolio_sha256"], "direction_count": len(direction_rows)}, at,
+    )
+    connection.commit()
+    return {"portfolio_id": portfolio_id, "status": "approved",
+            "portfolio_sha256": row["portfolio_sha256"],
+            "direction_count": len(direction_rows), "total_weight_percent": 100}
+
+
+def _direction_in_active_portfolio(connection: sqlite3.Connection, direction_id: str,
+                                   profile_sha256: str) -> bool:
+    portfolio_count = connection.execute("SELECT COUNT(*) FROM search_portfolios").fetchone()[0]
+    if portfolio_count == 0:
+        return True
+    return connection.execute("""
+        SELECT 1 FROM search_portfolio_directions pd
+        JOIN search_portfolios p ON p.portfolio_id=pd.portfolio_id
+        WHERE p.status='approved' AND pd.direction_id=? AND pd.profile_sha256=?
+    """, (direction_id, profile_sha256)).fetchone() is not None
+
+
 def _title_in_direction(profile: dict[str, Any], title: str) -> bool:
     actual = " ".join(title.casefold().split())
     return any(
@@ -289,6 +516,10 @@ def generate_plan(
     ).fetchone()
     if not direction or direction["status"] != "approved":
         raise ValueError("approved search direction not found")
+    if not _direction_in_active_portfolio(
+        connection, direction_id, direction["profile_sha256"]
+    ):
+        raise ValueError("search direction is outside the active approved portfolio")
     job_row = connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     if not job_row:
         raise ValueError("job not found")
@@ -394,6 +625,10 @@ def approve_plan(connection: sqlite3.Connection, plan_id: str, candidate_path: P
     if (not direction or direction["status"] != "approved"
             or direction["profile_sha256"] != plan["direction_profile_sha256"]):
         raise ValueError("adaptation plan direction is stale")
+    if not _direction_in_active_portfolio(
+        connection, plan["direction_id"], plan["direction_profile_sha256"]
+    ):
+        raise ValueError("adaptation plan direction is outside the active approved portfolio")
     job = connection.execute("SELECT job_card_json FROM jobs WHERE job_id=?", (plan["job_id"],)).fetchone()
     if not job or canonical_hash(json.loads(job["job_card_json"])) != plan["job_card_sha256"]:
         raise ValueError("adaptation plan JobCard is stale")
@@ -454,6 +689,48 @@ def revoke_direction(connection: sqlite3.Connection, direction_id: str, actor: s
     return {"direction_id": direction_id, "status": "revoked"}
 
 
+def revoke_portfolio(connection: sqlite3.Connection, portfolio_id: str, actor: str,
+                     reason: str, at: datetime | None = None) -> dict[str, Any]:
+    if actor != "user":
+        raise ValueError("search portfolio revocation requires the user actor")
+    if not reason.strip():
+        raise ValueError("revocation reason is required")
+    row = connection.execute(
+        "SELECT status FROM search_portfolios WHERE portfolio_id=?", (portfolio_id,)
+    ).fetchone()
+    if not row or row["status"] != "approved":
+        raise ValueError("approved search portfolio not found")
+    direction_ids = [item[0] for item in connection.execute(
+        "SELECT direction_id FROM search_portfolio_directions WHERE portfolio_id=?",
+        (portfolio_id,),
+    )]
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE search_portfolios SET status='revoked', revoked_at=?, status_reason=? "
+        "WHERE portfolio_id=?", (timestamp, reason, portfolio_id),
+    )
+    for direction_id in direction_ids:
+        connection.execute(
+            "UPDATE resume_adaptation_plans SET status='invalidated', invalidated_at=?, "
+            "invalidation_reason='portfolio_revoked' WHERE direction_id=? "
+            "AND status IN ('generated','approved')", (timestamp, direction_id),
+        )
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='material_locks'"
+        ).fetchone():
+            connection.execute("""
+                UPDATE material_locks SET invalidated_at=?, invalidation_reason='portfolio_revoked'
+                WHERE resume_version_id IN (
+                    SELECT version_id FROM resume_versions WHERE direction=?
+                ) AND invalidated_at IS NULL
+            """, (timestamp, direction_id))
+    _portfolio_event(connection, portfolio_id, actor, "revoked", reason,
+                     {"direction_count": len(direction_ids)}, at)
+    connection.commit()
+    return {"portfolio_id": portfolio_id, "status": "revoked",
+            "direction_count": len(direction_ids)}
+
+
 def status(connection: sqlite3.Connection) -> dict[str, Any]:
     directions = connection.execute(
         "SELECT status, COUNT(*) AS count FROM search_directions GROUP BY status"
@@ -461,9 +738,14 @@ def status(connection: sqlite3.Connection) -> dict[str, Any]:
     plans = connection.execute(
         "SELECT status, COUNT(*) AS count FROM resume_adaptation_plans GROUP BY status"
     ).fetchall()
+    portfolios = connection.execute(
+        "SELECT status, COUNT(*) AS count FROM search_portfolios GROUP BY status"
+    ).fetchall()
     return {
         "directions": sum(row["count"] for row in directions),
         "directions_by_status": {row["status"]: row["count"] for row in directions},
+        "portfolios": sum(row["count"] for row in portfolios),
+        "portfolios_by_status": {row["status"]: row["count"] for row in portfolios},
         "plans": sum(row["count"] for row in plans),
         "plans_by_status": {row["status"]: row["count"] for row in plans},
     }
@@ -480,6 +762,16 @@ def main() -> None:
     approve.add_argument("--direction-id", required=True)
     approve.add_argument("--actor", required=True)
     approve.add_argument("--profile-sha256", required=True)
+    register_portfolio_parser = commands.add_parser("register-portfolio")
+    register_portfolio_parser.add_argument("--input", required=True, type=Path)
+    approve_portfolio_parser = commands.add_parser("approve-portfolio")
+    approve_portfolio_parser.add_argument("--portfolio-id", required=True)
+    approve_portfolio_parser.add_argument("--actor", required=True)
+    approve_portfolio_parser.add_argument("--portfolio-sha256", required=True)
+    revoke_portfolio_parser = commands.add_parser("revoke-portfolio")
+    revoke_portfolio_parser.add_argument("--portfolio-id", required=True)
+    revoke_portfolio_parser.add_argument("--actor", required=True)
+    revoke_portfolio_parser.add_argument("--reason", required=True)
     revoke = commands.add_parser("revoke-direction")
     revoke.add_argument("--direction-id", required=True)
     revoke.add_argument("--actor", required=True)
@@ -505,6 +797,18 @@ def main() -> None:
     elif args.command == "approve-direction":
         result = approve_direction(
             connection, args.direction_id, args.actor, args.profile_sha256
+        )
+    elif args.command == "register-portfolio":
+        result = register_portfolio(
+            connection, json.loads(args.input.read_text(encoding="utf-8"))
+        )
+    elif args.command == "approve-portfolio":
+        result = approve_portfolio(
+            connection, args.portfolio_id, args.actor, args.portfolio_sha256
+        )
+    elif args.command == "revoke-portfolio":
+        result = revoke_portfolio(
+            connection, args.portfolio_id, args.actor, args.reason
         )
     elif args.command == "revoke-direction":
         result = revoke_direction(connection, args.direction_id, args.actor, args.reason)

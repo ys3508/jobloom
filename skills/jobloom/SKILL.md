@@ -80,13 +80,15 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 
 ## Search directions and adaptation plans
 
-1. Register a structured direction from `assets/search-direction.template.json`. A draft is inert until the user approves the exact profile SHA-256.
-2. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside the approved direction and whose deterministic evaluation is eligible for `broad` or `precision` action.
-3. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
-4. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged direction, unchanged JobCard, and an approved unchanged base resume.
-5. `direct_reuse` creates no file. For `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent.
-6. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
-7. Revoking a direction invalidates its plans and active material locks. Do not select, bind, or lock a master resume once direction enforcement is initialized.
+1. Register each structured direction from `assets/search-direction.template.json`. Individual drafts are inert routing components, not the user's approval surface.
+2. Build one weighted `SearchPortfolio` from `assets/search-portfolio.template.json`. It may contain multiple exact direction hashes; IDs must be unique and integer weights must total 100.
+3. Show the complete portfolio and its exact SHA-256 once. Only actor `user` may approve that hash. Portfolio approval atomically approves its draft member directions; never request separate approvals for the same reviewed portfolio.
+4. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside a direction belonging to the active approved portfolio and whose deterministic evaluation is eligible for `broad` or `precision` action.
+5. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
+6. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged portfolio direction, unchanged JobCard, and an approved unchanged base resume.
+7. `direct_reuse` creates no file. For `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent.
+8. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
+9. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
 
 ## Cover-letter versions
 

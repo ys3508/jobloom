@@ -11,7 +11,7 @@
 7. Standing authorization
 8. Application core
 9. Resume version
-10. Search direction and adaptation plan
+10. Search portfolio, direction, and adaptation plan
 11. Cover-letter version
 12. Fill-only execution
 13. Pre-submission review
@@ -154,13 +154,15 @@ When the CandidateSnapshot registry is initialized, ResumeVersion approval requi
 
 A material lock records the exact approved resume version and file hash, plus the optional approved cover-letter version and file hash, selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
 
-## Search direction and adaptation plan
+## Search portfolio, direction, and adaptation plan
+
+SearchPortfolio is the user-facing search strategy. It stores one immutable allocation across one to twenty registered SearchDirection hashes. Direction IDs are unique and positive integer weights total exactly 100. Registration creates `draft`; only actor `user` may approve the exact portfolio SHA-256. Approval atomically approves unchanged draft member directions and makes the portfolio the single active routing scope.
 
 SearchDirection stores an immutable structured profile, optional approved parent, deterministic profile SHA-256, status, user approval metadata, and revocation metadata. The profile contains target titles, role family, keyword groups, and bounded direction criteria. Registration creates `draft`; only actor `user` may approve or revoke it.
 
 ResumeAdaptationPlan stores one approved direction, reviewed JobCard, approved base ResumeVersion, candidate/profile/job hashes, deterministic value-free plan JSON and SHA-256, recommended kind, status, user approval metadata, and invalidation metadata. Its evidence records preserve original strength and CandidateFact IDs without values.
 
-After direction enforcement is initialized, every non-master ResumeVersion requires an approved plan whose direction, recommended kind, base parent, candidate hash, JobCard hash, and direction-profile hash match. Plan approval and physical ResumeVersion approval remain separate.
+After portfolio enforcement is initialized, every plan direction must belong to the active approved portfolio. Every non-master ResumeVersion requires an approved plan whose direction, recommended kind, base parent, candidate hash, JobCard hash, and direction-profile hash match. Portfolio, plan, and physical ResumeVersion approvals remain separate.
 
 ## Cover-letter version
 

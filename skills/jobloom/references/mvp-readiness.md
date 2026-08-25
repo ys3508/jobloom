@@ -15,14 +15,14 @@ python3 skills/jobloom/scripts/mvp_core.py \
   init
 ```
 
-This initializes application state, answers/authorization, resumes/material locks, CandidateSnapshots, SearchDirections/plans, cover letters, archive/tracker state, outcomes/usage, pre-submit reviews, and Fill-Only execution. The database is mode 0600; private directories are mode 0700.
+This initializes application state, answers/authorization, resumes/material locks, CandidateSnapshots, SearchPortfolios/SearchDirections/plans, cover letters, archive/tracker state, outcomes/usage, pre-submit reviews, and Fill-Only execution. The database is mode 0600; private directories are mode 0700.
 
 Initialization creates schemas and empty directories only. It never creates a candidate, direction, resume, answer, job, authorization, application, approval, outcome, or submission.
 
 ## Readiness levels
 
 - `implementation`: required tables and private-directory permissions exist.
-- `onboarding`: exactly one active user-registered CandidateSnapshot, at least one user-approved SearchDirection, and at least one user-approved direction ResumeVersion with its approved plan exist.
+- `onboarding`: exactly one active user-registered CandidateSnapshot, exactly one active user-approved SearchPortfolio with one or more member directions, and at least one user-approved direction ResumeVersion with its approved plan exist.
 - `live_job_evaluation`: onboarding is ready and at least one real JobCard has been reviewed against its full JD.
 - `fill_queue`: live-job evaluation is ready, a current standing authorization exists, and an approved material-locked application is in the fill queue.
 
@@ -37,7 +37,7 @@ The report always sets `submission_authorized: false`. Readiness does not replac
 | Master resume ingestion | `extract_candidate_facts.py`, ResumeVersion master snapshot |
 | Candidate fact extraction | traceable review packet with source/excerpt hashes |
 | User confirmation and locking | `finalize_candidate.py`, `candidate_core.py` |
-| One search direction | user-approved SearchDirection |
+| Weighted search strategy | one user-approved SearchPortfolio containing one or more exact SearchDirection hashes whose weights total 100 |
 | One approved direction resume | approved adaptation plan + immutable ResumeVersion + claims manifest |
 | Work authorization and preferences | CandidateProfile plus independent answer meanings |
 | Answer reuse | AnswerLibrary exact/user-reviewed semantic forms and two-channel freshness |
@@ -73,7 +73,7 @@ The software cannot safely clear these itself:
 
 1. reviewing and confirming real resume-derived facts and work authorization
 2. registering the resulting CandidateSnapshot
-3. approving a real search direction profile
+3. approving one real weighted SearchPortfolio and its exact member-direction hashes
 4. reviewing and approving the actual direction resume and claims manifest
 5. reviewing a real JobCard against the full JD
 6. approving a real application and current authorization scope
