@@ -173,6 +173,72 @@ class DeQualifiedTitleContextTests(unittest.TestCase):
                        title="Life Sciences Data Analyst", employer="Northwind Retail")
         self.assertEqual(result["decision"], "match")
 
+    def direction(self, direction_id, titles, industries, keywords):
+        """Mirrors a registered v2 profile; the private drafts are not in the repo."""
+        return {
+            "schema_version": "0.1.0", "direction_id": direction_id, "name": direction_id,
+            "role_family": f"family.{direction_id}", "target_titles": titles,
+            "auxiliary_titles": [], "positive_keywords": keywords, "negative_keywords": [],
+            "precision_keywords": [], "discovery_keywords": [], "hard_exclusion_keywords": [],
+            "criteria": {"industries": industries}, "parent_direction_id": None,
+        }
+
+    def test_a_positive_keyword_can_never_stand_in_for_industry_context(self):
+        """A relevance keyword says nothing about the sector. Accepting one would let a
+        bare de-qualified title match a retail or technology posting."""
+        cases = [
+            ("pharma-analytics-v2", ["Sales Operations Analyst"],
+             ["pharmaceuticals", "biotechnology", "life sciences"],
+             ["commercial analytics", "market access"],
+             "Northwind Retail", ["Manage retail store replenishment and shelf planning"],
+             ["commercial analytics"]),
+            ("life-sciences-consulting-v2", ["Associate Consultant"],
+             ["life sciences", "healthcare", "pharmaceuticals", "consulting"],
+             ["data analysis", "commercial strategy"],
+             "Northwind Retail Group", ["Support store operations reporting"], ["data analysis"]),
+            ("healthcare-data-science-stretch-v2", ["Junior Data Scientist"],
+             ["healthcare", "life sciences", "pharmaceuticals", "biotechnology"],
+             ["machine learning", "advanced analytics"],
+             "Northwind Software", ["Build recommendation systems for e-commerce"],
+             ["machine learning"]),
+        ]
+        for name, titles, industries, keywords, employer, responsibilities, skills in cases:
+            with self.subTest(direction=name):
+                result = route(self.direction(name, titles, industries, keywords),
+                               title=titles[0], employer=employer,
+                               responsibilities=responsibilities, required_skills=skills)
+                self.assertNotEqual(result["decision"], "match")
+                self.assertIn("target_title_without_direction_context", result["review_reasons"])
+                self.assertEqual(result["signal_hits"]["direction_context"], [])
+                self.assertTrue(result["field_hits"]["positive_keywords"],
+                                "the keyword must have hit, and still not count as context")
+
+    def test_a_declared_industry_alias_satisfies_the_requirement(self):
+        pharma = self.direction("pharma-analytics-v2", ["Sales Operations Analyst"],
+                                ["pharmaceuticals", "biotechnology", "life sciences"],
+                                ["commercial analytics"])
+        for phrase in ("pharma", "pharmaceutical", "pharmaceuticals", "biotech", "life science"):
+            with self.subTest(phrase=phrase):
+                result = route(pharma, title="Sales Operations Analyst", employer="Northwind Group",
+                               responsibilities=[f"Support the {phrase} commercial portfolio"])
+                self.assertEqual(result["decision"], "match")
+
+    def test_the_stretch_direction_still_matches_a_real_healthcare_posting(self):
+        stretch = self.direction("healthcare-data-science-stretch-v2", ["Junior Data Scientist"],
+                                 ["healthcare", "life sciences", "pharmaceuticals", "biotechnology"],
+                                 ["machine learning"])
+        result = route(stretch, title="Junior Data Scientist", employer="Northwind Health System",
+                       responsibilities=["Model patient readmission for the healthcare network"],
+                       required_skills=["machine learning"])
+        self.assertEqual(result["decision"], "match")
+
+    def test_an_alias_never_matches_by_prefix(self):
+        pharma = self.direction("pharma-analytics-v2", ["Sales Operations Analyst"],
+                                ["pharmaceuticals"], [])
+        result = route(pharma, title="Sales Operations Analyst", employer="Northwind Group",
+                       responsibilities=["Manage the pharmacy counter rota"])
+        self.assertNotEqual(result["decision"], "match")
+
     def test_a_direction_without_declared_industries_imposes_no_requirement(self):
         result = route(self.pharma(criteria={}), title="Sales Operations Analyst",
                        employer="Northwind Retail")

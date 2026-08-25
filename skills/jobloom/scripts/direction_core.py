@@ -618,6 +618,31 @@ QUANT_RESEARCH_TRANSFER_TERMS = (
 )
 CONTEXT_REVIEW_MIN_DISTINCT_TERMS = 2
 
+# Industry context is satisfied only by a declared industry or one of its controlled
+# surface forms. An ordinary positive keyword must never satisfy it: "commercial
+# analytics" or "machine learning" says nothing about the sector, so accepting one
+# would let a bare de-qualified title match a retail or technology posting.
+INDUSTRY_ALIASES: dict[str, tuple[str, ...]] = {
+    "pharmaceuticals": ("pharmaceuticals", "pharmaceutical", "pharma"),
+    "biotechnology": ("biotechnology", "biotech"),
+    "healthcare": ("healthcare", "health care"),
+    "life sciences": ("life sciences", "life science"),
+    "clinical research": ("clinical research", "clinical"),
+    "hospitals": ("hospitals", "hospital", "health system", "health systems"),
+    "public health": ("public health",),
+    "research": ("research",),
+    "consulting": ("consulting",),
+}
+
+
+def _industry_terms(declared: tuple[str, ...]) -> tuple[str, ...]:
+    terms: list[str] = []
+    for industry in declared:
+        for term in INDUSTRY_ALIASES.get(industry.casefold(), (industry,)):
+            if term not in terms:
+                terms.append(term)
+    return tuple(terms)
+
 # --- Sponsorship -----------------------------------------------------------
 SPONSORSHIP_REFUSAL_PATTERNS = (
     "unable to sponsor", "not able to sponsor", "cannot sponsor", "can not sponsor",
@@ -1183,9 +1208,10 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     # Context is what the direction itself declares, not a fixed global vocabulary:
     # criteria.industries plus its own positive keywords.
     declared_industries = tuple(str(item) for item in (profile.get("criteria") or {}).get("industries") or [])
-    industry_hits = _phrase_hits(declared_industries, tokens_by_field,
+    industry_terms = _industry_terms(declared_industries)
+    industry_hits = _phrase_hits(industry_terms, tokens_by_field,
                                  ("title", "summary", "responsibilities", "required_skills"))
-    industry_hits.extend({"term": term, "field": "employer"} for term in declared_industries
+    industry_hits.extend({"term": term, "field": "employer"} for term in industry_terms
                          if _token_run(_tokens(term), employer_tokens) >= 0)
     signal_hits["direction_context"] = industry_hits
     signal_hits["domain_context"].extend(
@@ -1195,7 +1221,9 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     # Only a declared industry list imposes the requirement; a positive-keyword hit
     # can satisfy it, but keywords alone never impose it.
     context_configured = bool(declared_industries)
-    has_direction_context = bool(industry_hits) or bool(field_hits["positive_keywords"])
+    # Only a declared industry satisfies this. A positive keyword is a relevance
+    # signal, not a sector claim, and must never stand in for one.
+    has_direction_context = bool(industry_hits)
     if title_hits:
         # A target title carries its own context when the title itself names the
         # industry ("Clinical Data Analyst"). A de-qualified bare title ("Sales
