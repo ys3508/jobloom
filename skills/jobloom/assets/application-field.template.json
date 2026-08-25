@@ -1,0 +1,10 @@
+{
+  "application_id": "app-example-1",
+  "field_id": "work_authorization",
+  "question": "Are you currently authorized to work in this country?",
+  "value": true,
+  "source_kind": "answer",
+  "source_id": "answer-work-authorized-now",
+  "source_status": "active",
+  "sensitivity": "normal"
+}

@@ -33,6 +33,8 @@ Entering `submitting` requires:
 
 Entering `submitted` requires stored positive evidence: success page, confirmation ID, account record, or confirmation email. Record evidence only while `submitting` or `submission_uncertain`.
 
+After a confirmed submission, create and verify the immutable local archive described in `submission-archive.md`. Archive state is separate from application state; an archive failure must remain visible and must not rewrite a confirmed application as unsubmitted.
+
 `submission_uncertain` is never part of the automatic work queue. Only an explicit user resolution may move it to `submitted` or `submission_failed`; moving it to `submitted` still requires positive evidence.
 
 ## Failure handling

@@ -11,7 +11,8 @@
 7. Standing authorization
 8. Application core
 9. Resume version
-10. Future core entities
+10. Submission archive
+11. Future core entities
 
 ## Candidate profile
 
@@ -146,6 +147,14 @@ The claims manifest maps each exact resume claim to one or more confirmed Candid
 
 A material lock records the exact approved resume version and file hash selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
 
+## Submission archive
+
+ApplicationField records preserve the exact locally stored field value, its application and field IDs, question, source kind and ID, source status at use, sensitivity class, and recording time. Values remain in the protected database. Archive output applies the redaction contract in `submission-archive.md`.
+
+A SubmissionArchive stores a stable archive ID, one application ID, immutable directory and manifest paths, manifest SHA-256, archive time, verification time, and verification status. Its manifest lists physical artifacts with byte size and SHA-256, submission metadata, evidence type, unresolved-uncertainty status, and aggregate redaction counts.
+
+The master tracker is generated from archive, application, and job backend records. It contains no answer values and does not become a separately editable source of truth.
+
 ## Future core entities
 
-Add separate archive-manifest and outcome records next. Do not collapse them into the job or application records. Every submitted application must eventually preserve exact resume/cover-letter snapshots and a redacted material-answer snapshot.
+Add separate outcome records next. Do not collapse them into the job or application records.

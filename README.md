@@ -118,6 +118,33 @@ python3 skills/jobloom/scripts/resume_core.py \
 
 Registration never approves a resume. Approval requires a user-reviewed claims manifest, a finalized hash-valid `candidate.json`, and the `user` actor. Approved resumes can then be bound to applications and material-locked before `ready_to_fill`. Fill acquisition and pre-submit transitions recheck both approval state and physical file hash.
 
+Initialize the private submission archive and generate its deterministic tracker source:
+
+```bash
+python3 skills/jobloom/scripts/archive_core.py \
+  --db .jobloom/jobloom.db \
+  --archive-root .jobloom/archive \
+  init
+
+python3 skills/jobloom/scripts/archive_core.py \
+  --db .jobloom/jobloom.db \
+  tracker-source \
+  --output .jobloom/archive/applications-tracker.json
+```
+
+`archive_core.py` records source-linked application fields, redacts or omits sensitive values, copies exact submitted materials and confirmation evidence, writes a hash manifest, and verifies that no archived file was changed or added. It refuses unconfirmed submissions and declared cover letters without an immutable snapshot.
+
+Build `applications.xlsx` from the tracker JSON with the bundled spreadsheet runtime or another environment where `@oai/artifact-tool` is available to Node:
+
+```bash
+node skills/jobloom/scripts/build_application_tracker.mjs \
+  --input .jobloom/archive/applications-tracker.json \
+  --output .jobloom/archive/applications.xlsx \
+  --preview .jobloom/archive/applications-preview.png
+```
+
+The workbook is a generated view, not a hand-edited source of truth, and never contains application answer values.
+
 Run the current test suite:
 
 ```bash

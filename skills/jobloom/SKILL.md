@@ -14,7 +14,8 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
-- For form filling or submission preparation, read all six references. Default to Fill-Only and stop before the final submission action.
+- For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
+- For form filling or submission preparation, read all seven references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -90,6 +91,17 @@ Store the database in `.jobloom/`. It contains plaintext local answers protected
 5. Preserve `submission_failed` and `submission_uncertain` as distinct states. Never enqueue uncertain submissions for retry.
 6. Record success evidence before marking an application submitted.
 7. Use stable reason and failure codes. Do not place job descriptions, answers, secrets, or personal data in event metadata.
+
+## Submission archive
+
+1. Record every filled field from `assets/application-field.template.json` while filling or preparing submission. Map it to an active AnswerEntry or locked CandidateFact and classify sensitivity explicitly.
+2. Create an archive only after the application has positive evidence and reaches the confirmed-submission lineage. Never archive a click, failure, or unresolved uncertainty as a submission.
+3. Require the exact `submitted` resume usage record and verify the physical resume and claims-manifest hashes before copying.
+4. Copy physical artifacts; do not store mutable pointers. If a declared cover-letter version has no immutable snapshot, pause.
+5. Redact addresses and sensitive personal values. Omit credentials, identity-document numbers, tax identifiers, banking values, and dates of birth entirely from `answers_snapshot.json`.
+6. Verify every archived file against `archive_manifest.json` and reject untracked files. Archive creation is idempotent per application.
+7. Generate `applications.xlsx` only from deterministic tracker-source JSON. Keep answers out of the workbook and leave unavailable metrics blank.
+8. Keep all archives and tracker artifacts private under `.jobloom/`; never feed archived contents into a model context.
 
 ## Output discipline
 
