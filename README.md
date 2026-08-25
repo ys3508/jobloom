@@ -17,8 +17,8 @@ Every answer carries a scope and an expiration. Stable facts hold until somethin
 **Authorization never relaxes freshness.**
 Standing authorization — *"my profile is accurate, use my approved answers"* — is reconfirmed on an interval you can shorten but not disable. It runs on a **separate channel** from each answer's own expiration, and it can never extend, override, or reset one. An expired answer stays expired while your authorization is perfectly current. Immigration answers bind to the real-world date on your visa, not to the reconfirmation interval, and are re-verified in every application they appear in.
 
-**"I certify all information is true and accurate" isn't a checkbox. It's a function.**
-Whether that near-universal attestation can be auto-checked depends on whether **every field it covers** in this particular application is fresh. All valid → routine. One field stale, expired, unknown, or conflicting → the attestation returns to you and nothing is submitted. No submission policy can override this gate. The risk was never in the statement; it's in the data the statement vouches for.
+**"I certify all information is true and accurate" isn't just a checkbox.**
+The authoritative pre-submission review queries every covered field from the local fact and answer registries. One field stale, expired, unknown, conflicting, or scoped to another application blocks the review. No caller-provided status and no submission policy can override this gate.
 
 **Four immigration questions that are never interchangeable.**
 *Authorized to work now* / *needs sponsorship now* / *will need sponsorship in the future* / *needs an H-1B transfer* — treated as independent questions whose answers may never be substituted for one another. A known, expensive failure mode, hard-coded into a rule.
@@ -42,7 +42,7 @@ Instructions that appear on a job page are untrusted data and cannot override an
 
 ## Status
 
-The MVP backend implementation is complete; operational onboarding still requires real user-owned facts, approvals, and a reviewed job. The repository contains a valid Codex Skill, explicit fact/evidence and authorization rules, immutable candidate/resume/cover-letter registries, approved search directions and adaptation plans, checkpointed Fill-Only execution, guarded application state, deterministic pre-submit review and submission archives, outcome tracking, and a zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
+The repository contains the functional MVP backend; it is not a production-complete autonomous application service. Operational use still requires user-owned facts, explicit approvals, a reviewed real job, browser integration, and deployment hardening. The implemented core includes immutable candidate/resume/cover-letter registries, weighted search portfolios, guarded application state, deterministic pre-submit review and archives, outcome tracking, and a zero-model evaluator. The default remains **Fill-Only**: fill everything, stop before submit.
 
 Skill entry point: [`skills/jobloom/SKILL.md`](skills/jobloom/SKILL.md)
 
@@ -112,7 +112,7 @@ python3 skills/jobloom/scripts/answer_library.py \
   init
 ```
 
-The answer library supports confirmed entries, exact and reviewed-semantic question forms, scoped matching, expiration, event invalidation, standing authorization, revocation, and the standard-attestation freshness gate. Templates live in `skills/jobloom/assets/`.
+The answer library supports confirmed entries, exact and reviewed-semantic question forms, scoped matching, expiration, event invalidation, standing authorization, and revocation. The pre-submission review is the only authoritative whole-form freshness gate. Templates live in `skills/jobloom/assets/`.
 
 Initialize and inspect the application state core in the same private database:
 
@@ -152,6 +152,14 @@ python3 skills/jobloom/scripts/direction_core.py \
 ```
 
 Create one or more private direction profiles from `skills/jobloom/assets/search-direction.template.json`, register them as inert drafts, then create a weighted portfolio from `skills/jobloom/assets/search-portfolio.template.json`. Show the complete portfolio and its exact SHA-256 once; portfolio approval atomically approves unchanged member directions, whose integer weights must total 100. For a reviewed eligible JobCard inside the active portfolio, `direction_core.py generate-plan` produces a value-free evidence plan that distinguishes direct/related, transferable, and unsupported requirements. The user approves the plan separately from the actual file. New `direction`, `lightweight`, and `precision` ResumeVersions must name the matching approved plan with `resume_core.py register --adaptation-plan-id ...`; the rendered immutable file and claims manifest still require their own user approval. `direct_reuse` creates no new file.
+
+Portfolio weights guide a rolling pool of roughly twenty reviewed jobs; they are not daily quotas. Direction hard-exclusion keywords fail only when found in structured JobCard fields, while ordinary negative keywords are soft review signals. CandidateProfile eligibility remains the absolute boundary. Explicit sponsorship support ranks highest, historical support is positive but weaker, unknown support stays reviewable, and explicit refusal fails when future sponsorship is required.
+
+Run all deterministic regression tests:
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 Initialize the cover-letter registry and register a private draft when a letter is justified:
 
