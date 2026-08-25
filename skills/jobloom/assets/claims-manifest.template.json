@@ -1,0 +1,12 @@
+{
+  "schema_version": "0.1.0",
+  "claims": [
+    {
+      "claim_id": "claim-example-1",
+      "claim_text": "Exact text appearing in the resume",
+      "fact_ids": ["fact-supporting-1"],
+      "evidence_strength": "direct",
+      "exact_locked_value_preserved": false
+    }
+  ]
+}

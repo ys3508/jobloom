@@ -9,11 +9,12 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 
 ## Choose the workflow
 
-- For candidate onboarding or resume work, read `references/facts-and-evidence.md`.
+- For candidate onboarding, read `references/facts-and-evidence.md`.
+- For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
-- For form filling or submission preparation, read all five references. Default to Fill-Only and stop before the final submission action.
+- For form filling or submission preparation, read all six references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -50,6 +51,16 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 4. Run `finalize_candidate.py --review <review.json> --settings <settings.json> --output <candidate.json>`. Pending facts or unconfirmed work authorization must block output.
 5. Keep resume-derived artifacts and `candidate.json` in a private, ignored local data directory; never commit personal data by default.
 
+## Resume versions
+
+1. Initialize the shared private database and register the source file with `resume_core.py`. Registration copies exact bytes into the private store and always creates a draft.
+2. Build a claims manifest from `assets/claims-manifest.template.json`. Map every resume claim to confirmed or locked CandidateFact IDs.
+3. Approve only after the user reviews the actual file. Approval requires actor `user`, a hash-valid `candidate.json`, a valid claims manifest, and an unchanged snapshot.
+4. Derive direction, lightweight, and precision versions only from approved parents. Never overwrite or reuse a version ID.
+5. Bind an approved version during application material preparation, then create the material lock before moving to `ready_to_fill`.
+6. Recheck the active lock and physical file hash at fill acquisition, pre-submit readiness, and submission. Revocation or rebinding invalidates the old lock.
+7. Keep snapshots and manifests under `.jobloom/`; never commit personal resume content by default.
+
 ## Job ingestion and evaluation
 
 1. Run `ingest_job.py --url <job-url> --output <job-card.json>`, or use `--file` for saved HTML, JSON, or plain text.
@@ -75,7 +86,7 @@ Store the database in `.jobloom/`. It contains plaintext local answers protected
 1. Initialize the shared local database with `application_core.py --db <private.db> init`.
 2. Ingest a reviewed JobCard before creating an application. Respect definite and possible duplicate results.
 3. Create at most one application per job identity. Never bypass related-job application history.
-4. Use guarded `transition` commands for analysis and user decisions. Use `acquire` and `release` for fill workers; never enter `filling` by direct transition.
+4. Bind and lock an approved ResumeVersion before `ready_to_fill`. Use guarded `transition` commands for analysis and user decisions. Use `acquire` and `release` for fill workers; never enter `filling` by direct transition.
 5. Preserve `submission_failed` and `submission_uncertain` as distinct states. Never enqueue uncertain submissions for retry.
 6. Record success evidence before marking an application submitted.
 7. Use stable reason and failure codes. Do not place job descriptions, answers, secrets, or personal data in event metadata.

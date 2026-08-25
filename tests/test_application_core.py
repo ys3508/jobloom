@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ def load_script(name):
 
 CORE = load_script("application_core")
 ANSWERS = load_script("answer_library")
+RESUMES = load_script("resume_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -39,6 +42,9 @@ class ApplicationCoreTests(unittest.TestCase):
         self.db.execute("PRAGMA foreign_keys=ON")
         CORE.initialize(self.db)
         ANSWERS.initialize(self.db)
+        RESUMES.initialize(self.db)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(self.db.close)
 
     def add_job_and_application(self, application_id="app-1", policy="stop_before_submit", category="broad"):
@@ -50,7 +56,31 @@ class ApplicationCoreTests(unittest.TestCase):
         CORE.transition(self.db, application_id, "broad_recommended", "system", "broad_match", at=AT)
         CORE.transition(self.db, application_id, "approved", "user", "user_approved", at=AT)
         CORE.transition(self.db, application_id, "materials_in_progress", "system", "materials_started", at=AT)
+        self.install_materials(application_id)
         CORE.transition(self.db, application_id, "ready_to_fill", "system", "materials_ready", at=AT)
+
+    def install_materials(self, application_id="app-1"):
+        root = Path(self.temp_dir.name)
+        source = root / f"{application_id}.txt"
+        source.write_text("Verified resume claim\n", encoding="utf-8")
+        version_id = f"resume-{application_id}"
+        RESUMES.register_version(self.db, root / "store", source, version_id, "master_source", "general", at=AT)
+        fact = {
+            "id": "fact-1", "type": "skill", "value": "Verified resume claim",
+            "evidence_strength": "direct", "status": "confirmed", "locked": False,
+        }
+        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": [fact]}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        candidate_path = root / f"candidate-{application_id}.json"
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        manifest_path = root / f"manifest-{application_id}.json"
+        manifest_path.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
+            "claim_id": "claim-1", "claim_text": "Verified resume claim", "fact_ids": ["fact-1"],
+            "evidence_strength": "direct", "exact_locked_value_preserved": False,
+        }]}), encoding="utf-8")
+        RESUMES.approve_version(self.db, version_id, candidate_path, manifest_path, "user", AT)
+        RESUMES.bind_version(self.db, application_id, version_id, at=AT)
+        RESUMES.lock_materials(self.db, application_id, lock_id=f"lock-{application_id}", at=AT)
 
     def move_to_pre_submit(self, application_id="app-1"):
         self.move_to_ready(application_id)
@@ -242,6 +272,11 @@ class ApplicationCoreTests(unittest.TestCase):
         self.assertEqual(result["state"], "submitted")
         row = self.db.execute("SELECT confirmation_id FROM applications WHERE application_id='app-1'").fetchone()
         self.assertEqual(row["confirmation_id"], "ABC-123")
+        usage = self.db.execute(
+            "SELECT version_id, file_sha256 FROM resume_usage WHERE application_id='app-1' AND use_type='submitted'"
+        ).fetchone()
+        self.assertEqual(usage["version_id"], "resume-app-1")
+        self.assertTrue(usage["file_sha256"])
 
     def test_evidence_cannot_be_recorded_before_submission_attempt(self):
         self.add_job_and_application()

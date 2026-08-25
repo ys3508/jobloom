@@ -103,6 +103,21 @@ python3 skills/jobloom/scripts/application_core.py \
 
 The application core provides persistent multi-key job deduplication, duplicate-application prevention, guarded state transitions, atomic fill-worker leases, bounded retry attempts, submission-policy enforcement, and positive submission evidence requirements.
 
+Register an immutable resume draft in the private store:
+
+```bash
+python3 skills/jobloom/scripts/resume_core.py \
+  --db .jobloom/jobloom.db \
+  --store .jobloom/resumes \
+  register \
+  --file /path/to/master-resume.docx \
+  --version-id master-2026-08-25 \
+  --kind master_source \
+  --direction unassigned
+```
+
+Registration never approves a resume. Approval requires a user-reviewed claims manifest, a finalized hash-valid `candidate.json`, and the `user` actor. Approved resumes can then be bound to applications and material-locked before `ready_to_fill`. Fill acquisition and pre-submit transitions recheck both approval state and physical file hash.
+
 Run the current test suite:
 
 ```bash

@@ -18,6 +18,8 @@ Use `application_core.py`; do not edit SQLite state directly. Every transition w
 
 User approval is required to enter `approved`. Use atomic acquisition to enter `filling`; a worker lease expires and may be recovered, but a live lease cannot be stolen. Limit automatic attempts and preserve the failed step.
 
+Entering `ready_to_fill` requires an active material lock for the application's bound, approved ResumeVersion. The lock must match the registered resume hash and the current snapshot bytes. Acquisition repeats these checks; a missing, revoked, rebound, or modified resume cannot enter the fill queue.
+
 Reset the pre-submit check whenever the application returns to materials, filling, user-answer, failed, or takeover states.
 
 ## Submission gates
@@ -25,6 +27,7 @@ Reset the pre-submit check whenever the application returns to materials, fillin
 Entering `submitting` requires:
 
 - a passed pre-submit check
+- an active, hash-valid material lock matching the bound approved resume
 - a real active, unrevoked, unexpired authorization in the shared local database
 - satisfaction of the selected submission policy
 

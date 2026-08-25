@@ -10,7 +10,8 @@
 6. Answer entry
 7. Standing authorization
 8. Application core
-9. Future core entities
+9. Resume version
+10. Future core entities
 
 ## Candidate profile
 
@@ -137,6 +138,14 @@ Keep jobs, job sources, applications, application events, and submission evidenc
 
 Application events contain no answer values or full JobCards. Submission evidence is recorded separately and is required before the `submitted` state. The complete state and transition rules live in `application-state.md`.
 
+## Resume version
+
+A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, parent version, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
+
+The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
+
+A material lock records the exact approved resume version and file hash selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
+
 ## Future core entities
 
-Add separate `ResumeVersion`, archive-manifest, and outcome records next. Do not collapse them into the job or application records. Every submitted application must eventually preserve exact resume/cover-letter snapshots and a redacted material-answer snapshot.
+Add separate archive-manifest and outcome records next. Do not collapse them into the job or application records. Every submitted application must eventually preserve exact resume/cover-letter snapshots and a redacted material-answer snapshot.

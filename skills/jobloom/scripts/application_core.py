@@ -189,6 +189,52 @@ def initialize(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _hash_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def require_active_material_lock(connection: sqlite3.Connection, application_id: str) -> sqlite3.Row:
+    if not _table_exists(connection, "material_locks") or not _table_exists(connection, "resume_versions"):
+        raise ValueError("resume material store is unavailable")
+    row = connection.execute("""
+        SELECT ml.*, rv.status AS resume_status, rv.snapshot_path, rv.file_sha256 AS current_file_sha256,
+               rv.claims_manifest_path, rv.claims_manifest_sha256,
+               a.resume_version_id AS bound_resume_version_id
+        FROM material_locks ml
+        JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+        JOIN applications a ON a.application_id=ml.application_id
+        WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+    """, (application_id,)).fetchone()
+    if not row:
+        raise ValueError("application has no active material lock")
+    if row["resume_status"] != "approved":
+        raise ValueError("locked resume version is not approved")
+    if row["bound_resume_version_id"] != row["resume_version_id"]:
+        raise ValueError("material lock does not match the bound resume")
+    if row["resume_file_sha256"] != row["current_file_sha256"]:
+        raise ValueError("material lock resume hash mismatch")
+    snapshot = Path(row["snapshot_path"])
+    if not snapshot.is_file() or _hash_file(str(snapshot)) != row["resume_file_sha256"]:
+        raise ValueError("locked resume snapshot hash mismatch")
+    manifest_path = row["claims_manifest_path"]
+    if not manifest_path or not row["claims_manifest_sha256"]:
+        raise ValueError("locked resume claims manifest is unavailable")
+    manifest = Path(manifest_path)
+    if not manifest.is_file() or _hash_file(str(manifest)) != row["claims_manifest_sha256"]:
+        raise ValueError("locked resume claims manifest hash mismatch")
+    return row
+
+
 def _event(
     connection: sqlite3.Connection,
     application_id: str,
@@ -359,6 +405,8 @@ def transition(
         raise ValueError("application approval requires the user actor")
     if to_state == "filling":
         raise ValueError("use acquire_next to enter the filling state")
+    if to_state in {"ready_to_fill", "pre_submit_ready", "submitting"}:
+        require_active_material_lock(connection, application_id)
     if to_state == "pre_submit_ready" and not metadata.get("pre_submit_check_passed"):
         raise ValueError("pre-submit readiness requires a passed check")
     if to_state == "submitting":
@@ -396,6 +444,7 @@ def transition(
         ).fetchone()
         if not evidence:
             raise ValueError("submitted state requires positive submission evidence")
+        material_lock = require_active_material_lock(connection, application_id)
     if current == "submission_uncertain" and not (actor == "user" and metadata.get("manual_resolution")):
         raise ValueError("submission uncertainty requires explicit user resolution")
     if to_state == "submission_failed":
@@ -427,6 +476,15 @@ def transition(
             values.append(evidence["confirmation_id"])
     values.append(application_id)
     connection.execute(f"UPDATE applications SET {', '.join(fields)} WHERE application_id=?", values)
+    if to_state == "submitted" and _table_exists(connection, "resume_usage"):
+        connection.execute("""
+            INSERT OR IGNORE INTO resume_usage (
+                version_id, application_id, job_id, use_type, file_sha256, recorded_at
+            ) VALUES (?, ?, ?, 'submitted', ?, ?)
+        """, (
+            material_lock["resume_version_id"], application_id, row["job_id"],
+            material_lock["resume_file_sha256"], timestamp,
+        ))
     event_metadata = {
         key: metadata[key] for key in (
             "authorization_id", "error_code", "manual_resolution", "final_summary_approved", "known_form", "approved_queue"
@@ -477,16 +535,24 @@ def acquire_next(
     current_time = at or now_utc()
     connection.execute("BEGIN IMMEDIATE")
     try:
+        if not _table_exists(connection, "material_locks") or not _table_exists(connection, "resume_versions"):
+            connection.rollback()
+            raise ValueError("resume material store is unavailable")
         row = connection.execute("""
-            SELECT * FROM applications
-            WHERE attempts < max_attempts
-              AND (state='ready_to_fill' OR (state='filling' AND lease_expires_at < ?))
-            ORDER BY CASE category WHEN 'precision' THEN 0 WHEN 'broad' THEN 1 ELSE 2 END, created_at
+            SELECT a.* FROM applications a
+            JOIN material_locks ml ON ml.application_id=a.application_id AND ml.invalidated_at IS NULL
+            JOIN resume_versions rv ON rv.version_id=ml.resume_version_id AND rv.status='approved'
+            WHERE a.attempts < a.max_attempts
+              AND a.resume_version_id=ml.resume_version_id
+              AND ml.resume_file_sha256=rv.file_sha256
+              AND (a.state='ready_to_fill' OR (a.state='filling' AND a.lease_expires_at < ?))
+            ORDER BY CASE a.category WHEN 'precision' THEN 0 WHEN 'broad' THEN 1 ELSE 2 END, a.created_at
             LIMIT 1
         """, (current_time.isoformat(),)).fetchone()
         if not row:
             connection.rollback()
             return None
+        require_active_material_lock(connection, row["application_id"])
         lease_expires = current_time + timedelta(seconds=lease_seconds)
         connection.execute("""
             UPDATE applications
