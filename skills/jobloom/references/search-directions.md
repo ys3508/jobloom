@@ -32,6 +32,14 @@ Seniority is read as title tokens with domain guards, so `Senior Care`, `Lead Ge
 
 Apply routing before portfolio allocation. Use the portfolio weights over a rolling pool of about twenty jobs entering review, not as a daily quota. Sponsorship is a core ranking signal: explicit support is strongest, historical support is next, unknown remains eligible for investigation, and explicit non-support fails when the candidate will require sponsorship.
 
+## Persisted routing records
+
+`record_routing` routes one JobCard against one approved direction and stores the decision with the exact JobCard hash, direction profile hash, and active portfolio ID. It is idempotent per job, direction, and JobCard hash: re-recording an unchanged card returns the stored record. A changed JobCard invalidates the previous record for that job and direction with reason `job_card_changed` rather than mutating it, so history stays append-only and auditable.
+
+Only `match` and `review` decisions enter the review pool. A hard failure is still persisted for audit, with a null `entered_pool_at`, and is invisible to allocation: a portfolio weight can therefore never rescue a job that routing rejected. `portfolio_allocation_status` computes deficits from that persisted pool rather than a caller-supplied list, ordering only jobs that already passed routing, and surfaces the job IDs whose sponsorship needs investigation.
+
+Routing events record the job ID, JobCard hash, and counts only. Matched text, token offsets, and sponsorship evidence segments may be shown to the user but are never written to an events table.
+
 ## Deterministic adaptation plan
 
 Generate a plan only when:

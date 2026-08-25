@@ -141,6 +141,30 @@ def initialize(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS adaptation_plan_selection_idx
             ON resume_adaptation_plans(direction_id, job_id, status, created_at);
 
+        CREATE TABLE IF NOT EXISTS routing_records (
+            record_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            job_card_sha256 TEXT NOT NULL,
+            direction_id TEXT NOT NULL,
+            direction_profile_sha256 TEXT NOT NULL,
+            portfolio_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            hard_failures_json TEXT NOT NULL,
+            review_reasons_json TEXT NOT NULL,
+            field_hit_totals_json TEXT NOT NULL,
+            sponsorship_state TEXT NOT NULL,
+            sponsorship_priority INTEGER NOT NULL,
+            investigation_required INTEGER NOT NULL,
+            ranking_score INTEGER NOT NULL,
+            entered_pool_at TEXT,
+            recorded_at TEXT NOT NULL,
+            invalidated_at TEXT,
+            invalidation_reason TEXT,
+            UNIQUE (job_id, direction_id, job_card_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS routing_records_pool_idx
+            ON routing_records(invalidated_at, entered_pool_at);
+
         CREATE TABLE IF NOT EXISTS direction_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             direction_id TEXT NOT NULL,
@@ -1250,8 +1274,129 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
 
 
 
+
+POOL_DECISIONS = frozenset({"match", "review"})
+DEFAULT_POOL_WINDOW = 20
+
+
+def _active_portfolio(connection: sqlite3.Connection) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM search_portfolios WHERE status='approved' ORDER BY approved_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        raise ValueError("no approved SearchPortfolio is active")
+    return row
+
+
+def record_routing(connection: sqlite3.Connection, record_id: str, direction_id: str,
+                   job: dict[str, Any], candidate: dict[str, Any],
+                   at: datetime | None = None) -> dict[str, Any]:
+    """Route one JobCard against one approved direction and persist the decision.
+
+    Idempotent per (job_id, direction_id, job_card_sha256): re-recording an unchanged
+    card returns the stored record untouched. A changed JobCard invalidates the previous
+    record for that job and direction rather than mutating it.
+
+    Only `match` and `review` enter the review pool, so a portfolio weight can never
+    rescue a hard-filter failure: a failed job is persisted for audit with a null
+    entered_pool_at and is invisible to allocation.
+    """
+    resume_core._require_safe_id(record_id, "record_id")
+    portfolio = _active_portfolio(connection)
+    direction = connection.execute(
+        "SELECT * FROM search_directions WHERE direction_id=?", (direction_id,)
+    ).fetchone()
+    if not direction or direction["status"] != "approved":
+        raise ValueError("routing requires an approved search direction")
+    if not _direction_in_active_portfolio(connection, direction_id, direction["profile_sha256"]):
+        raise ValueError("search direction is outside the active approved portfolio")
+
+    job_hash = canonical_hash(job)
+    existing = connection.execute(
+        "SELECT * FROM routing_records WHERE job_id=? AND direction_id=? AND job_card_sha256=?",
+        (job["job_id"], direction_id, job_hash),
+    ).fetchone()
+    if existing:
+        if existing["invalidated_at"]:
+            raise ValueError("routing record for this JobCard was invalidated; use a new record ID")
+        return _routing_row(existing)
+
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE routing_records SET invalidated_at=?, invalidation_reason='job_card_changed' "
+        "WHERE job_id=? AND direction_id=? AND job_card_sha256<>? AND invalidated_at IS NULL",
+        (timestamp, job["job_id"], direction_id, job_hash),
+    )
+    profile = json.loads(direction["profile_json"])
+    routing = route_job(profile, candidate, job)
+    sponsorship = routing["sponsorship_assessment"]
+    investigation = any(
+        reason.startswith("employer_sponsorship_") or
+        reason == "sponsorship_historical_only_requires_confirmation"
+        for reason in routing["review_reasons"]
+    )
+    connection.execute("""
+        INSERT INTO routing_records (
+            record_id, job_id, job_card_sha256, direction_id, direction_profile_sha256,
+            portfolio_id, decision, hard_failures_json, review_reasons_json,
+            field_hit_totals_json, sponsorship_state, sponsorship_priority,
+            investigation_required, ranking_score, entered_pool_at, recorded_at,
+            invalidated_at, invalidation_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+    """, (
+        record_id, job["job_id"], job_hash, direction_id, direction["profile_sha256"],
+        portfolio["portfolio_id"], routing["decision"],
+        canonical_json(routing["hard_failures"]), canonical_json(routing["review_reasons"]),
+        canonical_json(routing["field_hit_totals"]), sponsorship["state"], sponsorship["priority"],
+        int(investigation), routing["ranking_score"],
+        timestamp if routing["decision"] in POOL_DECISIONS else None, timestamp,
+    ))
+    # Events carry counts and hashes only: no matched text, no posting prose.
+    _event(connection, direction_id, "system", "job_routed", routing["decision"],
+           metadata={"job_id": job["job_id"], "job_card_sha256": job_hash,
+                     "hard_failure_count": len(routing["hard_failures"]),
+                     "review_reason_count": len(routing["review_reasons"])},
+           at=at)
+    connection.commit()
+    stored = connection.execute(
+        "SELECT * FROM routing_records WHERE record_id=?", (record_id,)
+    ).fetchone()
+    return _routing_row(stored)
+
+
+def _routing_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "record_id": row["record_id"], "job_id": row["job_id"],
+        "job_card_sha256": row["job_card_sha256"], "direction_id": row["direction_id"],
+        "direction_profile_sha256": row["direction_profile_sha256"],
+        "portfolio_id": row["portfolio_id"], "decision": row["decision"],
+        "hard_failures": json.loads(row["hard_failures_json"]),
+        "review_reasons": json.loads(row["review_reasons_json"]),
+        "field_hit_totals": json.loads(row["field_hit_totals_json"]),
+        "sponsorship_state": row["sponsorship_state"],
+        "sponsorship_priority": row["sponsorship_priority"],
+        "investigation_required": bool(row["investigation_required"]),
+        "ranking_score": row["ranking_score"], "entered_pool_at": row["entered_pool_at"],
+        "in_review_pool": row["entered_pool_at"] is not None and row["invalidated_at"] is None,
+        "invalidated_at": row["invalidated_at"], "invalidation_reason": row["invalidation_reason"],
+    }
+
+
+def review_pool(connection: sqlite3.Connection,
+                window_size: int = DEFAULT_POOL_WINDOW) -> list[dict[str, Any]]:
+    """The most recent live review-pool records, oldest first. Deterministic ordering."""
+    if not isinstance(window_size, int) or isinstance(window_size, bool) or window_size < 1:
+        raise ValueError("window_size must be a positive integer")
+    rows = connection.execute("""
+        SELECT * FROM routing_records
+        WHERE invalidated_at IS NULL AND entered_pool_at IS NOT NULL
+        ORDER BY entered_pool_at DESC, record_id DESC LIMIT ?
+    """, (window_size,)).fetchall()
+    return [_routing_row(row) for row in reversed(rows)]
+
+
 def rolling_allocation_targets(allocations: list[dict[str, Any]], reviewed_direction_ids: list[str],
-                               window_size: int = 20) -> list[dict[str, Any]]:
+                               window_size: int = DEFAULT_POOL_WINDOW) -> list[dict[str, Any]]:
     """Return current deficits for a rolling review pool; weights are never daily quotas."""
     recent = reviewed_direction_ids[-window_size:]
     counts = {item["direction_id"]: recent.count(item["direction_id"]) for item in allocations}
@@ -1262,6 +1407,32 @@ def rolling_allocation_targets(allocations: list[dict[str, Any]], reviewed_direc
                        "reviewed_count": counts[item["direction_id"]],
                        "target_count": target, "deficit": target - counts[item["direction_id"]]})
     return sorted(result, key=lambda item: (-item["deficit"], item["direction_id"]))
+
+
+def portfolio_allocation_status(connection: sqlite3.Connection,
+                                window_size: int = DEFAULT_POOL_WINDOW) -> dict[str, Any]:
+    """Deficits computed from persisted review-pool history, not a caller-supplied list.
+
+    Allocation runs strictly after routing and only orders jobs that already passed it.
+    """
+    portfolio = _active_portfolio(connection)
+    allocations = [
+        {"direction_id": row["direction_id"], "weight_percent": row["weight_percent"]}
+        for row in connection.execute(
+            "SELECT direction_id, weight_percent FROM search_portfolio_directions "
+            "WHERE portfolio_id=? ORDER BY direction_id", (portfolio["portfolio_id"],))
+    ]
+    pool = review_pool(connection, window_size)
+    targets = rolling_allocation_targets(
+        allocations, [record["direction_id"] for record in pool], window_size)
+    return {
+        "portfolio_id": portfolio["portfolio_id"], "window_size": window_size,
+        "pool_size": len(pool), "targets": targets,
+        "underfilled_directions": [item["direction_id"] for item in targets if item["deficit"] > 0],
+        "investigation_required_job_ids": sorted(
+            {record["job_id"] for record in pool if record["investigation_required"]}),
+    }
+
 
 
 def _base_resume(connection: sqlite3.Connection, direction_id: str) -> sqlite3.Row:

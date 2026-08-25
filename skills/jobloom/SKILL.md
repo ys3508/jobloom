@@ -89,6 +89,8 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 7. `direct_reuse` creates no file. For `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent.
 8. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
 9. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
+10. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
+11. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
 
 ## Cover-letter versions
 
