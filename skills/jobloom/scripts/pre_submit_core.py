@@ -9,9 +9,16 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from _common import answer_issue, context_matches, parse_time, require_table  # noqa: E402
+from answer_library import IMMIGRATION_CANONICAL_IDS  # noqa: E402
 
 
 ALLOWED_LEGAL_ITEMS = {"standard_attestation", "privacy_notice", "equal_opportunity_notice"}
@@ -25,13 +32,6 @@ UPLOAD_KINDS = {"resume", "cover_letter"}
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def canonical_json(value: Any) -> str:
@@ -221,41 +221,6 @@ def register_inventory(
             "inventory_sha256": digest}
 
 
-def _context_matches(rules: dict[str, Any], context: dict[str, Any]) -> bool:
-    for key, expected in rules.items():
-        actual = context.get(key)
-        if isinstance(expected, list):
-            if actual not in expected:
-                return False
-        elif actual != expected:
-            return False
-    return True
-
-
-def _answer_issue(row: sqlite3.Row, context: dict[str, Any], at: datetime) -> str | None:
-    if row["status"] != "active" or row["confirmation_status"] != "confirmed":
-        return f"answer_{row['status']}"
-    effective = parse_time(row["effective_from"])
-    expires = parse_time(row["expires_at"])
-    review_after = parse_time(row["review_after"])
-    if effective and at < effective:
-        return "answer_not_effective"
-    if expires and at >= expires:
-        return "answer_expired"
-    if review_after and at >= review_after:
-        return "answer_review_due"
-    if not _context_matches(json.loads(row["scope_json"]), context):
-        return "answer_scope_mismatch"
-    if not _context_matches(json.loads(row["preconditions_json"]), context):
-        return "answer_precondition_failed"
-    exclusions = json.loads(row["exclusions_json"])
-    if any(context.get(key) in (values if isinstance(values, list) else [values]) for key, values in exclusions.items()):
-        return "answer_excluded"
-    if row["answer_type"] == "legal_commitment":
-        return "legal_commitment_requires_review"
-    return None
-
-
 def _active_material(connection: sqlite3.Connection, application_id: str) -> sqlite3.Row:
     row = connection.execute("""
         SELECT ml.*, rv.snapshot_path, rv.file_sha256 AS registered_resume_sha256,
@@ -356,13 +321,17 @@ def create_review(
         context["country"] = card["country"]
     if card.get("employment_type") is not None:
         context["employment_type"] = card["employment_type"]
+    if any(field["source_kind"] == "fact" for field in field_rows):
+        require_table(connection, "candidate_facts")
+        require_table(connection, "candidate_snapshots")
+    active_candidate = connection.execute(
+        "SELECT 1 FROM candidate_snapshots WHERE status='active' AND registered_by='user'"
+    ).fetchone() if any(field["source_kind"] == "fact" for field in field_rows) else None
     for field in field_rows:
         if field["source_kind"] == "fact":
             if field["source_status"] != "locked":
                 issues.append(f"fact_not_locked:{field['field_id']}")
-            elif connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_facts'"
-            ).fetchone():
+            elif active_candidate:
                 fact = connection.execute("""
                     SELECT cf.value_json, cf.status, cf.locked
                     FROM material_locks ml
@@ -381,9 +350,13 @@ def create_review(
             if not answer:
                 issues.append(f"answer_unknown:{field['field_id']}")
             else:
-                answer_issue = _answer_issue(answer, context, current_time)
-                if answer_issue:
-                    issues.append(f"{answer_issue}:{field['field_id']}")
+                issue = answer_issue(answer, context, current_time)
+                if issue:
+                    issues.append(f"{issue}:{field['field_id']}")
+                if answer["canonical_id"] in IMMIGRATION_CANONICAL_IDS:
+                    scope = json.loads(answer["scope_json"])
+                    if scope.get("application_id") != application["application_id"]:
+                        issues.append(f"immigration_recheck_required:{field['field_id']}")
                 if answer["answer_json"] != field["value_json"]:
                     issues.append(f"answer_value_changed:{field['field_id']}")
         else:
@@ -398,7 +371,7 @@ def create_review(
         authorization_expires = parse_time(authorization["expires_at"])
         if not authorization_expires or current_time >= authorization_expires:
             issues.append("authorization_expired")
-        if not _context_matches(json.loads(authorization["scope_json"]), context):
+        if not context_matches(json.loads(authorization["scope_json"]), context):
             issues.append("authorization_scope_mismatch")
     material = _active_material(connection, application["application_id"])
     duplicate_count = connection.execute(

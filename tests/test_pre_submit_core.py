@@ -24,6 +24,7 @@ APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
+CANDIDATE = load_script("candidate_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -38,6 +39,7 @@ class PreSubmitCoreTests(unittest.TestCase):
         APPLICATIONS.initialize(self.db)
         ANSWERS.initialize(self.db)
         RESUMES.initialize(self.db)
+        CANDIDATE.initialize(self.db)
         ARCHIVE.initialize(self.db)
         PRE.initialize(self.db)
         self.addCleanup(self.db.close)
@@ -55,6 +57,21 @@ class PreSubmitCoreTests(unittest.TestCase):
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = self.root / "candidate.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        self.db.execute(
+            "INSERT INTO candidate_snapshots VALUES (?, ?, ?, ?, 'active', ?, 'user', NULL, NULL)",
+            (candidate["content_sha256"], "candidate-1", str(candidate_path),
+             RESUMES.file_sha256(candidate_path), AT.isoformat()),
+        )
+        for fact_id, fact_type, value in (
+            ("fact-1", "skill", "Python"), ("fact-name", "identity", "Verified Candidate")
+        ):
+            value_json = json.dumps(value, sort_keys=True, separators=(",", ":"))
+            self.db.execute(
+                "INSERT INTO candidate_facts VALUES (?, ?, ?, ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
+                (candidate["content_sha256"], fact_id, fact_type, value_json, AT.isoformat(),
+                 RESUMES.canonical_hash({"id": fact_id, "value": value})),
+            )
+        self.db.commit()
         manifest_path = self.root / "manifest.json"
         manifest_path.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
             "claim_id": "claim-1", "claim_text": "Python", "fact_ids": ["fact-1"],
@@ -81,8 +98,9 @@ class PreSubmitCoreTests(unittest.TestCase):
             "canonical_meaning": "Authorized to work", "answer": True,
             "answer_type": "time_sensitive_fact", "source_type": "user_confirmed",
             "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
-            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "event_driven",
-            "scope": {"country": "US"}, "auto_fill_allowed": True, "auto_submit_allowed": True,
+            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "per_application",
+            "scope": {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
         })
         ARCHIVE.record_field(
             self.db, "app-1", "candidate_name", "Candidate name", "Verified Candidate",

@@ -25,6 +25,7 @@ ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 OUTCOMES = load_script("outcome_core")
 PRE_SUBMIT = load_script("pre_submit_core")
+CANDIDATE = load_script("candidate_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -89,7 +90,8 @@ class ArchiveCoreTests(unittest.TestCase):
             "canonical_meaning": "Authorized to work now", "answer": True,
             "answer_type": "time_sensitive_fact", "source_type": "user_confirmed",
             "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
-            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "event_driven",
+            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "per_application",
+            "scope": {"application_id": "app-1"},
             "auto_fill_allowed": True, "auto_submit_allowed": True,
         })
         ARCHIVE.record_field(
@@ -104,6 +106,23 @@ class ArchiveCoreTests(unittest.TestCase):
             self.db, "app-1", "birth_date", "Date of birth", "2000-01-01",
             "fact", "fact-birth-date", "locked", "date_of_birth", AT,
         )
+        CANDIDATE.initialize(self.db)
+        content_sha = candidate["content_sha256"]
+        self.db.execute(
+            "INSERT INTO candidate_snapshots VALUES (?, 'candidate-1', ?, ?, 'active', ?, 'user', NULL, NULL)",
+            (content_sha, str(candidate_path), RESUMES.file_sha256(candidate_path), AT.isoformat()),
+        )
+        for fact_id, fact_type, value in (
+            ("fact-address", "address", "123 Private Street"),
+            ("fact-birth-date", "date_of_birth", "2000-01-01"),
+        ):
+            value_json = json.dumps(value, separators=(",", ":"))
+            self.db.execute(
+                "INSERT INTO candidate_facts VALUES (?, ?, ?, ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
+                (content_sha, fact_id, fact_type, value_json, AT.isoformat(),
+                 RESUMES.canonical_hash({"value": value})),
+            )
+        self.db.commit()
         PRE_SUBMIT.register_inventory(
             self.db, "inventory-1", "app-1", "https://example.com/jobs/1/apply",
             "Example Corp", "Backend Engineer", True,

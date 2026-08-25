@@ -9,10 +9,16 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from _common import answer_issue, context_matches, parse_time  # noqa: E402
 
 
 IMMIGRATION_CANONICAL_IDS = {
@@ -35,13 +41,6 @@ SCOPE_FIELDS = {"country", "jurisdiction", "company", "role_family", "employment
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def normalize_question(question: str) -> str:
@@ -156,6 +155,10 @@ def add_answer(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:
     unknown_scope = sorted(set(scope) - SCOPE_FIELDS)
     if unknown_scope:
         raise ValueError(f"unsupported scope fields: {', '.join(unknown_scope)}")
+    if entry["validity_class"] == "per_application":
+        application_id = scope.get("application_id")
+        if not isinstance(application_id, str) or not application_id.strip():
+            raise ValueError("per_application answers require scope.application_id")
     if entry["answer_type"] in {"legal_commitment", "voluntary_disclosure"} and entry["auto_submit_allowed"]:
         raise ValueError(f"{entry['answer_type']} cannot enable automatic submission in the MVP")
     confirmed = parse_time(entry["confirmed_at"])
@@ -215,41 +218,6 @@ def add_question_form(
     connection.commit()
 
 
-def _context_matches(rules: dict[str, Any], context: dict[str, Any]) -> bool:
-    for key, expected in rules.items():
-        actual = context.get(key)
-        if isinstance(expected, list):
-            if actual not in expected:
-                return False
-        elif actual != expected:
-            return False
-    return True
-
-
-def _excluded(rules: dict[str, Any], context: dict[str, Any]) -> bool:
-    for key, denied in rules.items():
-        actual = context.get(key)
-        denied_values = denied if isinstance(denied, list) else [denied]
-        if actual in denied_values:
-            return True
-    return False
-
-
-def _row_validity(row: sqlite3.Row, at: datetime) -> str | None:
-    if row["status"] != "active":
-        return f"answer_{row['status']}"
-    effective = parse_time(row["effective_from"])
-    if effective and at < effective:
-        return "answer_not_yet_effective"
-    expires = parse_time(row["expires_at"])
-    if expires and at >= expires:
-        return "answer_expired"
-    review_after = parse_time(row["review_after"])
-    if review_after and at >= review_after:
-        return "answer_review_due"
-    return None
-
-
 def authorization_current(
     connection: sqlite3.Connection,
     authorization_id: str | None,
@@ -265,7 +233,7 @@ def authorization_current(
         return False, "standing_authorization_revoked"
     if at >= parse_time(row["expires_at"]):
         return False, "standing_authorization_expired"
-    if not _context_matches(json.loads(row["scope_json"]), context):
+    if not context_matches(json.loads(row["scope_json"]), context):
         return False, "standing_authorization_scope_mismatch"
     return True, None
 
@@ -296,13 +264,7 @@ def match_answer(
     candidates: list[tuple[int, sqlite3.Row]] = []
     for row in rows:
         scope = json.loads(row["scope_json"])
-        if not _context_matches(scope, context):
-            continue
-        if not _context_matches(json.loads(row["preconditions_json"]), context):
-            continue
-        if _excluded(json.loads(row["exclusions_json"]), context):
-            continue
-        validity = _row_validity(row, at)
+        validity = answer_issue(row, context, at)
         if validity:
             stale_reasons.append(validity)
             continue
@@ -389,56 +351,6 @@ def invalidate_by_trigger(connection: sqlite3.Connection, trigger: str) -> list[
     return affected
 
 
-def attestation_gate(
-    connection: sqlite3.Connection,
-    authorization_id: str | None,
-    context: dict[str, Any],
-    fields: list[dict[str, Any]],
-    at: datetime | None = None,
-    new_legal_commitment: bool = False,
-) -> dict[str, Any]:
-    at = at or now_utc()
-    reasons = []
-    authorized, authorization_reason = authorization_current(connection, authorization_id, context, at)
-    if not authorized:
-        reasons.append(authorization_reason)
-    if new_legal_commitment:
-        reasons.append("new_legal_commitment")
-    if not fields:
-        reasons.append("no_fields_to_attest")
-    for field in fields:
-        field_id = field.get("field_id", "unknown")
-        if field.get("unknown") or field.get("conflicting"):
-            reasons.append(f"field_not_fresh:{field_id}")
-            continue
-        if field.get("source_kind") == "fact" and field.get("status") != "locked":
-            reasons.append(f"fact_not_locked:{field_id}")
-        elif field.get("source_kind") == "answer":
-            answer_id = field.get("source_id")
-            row = connection.execute("SELECT * FROM answers WHERE answer_id=?", (answer_id,)).fetchone()
-            if not row:
-                reasons.append(f"answer_unknown:{field_id}")
-            else:
-                validity = _row_validity(row, at)
-                if validity:
-                    reasons.append(f"{validity}:{field_id}")
-                elif not _context_matches(json.loads(row["scope_json"]), context):
-                    reasons.append(f"answer_scope_mismatch:{field_id}")
-                elif not _context_matches(json.loads(row["preconditions_json"]), context):
-                    reasons.append(f"answer_precondition_failed:{field_id}")
-                elif _excluded(json.loads(row["exclusions_json"]), context):
-                    reasons.append(f"answer_excluded:{field_id}")
-                elif row["answer_type"] == "legal_commitment":
-                    reasons.append(f"legal_commitment_requires_review:{field_id}")
-        elif field.get("source_kind") not in {"fact", "answer"}:
-            reasons.append(f"field_source_unknown:{field_id}")
-        if field.get("source_kind") == "fact":
-            expires = parse_time(field.get("expires_at"))
-            if expires and at >= expires:
-                reasons.append(f"field_expired:{field_id}")
-    return {"allowed": not reasons, "decision": "allow" if not reasons else "pause", "reasons": reasons}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
@@ -461,11 +373,6 @@ def main() -> None:
     match.add_argument("--question", required=True)
     match.add_argument("--context", required=True, type=Path)
     match.add_argument("--authorization-id")
-    attest = subparsers.add_parser("attest")
-    attest.add_argument("--authorization-id", required=True)
-    attest.add_argument("--context", required=True, type=Path)
-    attest.add_argument("--fields", required=True, type=Path)
-    attest.add_argument("--new-legal-commitment", action="store_true")
     args = parser.parse_args()
     args.db.parent.mkdir(parents=True, exist_ok=True)
     connection = connect(args.db)
@@ -491,13 +398,6 @@ def main() -> None:
     elif args.command == "match":
         context = json.loads(args.context.read_text(encoding="utf-8"))
         result = match_answer(connection, args.question, context, args.authorization_id)
-    else:
-        context = json.loads(args.context.read_text(encoding="utf-8"))
-        fields = json.loads(args.fields.read_text(encoding="utf-8"))
-        result = attestation_gate(
-            connection, args.authorization_id, context, fields,
-            new_legal_commitment=args.new_legal_commitment,
-        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

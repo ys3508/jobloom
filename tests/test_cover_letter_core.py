@@ -25,6 +25,7 @@ ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
 PRE_SUBMIT = load_script("pre_submit_core")
+CANDIDATE = load_script("candidate_core")
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -207,8 +208,9 @@ class CoverLetterCoreTests(unittest.TestCase):
             "canonical_meaning": "Authorized to work", "answer": True,
             "answer_type": "time_sensitive_fact", "source_type": "user_confirmed",
             "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
-            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "event_driven",
-            "scope": {"country": "US"}, "auto_fill_allowed": True, "auto_submit_allowed": True,
+            "expires_at": (AT + timedelta(days=30)).isoformat(), "validity_class": "per_application",
+            "scope": {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
         })
         ARCHIVE.record_field(
             self.db, "app-1", "work_auth", "Authorized to work?", True,

@@ -427,7 +427,8 @@ def observe_page(
     if not _same_origin(session["form_url"], sanitized_page_url):
         reasons.append("unexpected_navigation")
     unknown_legal = legal_items - pre_submit_core.ALLOWED_LEGAL_ITEMS
-    reasons.extend(f"{item}" for item in sorted(unknown_legal))
+    if unknown_legal:
+        reasons.append("unknown_legal_item")
     unknown_restrictions = restrictions - pre_submit_core.MANDATORY_PAUSES
     if unknown_restrictions:
         reasons.append("unknown_restricted_request")

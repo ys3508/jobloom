@@ -106,7 +106,7 @@ class AnswerLibraryTests(unittest.TestCase):
         MODULE.add_answer(db, entry(scope={"country": "CA"}))
         MODULE.add_question_form(db, "work_authorized_now", "Authorized to work now?")
         result = MODULE.match_answer(db, "Authorized to work now?", CONTEXT, at=AT)
-        self.assertEqual(result["reason"], "no_applicable_answer")
+        self.assertEqual(result["reason"], "answer_scope_mismatch")
 
     def test_equally_specific_conflicting_answers_stop(self):
         db = self.db()
@@ -151,51 +151,22 @@ class AnswerLibraryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot enable"):
             MODULE.add_answer(db, legal)
 
-    def test_attestation_requires_current_authorization_and_fresh_fields(self):
+    def test_per_application_answer_requires_application_scope(self):
         db = self.db()
-        MODULE.add_answer(db, entry())
-        MODULE.add_authorization(db, authorization())
-        fields = [
-            {"field_id": "name", "source_kind": "fact", "source_id": "fact-name", "status": "locked"},
-            {"field_id": "work_auth", "source_kind": "answer", "source_id": "answer-1"},
-        ]
-        result = MODULE.attestation_gate(db, "auth-1", CONTEXT, fields, AT)
-        self.assertTrue(result["allowed"])
+        with self.assertRaisesRegex(ValueError, "scope.application_id"):
+            MODULE.add_answer(db, entry(validity_class="per_application"))
 
-    def test_one_expired_field_blocks_attestation(self):
+    def test_per_application_answer_does_not_match_another_application(self):
         db = self.db()
-        MODULE.add_answer(db, entry(expires_at="2026-08-24T00:00:00Z"))
-        MODULE.add_authorization(db, authorization())
-        fields = [{"field_id": "work_auth", "source_kind": "answer", "source_id": "answer-1"}]
-        result = MODULE.attestation_gate(db, "auth-1", CONTEXT, fields, AT)
-        self.assertFalse(result["allowed"])
-        self.assertIn("answer_expired:work_auth", result["reasons"])
-
-    def test_out_of_scope_answer_blocks_attestation(self):
-        db = self.db()
-        MODULE.add_answer(db, entry(scope={"country": "CA"}))
-        MODULE.add_authorization(db, authorization())
-        fields = [{"field_id": "work_auth", "source_kind": "answer", "source_id": "answer-1"}]
-        result = MODULE.attestation_gate(db, "auth-1", CONTEXT, fields, AT)
-        self.assertFalse(result["allowed"])
-        self.assertIn("answer_scope_mismatch:work_auth", result["reasons"])
-
-    def test_stored_legal_commitment_blocks_attestation(self):
-        db = self.db()
-        MODULE.add_answer(db, entry(answer_type="legal_commitment", auto_submit_allowed=False))
-        MODULE.add_authorization(db, authorization())
-        fields = [{"field_id": "arbitration", "source_kind": "answer", "source_id": "answer-1"}]
-        result = MODULE.attestation_gate(db, "auth-1", CONTEXT, fields, AT)
-        self.assertFalse(result["allowed"])
-        self.assertIn("legal_commitment_requires_review:arbitration", result["reasons"])
-
-    def test_new_legal_commitment_always_blocks_attestation(self):
-        db = self.db()
-        MODULE.add_authorization(db, authorization())
-        fields = [{"field_id": "name", "source_kind": "fact", "source_id": "fact-name", "status": "locked"}]
-        result = MODULE.attestation_gate(db, "auth-1", CONTEXT, fields, AT, new_legal_commitment=True)
-        self.assertFalse(result["allowed"])
-        self.assertIn("new_legal_commitment", result["reasons"])
+        MODULE.add_answer(db, entry(
+            validity_class="per_application", scope={"country": "US", "application_id": "app-1"}
+        ))
+        MODULE.add_question_form(db, "work_authorized_now", "Authorized to work now?")
+        result = MODULE.match_answer(
+            db, "Authorized to work now?", dict(CONTEXT, application_id="app-2"), at=AT
+        )
+        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["reason"], "answer_scope_mismatch")
 
     def test_audit_log_never_contains_answer_value(self):
         db = self.db()
