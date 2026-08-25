@@ -232,6 +232,36 @@ class DeQualifiedTitleContextTests(unittest.TestCase):
                        required_skills=["machine learning"])
         self.assertEqual(result["decision"], "match")
 
+    def test_a_generic_industry_cannot_gate_its_own_role_family(self):
+        """Declaring `consulting` as an industry let any consulting job satisfy the gate,
+        defeating the rule for exactly the two titles it was meant to protect."""
+        leaky = self.direction("consulting-leaky", ["Associate Consultant", "Consulting Analyst"],
+                               ["life sciences", "healthcare", "pharmaceuticals", "consulting"], [])
+        fixed = self.direction("consulting-fixed", ["Associate Consultant", "Consulting Analyst"],
+                               ["life sciences", "healthcare", "pharmaceuticals", "biotechnology"], [])
+        for title in ("Associate Consultant", "Consulting Analyst"):
+            with self.subTest(title=title):
+                retail = dict(title=title, employer="Northwind Management",
+                              responsibilities=["Provide consulting services to retail clients"])
+                self.assertEqual(route(leaky, **retail)["decision"], "match")
+                result = route(fixed, **retail)
+                self.assertEqual(result["decision"], "review")
+                self.assertIn("target_title_without_direction_context", result["review_reasons"])
+                self.assertEqual(result["signal_hits"]["direction_context"], [])
+
+    def test_the_consulting_direction_still_matches_a_life_sciences_engagement(self):
+        fixed = self.direction("consulting-fixed", ["Associate Consultant", "Consulting Analyst"],
+                               ["life sciences", "healthcare", "pharmaceuticals", "biotechnology"], [])
+        for responsibility, employer in (
+            ("Advise life sciences clients on launch strategy", "Northwind Management"),
+            ("Provide consulting services to hospital clients", "Northwind Healthcare Advisory"),
+            ("Support biotech portfolio strategy engagements", "Northwind Biotechnology Partners"),
+        ):
+            with self.subTest(responsibility=responsibility):
+                result = route(fixed, title="Associate Consultant", employer=employer,
+                               responsibilities=[responsibility])
+                self.assertEqual(result["decision"], "match")
+
     def test_an_alias_never_matches_by_prefix(self):
         pharma = self.direction("pharma-analytics-v2", ["Sales Operations Analyst"],
                                 ["pharmaceuticals"], [])
