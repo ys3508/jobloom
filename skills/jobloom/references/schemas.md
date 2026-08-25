@@ -53,7 +53,7 @@ Dates use ISO 8601. Country values use a consistent code chosen by the implement
 
 ## Candidate review packet
 
-Resume extraction produces proposed facts, never immediately reusable facts. Each proposed fact contains a document SHA-256, line locator, excerpt SHA-256, evidence strength, and a `pending` decision. Every decision must become `confirmed` or `rejected` before finalization. Confirmed protected facts become locked; rejected facts are excluded. The final `candidate.json` includes a deterministic content hash.
+Resume extraction produces proposed facts, never immediately reusable facts. Each proposed fact contains a document SHA-256, line locator, excerpt SHA-256, evidence strength, and a `pending` decision. Every decision must become `confirmed` or `rejected` before finalization. Confirmed protected facts become locked; rejected facts are excluded. The final `candidate.json` includes a deterministic content hash. CandidateSnapshot registration stores a read-only physical copy and file hash, active/superseded status, user registration metadata, and an exact CandidateFact row for every fact. Only one snapshot is active.
 
 ## Candidate fact
 
@@ -149,6 +149,8 @@ Application events contain no answer values or full JobCards. Submission evidenc
 A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, direction, parent version, optional adaptation-plan ID and direction-profile hash, status, candidate profile hash, claims-manifest hash, approval metadata, and revocation metadata. Kinds are `master_source`, `direction`, `lightweight`, and `precision`. Registration always creates `draft`; only the user actor may move it to `approved` or `revoked`.
 
 The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
+
+When the CandidateSnapshot registry is initialized, ResumeVersion approval requires the same active user-registered candidate content hash. Selecting, binding, and locking a resume rechecks that its candidate hash is still active.
 
 A material lock records the exact approved resume version and file hash, plus the optional approved cover-letter version and file hash, selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
 

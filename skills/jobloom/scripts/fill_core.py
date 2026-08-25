@@ -332,8 +332,35 @@ def _active_session(connection: sqlite3.Connection, session_id: str, worker_id: 
     return session
 
 
-def _candidate_facts(candidate_path: Path) -> dict[str, dict[str, Any]]:
-    candidate, _ = resume_core.load_valid_candidate(candidate_path)
+def _candidate_facts(connection: sqlite3.Connection, application_id: str,
+                     candidate_path: Path) -> dict[str, dict[str, Any]]:
+    candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_snapshots'"
+    ).fetchone():
+        snapshot = connection.execute(
+            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+            "AND registered_by='user'", (candidate_hash,)
+        ).fetchone()
+        if not snapshot:
+            raise ValueError("candidate profile is not the active registered snapshot")
+        snapshot_path = Path(snapshot["snapshot_path"])
+        if not snapshot_path.is_file() or resume_core.file_sha256(snapshot_path) != snapshot["file_sha256"]:
+            raise ValueError("registered candidate snapshot hash mismatch")
+        material = connection.execute("""
+            SELECT rv.candidate_profile_sha256
+            FROM material_locks ml JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+            WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+        """, (application_id,)).fetchone()
+        if not material or material["candidate_profile_sha256"] != candidate_hash:
+            raise ValueError("candidate profile does not match the active material lock")
+        stored = {row["fact_id"]: row for row in connection.execute(
+            "SELECT * FROM candidate_facts WHERE content_sha256=?", (candidate_hash,)
+        )}
+        for fact in candidate["facts"]:
+            row = stored.get(fact["id"])
+            if not row or row["fact_sha256"] != resume_core.canonical_hash(fact):
+                raise ValueError("candidate fact registry does not match candidate.json")
     return {fact["id"]: fact for fact in candidate["facts"]}
 
 
@@ -392,7 +419,7 @@ def observe_page(
         "SELECT 1 FROM fill_pages WHERE session_id=? AND page_id=?", (session_id, page_id)
     ).fetchone():
         raise ValueError("page was already observed")
-    facts = _candidate_facts(candidate_path)
+    facts = _candidate_facts(connection, session["application_id"], candidate_path)
     current_time = at or now_utc()
     reasons: list[str] = []
     legal_items = set(observation["legal_items"])

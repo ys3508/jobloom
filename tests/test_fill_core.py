@@ -21,6 +21,7 @@ def load_script(name):
 
 
 FILL = load_script("fill_core")
+CANDIDATES = load_script("candidate_core")
 APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
@@ -45,8 +46,12 @@ class FillCoreTests(unittest.TestCase):
         ARCHIVE.initialize(self.db)
         PRE_SUBMIT.initialize(self.db)
         FILL.initialize(self.db)
+        CANDIDATES.initialize(self.db)
         self.addCleanup(self.db.close)
         self.candidate_path, self.manifest_path = self.make_candidate()
+        CANDIDATES.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
         self.prepare_application()
 
     def make_candidate(self):
@@ -56,7 +61,14 @@ class FillCoreTests(unittest.TestCase):
             {"id": "fact-unlocked", "type": "location", "value": "New York",
              "status": "confirmed", "locked": False, "evidence_strength": "direct"},
         ]
-        candidate = {"schema_version": "0.2.0", "profile_id": "candidate-1", "facts": facts}
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": facts,
+        }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
         candidate_path = self.root / "candidate.json"
         candidate_path.write_text(json.dumps(candidate), encoding="utf-8")

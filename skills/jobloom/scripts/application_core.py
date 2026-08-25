@@ -306,6 +306,20 @@ def require_approved_pre_submit_review(
         if stored_field["source_kind"] == "fact":
             if stored_field["source_status"] != "locked":
                 raise ValueError("pre-submit review fact is no longer locked")
+            if _table_exists(connection, "candidate_facts"):
+                fact = connection.execute("""
+                    SELECT cf.value_json, cf.status, cf.locked
+                    FROM material_locks ml
+                    JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+                    JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+                    JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+                    WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+                      AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+                """, (application_id, stored_field["source_id"])).fetchone()
+                if not fact or fact["status"] != "locked" or not fact["locked"]:
+                    raise ValueError("pre-submit review CandidateFact is no longer locked")
+                if fact["value_json"] != stored_field["value_json"]:
+                    raise ValueError("pre-submit review CandidateFact value changed")
         elif stored_field["source_kind"] == "answer":
             answer = connection.execute("SELECT * FROM answers WHERE answer_id=?", (stored_field["source_id"],)).fetchone()
             if not answer or answer["status"] != "active" or answer["confirmation_status"] != "confirmed":

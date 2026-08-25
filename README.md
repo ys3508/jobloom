@@ -67,7 +67,16 @@ python3 skills/jobloom/scripts/finalize_candidate.py \
   --review .jobloom/candidate-review.json \
   --settings .jobloom/profile-settings.json \
   --output .jobloom/candidate.json
+
+python3 skills/jobloom/scripts/candidate_core.py \
+  --db .jobloom/jobloom.db \
+  --store .jobloom/candidates \
+  register \
+  --candidate .jobloom/candidate.json \
+  --actor user
 ```
+
+The final command registers exact CandidateFact values and a read-only CandidateSnapshot. Downstream resume approval and form filling reject caller-only “locked” assertions and require the same active user-registered candidate hash. A new registered snapshot invalidates old material locks and answers that depend on changed facts.
 
 Build a reviewable JobCard from a real posting:
 

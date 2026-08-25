@@ -18,7 +18,7 @@ Observe one page at a time with `assets/form-page-observation.template.json`. Pa
 
 For every value field:
 
-- `source_kind: fact` requires an explicit CandidateFact ID from a hash-valid `candidate.json`; the fact must be locked, unexpired, and have a scalar value.
+- `source_kind: fact` requires an explicit CandidateFact ID from a hash-valid `candidate.json`; its content hash and every fact hash must match the active user-registered CandidateSnapshot and material-locked ResumeVersion. The fact must be locked, unexpired, and have a scalar value.
 - `source_kind: answer` or an omitted source invokes exact or previously user-reviewed question-form matching. Scope, preconditions, exclusions, expiration, conflicts, automatic-fill permission, and standing authorization are rechecked.
 - `control: file` resolves only `resume` or `cover_letter` from the active material lock. An absent or different upload pauses.
 - `control: standard_attestation` is recorded as a legal item but is not checked by the fill engine.

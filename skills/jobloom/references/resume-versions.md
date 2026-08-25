@@ -33,6 +33,8 @@ Approval requires a private JSON manifest containing at least one claim. Every c
 
 All referenced facts must be confirmed or locked in a hash-valid `candidate.json`. A transferable fact cannot support a direct claim. The manifest assertion does not replace human review of the rendered resume; it creates an auditable evidence contract for that review.
 
+When `candidate_core.py` is initialized, the `candidate.json` content hash must also identify the active user-registered CandidateSnapshot. File-level validity alone is insufficient.
+
 ## Approval and revocation
 
 Only the `user` actor may approve or revoke a resume. Approval verifies:

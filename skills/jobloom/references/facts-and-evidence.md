@@ -14,6 +14,16 @@ Use a fact only when its source is traceable and its status permits the requeste
 
 Lock employer and institution names, dates, degrees, formal titles, certifications, project identity, metrics, immigration facts, and security clearance by default after confirmation.
 
+## Active CandidateSnapshot
+
+`candidate.json` is not authoritative merely because a caller supplies its path. After finalization, register it through `candidate_core.py` with actor `user`. Registration verifies its deterministic content hash and every fact, copies exact bytes into a read-only private snapshot, and stores each fact's exact value JSON, status, lock flag, evidence strength, expiration, and fact hash.
+
+Only one CandidateSnapshot is active. Resume approval, fill planning, direct ApplicationField recording, pre-submit review, and application use must resolve CandidateFact IDs and exact values against that active user-registered snapshot and the candidate hash bound to the ResumeVersion/material lock.
+
+A newer registered snapshot supersedes the old snapshot. It invalidates material locks using another candidate hash, invalidates affected pre-submit reviews, and marks active AnswerEntries stale when their dependent fact IDs changed or disappeared. Old snapshots remain immutable history and cannot be reactivated.
+
+Never accept a caller-only `source_status: locked` assertion as proof that a fact exists or that its value is exact when the CandidateSnapshot registry is initialized.
+
 ## Evidence strengths
 
 - `direct`: candidate performed the requested work.

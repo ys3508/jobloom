@@ -23,7 +23,7 @@ Generate the review only after filling reaches `waiting_for_submission_approval`
 
 1. observed employer and role match the JobCard
 2. every required field was recorded
-3. fact-backed fields remain locked
+3. fact-backed fields remain locked and their exact stored values still match the active CandidateSnapshot bound through the material-locked ResumeVersion
 4. answer-backed fields still match active, applicable, unexpired AnswerEntries
 5. authorization remains active, unexpired, and scoped to backend-derived application/job context
 6. resume upload matches the active material lock and physical hashes

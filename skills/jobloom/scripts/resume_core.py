@@ -188,6 +188,16 @@ def _approved_adaptation_plan(
 def _require_resume_authorized_for_application(
     connection: sqlite3.Connection, version: sqlite3.Row
 ) -> None:
+    if _table_exists(connection, "candidate_snapshots"):
+        snapshot = connection.execute(
+            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+            "AND registered_by='user'", (version["candidate_profile_sha256"],)
+        ).fetchone()
+        if not snapshot:
+            raise ValueError("resume candidate profile is not the active registered snapshot")
+        path = Path(snapshot["snapshot_path"])
+        if not path.is_file() or file_sha256(path) != snapshot["file_sha256"]:
+            raise ValueError("registered candidate snapshot hash mismatch")
     if not _table_exists(connection, "search_directions"):
         return
     if version["kind"] == "master_source":
@@ -399,6 +409,16 @@ def approve_version(
         raise ValueError("only a draft resume can be approved")
     verify_version_file(row)
     candidate, candidate_hash = load_valid_candidate(candidate_path)
+    if _table_exists(connection, "candidate_snapshots"):
+        snapshot = connection.execute(
+            "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+            "AND registered_by='user'", (candidate_hash,)
+        ).fetchone()
+        if not snapshot:
+            raise ValueError("candidate profile is not the active user-registered snapshot")
+        snapshot_path = Path(snapshot["snapshot_path"])
+        if not snapshot_path.is_file() or file_sha256(snapshot_path) != snapshot["file_sha256"]:
+            raise ValueError("registered candidate snapshot hash mismatch")
     if row["kind"] != "master_source" and _table_exists(connection, "search_directions"):
         direction_row = _active_direction(connection, row["direction"])
         if row["direction_profile_sha256"] != direction_row["profile_sha256"]:

@@ -170,6 +170,22 @@ def record_field(
     elif source_kind == "fact":
         if source_status != "locked":
             raise ValueError("fact source must be locked when recorded")
+        candidate_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_facts'"
+        ).fetchone()
+        if candidate_table:
+            fact = connection.execute("""
+                SELECT cf.* FROM material_locks ml
+                JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+                JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+                JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+                WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+                  AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+            """, (application_id, source_id)).fetchone()
+            if not fact or fact["status"] != "locked" or not fact["locked"]:
+                raise ValueError("fact source must exist as a locked active CandidateFact")
+            if canonical_json(value) != fact["value_json"]:
+                raise ValueError("recorded field value does not match its CandidateFact source")
     else:
         raise ValueError("source_kind must be fact or answer")
     timestamp = (at or now_utc()).isoformat()

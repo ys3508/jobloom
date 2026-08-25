@@ -360,6 +360,22 @@ def create_review(
         if field["source_kind"] == "fact":
             if field["source_status"] != "locked":
                 issues.append(f"fact_not_locked:{field['field_id']}")
+            elif connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_facts'"
+            ).fetchone():
+                fact = connection.execute("""
+                    SELECT cf.value_json, cf.status, cf.locked
+                    FROM material_locks ml
+                    JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+                    JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+                    JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+                    WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+                      AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+                """, (application["application_id"], field["source_id"])).fetchone()
+                if not fact or fact["status"] != "locked" or not fact["locked"]:
+                    issues.append(f"fact_registry_mismatch:{field['field_id']}")
+                elif fact["value_json"] != field["value_json"]:
+                    issues.append(f"fact_value_changed:{field['field_id']}")
         elif field["source_kind"] == "answer":
             answer = connection.execute("SELECT * FROM answers WHERE answer_id=?", (field["source_id"],)).fetchone()
             if not answer:
