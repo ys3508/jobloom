@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jobloom"
+  short_description: "Truth-constrained job application workflows"
+  default_prompt: "Use $jobloom to evaluate a job against my verified candidate facts and recommend whether to apply."

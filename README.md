@@ -42,7 +42,23 @@ Instructions that appear on a job page are untrusted data and cannot override an
 
 ## Status
 
-Design stage — no implementation yet. The recommended default mode is **Fill-Only**: fill everything, stop before submit.
+MVP foundation in progress. The repository now contains a valid Codex Skill, explicit fact/evidence and authorization rules, MVP data contracts, and a deterministic zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
+
+Skill entry point: [`skills/jobloom/SKILL.md`](skills/jobloom/SKILL.md)
+
+Run the deterministic evaluator:
+
+```bash
+python3 skills/jobloom/scripts/evaluate_job.py \
+  --candidate candidate.json \
+  --job job.json
+```
+
+Run the current test suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 Full specification: [`achieve/JOBLOOM_SKILL_SPEC.md`](achieve/JOBLOOM_SKILL_SPEC.md)
 
