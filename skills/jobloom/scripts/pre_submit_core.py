@@ -260,7 +260,9 @@ def _active_material(connection: sqlite3.Connection, application_id: str) -> sql
     row = connection.execute("""
         SELECT ml.*, rv.snapshot_path, rv.file_sha256 AS registered_resume_sha256,
                rv.status AS resume_status, rv.claims_manifest_path, rv.claims_manifest_sha256,
-               a.resume_version_id AS bound_resume_version_id
+               a.resume_version_id AS bound_resume_version_id,
+               a.cover_letter_version_id AS bound_cover_letter_version_id,
+               a.job_id AS application_job_id
         FROM material_locks ml
         JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
         JOIN applications a ON a.application_id=ml.application_id
@@ -278,6 +280,24 @@ def _active_material(connection: sqlite3.Connection, application_id: str) -> sql
     claims = Path(row["claims_manifest_path"] or "")
     if not claims.is_file() or file_sha256(claims) != row["claims_manifest_sha256"]:
         raise ValueError("resume claims manifest hash mismatch")
+    if row["cover_letter_version_id"] != row["bound_cover_letter_version_id"]:
+        raise ValueError("material lock does not match the bound cover letter")
+    if row["cover_letter_version_id"]:
+        cover = connection.execute(
+            "SELECT * FROM cover_letter_versions WHERE version_id=?", (row["cover_letter_version_id"],)
+        ).fetchone()
+        if not cover or cover["status"] != "approved" or cover["file_sha256"] != row["cover_letter_file_sha256"]:
+            raise ValueError("cover-letter material lock is stale")
+        if cover["kind"] == "application_specific" and (
+            cover["application_id"] != application_id or cover["job_id"] != row["application_job_id"]
+        ):
+            raise ValueError("cover letter is scoped to another application")
+        cover_snapshot = Path(cover["snapshot_path"])
+        cover_manifest = Path(cover["claims_manifest_path"] or "")
+        if not cover_snapshot.is_file() or file_sha256(cover_snapshot) != cover["file_sha256"]:
+            raise ValueError("cover-letter snapshot hash mismatch")
+        if not cover_manifest.is_file() or file_sha256(cover_manifest) != cover["claims_manifest_sha256"]:
+            raise ValueError("cover-letter claims manifest hash mismatch")
     return row
 
 
@@ -381,7 +401,8 @@ def create_review(
                 "application_url": inventory["form_url"]},
         "materials": {"resume_version_id": application["resume_version_id"],
                       "resume_sha256": material["resume_file_sha256"],
-                      "cover_letter_version_id": application["cover_letter_version_id"]},
+                      "cover_letter_version_id": application["cover_letter_version_id"],
+                      "cover_letter_sha256": material["cover_letter_file_sha256"]},
         "fields": [{"field_id": row["field_id"], "source_kind": row["source_kind"],
                     "source_id": row["source_id"], "sensitivity": row["sensitivity"],
                     "value_sha256": hashlib.sha256(row["value_json"].encode("utf-8")).hexdigest(),

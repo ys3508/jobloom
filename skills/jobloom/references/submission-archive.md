@@ -14,9 +14,10 @@ An application is archivable only when all of these are true:
 - a `submitted` ResumeVersion usage record exists
 - the resume snapshot, registered hash, and submitted-use hash agree
 - the resume claims-manifest snapshot still matches its hash
-- every declared cover-letter version has an immutable snapshot source
+- if a cover letter is declared, its registry record and `submitted` usage exist
+- cover-letter snapshot, registered hash, submitted-use hash, and claims-manifest hash agree
 
-Do not fabricate a placeholder cover letter or confirmation. If an application declares a cover-letter version before a cover-letter registry exists, pause the archive.
+Do not fabricate a placeholder cover letter or confirmation. Missing, changed, or unsubmitted material pauses the archive. A later revocation does not erase a submission that already passed the approval and hash gates; its exact submitted bytes remain archivable.
 
 ## Recorded application fields
 
@@ -40,6 +41,8 @@ Each application directory contains:
 
 - `resume_used.<original-format>`
 - `resume_claims_manifest.json`
+- optional `cover_letter_used.<original-format>`
+- optional `cover_letter_claims_manifest.json`
 - `answers_snapshot.json`
 - `job_card.json`
 - `confirmation.<allowlisted-format>` or `confirmation.txt`

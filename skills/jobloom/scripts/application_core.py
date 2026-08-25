@@ -213,7 +213,9 @@ def require_active_material_lock(connection: sqlite3.Connection, application_id:
     row = connection.execute("""
         SELECT ml.*, rv.status AS resume_status, rv.snapshot_path, rv.file_sha256 AS current_file_sha256,
                rv.claims_manifest_path, rv.claims_manifest_sha256,
-               a.resume_version_id AS bound_resume_version_id
+               a.resume_version_id AS bound_resume_version_id,
+               a.cover_letter_version_id AS bound_cover_letter_version_id,
+               a.job_id AS application_job_id
         FROM material_locks ml
         JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
         JOIN applications a ON a.application_id=ml.application_id
@@ -227,6 +229,8 @@ def require_active_material_lock(connection: sqlite3.Connection, application_id:
         raise ValueError("material lock does not match the bound resume")
     if row["resume_file_sha256"] != row["current_file_sha256"]:
         raise ValueError("material lock resume hash mismatch")
+    if row["bound_cover_letter_version_id"] != row["cover_letter_version_id"]:
+        raise ValueError("material lock does not match the bound cover letter")
     snapshot = Path(row["snapshot_path"])
     if not snapshot.is_file() or _hash_file(str(snapshot)) != row["resume_file_sha256"]:
         raise ValueError("locked resume snapshot hash mismatch")
@@ -236,6 +240,26 @@ def require_active_material_lock(connection: sqlite3.Connection, application_id:
     manifest = Path(manifest_path)
     if not manifest.is_file() or _hash_file(str(manifest)) != row["claims_manifest_sha256"]:
         raise ValueError("locked resume claims manifest hash mismatch")
+    if row["cover_letter_version_id"]:
+        if not _table_exists(connection, "cover_letter_versions"):
+            raise ValueError("cover-letter version store is unavailable")
+        cover = connection.execute(
+            "SELECT * FROM cover_letter_versions WHERE version_id=?", (row["cover_letter_version_id"],)
+        ).fetchone()
+        if not cover or cover["status"] != "approved":
+            raise ValueError("locked cover-letter version is not approved")
+        if cover["kind"] == "application_specific" and (
+            cover["application_id"] != application_id or cover["job_id"] != row["application_job_id"]
+        ):
+            raise ValueError("locked cover letter is scoped to another application")
+        if cover["file_sha256"] != row["cover_letter_file_sha256"]:
+            raise ValueError("material lock cover-letter hash mismatch")
+        cover_snapshot = Path(cover["snapshot_path"])
+        if not cover_snapshot.is_file() or _hash_file(str(cover_snapshot)) != row["cover_letter_file_sha256"]:
+            raise ValueError("locked cover-letter snapshot hash mismatch")
+        cover_manifest = Path(cover["claims_manifest_path"] or "")
+        if not cover_manifest.is_file() or _hash_file(str(cover_manifest)) != cover["claims_manifest_sha256"]:
+            raise ValueError("locked cover-letter claims manifest hash mismatch")
     return row
 
 
@@ -309,6 +333,10 @@ def require_approved_pre_submit_review(
     material = require_active_material_lock(connection, application_id)
     if material["lock_id"] != review["material_lock_id"]:
         raise ValueError("pre-submit review material lock is stale")
+    summary_materials = summary.get("materials", {})
+    if (summary_materials.get("resume_sha256") != material["resume_file_sha256"]
+            or summary_materials.get("cover_letter_sha256") != material["cover_letter_file_sha256"]):
+        raise ValueError("pre-submit review material hashes are stale")
     authorization = connection.execute(
         "SELECT * FROM authorizations WHERE authorization_id=?", (review["authorization_id"],)
     ).fetchone()
@@ -584,6 +612,16 @@ def transition(
         """, (
             material_lock["resume_version_id"], application_id, row["job_id"],
             material_lock["resume_file_sha256"], timestamp,
+        ))
+    if (to_state == "submitted" and material_lock["cover_letter_version_id"]
+            and _table_exists(connection, "cover_letter_usage")):
+        connection.execute("""
+            INSERT OR IGNORE INTO cover_letter_usage (
+                version_id, application_id, job_id, use_type, file_sha256, recorded_at
+            ) VALUES (?, ?, ?, 'submitted', ?, ?)
+        """, (
+            material_lock["cover_letter_version_id"], application_id, row["job_id"],
+            material_lock["cover_letter_file_sha256"], timestamp,
         ))
     event_metadata = {
         key: metadata[key] for key in (

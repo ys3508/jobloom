@@ -88,6 +88,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             resume_version_id TEXT NOT NULL,
             resume_file_sha256 TEXT NOT NULL,
             cover_letter_version_id TEXT,
+            cover_letter_file_sha256 TEXT,
             locked_at TEXT NOT NULL,
             invalidated_at TEXT,
             invalidation_reason TEXT,
@@ -124,6 +125,9 @@ def initialize(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (version_id) REFERENCES resume_versions(version_id)
         );
     """)
+    lock_columns = {row[1] for row in connection.execute("PRAGMA table_info(material_locks)")}
+    if "cover_letter_file_sha256" not in lock_columns:
+        connection.execute("ALTER TABLE material_locks ADD COLUMN cover_letter_file_sha256 TEXT")
     connection.commit()
 
 
@@ -444,6 +448,31 @@ def lock_materials(
     if not version or version["status"] != "approved":
         raise ValueError("bound resume version is not approved")
     verify_version_file(version)
+    cover_letter = None
+    if application["cover_letter_version_id"]:
+        cover_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cover_letter_versions'"
+        ).fetchone()
+        if not cover_table:
+            raise ValueError("cover-letter version store is unavailable")
+        cover_letter = connection.execute(
+            "SELECT * FROM cover_letter_versions WHERE version_id=?",
+            (application["cover_letter_version_id"],),
+        ).fetchone()
+        if not cover_letter or cover_letter["status"] != "approved":
+            raise ValueError("bound cover-letter version is not approved")
+        if cover_letter["kind"] == "application_specific" and (
+            cover_letter["application_id"] != application_id or cover_letter["job_id"] != application["job_id"]
+        ):
+            raise ValueError("bound cover letter is scoped to another application")
+        cover_snapshot = Path(cover_letter["snapshot_path"])
+        if not cover_snapshot.is_file() or cover_snapshot.stat().st_size != cover_letter["file_size"]:
+            raise ValueError("cover-letter snapshot is missing or changed size")
+        if file_sha256(cover_snapshot) != cover_letter["file_sha256"]:
+            raise ValueError("cover-letter snapshot hash mismatch")
+        cover_manifest = Path(cover_letter["claims_manifest_path"] or "")
+        if not cover_manifest.is_file() or file_sha256(cover_manifest) != cover_letter["claims_manifest_sha256"]:
+            raise ValueError("cover-letter claims manifest hash mismatch")
     existing = connection.execute(
         "SELECT lock_id FROM material_locks WHERE application_id=? AND invalidated_at IS NULL", (application_id,)
     ).fetchone()
@@ -453,17 +482,28 @@ def lock_materials(
     _require_safe_id(actual_lock_id, "lock_id")
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
-        "INSERT INTO material_locks (lock_id, application_id, resume_version_id, resume_file_sha256, locked_at) VALUES (?, ?, ?, ?, ?)",
-        (actual_lock_id, application_id, version["version_id"], version["file_sha256"], timestamp),
+        "INSERT INTO material_locks (lock_id, application_id, resume_version_id, resume_file_sha256, cover_letter_version_id, cover_letter_file_sha256, locked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (actual_lock_id, application_id, version["version_id"], version["file_sha256"],
+         cover_letter["version_id"] if cover_letter else None,
+         cover_letter["file_sha256"] if cover_letter else None, timestamp),
     )
     connection.execute(
         "INSERT OR IGNORE INTO resume_usage (version_id, application_id, job_id, use_type, file_sha256, recorded_at) VALUES (?, ?, ?, 'locked', ?, ?)",
         (version["version_id"], application_id, application["job_id"], version["file_sha256"], timestamp),
     )
+    if cover_letter is not None:
+        connection.execute("""
+            INSERT OR IGNORE INTO cover_letter_usage (
+                version_id, application_id, job_id, use_type, file_sha256, recorded_at
+            ) VALUES (?, ?, ?, 'locked', ?, ?)
+        """, (cover_letter["version_id"], application_id, application["job_id"],
+              cover_letter["file_sha256"], timestamp))
     _event(connection, version["version_id"], actor, "locked", "application_materials_frozen", application_id, at=at)
     connection.commit()
     return {"lock_id": actual_lock_id, "application_id": application_id,
-            "resume_version_id": version["version_id"], "resume_file_sha256": version["file_sha256"]}
+            "resume_version_id": version["version_id"], "resume_file_sha256": version["file_sha256"],
+            "cover_letter_version_id": cover_letter["version_id"] if cover_letter else None,
+            "cover_letter_file_sha256": cover_letter["file_sha256"] if cover_letter else None}
 
 
 def status(connection: sqlite3.Connection) -> dict[str, Any]:

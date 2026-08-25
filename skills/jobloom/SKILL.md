@@ -11,13 +11,14 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 
 - For candidate onboarding, read `references/facts-and-evidence.md`.
 - For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
+- For cover-letter registration, approval, application scoping, or binding, read `references/cover-letter-versions.md`, `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
 - For form inventory, mandatory pauses, pre-submission summaries, or final user approval, read `references/pre-submission-review.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
 - For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
-- For form filling or submission preparation, read all nine references. Default to Fill-Only and stop before the final submission action.
+- For form filling or submission preparation, read all ten references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow
 
@@ -64,6 +65,16 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 6. Recheck the active lock and physical file hash at fill acquisition, pre-submit readiness, and submission. Revocation or rebinding invalidates the old lock.
 7. Keep snapshots and manifests under `.jobloom/`; never commit personal resume content by default.
 
+## Cover-letter versions
+
+1. Register a reusable template or an application-specific letter with `cover_letter_core.py`. Registration copies exact bytes into the private store and creates a draft.
+2. Map every factual claim to confirmed or locked CandidateFact IDs. The same evidence-strength and exact-locked-value rules used for resumes apply.
+3. Require the user to review and approve the actual file. System or model actors cannot approve or revoke a version.
+4. Scope application-specific letters to one application and job. Never bind one to a different application, even for a similar role.
+5. Bind an approved version during material preparation. Material locking freezes both its version ID and file hash alongside the resume.
+6. Recheck the physical letter and claims-manifest hashes at fill, pre-submit, submission, and archive time. Rebinding or revocation invalidates affected locks and reviews.
+7. Record prepared, locked, and submitted usage separately, then archive a physical copy of the submitted bytes. Keep every snapshot private under `.jobloom/`.
+
 ## Job ingestion and evaluation
 
 1. Run `ingest_job.py --url <job-url> --output <job-card.json>`, or use `--file` for saved HTML, JSON, or plain text.
@@ -108,8 +119,8 @@ Store the database in `.jobloom/`. It contains plaintext local answers protected
 
 1. Record every filled field from `assets/application-field.template.json` while filling or preparing submission. Map it to an active AnswerEntry or locked CandidateFact and classify sensitivity explicitly.
 2. Create an archive only after the application has positive evidence and reaches the confirmed-submission lineage. Never archive a click, failure, or unresolved uncertainty as a submission.
-3. Require the exact `submitted` resume usage record and verify the physical resume and claims-manifest hashes before copying.
-4. Copy physical artifacts; do not store mutable pointers. If a declared cover-letter version has no immutable snapshot, pause.
+3. Require exact `submitted` usage records and verify the physical resume, optional cover letter, and claims-manifest hashes before copying.
+4. Copy physical artifacts; do not store mutable pointers. If a declared cover-letter version is missing, changed, unapproved, or lacks submitted usage, pause.
 5. Redact addresses and sensitive personal values. Omit credentials, identity-document numbers, tax identifiers, banking values, and dates of birth entirely from `answers_snapshot.json`.
 6. Verify every archived file against `archive_manifest.json` and reject untracked files. Archive creation is idempotent per application.
 7. Generate `applications.xlsx` only from deterministic tracker-source JSON. Keep answers out of the workbook and leave unavailable metrics blank.

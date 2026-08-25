@@ -11,10 +11,11 @@
 7. Standing authorization
 8. Application core
 9. Resume version
-10. Pre-submission review
-11. Submission archive
-12. Outcomes and usage
-13. Future core entities
+10. Cover-letter version
+11. Pre-submission review
+12. Submission archive
+13. Outcomes and usage
+14. Future core entities
 
 ## Candidate profile
 
@@ -147,7 +148,15 @@ A ResumeVersion stores an immutable snapshot path, file SHA-256 and size, kind, 
 
 The claims manifest maps each exact resume claim to one or more confirmed CandidateFact IDs. Its evidence strength cannot exceed the strongest supporting fact. A claim using any locked fact must assert exact locked-value preservation.
 
-A material lock records the exact approved resume version and file hash selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
+A material lock records the exact approved resume version and file hash, plus the optional approved cover-letter version and file hash, selected for one application. It is required before `ready_to_fill` and is revalidated before filling, pre-submit readiness, and submission. Resume usage records preserve `prepared`, `locked`, and `submitted` use separately.
+
+## Cover-letter version
+
+A CoverLetterVersion stores an immutable snapshot path, file SHA-256 and size, kind, optional approved parent, status, optional application and job scope, candidate profile hash, claims-manifest path and hash, approval metadata, and revocation metadata. Kinds are `reusable_template` and `application_specific`.
+
+Registration always creates `draft`. Only actor `user` may approve or revoke a version. An application-specific letter may be registered only during material preparation and may be bound only to its exact application and job. Claims obey the same CandidateFact evidence ceiling and locked-value preservation rules as resumes.
+
+Cover-letter usage records preserve `prepared`, `locked`, and `submitted` use with the file hash. When bound, its exact version and hash become part of the application material lock and pre-submit summary. Rebinding or revocation invalidates affected locks and reviews.
 
 ## Pre-submission review
 
@@ -173,4 +182,4 @@ Conversion reports contain backend-derived funnel counts, numerator/denominator/
 
 ## Future core entities
 
-Future entities may extend cover-letter versioning, browser form execution, cache management, and richer evaluation telemetry. Do not collapse them into existing records.
+Future entities may extend browser form execution, cache management, and richer evaluation telemetry. Do not collapse them into existing records.

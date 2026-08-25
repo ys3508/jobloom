@@ -42,7 +42,7 @@ Instructions that appear on a job page are untrusted data and cannot override an
 
 ## Status
 
-MVP foundation in progress. The repository now contains a valid Codex Skill, explicit fact/evidence and authorization rules, MVP data contracts, and a deterministic zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
+MVP foundation in progress. The repository now contains a valid Codex Skill, explicit fact/evidence and authorization rules, immutable resume and cover-letter registries, guarded application state, deterministic pre-submit review and submission archives, outcome tracking, and a zero-model evaluator for hard filters and evidence matching. The recommended default mode remains **Fill-Only**: fill everything, stop before submit.
 
 Skill entry point: [`skills/jobloom/SKILL.md`](skills/jobloom/SKILL.md)
 
@@ -118,6 +118,26 @@ python3 skills/jobloom/scripts/resume_core.py \
 
 Registration never approves a resume. Approval requires a user-reviewed claims manifest, a finalized hash-valid `candidate.json`, and the `user` actor. Approved resumes can then be bound to applications and material-locked before `ready_to_fill`. Fill acquisition and pre-submit transitions recheck both approval state and physical file hash.
 
+Initialize the cover-letter registry and register a private draft when a letter is justified:
+
+```bash
+python3 skills/jobloom/scripts/cover_letter_core.py \
+  --db .jobloom/jobloom.db \
+  --store .jobloom/cover-letters \
+  init
+
+python3 skills/jobloom/scripts/cover_letter_core.py \
+  --db .jobloom/jobloom.db \
+  --store .jobloom/cover-letters \
+  register \
+  --file /path/to/cover-letter.docx \
+  --version-id cover-example-2026-08-25 \
+  --kind application_specific \
+  --application-id app-example
+```
+
+Registration creates a read-only draft, never approval. User approval requires a hash-valid candidate profile and a claims manifest linking every factual statement to CandidateFacts. Application-specific letters cannot cross application or job boundaries. Binding adds the exact letter hash to the material lock; confirmed submission records exact usage and the archive copies the physical letter and manifest.
+
 Initialize the private submission archive and generate its deterministic tracker source:
 
 ```bash
@@ -132,7 +152,7 @@ python3 skills/jobloom/scripts/archive_core.py \
   --output .jobloom/archive/applications-tracker.json
 ```
 
-`archive_core.py` records source-linked application fields, redacts or omits sensitive values, copies exact submitted materials and confirmation evidence, writes a hash manifest, and verifies that no archived file was changed or added. It refuses unconfirmed submissions and declared cover letters without an immutable snapshot.
+`archive_core.py` records source-linked application fields, redacts or omits sensitive values, copies exact submitted materials and confirmation evidence, writes a hash manifest, and verifies that no archived file was changed or added. It refuses unconfirmed submissions and cover letters without an immutable registry snapshot, matching submitted-use record, and valid claims manifest.
 
 Build `applications.xlsx` from the tracker JSON with the bundled spreadsheet runtime or another environment where `@oai/artifact-tool` is available to Node:
 

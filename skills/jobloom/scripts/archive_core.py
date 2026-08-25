@@ -299,8 +299,29 @@ def create_archive(
         raise ValueError("application has no submitted resume usage record")
     if row["state"] not in ARCHIVABLE_STATES or not row["submitted_at"]:
         raise ValueError("only a positively confirmed submission can be archived")
+    cover_letter = None
     if row["cover_letter_version_id"]:
-        raise ValueError("cover-letter version is set but no immutable cover-letter snapshot store exists")
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cover_letter_versions'"
+        ).fetchone():
+            raise ValueError("cover-letter version store is unavailable")
+        cover_letter = connection.execute("""
+            SELECT cv.*, cu.file_sha256 AS submitted_file_sha256
+            FROM cover_letter_versions cv JOIN cover_letter_usage cu
+              ON cu.version_id=cv.version_id AND cu.application_id=? AND cu.use_type='submitted'
+            WHERE cv.version_id=?
+        """, (application_id, row["cover_letter_version_id"])).fetchone()
+        if not cover_letter:
+            raise ValueError("application has no submitted cover-letter usage record")
+        cover_snapshot = Path(cover_letter["snapshot_path"])
+        if not cover_snapshot.is_file() or cover_snapshot.stat().st_size != cover_letter["file_size"]:
+            raise ValueError("submitted cover-letter snapshot is missing or changed size")
+        cover_hash = file_sha256(cover_snapshot)
+        if cover_hash != cover_letter["file_sha256"] or cover_hash != cover_letter["submitted_file_sha256"]:
+            raise ValueError("submitted cover-letter snapshot hash mismatch")
+        cover_manifest = Path(cover_letter["claims_manifest_path"] or "")
+        if not cover_manifest.is_file() or file_sha256(cover_manifest) != cover_letter["claims_manifest_sha256"]:
+            raise ValueError("submitted cover-letter claims manifest hash mismatch")
     evidence = connection.execute("""
         SELECT * FROM submission_evidence WHERE application_id=?
         ORDER BY CASE evidence_type WHEN 'confirmation_id' THEN 0 WHEN 'success_page' THEN 1
@@ -350,6 +371,15 @@ def create_archive(
         claims_output = application_dir / "resume_claims_manifest.json"
         shutil.copyfile(manifest_snapshot, claims_output)
         artifacts.append(_manifest_entry(application_dir, claims_output, "resume_claims_manifest"))
+        if cover_letter is not None:
+            cover_output = application_dir / f"cover_letter_used.{cover_letter['file_format']}"
+            shutil.copyfile(Path(cover_letter["snapshot_path"]), cover_output)
+            artifacts.append(_manifest_entry(application_dir, cover_output, "cover_letter"))
+            cover_claims_output = application_dir / "cover_letter_claims_manifest.json"
+            shutil.copyfile(Path(cover_letter["claims_manifest_path"]), cover_claims_output)
+            artifacts.append(_manifest_entry(
+                application_dir, cover_claims_output, "cover_letter_claims_manifest"
+            ))
 
         answers, redaction = build_redacted_answers(connection, application_id)
         answers_output = application_dir / "answers_snapshot.json"

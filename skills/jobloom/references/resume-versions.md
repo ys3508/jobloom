@@ -45,7 +45,7 @@ Approval snapshots the claims manifest beside the resume and records both candid
 
 ## Application binding and material lock
 
-Bind an approved version while an application is `approved` or `materials_in_progress`. Binding another resume invalidates the previous lock. While the application is `materials_in_progress`, create a material lock that freezes the resume version and file hash.
+Bind an approved version while an application is `approved` or `materials_in_progress`. Binding another resume invalidates the previous lock. While the application is `materials_in_progress`, create a material lock that freezes the resume version and file hash plus the optional bound cover-letter version and file hash described in `cover-letter-versions.md`.
 
 An application cannot enter `ready_to_fill`, be acquired by a fill worker, enter `pre_submit_ready`, or submit unless its active lock:
 
@@ -53,6 +53,7 @@ An application cannot enter `ready_to_fill`, be acquired by a fill worker, enter
 - points to a still-approved ResumeVersion
 - matches the registered hash
 - matches the current snapshot bytes
+- matches the bound, still-approved cover-letter version and bytes when one is present
 
 Record `prepared`, `locked`, and `submitted` usage separately. Never place resume content or CandidateFact values in event metadata.
 
