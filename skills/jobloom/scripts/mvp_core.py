@@ -165,8 +165,6 @@ def _approved_direction_resumes(connection: sqlite3.Connection) -> int:
             # its hashes and the stores it depends on, so a plan edited after approval
             # cannot keep counting as ready.
             resume_core._require_resume_authorized_for_application(connection, row)
-            if row["source_mode"] == "direction_baseline" and row["rendered_page_count"] != 1:
-                continue
             valid += 1
         except (ValueError, RuntimeError):
             continue

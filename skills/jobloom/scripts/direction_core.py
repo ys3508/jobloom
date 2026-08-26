@@ -1280,6 +1280,33 @@ def require_approved_baseline_plan(connection: sqlite3.Connection, plan_id: str 
     return row
 
 
+def cascade_invalidate_baseline_plans(connection: sqlite3.Connection, reason: str,
+                                      direction_id: str | None = None,
+                                      master_version_id: str | None = None,
+                                      at: datetime | None = None) -> list[str]:
+    """Retire plans that an authorized revocation has just undermined.
+
+    A cascade may retire a user-approved plan, because the revocation that triggered it
+    was itself a user action. Each retirement is recorded individually.
+    """
+    if not (direction_id or master_version_id):
+        raise ValueError("a baseline plan cascade needs a direction or a master version")
+    clause, parameter = (("direction_id=?", direction_id) if direction_id
+                         else ("master_version_id=?", master_version_id))
+    rows = connection.execute(
+        f"SELECT plan_id, direction_id, plan_sha256 FROM baseline_plans "
+        f"WHERE {clause} AND invalidated_at IS NULL", (parameter,)).fetchall()
+    timestamp = (at or now_utc()).isoformat()
+    for row in rows:
+        connection.execute(
+            "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, "
+            "invalidation_reason=? WHERE plan_id=?", (timestamp, reason, row["plan_id"]))
+        _event(connection, row["direction_id"], "user", "baseline_plan_invalidated", reason,
+               metadata={"plan_id": row["plan_id"], "plan_sha256": row["plan_sha256"],
+                         "cascaded_from": direction_id or master_version_id}, at=at)
+    return [row["plan_id"] for row in rows]
+
+
 def invalidate_baseline_plan(connection: sqlite3.Connection, plan_id: str, actor: str,
                              reason: str, superseded_by: str | None = None,
                              at: datetime | None = None) -> dict[str, Any]:
@@ -1293,6 +1320,10 @@ def invalidate_baseline_plan(connection: sqlite3.Connection, plan_id: str, actor
         raise ValueError("baseline plan not found")
     if row["invalidated_at"]:
         raise ValueError("baseline plan is already invalidated")
+    # Only the user may retire what the user approved. An unapproved plan is scaffolding
+    # and the system may retire it; an approved one is a decision.
+    if row["status"] == "approved" and actor != "user":
+        raise ValueError("only the user may invalidate a user-approved baseline plan")
     if superseded_by:
         replacement = connection.execute(
             "SELECT direction_id, invalidated_at FROM baseline_plans WHERE plan_id=?",
@@ -1990,11 +2021,8 @@ def revoke_direction(connection: sqlite3.Connection, direction_id: str, actor: s
         "invalidation_reason='direction_revoked' WHERE direction_id=? AND status IN ('generated','approved')",
         (timestamp, direction_id),
     )
-    connection.execute(
-        "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, "
-        "invalidation_reason='direction_revoked' WHERE direction_id=? AND invalidated_at IS NULL",
-        (timestamp, direction_id),
-    )
+    cascade_invalidate_baseline_plans(connection, "direction_revoked",
+                                      direction_id=direction_id, at=at)
     require_table(connection, "material_locks")
     connection.execute("""
             UPDATE material_locks SET invalidated_at=?, invalidation_reason='direction_revoked'
@@ -2033,11 +2061,8 @@ def revoke_portfolio(connection: sqlite3.Connection, portfolio_id: str, actor: s
             "invalidation_reason='portfolio_revoked' WHERE direction_id=? "
             "AND status IN ('generated','approved')", (timestamp, direction_id),
         )
-        connection.execute(
-            "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, "
-            "invalidation_reason='portfolio_revoked' WHERE direction_id=? AND invalidated_at IS NULL",
-            (timestamp, direction_id),
-        )
+        cascade_invalidate_baseline_plans(connection, "portfolio_revoked",
+                                          direction_id=direction_id, at=at)
         require_table(connection, "material_locks")
         connection.execute("""
                 UPDATE material_locks SET invalidated_at=?, invalidation_reason='portfolio_revoked'

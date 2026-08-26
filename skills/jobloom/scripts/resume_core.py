@@ -254,6 +254,10 @@ def _require_resume_authorized_for_application(
         )
     elif version["source_mode"] == "direction_baseline":
         _require_baseline_plan(connection, version["baseline_plan_id"], version["direction"])
+        # A direction baseline is one page by definition. The rule lives here so readiness
+        # and fill acquisition cannot drift apart.
+        if version["status"] == "approved" and version["rendered_page_count"] != 1:
+            raise ValueError("approved direction_baseline resume is not recorded as a single page")
 
 
 def _event(
@@ -587,6 +591,10 @@ def revoke_version(
         "UPDATE material_locks SET invalidated_at=?, invalidation_reason='resume_revoked' WHERE resume_version_id=? AND invalidated_at IS NULL",
         (timestamp, version_id),
     )
+    if _table_exists(connection, "baseline_plans"):
+        import direction_core  # local import: direction_core imports resume_core at module load
+        direction_core.cascade_invalidate_baseline_plans(
+            connection, "master_resume_revoked", master_version_id=version_id, at=at)
     _event(connection, version_id, actor, "revoked", reason, at=at)
     connection.commit()
     return {"version_id": version_id, "status": "revoked"}

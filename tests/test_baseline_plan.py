@@ -387,6 +387,61 @@ class BaselinePlanTests(unittest.TestCase):
             DIRECTIONS.invalidate_baseline_plan(self.db, "baseline-1", "user", "x",
                                                 superseded_by="ghost", at=AT)
 
+    def test_revoking_the_master_retires_the_plans_built_on_it(self):
+        self.approve_plan()
+        RESUMES.revoke_version(self.db, self.master_id, "user", "replaced_by_a_new_master", at=AT)
+        row = self.db.execute("SELECT status, invalidation_reason FROM baseline_plans "
+                              "WHERE plan_id='baseline-1'").fetchone()
+        self.assertEqual(row["status"], "invalidated")
+        self.assertEqual(row["invalidation_reason"], "master_resume_revoked")
+        event = self.db.execute(
+            "SELECT reason_code, metadata_json FROM direction_events "
+            "WHERE event_type='baseline_plan_invalidated'").fetchone()
+        self.assertEqual(event["reason_code"], "master_resume_revoked")
+        self.assertEqual(json.loads(event["metadata_json"])["cascaded_from"], self.master_id)
+
+    def test_a_cascade_records_an_event_for_every_retired_plan(self):
+        self.approve_plan()
+        self.generate_plan("baseline-2")
+        DIRECTIONS.revoke_direction(self.db, "lsc", "user", "no_longer_targeted", at=AT)
+        retired = self.db.execute(
+            "SELECT plan_id FROM baseline_plans WHERE status='invalidated' ORDER BY plan_id").fetchall()
+        events = self.db.execute(
+            "SELECT plan_id FROM (SELECT json_extract(metadata_json,'$.plan_id') AS plan_id "
+            "FROM direction_events WHERE event_type='baseline_plan_invalidated') ORDER BY plan_id").fetchall()
+        self.assertEqual([r["plan_id"] for r in retired], ["baseline-1", "baseline-2"])
+        self.assertEqual([r["plan_id"] for r in events], ["baseline-1", "baseline-2"])
+
+    def test_only_the_user_may_retire_a_user_approved_plan(self):
+        self.approve_plan()
+        with self.assertRaisesRegex(ValueError, "only the user may invalidate"):
+            DIRECTIONS.invalidate_baseline_plan(self.db, "baseline-1", "system", "cleanup", at=AT)
+        self.assertEqual(
+            DIRECTIONS.invalidate_baseline_plan(self.db, "baseline-1", "user", "cleanup",
+                                                at=AT)["status"], "invalidated")
+
+    def test_the_system_may_retire_an_unapproved_plan(self):
+        self.generate_plan("baseline-draft")
+        result = DIRECTIONS.invalidate_baseline_plan(
+            self.db, "baseline-draft", "system", "regenerated", at=AT)
+        self.assertEqual(result["status"], "invalidated")
+
+    def test_the_single_page_rule_lives_in_one_gate(self):
+        """readiness and fill acquisition must not be able to disagree."""
+        self.approve_plan()
+        self.register_baseline()
+        RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                self.baseline_manifest(), "user", AT, rendered_page_count=1)
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 1)
+        self.db.execute("UPDATE resume_versions SET rendered_page_count=2 "
+                        "WHERE version_id='baseline-resume-1'")
+        self.db.commit()
+        version = self.db.execute("SELECT * FROM resume_versions "
+                                  "WHERE version_id='baseline-resume-1'").fetchone()
+        with self.assertRaisesRegex(ValueError, "not recorded as a single page"):
+            RESUMES._require_resume_authorized_for_application(self.db, version)
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 0)
+
     # --- fail closed on drift --------------------------------------------
 
     def test_a_changed_candidate_profile_invalidates_the_plan(self):
