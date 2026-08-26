@@ -1252,11 +1252,14 @@ def _require_baseline_plan_current(connection: sqlite3.Connection, row: sqlite3.
     if master["version_id"] != row["master_version_id"] or master["file_sha256"] != row["master_file_sha256"]:
         raise ValueError("baseline plan master resume is stale")
     resume_core.verify_version_file(master)
+    if master["candidate_profile_sha256"] != row["candidate_profile_sha256"]:
+        raise ValueError("baseline plan master resume was approved against another candidate profile")
     active = connection.execute(
-        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active' AND registered_by='user'"
+        "SELECT * FROM candidate_snapshots WHERE status='active' AND registered_by='user'"
     ).fetchone()
     if not active or active["content_sha256"] != row["candidate_profile_sha256"]:
         raise ValueError("baseline plan candidate profile is stale")
+    resume_core.verify_snapshot_file_hash(active)
     if candidate_path is not None:
         _, candidate_hash = resume_core.load_valid_candidate(candidate_path)
         if candidate_hash != row["candidate_profile_sha256"]:
@@ -1275,6 +1278,41 @@ def require_approved_baseline_plan(connection: sqlite3.Connection, plan_id: str 
         raise ValueError("baseline plan belongs to another direction")
     _require_baseline_plan_current(connection, row)
     return row
+
+
+def invalidate_baseline_plan(connection: sqlite3.Connection, plan_id: str, actor: str,
+                             reason: str, superseded_by: str | None = None,
+                             at: datetime | None = None) -> dict[str, Any]:
+    """Retire a baseline plan with an audit trail, rather than editing the table by hand."""
+    if actor not in {"user", "system"}:
+        raise ValueError("baseline plan invalidation requires a known actor")
+    if not reason or not reason.strip():
+        raise ValueError("baseline plan invalidation requires a reason")
+    row = connection.execute("SELECT * FROM baseline_plans WHERE plan_id=?", (plan_id,)).fetchone()
+    if not row:
+        raise ValueError("baseline plan not found")
+    if row["invalidated_at"]:
+        raise ValueError("baseline plan is already invalidated")
+    if superseded_by:
+        replacement = connection.execute(
+            "SELECT direction_id, invalidated_at FROM baseline_plans WHERE plan_id=?",
+            (superseded_by,)).fetchone()
+        if not replacement:
+            raise ValueError("replacement baseline plan not found")
+        if replacement["invalidated_at"]:
+            raise ValueError("replacement baseline plan is itself invalidated")
+        if replacement["direction_id"] != row["direction_id"]:
+            raise ValueError("replacement baseline plan belongs to another direction")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, invalidation_reason=? "
+        "WHERE plan_id=?", (timestamp, reason, plan_id))
+    _event(connection, row["direction_id"], actor, "baseline_plan_invalidated", reason,
+           metadata={"plan_id": plan_id, "plan_sha256": row["plan_sha256"],
+                     "superseded_by": superseded_by}, at=at)
+    connection.commit()
+    return {"plan_id": plan_id, "status": "invalidated", "reason": reason,
+            "superseded_by": superseded_by}
 
 
 def baseline_plan_selected_fact_ids(row: sqlite3.Row) -> set[str]:
@@ -2082,6 +2120,11 @@ def main() -> None:
     approve_baseline_parser.add_argument("--candidate", required=True, type=Path)
     approve_baseline_parser.add_argument("--actor", required=True)
     approve_baseline_parser.add_argument("--plan-sha256", required=True)
+    invalidate_baseline_parser = commands.add_parser("invalidate-baseline-plan")
+    invalidate_baseline_parser.add_argument("--plan-id", required=True)
+    invalidate_baseline_parser.add_argument("--actor", required=True)
+    invalidate_baseline_parser.add_argument("--reason", required=True)
+    invalidate_baseline_parser.add_argument("--superseded-by")
     commands.add_parser("status")
     args = parser.parse_args()
     args.db.parent.mkdir(parents=True, exist_ok=True)
@@ -2125,6 +2168,9 @@ def main() -> None:
     elif args.command == "approve-baseline-plan":
         result = approve_baseline_plan(
             connection, args.plan_id, args.candidate, args.actor, args.plan_sha256)
+    elif args.command == "invalidate-baseline-plan":
+        result = invalidate_baseline_plan(
+            connection, args.plan_id, args.actor, args.reason, args.superseded_by)
     else:
         result = status(connection)
     print(json.dumps(result, indent=2, ensure_ascii=False))

@@ -326,6 +326,67 @@ class BaselinePlanTests(unittest.TestCase):
         self.assertEqual(row["status"], "invalidated")
         self.assertEqual(row["invalidation_reason"], "direction_revoked")
 
+    def test_readiness_revalidates_the_plan_after_approval(self):
+        """A plan edited after the resume was approved must stop counting as ready."""
+        self.approve_plan()
+        self.register_baseline()
+        RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                self.baseline_manifest(), "user", AT, rendered_page_count=1)
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 1)
+        row = self.db.execute("SELECT plan_json FROM baseline_plans WHERE plan_id='baseline-1'").fetchone()
+        plan = json.loads(row["plan_json"])
+        plan["selection"] = []
+        self.db.execute("UPDATE baseline_plans SET plan_json=? WHERE plan_id='baseline-1'",
+                        (DIRECTIONS.canonical_json(plan),))
+        self.db.commit()
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 0)
+        self.assertIn("user_approved_direction_resume_required",
+                      MVP.readiness(self.db, self.root)["onboarding"]["blockers"])
+
+    def test_readiness_requires_a_recorded_single_page(self):
+        self.approve_plan()
+        self.register_baseline()
+        RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                self.baseline_manifest(), "user", AT, rendered_page_count=1)
+        self.db.execute("UPDATE resume_versions SET rendered_page_count=2 "
+                        "WHERE version_id='baseline-resume-1'")
+        self.db.commit()
+        self.assertEqual(MVP._approved_direction_resumes(self.db), 0)
+
+    def test_a_replaced_candidate_snapshot_file_is_caught_on_every_use(self):
+        self.approve_plan()
+        row = self.db.execute("SELECT snapshot_path FROM candidate_snapshots "
+                              "WHERE status='active'").fetchone()
+        Path(row["snapshot_path"]).chmod(0o600)
+        Path(row["snapshot_path"]).write_text("tampered", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "snapshot hash mismatch"):
+            self.register_baseline()
+
+    def test_invalidating_a_plan_is_a_recorded_operation(self):
+        self.approve_plan()
+        second = self.generate_plan("baseline-2")
+        result = DIRECTIONS.invalidate_baseline_plan(
+            self.db, "baseline-1", "user", "superseded_by_v2", superseded_by="baseline-2", at=AT)
+        self.assertEqual(result["status"], "invalidated")
+        row = self.db.execute("SELECT status, invalidation_reason FROM baseline_plans "
+                              "WHERE plan_id='baseline-1'").fetchone()
+        self.assertEqual(row["status"], "invalidated")
+        event = self.db.execute(
+            "SELECT actor, event_type, reason_code, metadata_json FROM direction_events "
+            "WHERE event_type='baseline_plan_invalidated'").fetchone()
+        self.assertEqual(event["actor"], "user")
+        self.assertEqual(event["reason_code"], "superseded_by_v2")
+        self.assertEqual(json.loads(event["metadata_json"])["superseded_by"], "baseline-2")
+        with self.assertRaisesRegex(ValueError, "already invalidated"):
+            DIRECTIONS.invalidate_baseline_plan(self.db, "baseline-1", "user", "again", at=AT)
+
+    def test_a_replacement_plan_must_be_live_and_same_direction(self):
+        self.approve_plan()
+        self.approve_direction("other")
+        with self.assertRaisesRegex(ValueError, "replacement baseline plan not found"):
+            DIRECTIONS.invalidate_baseline_plan(self.db, "baseline-1", "user", "x",
+                                                superseded_by="ghost", at=AT)
+
     # --- fail closed on drift --------------------------------------------
 
     def test_a_changed_candidate_profile_invalidates_the_plan(self):

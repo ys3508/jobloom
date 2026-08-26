@@ -161,8 +161,14 @@ def _approved_direction_resumes(connection: sqlite3.Connection) -> int:
             if (not candidate_path.is_file()
                     or resume_core.file_sha256(candidate_path) != row["candidate_file_sha256"]):
                 continue
+            # The SQL reads plan columns; only this call re-validates the plan payload,
+            # its hashes and the stores it depends on, so a plan edited after approval
+            # cannot keep counting as ready.
+            resume_core._require_resume_authorized_for_application(connection, row)
+            if row["source_mode"] == "direction_baseline" and row["rendered_page_count"] != 1:
+                continue
             valid += 1
-        except ValueError:
+        except (ValueError, RuntimeError):
             continue
     return valid
 
