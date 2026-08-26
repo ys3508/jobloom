@@ -91,6 +91,7 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 9. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
 10. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
 11. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
+12. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
 
 ## Cover-letter versions
 

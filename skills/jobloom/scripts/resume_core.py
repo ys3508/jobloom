@@ -24,7 +24,7 @@ from _common import require_table  # noqa: E402
 
 RESUME_KINDS = {"master_source", "direction", "lightweight", "precision"}
 RESUME_STATUSES = {"draft", "approved", "revoked", "superseded"}
-SOURCE_MODES = {"generated", "user_provided"}
+SOURCE_MODES = {"generated", "direction_baseline", "user_provided"}
 EVIDENCE_RANK = {
     "none": 0,
     "mention_only": 1,
@@ -87,6 +87,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             adaptation_plan_id TEXT,
             direction_profile_sha256 TEXT,
             source_mode TEXT NOT NULL DEFAULT 'generated',
+            baseline_plan_id TEXT,
             FOREIGN KEY (parent_version_id) REFERENCES resume_versions(version_id)
         );
         CREATE INDEX IF NOT EXISTS resume_versions_selection_idx
@@ -147,6 +148,8 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE resume_versions ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'generated'"
         )
+    if "baseline_plan_id" not in version_columns:
+        connection.execute("ALTER TABLE resume_versions ADD COLUMN baseline_plan_id TEXT")
     connection.commit()
 
 
@@ -161,6 +164,13 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     return connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def _require_baseline_plan(connection: sqlite3.Connection, plan_id: str | None, direction: str):
+    if not _table_exists(connection, "baseline_plans"):
+        raise RuntimeError("required safety table is missing: baseline_plans")
+    import direction_core  # local import: direction_core imports resume_core at module load
+    return direction_core.require_approved_baseline_plan(connection, plan_id, direction)
 
 
 def _active_direction(connection: sqlite3.Connection, direction: str) -> sqlite3.Row | None:
@@ -239,6 +249,8 @@ def _require_resume_authorized_for_application(
             connection, version["adaptation_plan_id"], version["direction"], version["kind"],
             require_fresh_job=False,
         )
+    elif version["source_mode"] == "direction_baseline":
+        _require_baseline_plan(connection, version["baseline_plan_id"], version["direction"])
 
 
 def _event(
@@ -282,6 +294,8 @@ def _validate_parent(
         if parent_version_id:
             raise ValueError("user-provided direction resume must not claim a generated parent")
         return
+    if source_mode == "direction_baseline" and kind != "direction":
+        raise ValueError("only direction resumes may use direction_baseline source mode")
     if not parent_version_id:
         raise ValueError(f"{kind} requires an approved parent version")
     parent = connection.execute("SELECT * FROM resume_versions WHERE version_id=?", (parent_version_id,)).fetchone()
@@ -309,6 +323,7 @@ def register_version(
     at: datetime | None = None,
     adaptation_plan_id: str | None = None,
     source_mode: str | None = None,
+    baseline_plan_id: str | None = None,
 ) -> dict[str, Any]:
     _require_safe_id(version_id, "version_id")
     if kind not in RESUME_KINDS:
@@ -318,6 +333,8 @@ def register_version(
         raise ValueError("invalid resume source mode")
     if kind == "master_source" and actual_source_mode != "user_provided":
         raise ValueError("master_source must use user_provided source mode")
+    if actual_source_mode == "direction_baseline" and kind != "direction":
+        raise ValueError("only direction resumes may use direction_baseline source mode")
     if not direction.strip():
         raise ValueError("direction is required")
     if not source_file.is_file():
@@ -333,6 +350,12 @@ def register_version(
             plan = _approved_adaptation_plan(connection, adaptation_plan_id, direction, kind)
             if plan and plan["base_resume_version_id"] != parent_version_id:
                 raise ValueError("resume parent does not match the approved adaptation plan")
+        elif actual_source_mode == "direction_baseline":
+            if adaptation_plan_id:
+                raise ValueError("direction_baseline resume must not bind a JobCard adaptation plan")
+            baseline = _require_baseline_plan(connection, baseline_plan_id, direction)
+            if baseline["master_version_id"] != parent_version_id:
+                raise ValueError("direction_baseline parent must be the planned master resume")
         elif adaptation_plan_id:
             raise ValueError("user-provided direction resume must not bind an adaptation plan")
     suffix = source_file.suffix.casefold()
@@ -356,11 +379,12 @@ def register_version(
             INSERT INTO resume_versions (
                 version_id, parent_version_id, kind, direction, status, snapshot_path,
                 file_sha256, file_size, file_format, created_at, adaptation_plan_id,
-                direction_profile_sha256, source_mode
-            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)
+                direction_profile_sha256, source_mode, baseline_plan_id
+            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (version_id, parent_version_id, kind, direction, str(snapshot), digest, size,
               suffix[1:], timestamp, adaptation_plan_id,
-              direction_row["profile_sha256"] if direction_row else None, actual_source_mode))
+              direction_row["profile_sha256"] if direction_row else None, actual_source_mode,
+              baseline_plan_id))
         _event(
             connection, version_id, actor, "registered", "immutable_snapshot_created",
             metadata={"source_mode": actual_source_mode}, at=at,
@@ -383,6 +407,7 @@ def register_version(
         "snapshot_path": str(snapshot),
         "adaptation_plan_id": adaptation_plan_id,
         "source_mode": actual_source_mode,
+        "baseline_plan_id": baseline_plan_id,
     }
 
 
@@ -485,6 +510,10 @@ def approve_version(
             )
             if not plan or plan["candidate_profile_sha256"] != candidate_hash:
                 raise ValueError("adaptation plan candidate profile is stale")
+        elif row["source_mode"] == "direction_baseline":
+            baseline = _require_baseline_plan(connection, row["baseline_plan_id"], row["direction"])
+            if baseline["candidate_profile_sha256"] != candidate_hash:
+                raise ValueError("baseline plan candidate profile is stale")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_claims_manifest(manifest, candidate)
     manifest_snapshot = Path(row["snapshot_path"]).parent / "claims-manifest.json"
@@ -693,6 +722,7 @@ def main() -> None:
     register.add_argument("--direction", required=True)
     register.add_argument("--parent")
     register.add_argument("--adaptation-plan-id")
+    register.add_argument("--baseline-plan-id")
     register.add_argument("--source-mode", choices=sorted(SOURCE_MODES))
     approve = commands.add_parser("approve")
     approve.add_argument("--version-id", required=True)
@@ -724,7 +754,8 @@ def main() -> None:
     elif args.command == "register":
         result = register_version(
             connection, store, args.file, args.version_id, args.kind, args.direction,
-            args.parent, adaptation_plan_id=args.adaptation_plan_id, source_mode=args.source_mode,
+            args.parent, adaptation_plan_id=args.adaptation_plan_id,
+            source_mode=args.source_mode, baseline_plan_id=args.baseline_plan_id,
         )
     elif args.command == "approve":
         result = approve_version(connection, args.version_id, args.candidate, args.manifest, args.actor)

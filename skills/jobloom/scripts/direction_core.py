@@ -165,6 +165,27 @@ def initialize(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS routing_records_pool_idx
             ON routing_records(invalidated_at, entered_pool_at);
 
+        CREATE TABLE IF NOT EXISTS baseline_plans (
+            plan_id TEXT PRIMARY KEY,
+            direction_id TEXT NOT NULL,
+            direction_profile_sha256 TEXT NOT NULL,
+            master_version_id TEXT NOT NULL,
+            master_file_sha256 TEXT NOT NULL,
+            candidate_profile_sha256 TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            plan_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            invalidated_at TEXT,
+            invalidation_reason TEXT,
+            FOREIGN KEY (direction_id) REFERENCES search_directions(direction_id),
+            FOREIGN KEY (master_version_id) REFERENCES resume_versions(version_id)
+        );
+        CREATE INDEX IF NOT EXISTS baseline_plans_direction_idx
+            ON baseline_plans(direction_id, status);
+
         CREATE TABLE IF NOT EXISTS direction_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             direction_id TEXT NOT NULL,
@@ -1047,6 +1068,203 @@ def _criteria(profile, candidate, job, sponsorship_state):
     return evaluated, failures, review, conflicts
 
 
+# A BaselinePlan records which confirmed facts a direction's standing one-page resume
+# carries and in what order. It is a selection record, never a wording record: it holds
+# fact IDs and controlled reason codes only, so approving it can never approve prose.
+BASELINE_SELECTION_REASONS = {
+    "direction_core_evidence", "direction_supporting_evidence", "domain_context",
+    "recency", "structural_identity", "structural_education", "structural_skill",
+    "structural_certification", "structural_publication",
+}
+BASELINE_EXCLUSION_REASONS = {
+    "outside_direction_scope", "superseded_by_stronger_evidence",
+    "space_constrained", "not_relevant_to_direction",
+}
+
+
+def _approved_master(connection: sqlite3.Connection) -> sqlite3.Row:
+    rows = connection.execute(
+        "SELECT * FROM resume_versions WHERE kind='master_source' AND status='approved' "
+        "AND approved_by='user' ORDER BY approved_at DESC"
+    ).fetchall()
+    if not rows:
+        raise ValueError("a user-approved master_source resume is required")
+    if len(rows) > 1:
+        raise ValueError("more than one approved master_source resume is active")
+    return rows[0]
+
+
+def generate_baseline_plan(connection: sqlite3.Connection, plan_id: str, direction_id: str,
+                           candidate_path: Path, selection: list[dict[str, Any]],
+                           exclusions: list[dict[str, Any]],
+                           unsupported_terms: list[str] | None = None,
+                           at: datetime | None = None) -> dict[str, Any]:
+    """Build a reviewable selection plan for a direction's standing one-page resume.
+
+    No JobCard is involved: a baseline serves the direction, not a posting. Every fact in
+    the candidate profile must be either selected or explicitly excluded, so nothing is
+    dropped silently.
+    """
+    resume_core._require_safe_id(plan_id, "plan_id")
+    if connection.execute("SELECT 1 FROM baseline_plans WHERE plan_id=?", (plan_id,)).fetchone():
+        raise ValueError("baseline plan already exists")
+    direction = connection.execute(
+        "SELECT * FROM search_directions WHERE direction_id=?", (direction_id,)).fetchone()
+    if not direction or direction["status"] != "approved":
+        raise ValueError("approved search direction not found")
+    if not _direction_in_active_portfolio(connection, direction_id, direction["profile_sha256"]):
+        raise ValueError("search direction is outside the active approved portfolio")
+    master = _approved_master(connection)
+    resume_core.verify_version_file(master)
+    candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
+    snapshot = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+        "AND registered_by='user'", (candidate_hash,)).fetchone()
+    if not snapshot:
+        raise ValueError("candidate profile is not the active user-registered snapshot")
+
+    usable = {fact["id"] for fact in candidate["facts"]
+              if fact.get("status") in {"confirmed", "locked"}}
+    selected_ids, orders = [], []
+    for item in selection:
+        if set(item) - {"fact_id", "order", "reason"}:
+            raise ValueError("baseline selection entries carry fact_id, order and reason only")
+        fact_id, order, reason = item.get("fact_id"), item.get("order"), item.get("reason")
+        if fact_id not in usable:
+            raise ValueError(f"baseline plan references an unconfirmed fact: {fact_id}")
+        if reason not in BASELINE_SELECTION_REASONS:
+            raise ValueError(f"invalid baseline selection reason: {reason}")
+        if not isinstance(order, int) or isinstance(order, bool) or order < 0:
+            raise ValueError("baseline selection order must be a non-negative integer")
+        selected_ids.append(fact_id)
+        orders.append(order)
+    if len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("baseline selection contains duplicate facts")
+    if sorted(orders) != list(range(len(orders))):
+        raise ValueError("baseline selection order must be contiguous from zero")
+
+    excluded_ids = []
+    for item in exclusions:
+        if set(item) - {"fact_id", "reason"}:
+            raise ValueError("baseline exclusion entries carry fact_id and reason only")
+        fact_id, reason = item.get("fact_id"), item.get("reason")
+        if fact_id not in usable:
+            raise ValueError(f"baseline plan references an unconfirmed fact: {fact_id}")
+        if reason not in BASELINE_EXCLUSION_REASONS:
+            raise ValueError(f"invalid baseline exclusion reason: {reason}")
+        excluded_ids.append(fact_id)
+    if set(selected_ids) & set(excluded_ids):
+        raise ValueError("a fact cannot be both selected and excluded")
+    missing = usable - set(selected_ids) - set(excluded_ids)
+    if missing:
+        raise ValueError(
+            "every confirmed fact must be selected or explicitly excluded; unaccounted: "
+            + ", ".join(sorted(missing)[:5]))
+
+    plan = {
+        "schema_version": "0.1.0", "plan_id": plan_id, "kind": "direction_baseline",
+        "direction_id": direction_id,
+        "direction_profile_sha256": direction["profile_sha256"],
+        "master_version_id": master["version_id"],
+        "master_file_sha256": master["file_sha256"],
+        "candidate_profile_sha256": candidate_hash,
+        "selection": sorted(({"fact_id": item["fact_id"], "order": item["order"],
+                              "reason": item["reason"]} for item in selection),
+                            key=lambda item: item["order"]),
+        "exclusions": sorted(({"fact_id": item["fact_id"], "reason": item["reason"]}
+                              for item in exclusions), key=lambda item: item["fact_id"]),
+        "unsupported_terms": sorted(set(unsupported_terms or [])),
+        "locked_fact_ids_must_remain_exact": sorted(
+            fact["id"] for fact in candidate["facts"] if fact.get("locked")),
+        "constraints": {
+            "allowed": ["select", "order", "compress", "clarify"],
+            "forbidden": ["unsupported_skill", "invented_achievement", "changed_date",
+                          "inflated_seniority", "invented_management", "transferable_as_direct",
+                          "changed_work_authorization", "promoted_evidence_strength"],
+            "evidence_strength_may_be_promoted": False,
+            "plan_approves_selection_only": True,
+        },
+    }
+    digest = canonical_hash(plan)
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute("""
+        INSERT INTO baseline_plans (
+            plan_id, direction_id, direction_profile_sha256, master_version_id,
+            master_file_sha256, candidate_profile_sha256, plan_json, plan_sha256,
+            status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'generated', ?)
+    """, (plan_id, direction_id, direction["profile_sha256"], master["version_id"],
+          master["file_sha256"], candidate_hash, canonical_json(plan), digest, timestamp))
+    _event(connection, direction_id, "system", "baseline_plan_generated", "selection_recorded",
+           metadata={"plan_id": plan_id, "selected": len(selected_ids),
+                     "excluded": len(excluded_ids)}, at=at)
+    connection.commit()
+    return {"plan_id": plan_id, "status": "generated", "plan_sha256": digest, "plan": plan}
+
+
+def approve_baseline_plan(connection: sqlite3.Connection, plan_id: str, candidate_path: Path,
+                          actor: str, plan_sha256: str, at: datetime | None = None) -> dict[str, Any]:
+    """Approve a selection plan. This never approves resume bytes or wording."""
+    if actor != "user":
+        raise ValueError("baseline plan approval requires the user actor")
+    row = connection.execute("SELECT * FROM baseline_plans WHERE plan_id=?", (plan_id,)).fetchone()
+    if not row or row["status"] != "generated":
+        raise ValueError("generated baseline plan not found")
+    if row["plan_sha256"] != plan_sha256:
+        raise ValueError("baseline plan hash does not match the reviewed plan")
+    _require_baseline_plan_current(connection, row, candidate_path)
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE baseline_plans SET status='approved', approved_at=?, approved_by='user' "
+        "WHERE plan_id=?", (timestamp, plan_id))
+    _event(connection, row["direction_id"], "user", "baseline_plan_approved",
+           "user_approved_exact_baseline_plan", metadata={"plan_id": plan_id}, at=at)
+    connection.commit()
+    return {"plan_id": plan_id, "status": "approved", "plan_sha256": row["plan_sha256"]}
+
+
+def _require_baseline_plan_current(connection: sqlite3.Connection, row: sqlite3.Row,
+                                   candidate_path: Path | None = None) -> None:
+    """Fail closed when anything the plan was reviewed against has moved."""
+    if row["invalidated_at"]:
+        raise ValueError("baseline plan was invalidated")
+    direction = connection.execute(
+        "SELECT * FROM search_directions WHERE direction_id=?", (row["direction_id"],)).fetchone()
+    if not direction or direction["status"] != "approved":
+        raise ValueError("baseline plan direction is no longer approved")
+    if direction["profile_sha256"] != row["direction_profile_sha256"]:
+        raise ValueError("baseline plan direction profile is stale")
+    if not _direction_in_active_portfolio(connection, row["direction_id"], direction["profile_sha256"]):
+        raise ValueError("baseline plan direction is outside the active approved portfolio")
+    master = _approved_master(connection)
+    if master["version_id"] != row["master_version_id"] or master["file_sha256"] != row["master_file_sha256"]:
+        raise ValueError("baseline plan master resume is stale")
+    resume_core.verify_version_file(master)
+    active = connection.execute(
+        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active' AND registered_by='user'"
+    ).fetchone()
+    if not active or active["content_sha256"] != row["candidate_profile_sha256"]:
+        raise ValueError("baseline plan candidate profile is stale")
+    if candidate_path is not None:
+        _, candidate_hash = resume_core.load_valid_candidate(candidate_path)
+        if candidate_hash != row["candidate_profile_sha256"]:
+            raise ValueError("baseline plan candidate profile is stale")
+
+
+def require_approved_baseline_plan(connection: sqlite3.Connection, plan_id: str | None,
+                                   direction_id: str) -> sqlite3.Row:
+    """Gate used by resume registration: an approved, still-current plan or nothing."""
+    if not plan_id:
+        raise ValueError("direction_baseline resume requires an approved baseline plan")
+    row = connection.execute("SELECT * FROM baseline_plans WHERE plan_id=?", (plan_id,)).fetchone()
+    if not row or row["status"] != "approved" or row["approved_by"] != "user":
+        raise ValueError("baseline plan is not user-approved")
+    if row["direction_id"] != direction_id:
+        raise ValueError("baseline plan belongs to another direction")
+    _require_baseline_plan_current(connection, row)
+    return row
+
+
 def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     """Route one structured JobCard. A direction may narrow CandidateProfile, never widen it.
 
@@ -1825,6 +2043,19 @@ def main() -> None:
     approve_plan_parser.add_argument("--candidate", required=True, type=Path)
     approve_plan_parser.add_argument("--actor", required=True)
     approve_plan_parser.add_argument("--plan-sha256", required=True)
+    baseline_parser = commands.add_parser("generate-baseline-plan")
+    baseline_parser.add_argument("--plan-id", required=True)
+    baseline_parser.add_argument("--direction-id", required=True)
+    baseline_parser.add_argument("--candidate", required=True, type=Path)
+    baseline_parser.add_argument("--selection", required=True, type=Path,
+                                 help="JSON list of {fact_id, order, reason}")
+    baseline_parser.add_argument("--exclusions", required=True, type=Path,
+                                 help="JSON list of {fact_id, reason}")
+    approve_baseline_parser = commands.add_parser("approve-baseline-plan")
+    approve_baseline_parser.add_argument("--plan-id", required=True)
+    approve_baseline_parser.add_argument("--candidate", required=True, type=Path)
+    approve_baseline_parser.add_argument("--actor", required=True)
+    approve_baseline_parser.add_argument("--plan-sha256", required=True)
     commands.add_parser("status")
     args = parser.parse_args()
     args.db.parent.mkdir(parents=True, exist_ok=True)
@@ -1859,6 +2090,15 @@ def main() -> None:
         result = approve_plan(
             connection, args.plan_id, args.candidate, args.actor, args.plan_sha256
         )
+    elif args.command == "generate-baseline-plan":
+        result = generate_baseline_plan(
+            connection, args.plan_id, args.direction_id, args.candidate,
+            json.loads(args.selection.read_text(encoding="utf-8")),
+            json.loads(args.exclusions.read_text(encoding="utf-8")),
+        )
+    elif args.command == "approve-baseline-plan":
+        result = approve_baseline_plan(
+            connection, args.plan_id, args.candidate, args.actor, args.plan_sha256)
     else:
         result = status(connection)
     print(json.dumps(result, indent=2, ensure_ascii=False))

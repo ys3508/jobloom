@@ -73,3 +73,38 @@ Record `prepared`, `locked`, and `submitted` usage separately. Never place resum
 ## Private storage
 
 Keep the database, resume snapshots, claims manifests, and CandidateFact artifacts under `.jobloom/`. They contain personal data and must not be committed by default.
+
+## Direction baselines
+
+A direction carries one standing one-page resume. It serves the direction, not a posting,
+so it needs no JobCard and no ResumeAdaptationPlan. Its evidence record is a **BaselinePlan**.
+
+Three source modes now exist for a `direction` resume:
+
+| `source_mode` | Origin | JobCard | Plan |
+|---|---|---|---|
+| `generated` | tailored to one real posting | required | `ResumeAdaptationPlan` |
+| `direction_baseline` | the direction's standing one-pager | none | `BaselinePlan` |
+| `user_provided` | a one-page resume the user supplies | none | none |
+
+The master is the fact and evidence archive, not a layout template. A baseline is composed
+afresh from the approved master, the CandidateFacts and the approved direction; it may
+follow the master's style but does not inherit its layout limits.
+
+A BaselinePlan records the exact approved master version and file hash, the CandidateProfile
+hash, the direction profile hash, the selected fact IDs with their order, the excluded fact
+IDs, a controlled reason code for every selection and exclusion, any unsupported terminology,
+and an explicit prohibition on promoting evidence strength. Every confirmed fact must be
+either selected or explicitly excluded, so nothing is dropped silently. The plan holds fact
+IDs and reason codes only — never fact values — so approving it can never approve wording.
+
+Approving a BaselinePlan approves the selection and ordering, nothing else. The rendered
+one-page DOCX, its claims manifest and its file hash are approved separately by the user, as
+for any other resume. Registration fails closed when the plan is unapproved, belongs to
+another direction, binds a JobCard adaptation plan, names a parent other than the planned
+master, or when the master, candidate profile or direction profile has moved since review.
+
+Do not select baseline content by keyword-matching the direction profile. Those keywords are
+job-posting vocabulary and the fact library is the candidate's own; matching one against the
+other misses genuinely relevant experience. Selection is a judgment that belongs in a
+reviewable BaselinePlan.
