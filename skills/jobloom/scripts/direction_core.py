@@ -1122,6 +1122,13 @@ def generate_baseline_plan(connection: sqlite3.Connection, plan_id: str, directi
         "AND registered_by='user'", (candidate_hash,)).fetchone()
     if not snapshot:
         raise ValueError("candidate profile is not the active user-registered snapshot")
+    resume_core.verify_snapshot_file_hash(snapshot)
+    if master["candidate_profile_sha256"] != candidate_hash:
+        raise ValueError("approved master resume was approved against a different candidate profile")
+    # A baseline plan carries fact IDs and controlled reason codes only. Free text would
+    # be wording, and approving the plan must never approve wording.
+    if unsupported_terms:
+        raise ValueError("a baseline plan carries no free text; unsupported_terms must be empty")
 
     usable = {fact["id"] for fact in candidate["facts"]
               if fact.get("status") in {"confirmed", "locked"}}
@@ -1153,6 +1160,8 @@ def generate_baseline_plan(connection: sqlite3.Connection, plan_id: str, directi
         if reason not in BASELINE_EXCLUSION_REASONS:
             raise ValueError(f"invalid baseline exclusion reason: {reason}")
         excluded_ids.append(fact_id)
+    if len(set(excluded_ids)) != len(excluded_ids):
+        raise ValueError("baseline exclusions contain duplicate facts")
     if set(selected_ids) & set(excluded_ids):
         raise ValueError("a fact cannot be both selected and excluded")
     missing = usable - set(selected_ids) - set(excluded_ids)
@@ -1173,9 +1182,10 @@ def generate_baseline_plan(connection: sqlite3.Connection, plan_id: str, directi
                             key=lambda item: item["order"]),
         "exclusions": sorted(({"fact_id": item["fact_id"], "reason": item["reason"]}
                               for item in exclusions), key=lambda item: item["fact_id"]),
-        "unsupported_terms": sorted(set(unsupported_terms or [])),
+        "unsupported_terms": [],
         "locked_fact_ids_must_remain_exact": sorted(
-            fact["id"] for fact in candidate["facts"] if fact.get("locked")),
+            fact["id"] for fact in candidate["facts"]
+            if fact.get("locked") and fact["id"] in set(selected_ids)),
         "constraints": {
             "allowed": ["select", "order", "compress", "clarify"],
             "forbidden": ["unsupported_skill", "invented_achievement", "changed_date",
@@ -1228,6 +1238,8 @@ def _require_baseline_plan_current(connection: sqlite3.Connection, row: sqlite3.
     """Fail closed when anything the plan was reviewed against has moved."""
     if row["invalidated_at"]:
         raise ValueError("baseline plan was invalidated")
+    if canonical_hash(json.loads(row["plan_json"])) != row["plan_sha256"]:
+        raise ValueError("baseline plan payload does not match its recorded hash")
     direction = connection.execute(
         "SELECT * FROM search_directions WHERE direction_id=?", (row["direction_id"],)).fetchone()
     if not direction or direction["status"] != "approved":
@@ -1263,6 +1275,10 @@ def require_approved_baseline_plan(connection: sqlite3.Connection, plan_id: str 
         raise ValueError("baseline plan belongs to another direction")
     _require_baseline_plan_current(connection, row)
     return row
+
+
+def baseline_plan_selected_fact_ids(row: sqlite3.Row) -> set[str]:
+    return {item["fact_id"] for item in json.loads(row["plan_json"])["selection"]}
 
 
 def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
@@ -1936,6 +1952,11 @@ def revoke_direction(connection: sqlite3.Connection, direction_id: str, actor: s
         "invalidation_reason='direction_revoked' WHERE direction_id=? AND status IN ('generated','approved')",
         (timestamp, direction_id),
     )
+    connection.execute(
+        "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, "
+        "invalidation_reason='direction_revoked' WHERE direction_id=? AND invalidated_at IS NULL",
+        (timestamp, direction_id),
+    )
     require_table(connection, "material_locks")
     connection.execute("""
             UPDATE material_locks SET invalidated_at=?, invalidation_reason='direction_revoked'
@@ -1973,6 +1994,11 @@ def revoke_portfolio(connection: sqlite3.Connection, portfolio_id: str, actor: s
             "UPDATE resume_adaptation_plans SET status='invalidated', invalidated_at=?, "
             "invalidation_reason='portfolio_revoked' WHERE direction_id=? "
             "AND status IN ('generated','approved')", (timestamp, direction_id),
+        )
+        connection.execute(
+            "UPDATE baseline_plans SET status='invalidated', invalidated_at=?, "
+            "invalidation_reason='portfolio_revoked' WHERE direction_id=? AND invalidated_at IS NULL",
+            (timestamp, direction_id),
         )
         require_table(connection, "material_locks")
         connection.execute("""

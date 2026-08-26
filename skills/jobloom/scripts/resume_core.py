@@ -88,6 +88,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             direction_profile_sha256 TEXT,
             source_mode TEXT NOT NULL DEFAULT 'generated',
             baseline_plan_id TEXT,
+            rendered_page_count INTEGER,
             FOREIGN KEY (parent_version_id) REFERENCES resume_versions(version_id)
         );
         CREATE INDEX IF NOT EXISTS resume_versions_selection_idx
@@ -150,6 +151,8 @@ def initialize(connection: sqlite3.Connection) -> None:
         )
     if "baseline_plan_id" not in version_columns:
         connection.execute("ALTER TABLE resume_versions ADD COLUMN baseline_plan_id TEXT")
+    if "rendered_page_count" not in version_columns:
+        connection.execute("ALTER TABLE resume_versions ADD COLUMN rendered_page_count INTEGER")
     connection.commit()
 
 
@@ -456,6 +459,13 @@ def validate_claims_manifest(manifest: dict[str, Any], candidate: dict[str, Any]
                 raise ValueError(f"claim {claim_id} must preserve exact locked values")
 
 
+def verify_snapshot_file_hash(row: sqlite3.Row) -> None:
+    """A registered CandidateSnapshot must still be the exact file that was registered."""
+    path = Path(row["snapshot_path"])
+    if not path.is_file() or file_sha256(path) != row["file_sha256"]:
+        raise ValueError("registered candidate snapshot hash mismatch")
+
+
 def verify_version_file(row: sqlite3.Row) -> None:
     snapshot = Path(row["snapshot_path"])
     if not snapshot.is_file():
@@ -479,6 +489,7 @@ def approve_version(
     manifest_path: Path,
     actor: str,
     at: datetime | None = None,
+    rendered_page_count: int | None = None,
 ) -> dict[str, Any]:
     if actor != "user":
         raise ValueError("resume approval requires the user actor")
@@ -514,8 +525,22 @@ def approve_version(
             baseline = _require_baseline_plan(connection, row["baseline_plan_id"], row["direction"])
             if baseline["candidate_profile_sha256"] != candidate_hash:
                 raise ValueError("baseline plan candidate profile is stale")
+            # One page is what a direction baseline is, and page count is a property of the
+            # rendered file, so it is confirmed here rather than assumed from the plan.
+            if rendered_page_count != 1:
+                raise ValueError(
+                    "direction_baseline approval requires a confirmed rendered_page_count of 1")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_claims_manifest(manifest, candidate)
+    if row["source_mode"] == "direction_baseline":
+        import direction_core  # local import: direction_core imports resume_core at module load
+        planned = direction_core.baseline_plan_selected_fact_ids(baseline)
+        claimed = {fact_id for claim in manifest["claims"] for fact_id in claim["fact_ids"]}
+        if claimed != planned:
+            raise ValueError(
+                "claims manifest does not match the approved baseline selection; missing: "
+                f"{sorted(planned - claimed)[:5] or 'none'}; not selected: "
+                f"{sorted(claimed - planned)[:5] or 'none'}")
     manifest_snapshot = Path(row["snapshot_path"]).parent / "claims-manifest.json"
     if manifest_snapshot.exists():
         raise ValueError("claims manifest snapshot already exists")
@@ -526,9 +551,11 @@ def approve_version(
     connection.execute("""
         UPDATE resume_versions
         SET status='approved', candidate_profile_sha256=?, claims_manifest_path=?,
-            claims_manifest_sha256=?, approved_at=?, approved_by=?, status_reason='user_approved'
+            claims_manifest_sha256=?, approved_at=?, approved_by=?, status_reason='user_approved',
+            rendered_page_count=COALESCE(?, rendered_page_count)
         WHERE version_id=?
-    """, (candidate_hash, str(manifest_snapshot), manifest_hash, timestamp, actor, version_id))
+    """, (candidate_hash, str(manifest_snapshot), manifest_hash, timestamp, actor,
+          rendered_page_count, version_id))
     _event(connection, version_id, actor, "approved", "claims_and_file_verified", at=at)
     connection.commit()
     return {"version_id": version_id, "status": "approved", "candidate_profile_sha256": candidate_hash,
@@ -729,6 +756,7 @@ def main() -> None:
     approve.add_argument("--candidate", required=True, type=Path)
     approve.add_argument("--manifest", required=True, type=Path)
     approve.add_argument("--actor", required=True)
+    approve.add_argument("--rendered-page-count", type=int)
     revoke = commands.add_parser("revoke")
     revoke.add_argument("--version-id", required=True)
     revoke.add_argument("--actor", required=True)
@@ -758,7 +786,8 @@ def main() -> None:
             source_mode=args.source_mode, baseline_plan_id=args.baseline_plan_id,
         )
     elif args.command == "approve":
-        result = approve_version(connection, args.version_id, args.candidate, args.manifest, args.actor)
+        result = approve_version(connection, args.version_id, args.candidate, args.manifest,
+                                 args.actor, rendered_page_count=args.rendered_page_count)
     elif args.command == "revoke":
         result = revoke_version(connection, args.version_id, args.actor, args.reason)
     elif args.command == "select":

@@ -87,6 +87,19 @@ class BaselinePlanTests(unittest.TestCase):
              "evidence_strength": "direct", "exact_locked_value_preserved": True}]}), encoding="utf-8")
         return candidate_path, manifest_path
 
+    def baseline_manifest(self, fact_ids=("fact-name", "fact-consulting"), name="baseline-claims"):
+        """A manifest claiming exactly the planned selection."""
+        values = {"fact-name": "Verified Candidate",
+                  "fact-consulting": "Advised life sciences clients on market strategy",
+                  "fact-vet": "Ran a veterinary lab bench"}
+        locked = {"fact-name"}
+        claims = [{"claim_id": f"claim-{fact_id}", "claim_text": values[fact_id],
+                   "fact_ids": [fact_id], "evidence_strength": "direct",
+                   "exact_locked_value_preserved": fact_id in locked} for fact_id in fact_ids]
+        path = self.root / f"{name}.json"
+        path.write_text(json.dumps({"schema_version": "0.1.0", "claims": claims}), encoding="utf-8")
+        return path
+
     def approve_direction(self, direction_id="lsc"):
         registered = DIRECTIONS.register_direction(self.db, {
             "schema_version": "0.1.0", "direction_id": direction_id, "name": "Consulting",
@@ -236,12 +249,16 @@ class BaselinePlanTests(unittest.TestCase):
         self.register_baseline()
         row = self.db.execute("SELECT status FROM resume_versions WHERE version_id='baseline-resume-1'").fetchone()
         self.assertEqual(row["status"], "draft", "approving a plan must not approve bytes")
+        manifest = self.baseline_manifest()
         with self.assertRaisesRegex(ValueError, "user actor"):
             RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
-                                    self.manifest_path, "system", AT)
+                                    manifest, "system", AT, rendered_page_count=1)
         approved = RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
-                                           self.manifest_path, "user", AT)
+                                           manifest, "user", AT, rendered_page_count=1)
         self.assertEqual(approved["status"], "approved")
+        row = self.db.execute("SELECT rendered_page_count FROM resume_versions "
+                              "WHERE version_id='baseline-resume-1'").fetchone()
+        self.assertEqual(row["rendered_page_count"], 1)
 
     def test_an_approved_baseline_resume_clears_the_readiness_blocker(self):
         self.assertIn("user_approved_direction_resume_required",
@@ -249,9 +266,65 @@ class BaselinePlanTests(unittest.TestCase):
         self.approve_plan()
         self.register_baseline()
         RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
-                                self.manifest_path, "user", AT)
+                                self.baseline_manifest(), "user", AT, rendered_page_count=1)
         self.assertEqual(MVP._approved_direction_resumes(self.db), 1)
         self.assertEqual(MVP.readiness(self.db, self.root)["onboarding"]["blockers"], [])
+
+    def test_the_manifest_must_claim_exactly_the_planned_selection(self):
+        self.approve_plan()
+        self.register_baseline()
+        short = self.baseline_manifest(("fact-name",), "short")
+        with self.assertRaisesRegex(ValueError, "does not match the approved baseline selection"):
+            RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                    short, "user", AT, rendered_page_count=1)
+        smuggled = self.baseline_manifest(("fact-name", "fact-consulting", "fact-vet"), "smuggled")
+        with self.assertRaisesRegex(ValueError, "does not match the approved baseline selection"):
+            RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                    smuggled, "user", AT, rendered_page_count=1)
+
+    def test_a_baseline_must_confirm_a_single_rendered_page(self):
+        self.approve_plan()
+        self.register_baseline()
+        manifest = self.baseline_manifest()
+        for value in (None, 2, 0):
+            with self.subTest(pages=value):
+                with self.assertRaisesRegex(ValueError, "rendered_page_count of 1"):
+                    RESUMES.approve_version(self.db, "baseline-resume-1", self.candidate_path,
+                                            manifest, "user", AT, rendered_page_count=value)
+
+    def test_a_tampered_plan_payload_is_refused(self):
+        self.approve_plan()
+        row = self.db.execute("SELECT plan_json FROM baseline_plans WHERE plan_id='baseline-1'").fetchone()
+        plan = json.loads(row["plan_json"])
+        plan["selection"] = []
+        self.db.execute("UPDATE baseline_plans SET plan_json=? WHERE plan_id='baseline-1'",
+                        (DIRECTIONS.canonical_json(plan),))
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "does not match its recorded hash"):
+            self.register_baseline()
+
+    def test_only_selected_locked_facts_must_stay_verbatim(self):
+        plan = self.generate_plan()["plan"]
+        selected = {item["fact_id"] for item in plan["selection"]}
+        self.assertTrue(set(plan["locked_fact_ids_must_remain_exact"]) <= selected)
+
+    def test_a_plan_carries_no_free_text(self):
+        with self.assertRaisesRegex(ValueError, "carries no free text"):
+            self.generate_plan(unsupported_terms=["client-facing analytics"])
+        self.assertEqual(self.generate_plan("baseline-2")["plan"]["unsupported_terms"], [])
+
+    def test_duplicate_exclusions_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "duplicate facts"):
+            self.generate_plan(exclusions=[{"fact_id": "fact-vet", "reason": "outside_direction_scope"},
+                                           {"fact_id": "fact-vet", "reason": "space_constrained"}])
+
+    def test_revoking_the_direction_marks_the_plan_invalidated(self):
+        self.approve_plan()
+        DIRECTIONS.revoke_direction(self.db, "lsc", "user", "no_longer_targeted", at=AT)
+        row = self.db.execute("SELECT status, invalidation_reason FROM baseline_plans "
+                              "WHERE plan_id='baseline-1'").fetchone()
+        self.assertEqual(row["status"], "invalidated")
+        self.assertEqual(row["invalidation_reason"], "direction_revoked")
 
     # --- fail closed on drift --------------------------------------------
 
