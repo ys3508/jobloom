@@ -3,18 +3,45 @@
   "direction_id": "backend-engineering",
   "name": "Backend Engineering",
   "role_family": "engineering.backend",
-  "target_titles": ["Backend Engineer", "Backend Developer"],
-  "positive_keywords": ["Python", "SQL", "APIs"],
-  "negative_keywords": ["commission only"],
-  "hard_exclusion_keywords": ["commission-only", "unpaid internship"],
+  "target_titles": [
+    "Backend Engineer",
+    "Backend Developer"
+  ],
+  "positive_keywords": [
+    "Python",
+    "SQL",
+    "APIs"
+  ],
+  "negative_keywords": [
+    "commission only"
+  ],
+  "hard_exclusion_keywords": [
+    "commission-only",
+    "unpaid internship"
+  ],
+  "warning_keywords": [
+    "Tableau",
+    "Power BI"
+  ],
   "discovery_keywords": [],
   "auxiliary_titles": [],
-  "precision_keywords": ["distributed systems"],
+  "precision_keywords": [
+    "distributed systems"
+  ],
   "criteria": {
-    "countries": ["US"],
-    "locations": ["New York, NY"],
-    "work_arrangements": ["remote", "hybrid"],
-    "employment_types": ["full_time"],
+    "countries": [
+      "US"
+    ],
+    "locations": [
+      "New York, NY"
+    ],
+    "work_arrangements": [
+      "remote",
+      "hybrid"
+    ],
+    "employment_types": [
+      "full_time"
+    ],
     "industries": [],
     "target_companies": [],
     "excluded_companies": [],

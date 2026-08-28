@@ -89,9 +89,10 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 7. `direct_reuse` creates no file. For generated `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent. A user-provided direction resume uses `--source-mode user_provided` and must not claim a plan or parent.
 8. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
 9. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
-10. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
-11. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
-12. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
+10. Read `warning_keywords` as obligation-scoped: mandatory in the posting demotes, preferred costs nothing. Never let a title match alone reach `match` when the candidate's facts cover fewer than half the stated requirements.
+11. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
+12. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
+13. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
 
 ## Cover-letter versions
 

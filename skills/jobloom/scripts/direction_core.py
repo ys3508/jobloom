@@ -26,8 +26,16 @@ PROFILE_KEYS = {
     "schema_version", "direction_id", "name", "role_family", "target_titles",
     "positive_keywords", "negative_keywords", "precision_keywords", "criteria",
     "parent_direction_id", "hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles",
+    "warning_keywords",
 }
-LEGACY_PROFILE_KEYS = PROFILE_KEYS - {"hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles"}
+# Optional groups may be absent. A profile registered without one is never rewritten to
+# include it, because the profile hash the user approved is computed from exactly these
+# keys: defaulting a new group into an old profile would silently change that hash.
+OPTIONAL_PROFILE_KEYS = {
+    "hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles", "warning_keywords",
+}
+REQUIRED_PROFILE_KEYS = PROFILE_KEYS - OPTIONAL_PROFILE_KEYS
+LEGACY_PROFILE_KEYS = REQUIRED_PROFILE_KEYS
 CRITERIA_KEYS = {
     "countries", "locations", "work_arrangements", "employment_types", "industries",
     "target_companies", "excluded_companies", "salary_floor", "salary_currency",
@@ -257,7 +265,8 @@ def _bounded_strings(value: Any, label: str, *, required: bool = False) -> list[
 
 
 def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(profile, dict) or set(profile) not in {frozenset(PROFILE_KEYS), frozenset(LEGACY_PROFILE_KEYS)}:
+    if not isinstance(profile, dict) or (set(profile) - PROFILE_KEYS) \
+            or (REQUIRED_PROFILE_KEYS - set(profile)):
         raise ValueError("direction profile has missing or unknown fields")
     resume_core._require_safe_id(profile["direction_id"], "direction_id")
     if profile["schema_version"] not in {"0.1.0", "0.2.0"}:
@@ -296,6 +305,10 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "hard_exclusion_keywords", "discovery_keywords", "auxiliary_titles",
     ):
         normalized[field] = _bounded_strings(normalized[field], field, required=field == "target_titles")
+    # Validated but never defaulted in, so an existing profile hash cannot move.
+    if "warning_keywords" in normalized:
+        normalized["warning_keywords"] = _bounded_strings(
+            normalized["warning_keywords"], "warning_keywords")
     normalized["criteria"] = normalized_criteria
     return normalized
 
@@ -557,6 +570,13 @@ GROUP_FIELDS: dict[str, frozenset[str]] = {
     "precision_keywords": _CONTENT_FIELDS,
     "discovery_keywords": _CONTENT_FIELDS,
     "negative_keywords": _CONTENT_FIELDS,
+    # Obligation is read from the field the term was found in, so prose is excluded:
+    # "Epic required" and "familiarity with Epic is a plus" are indistinguishable to a
+    # token matcher, and only the skill and certification lists state which is which.
+    "warning_keywords": frozenset({
+        "required_skills", "required_certifications",
+        "preferred_skills", "preferred_certifications",
+    }),
     # A pay structure is never a "skill", so skills stay out of the only hard path.
     "hard_exclusion_keywords": frozenset({
         "title", "employment_type", "compensation_structure", "required_certifications",
@@ -691,7 +711,12 @@ RANKING_BASE = 100
 RANKING_WEIGHTS = {
     "sponsorship": 10, "positive_keyword": 2, "analytics_duty": 1,
     "negative_keyword": -3, "career_growth": -15, "duty_demotion": -10, "stretch": -5,
+    "warning_required": -6, "evidence_gap": -12,
 }
+# Fields whose contents the posting itself states are mandatory.
+MANDATORY_OBLIGATION_FIELDS = frozenset({"required_skills", "required_certifications"})
+# Below this many stated requirements the coverage ratio is too noisy to act on.
+EVIDENCE_SUPPORT_MIN_REQUIREMENTS = 3
 
 
 def _tokens(value: str) -> list[str]:
@@ -1564,6 +1589,42 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     if field_hits["negative_keywords"]:
         review.append("direction_soft_negative_keyword")
 
+    # A warning term demotes only where the posting makes it mandatory. Listed under
+    # "preferred" it is recorded and nothing more: not holding a nice-to-have is not a
+    # reason to drop a posting the direction otherwise fits.
+    warning_required = sorted({hit["term"] for hit in field_hits["warning_keywords"]
+                               if hit["field"] in MANDATORY_OBLIGATION_FIELDS})
+    warning_preferred = sorted({hit["term"] for hit in field_hits["warning_keywords"]
+                                if hit["field"] not in MANDATORY_OBLIGATION_FIELDS}
+                               - set(warning_required))
+    if warning_required:
+        review.append("warning_term_required")
+    if warning_preferred:
+        notes.append("warning_term_preferred_only")
+
+    # A title match is an identity signal, not evidence. When the posting states enough
+    # mandatory requirements and the candidate's own confirmed facts cover almost none of
+    # them, the title is the only thing matching, so it must not carry an auto-match on
+    # its own. This stays a review rather than a hard failure: coverage is measured
+    # against the fact library, and a thin library is a reason to look, not to discard.
+    required_skill_evidence = []
+    for requirement in job.get("required_skills") or []:
+        needle = _tokens(str(requirement))
+        required_skill_evidence.append({
+            "requirement": str(requirement),
+            "covered_by_candidate_fact": bool(needle) and all(token in fact_terms for token in needle),
+        })
+    covered_requirements = sum(1 for item in required_skill_evidence
+                               if item["covered_by_candidate_fact"])
+    stated_requirements = len(required_skill_evidence)
+    evidence_unsupported = bool(
+        title_hits
+        and stated_requirements >= EVIDENCE_SUPPORT_MIN_REQUIREMENTS
+        and covered_requirements * 2 < stated_requirements
+    )
+    if evidence_unsupported:
+        review.append("title_match_without_evidence_support")
+
     failures.extend(criteria_failures)
     review.extend(criteria_review)
 
@@ -1606,6 +1667,8 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     career_penalty = 1 if signal_hits["career_growth_demotion"] else 0
     duty_penalty = min(2, erp + (1 if ownership else 0))
     stretch_penalty = 1 if mandatory_advanced else 0
+    warning_penalty = min(3, len(warning_required))
+    evidence_gap_penalty = 1 if evidence_unsupported else 0
     weights = RANKING_WEIGHTS
     ranking_score = (
         RANKING_BASE
@@ -1616,11 +1679,15 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
         + weights["career_growth"] * career_penalty
         + weights["duty_demotion"] * duty_penalty
         + weights["stretch"] * stretch_penalty
+        + weights["warning_required"] * warning_penalty
+        + weights["evidence_gap"] * evidence_gap_penalty
     )
     penalties = [{"code": code, "weight": weight} for code, weight in (
         ("career_growth_ceiling_coordinator_role", 15 * career_penalty),
         ("duty_demotion", 10 * duty_penalty),
         ("advanced_requirement_mandatory", 5 * stretch_penalty),
+        ("warning_term_required", 6 * warning_penalty),
+        ("title_match_without_evidence_support", 12 * evidence_gap_penalty),
     ) if weight]
 
     return {
@@ -1637,6 +1704,7 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
         "seniority_assessment": seniority_assessment,
         "sponsorship_assessment": sponsorship_assessment,
         "credential_findings": credential_findings,
+        "required_skill_evidence": required_skill_evidence,
         "ranking_signals": {
             "positive_keyword_hits": positive_terms,
             "positive_keyword_field_hits": len(field_hits["positive_keywords"]),
@@ -1649,6 +1717,12 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
             "career_growth_penalty": career_penalty,
             "duty_demotion_penalty": duty_penalty,
             "stretch_penalty": stretch_penalty,
+            "warning_terms_required": warning_required,
+            "warning_terms_preferred_only": warning_preferred,
+            "warning_penalty": warning_penalty,
+            "required_skills_stated": stated_requirements,
+            "required_skills_covered_by_facts": covered_requirements,
+            "evidence_gap_penalty": evidence_gap_penalty,
             "sponsorship_priority": sponsorship_assessment["priority"],
             "direction_industry_match": None,
             "direction_company_size_match": None,
