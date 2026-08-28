@@ -81,43 +81,67 @@ const VERDICT_TEXT = {
 // merges them and so rewards padding; keeping them apart is the point of this panel.
 const CLASS_VIEW = [
   ["hidden_strength", "You have done this — the resume does not show it", "ok",
-   "add it; this is your own confirmed work"],
-  ["evidence_gap", "Shown, but thin", "warn",
-   "no figure or outcome attached; worth strengthening"],
-  ["transferable", "Related, not the same thing", "warn",
-   "say it as adjacent work — it never becomes direct experience"],
+   "add it; this is your own confirmed work", false],
   ["real_gap", "You have not done this", "bad",
-   "leave it out; a stretch is honest, an invention is not"],
-  ["covered", "Covered and already shown", "ok", "nothing to do"]
+   "leave it out; a stretch is honest, an invention is not", false],
+  ["evidence_gap", "Shown, but thin", "warn",
+   "no figure or outcome attached; worth strengthening", false],
+  ["transferable", "Related, not the same thing", "warn",
+   "say it as adjacent work — it never becomes direct experience", false],
+  // Nothing to act on, so it does not get a screen of its own.
+  ["covered", "Already covered and shown", "ok", "nothing to do", true]
 ];
+
+const HUMAN_ARRANGEMENT = { on_site: "on site", hybrid: "hybrid", remote: "remote" };
+
+function evidenceLine(e) {
+  const where = e.on_resume ? "already on your resume" : "not on this resume";
+  const figure = e.quantified ? "has a figure" : "no figure or outcome";
+  return `${where} · ${figure}`;
+}
 
 function render(result) {
   const [label, cls] = VERDICT_TEXT[result.verdict.call] || ["Unclear", "warn"];
+  const groups = result.classified || {};
+  const count = (key) => (groups[key] || []).length;
+  const hardGaps = (groups.real_gap || []).filter((g) => g.obligation === "required").length;
+
   $("verdict").className = `verdict ${cls}`;
   $("verdict").innerHTML = `<strong>${label}</strong>
     <span>${result.verdict.because}</span>
-    <span class="muted">${result.verdict.direction || "no direction"} ·
-      your resume carries ${result.resume_shows} of your facts</span>`;
+    <span class="tally">
+      <b class="ok">${count("hidden_strength")}</b> to add ·
+      <b class="bad">${hardGaps}</b> required gap${hardGaps === 1 ? "" : "s"} ·
+      ${result.verdict.covered}/${result.verdict.stated} requirements met</span>`;
 
   $("job-title").textContent = result.job.title || "(title not read)";
-  $("job-meta").textContent = [result.job.employer, result.job.location,
-                               result.job.work_arrangement].filter(Boolean).join(" · ");
+  $("job-meta").textContent = [
+    result.job.employer, result.job.location,
+    HUMAN_ARRANGEMENT[result.job.work_arrangement]
+  ].filter((value) => value && value !== "unknown").join(" · ");
 
-  $("classes").innerHTML = CLASS_VIEW.map(([key, heading, tone, advice]) => {
-    const items = (result.classified || {})[key] || [];
+  $("classes").innerHTML = CLASS_VIEW.map(([key, heading, tone, advice, collapsed]) => {
+    const items = groups[key] || [];
     if (!items.length) return "";
-    return `<section class="group ${tone}">
-      <h3>${heading}</h3>
-      <p class="advice">${advice}</p>
-      <ul>${items.map((item) => `
-        <li class="stack">
+    const body = `<p class="advice">${advice}</p>
+      <ul>${items.map((item) => {
+        const first = item.evidence[0];
+        const rest = item.evidence.slice(1);
+        // One line and the move; the rest of the wording is there if it is wanted.
+        return `<li class="stack">
           <span class="name"><strong>${item.requirement}</strong>
-            <span class="tag ${item.obligation === "required" ? "bad" : "warn"}">${item.obligation}</span></span>
-          ${item.evidence.map((e) => `<span class="reasons">
-            ${e.on_resume ? "on your resume" : "not on this resume"} ·
-            ${e.quantified ? "has a figure" : "no figure"} — ${e.text}</span>`).join("")}
-        </li>`).join("")}</ul>
-    </section>`;
+            <span class="tag ${item.obligation === "required" ? "bad" : "muted-tag"}">${
+              item.obligation === "required" ? "required" : "nice to have"}</span></span>
+          ${first ? `<span class="reasons">${evidenceLine(first)}</span>
+            <details class="quote"><summary>your words</summary>
+              <span class="reasons">${first.text}</span>
+              ${rest.map((e) => `<span class="reasons">${e.text}</span>`).join("")}
+            </details>` : ""}
+        </li>`;
+      }).join("")}</ul>`;
+    return collapsed
+      ? `<details class="group ${tone}"><summary>${heading} · ${items.length}</summary>${body}</details>`
+      : `<section class="group ${tone}"><h3>${heading}</h3>${body}</section>`;
   }).join("") || "<p class='muted'>this posting stated no requirements we could read</p>";
 
   $("directions").innerHTML = result.directions.map((d) => {
@@ -160,11 +184,21 @@ function readVisiblePosting() {
   if (!pane) { pane = document.body; matched = "fallback_body"; }
 
   let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
-  const CHROME_HEADINGS = /^(are these results|about the job|people (also viewed|you can)|similar jobs|job search|meet the hiring|set alert|show more|premium|jobs? you)/i;
-  const heading = [...pane.querySelectorAll("h1, h2")]
-    .map((node) => (node.innerText || "").trim())
-    .find((value) => value.length > 2 && value.length < 140
-                     && !value.endsWith("?") && !CHROME_HEADINGS.test(value));
+  // The title is whatever the page itself calls the job the URL says is open: the text of
+  // the link to it, or the heading wrapping that link. Guessing at headings and excluding
+  // the site's own by name never finishes — the last two attempts read the posting as
+  // "Are these results helpful?" and "See how you compare to others who clicked apply".
+  let heading = "";
+  if (currentId) {
+    const link = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
+    const wrapper = link?.closest("h1, h2, h3");
+    heading = (wrapper?.innerText || link?.innerText || "").trim().split("\n")[0];
+  }
+  if (!heading) {
+    heading = [...pane.querySelectorAll("h1")]
+      .map((node) => (node.innerText || "").trim().split("\n")[0])
+      .find((value) => value.length > 2 && value.length < 140 && !value.endsWith("?")) || "";
+  }
   // The standalone job view puts "Employer hiring Title in Location" in the document
   // title; the search view puts the search there, so it is only trusted when it parses.
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();

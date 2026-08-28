@@ -42,3 +42,12 @@ details { margin-top:18px; } summary { cursor:pointer; font-size:12px; opacity:.
 #setup { margin-bottom:6px; }
 #setup summary { font-size:12px; opacity:.6; }
 #setup[open] { border-bottom:1px solid var(--line); padding-bottom:10px; }
+
+.tally { margin-top:6px; font-size:12px; }
+.tally b { font-variant-numeric:tabular-nums; }
+.muted-tag { opacity:.55; }
+details.quote { margin-top:2px; }
+details.quote summary { font-size:11px; opacity:.55; cursor:pointer; }
+details.group { margin:16px 0; padding-left:10px; border-left:3px solid currentColor; }
+details.group > summary { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+                          cursor:pointer; font-weight:600; }

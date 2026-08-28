@@ -392,12 +392,30 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertNotIn("const location =", panel)
         self.assertIn("window.location.href", panel)
 
-    def test_the_reader_is_present_and_prefers_the_document_title(self):
+    def test_the_title_comes_from_the_link_to_the_open_posting(self):
+        # Guessing at headings and excluding the site's own by name never finishes: two
+        # attempts read the posting as "Are these results helpful?" and "See how you
+        # compare to others who clicked apply". The page names the job in the link to it.
         panel = self.sources["panel.js"]
         self.assertIn("function readVisiblePosting", panel)
-        # LinkedIn writes "Employer hiring Title in Location"; a heading inside the pane can
-        # belong to any of the site's widgets, and blocklisting them never finishes.
-        self.assertIn("documentMatch?.groups?.title || heading", panel)
+        self.assertIn('link?.closest("h1, h2, h3")', panel)
+        self.assertNotIn("CHROME_HEADINGS", panel, "no blocklist of the site's own headings")
+
+    def test_nothing_to_act_on_does_not_get_a_screen(self):
+        panel = self.sources["panel.js"]
+        self.assertIn('["covered", "Already covered and shown", "ok", "nothing to do", true]',
+                      panel)
+
+    def test_the_verdict_carries_counts_a_user_can_decide_on(self):
+        panel = self.sources["panel.js"]
+        for piece in ("to add", "required gap", "requirements met"):
+            self.assertIn(piece, panel)
+
+    def test_internal_wording_does_not_reach_the_user(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("no figure or outcome", panel)
+        self.assertIn("HUMAN_ARRANGEMENT", panel)
+        self.assertIn('value !== "unknown"', panel, "unset fields are not shown as unknown")
 
     def test_the_panel_answers_rather_than_dumps(self):
         panel = self.sources["panel.js"]
