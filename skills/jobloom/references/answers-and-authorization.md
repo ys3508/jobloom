@@ -39,7 +39,7 @@ Both channels must pass:
 - Channel A: standing authorization is current, scoped to this queue/action, and not revoked.
 - Channel B: every individual answer and dependent fact is current, applicable, and conflict-free.
 
-Channel A never extends or overrides Channel B. Immigration answers bind to real-world expiration dates and are rechecked whenever used.
+Channel A never extends or overrides Channel B. Immigration answers bind to real-world expiration dates and are rechecked whenever used. That recheck is enforced, not advisory: an immigration answer is auto-filled only when its scope names the application being filled, so a broadly scoped one pauses for the user at match time with `immigration_recheck_required` instead of filling and failing the pre-submit review later. Matching without an `application_id` in context pauses for the same reason.
 
 Standing authorization expires no later than fourteen days after confirmation in the MVP. Revocation takes effect immediately. Authorization scope may include country, jurisdiction, company, role family, employment type, application, or approved queue.
 

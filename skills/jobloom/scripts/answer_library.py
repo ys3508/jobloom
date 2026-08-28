@@ -278,6 +278,13 @@ def match_answer(
     if len(values) > 1:
         return {"decision": "conflict", "reason": "conflicting_active_answers", "canonical_id": canonical_id, "auto_fill_ready": False}
     selected = max(best, key=lambda row: parse_time(row["confirmed_at"]) or datetime.min.replace(tzinfo=timezone.utc))
+    if canonical_id in IMMIGRATION_CANONICAL_IDS:
+        application_id = context.get("application_id")
+        selected_scope = json.loads(selected["scope_json"])
+        if not application_id or selected_scope.get("application_id") != application_id:
+            return {"decision": "ask", "reason": "immigration_recheck_required",
+                    "canonical_id": canonical_id, "answer_id": selected["answer_id"],
+                    "auto_fill_ready": False}
     if selected["answer_type"] == "legal_commitment":
         return {"decision": "ask", "reason": "legal_commitment_requires_review", "canonical_id": canonical_id, "answer_id": selected["answer_id"], "auto_fill_ready": False}
     if not selected["auto_fill_allowed"]:

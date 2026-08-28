@@ -33,7 +33,8 @@ VALUE_CONTROLS = {"text", "textarea", "select", "radio", "checkbox"}
 USER_ANSWER_PAUSES = {
     "new_question", "question_mapping_conflict", "no_applicable_answer", "answer_expired",
     "answer_review_due", "answer_not_yet_effective", "conflicting_active_answers",
-    "automatic_fill_not_allowed", "legal_commitment_requires_review", "standing_authorization_missing",
+    "automatic_fill_not_allowed", "legal_commitment_requires_review", "immigration_recheck_required",
+    "standing_authorization_missing",
     "standing_authorization_unknown", "standing_authorization_revoked",
     "standing_authorization_expired", "standing_authorization_scope_mismatch",
     "candidate_fact_unknown", "candidate_fact_not_locked", "candidate_fact_expired",

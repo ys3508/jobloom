@@ -38,7 +38,7 @@ def entry(answer_id="answer-1", canonical_id="work_authorized_now", answer=True,
         "expires_at": "2027-01-01T00:00:00Z",
         "review_after": None,
         "validity_class": "event_driven",
-        "scope": {"country": "US"},
+        "scope": {"country": "US", "application_id": "app-1"},
         "preconditions": {},
         "exclusions": {},
         "auto_fill_allowed": True,
@@ -63,7 +63,7 @@ def authorization(authorization_id="auth-1", **updates):
     return value
 
 
-CONTEXT = {"country": "US", "queue_id": "queue-1", "company": "Example"}
+CONTEXT = {"country": "US", "queue_id": "queue-1", "company": "Example", "application_id": "app-1"}
 
 
 class AnswerLibraryTests(unittest.TestCase):
@@ -103,7 +103,7 @@ class AnswerLibraryTests(unittest.TestCase):
 
     def test_scope_mismatch_does_not_reuse_answer(self):
         db = self.db()
-        MODULE.add_answer(db, entry(scope={"country": "CA"}))
+        MODULE.add_answer(db, entry(scope={"country": "CA", "application_id": "app-1"}))
         MODULE.add_question_form(db, "work_authorized_now", "Authorized to work now?")
         result = MODULE.match_answer(db, "Authorized to work now?", CONTEXT, at=AT)
         self.assertEqual(result["reason"], "answer_scope_mismatch")
@@ -154,7 +154,7 @@ class AnswerLibraryTests(unittest.TestCase):
     def test_per_application_answer_requires_application_scope(self):
         db = self.db()
         with self.assertRaisesRegex(ValueError, "scope.application_id"):
-            MODULE.add_answer(db, entry(validity_class="per_application"))
+            MODULE.add_answer(db, entry(validity_class="per_application", scope={"country": "US"}))
 
     def test_per_application_answer_does_not_match_another_application(self):
         db = self.db()
@@ -167,6 +167,36 @@ class AnswerLibraryTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "ask")
         self.assertEqual(result["reason"], "answer_scope_mismatch")
+
+    def test_immigration_answer_without_application_scope_is_never_auto_filled(self):
+        db = self.db()
+        MODULE.add_answer(db, entry(scope={"country": "US"}))
+        MODULE.add_question_form(db, "work_authorized_now", "Authorized to work now?")
+        MODULE.add_authorization(db, authorization())
+        result = MODULE.match_answer(db, "Authorized to work now?", CONTEXT, "auth-1", AT)
+        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["reason"], "immigration_recheck_required")
+        self.assertFalse(result["auto_fill_ready"])
+
+    def test_immigration_answer_requires_an_application_in_context(self):
+        db = self.db()
+        MODULE.add_answer(db, entry(scope={"country": "US"}))
+        MODULE.add_question_form(db, "work_authorized_now", "Authorized to work now?")
+        context = {key: value for key, value in CONTEXT.items() if key != "application_id"}
+        result = MODULE.match_answer(db, "Authorized to work now?", context, at=AT)
+        self.assertEqual(result["reason"], "immigration_recheck_required")
+
+    def test_non_immigration_answer_needs_no_application_scope(self):
+        db = self.db()
+        MODULE.add_answer(db, entry(
+            answer_id="answer-relocate", canonical_id="relocation_willingness",
+            answer_type="stable_fact", validity_class="stable", scope={"country": "US"},
+        ))
+        MODULE.add_question_form(db, "relocation_willingness", "Are you willing to relocate?")
+        MODULE.add_authorization(db, authorization())
+        result = MODULE.match_answer(db, "Are you willing to relocate?", CONTEXT, "auth-1", AT)
+        self.assertEqual(result["decision"], "use")
+        self.assertTrue(result["auto_fill_ready"])
 
     def test_audit_log_never_contains_answer_value(self):
         db = self.db()

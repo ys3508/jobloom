@@ -27,14 +27,17 @@ class AnswerLibraryCliTests(unittest.TestCase):
                 "answer_type": "time_sensitive_fact", "source_type": "user_confirmed",
                 "confirmation_status": "confirmed", "confirmed_at": confirmed.isoformat(),
                 "expires_at": expires.isoformat(), "validity_class": "event_driven",
-                "scope": {"country": "US"}, "auto_fill_allowed": True,
+                "scope": {"country": "US", "application_id": "app-cli"}, "auto_fill_allowed": True,
                 "auto_submit_allowed": False,
             }), encoding="utf-8")
             authorization_path.write_text(json.dumps({
                 "authorization_id": "auth-cli", "confirmed_at": confirmed.isoformat(),
                 "expires_at": expires.isoformat(), "scope": {"country": "US", "queue_id": "queue-cli"},
             }), encoding="utf-8")
-            context_path.write_text(json.dumps({"country": "US", "queue_id": "queue-cli"}), encoding="utf-8")
+            context_path.write_text(
+                json.dumps({"country": "US", "queue_id": "queue-cli", "application_id": "app-cli"}),
+                encoding="utf-8",
+            )
 
             base = [sys.executable, str(SCRIPT), "--db", str(database)]
             subprocess.run(base + ["init"], check=True, capture_output=True, text=True)

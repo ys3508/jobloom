@@ -112,13 +112,14 @@ class FillCoreTests(unittest.TestCase):
             "scope": {"country": "US", "application_id": "app-1"},
         })
 
-    def add_answer(self, answer_id, canonical_id, question, value):
+    def add_answer(self, answer_id, canonical_id, question, value, scope=None):
         ANSWERS.add_answer(self.db, {
             "answer_id": answer_id, "canonical_id": canonical_id,
             "canonical_meaning": question, "answer": value, "answer_type": "stable_fact",
             "source_type": "user_confirmed", "confirmation_status": "confirmed",
             "confirmed_at": AT.isoformat(), "validity_class": "stable",
-            "scope": {"country": "US"}, "auto_fill_allowed": True, "auto_submit_allowed": True,
+            "scope": scope if scope is not None else {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
         })
         ANSWERS.add_question_form(self.db, canonical_id, question)
 
@@ -174,6 +175,27 @@ class FillCoreTests(unittest.TestCase):
     def reacquire(self, worker_id="worker-2"):
         APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
         return APPLICATIONS.acquire_next(self.db, worker_id, at=AT)
+
+    def test_immigration_answer_from_another_application_pauses_before_filling(self):
+        self.db.execute("DELETE FROM answers WHERE answer_id='answer-auth'")
+        ANSWERS.add_answer(self.db, {
+            "answer_id": "answer-auth-broad", "canonical_id": "work_authorized_now",
+            "canonical_meaning": "Are you authorized to work?", "answer": True,
+            "answer_type": "stable_fact", "source_type": "user_confirmed",
+            "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
+            "validity_class": "stable", "scope": {"country": "US"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
+        })
+        self.start()
+        result = FILL.observe_page(
+            self.db, "session-1", "worker-1", self.candidate_path,
+            self.page(fields=[self.standard_fields()[1]]), AT,
+        )
+        self.assertEqual(result["state"], "waiting_for_user_answer")
+        self.assertIn("immigration_recheck_required:work_auth", result["reasons"])
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM fill_steps WHERE session_id='session-1'"
+        ).fetchone()[0], 0)
 
     def test_identity_mismatch_pauses_for_takeover(self):
         result = self.start(observed_employer="Unrelated Corp")

@@ -116,7 +116,7 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 2. Create only user-confirmed entries from `assets/answer-entry.template.json`; never use model inference as a factual source.
 3. Register exact question forms directly. Register a semantic equivalent only after the user verifies that it has the same canonical meaning.
 4. Match using the full application context. Respect scope, conditions, exclusions, answer freshness, conflicts, and automatic-fill permission.
-5. Keep `work_authorized_now`, `sponsorship_now`, `sponsorship_future`, and `employer_action_required` as separate canonical IDs. Recheck them for every application where they appear.
+5. Keep `work_authorized_now`, `sponsorship_now`, `sponsorship_future`, and `employer_action_required` as separate canonical IDs. Confirm them per application: matching auto-fills one only when its scope names the application in context, and otherwise pauses with `immigration_recheck_required`.
 6. Require a current standing authorization for automatic filling. Limit each authorization to fourteen days and a concrete scope.
 7. Use the authoritative pre-submission review over every covered field. It queries facts, answers, materials, and authorization from the database; never trust caller- or page-supplied freshness status.
 8. Use `invalidate --trigger <event>` immediately after a declared change. Never let current standing authorization reactivate stale answers.
