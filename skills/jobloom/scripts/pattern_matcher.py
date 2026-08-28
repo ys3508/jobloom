@@ -210,3 +210,16 @@ def unmatched_pattern_ids(
         if not samples or not any(match(pattern, sample) for sample in samples):
             missing.append(pattern_id)
     return sorted(missing)
+
+
+def resolve_semantic_cached(pattern: dict[str, Any], fact_id: str, fact: dict[str, Any] | str,
+                            model_version: str, cache: dict[tuple[str, str, str], bool],
+                            resolver: Any) -> bool:
+    """Call the semantic resolver once per pattern/fact/model tuple."""
+    pattern = validate_pattern(pattern)
+    if pattern["type"] != "semantic_anchor":
+        raise ValueError("semantic cache accepts semantic_anchor patterns only")
+    key = (pattern["pattern_id"], fact_id, model_version)
+    if key not in cache:
+        cache[key] = bool(resolver(pattern["anchor"], fact))
+    return cache[key]

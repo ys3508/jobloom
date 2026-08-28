@@ -18,6 +18,7 @@ if SCRIPT_DIR not in sys.path:
 import direction_core  # noqa: E402
 import extract_candidate_facts  # noqa: E402
 import resume_core  # noqa: E402
+import career_direction_pipeline  # noqa: E402
 from evidence_matcher import EVIDENCE_ORDER, STRENGTH_FACTORS, fact_supports  # noqa: E402
 
 
@@ -332,8 +333,14 @@ def generate_proposal(*, proposal_id: str, candidate: dict[str, Any], facts: lis
     }
 
 
+def generate_v2_proposal(**kwargs: Any) -> dict[str, Any]:
+    """Run the V2 evidence → capability → independent-axis pipeline."""
+    return career_direction_pipeline.generate(**kwargs)
+
+
 def propose_candidate(candidate_path: Path, catalog_path: Path, proposal_id: str, db_path: Path,
-                      goals_path: Path | None = None, max_directions: int = 6) -> dict[str, Any]:
+                      goals_path: Path | None = None, max_directions: int = 6,
+                      engine: str = "v2") -> dict[str, Any]:
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
@@ -347,8 +354,14 @@ def propose_candidate(candidate_path: Path, catalog_path: Path, proposal_id: str
     snapshot_path = Path(snapshot["snapshot_path"])
     if not snapshot_path.is_file() or resume_core.file_sha256(snapshot_path) != snapshot["file_sha256"]:
         raise ValueError("active CandidateSnapshot file hash mismatch")
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     goals = json.loads(goals_path.read_text(encoding="utf-8")) if goals_path else None
+    if engine == "v2":
+        return generate_v2_proposal(
+            proposal_id=proposal_id, candidate=candidate, facts=candidate["facts"],
+            mode="verified", snapshot_sha256=candidate_hash, goals=goals,
+            max_directions=max_directions,
+        )
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     return generate_proposal(proposal_id=proposal_id, candidate=candidate,
                              facts=candidate["facts"], mode="verified",
                              source_sha256=candidate_hash, catalog=catalog, goals=goals,
@@ -356,21 +369,29 @@ def propose_candidate(candidate_path: Path, catalog_path: Path, proposal_id: str
 
 
 def propose_material(material_path: Path, catalog_path: Path, proposal_id: str,
-                     goals_path: Path | None = None, max_directions: int = 6) -> tuple[dict[str, Any], dict[str, Any]]:
+                     goals_path: Path | None = None, max_directions: int = 6,
+                     engine: str = "v2") -> tuple[dict[str, Any], dict[str, Any]]:
     packet = extract_candidate_facts.build_review_packet(material_path)
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     goals = json.loads(goals_path.read_text(encoding="utf-8")) if goals_path else None
     candidate = {"search": {}}
-    proposal = generate_proposal(
-        proposal_id=proposal_id, candidate=candidate, facts=packet["facts"], mode="provisional",
-        source_sha256=packet["source_document"]["sha256"], catalog=catalog, goals=goals,
-        max_directions=max_directions,
-    )
+    if engine == "v2":
+        proposal = generate_v2_proposal(
+            proposal_id=proposal_id, candidate=candidate, facts=packet["facts"], mode="provisional",
+            snapshot_sha256=packet["source_document"]["sha256"], goals=goals,
+            max_directions=max_directions)
+    else:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        proposal = generate_proposal(
+            proposal_id=proposal_id, candidate=candidate, facts=packet["facts"], mode="provisional",
+            source_sha256=packet["source_document"]["sha256"], catalog=catalog, goals=goals,
+            max_directions=max_directions)
     return proposal, packet
 
 
 def materialize_selection(proposal: dict[str, Any], selection: dict[str, Any], *, actor: str,
-                          expected_proposal_sha256: str) -> dict[str, Any]:
+                          expected_proposal_sha256: str,
+                          current_snapshot_sha256: str | None = None,
+                          current_ontology_version: str | None = None) -> dict[str, Any]:
     if actor != "user":
         raise ValueError("career direction selection requires the user actor")
     content = {key: value for key, value in proposal.items()
@@ -380,6 +401,13 @@ def materialize_selection(proposal: dict[str, Any], selection: dict[str, Any], *
         raise ValueError("career direction proposal hash does not match reviewed content")
     if not proposal.get("adoptable") or proposal.get("mode") != "verified":
         raise ValueError("provisional career directions cannot be materialized")
+    if proposal.get("engine_version") == "v2" and (
+            current_snapshot_sha256 is None or current_ontology_version is None):
+        raise ValueError("V2 materialization requires the active snapshot and ontology version")
+    if current_snapshot_sha256 is not None and proposal.get("source_sha256") != current_snapshot_sha256:
+        raise ValueError("career direction proposal is stale for the active candidate snapshot")
+    if current_ontology_version is not None and proposal.get("ontology_version") != current_ontology_version:
+        raise ValueError("career direction proposal ontology has been superseded")
     if not isinstance(selection, dict) or set(selection) != {"portfolio_id", "name", "allocations"}:
         raise ValueError("career direction selection has missing or unknown fields")
     resume_core._require_safe_id(selection["portfolio_id"], "portfolio_id")
@@ -431,6 +459,7 @@ def main() -> None:
         command.add_argument("--catalog", type=Path, default=CATALOG_PATH)
         command.add_argument("--goals", type=Path)
         command.add_argument("--max-directions", type=int, default=6)
+        command.add_argument("--engine", choices=("v2", "v1"), default="v2")
         command.add_argument("--output", required=True, type=Path)
         if name == "propose-candidate":
             command.add_argument("--candidate", required=True, type=Path)
@@ -443,22 +472,26 @@ def main() -> None:
     materialize.add_argument("--selection", required=True, type=Path)
     materialize.add_argument("--actor", required=True)
     materialize.add_argument("--proposal-sha256", required=True)
+    materialize.add_argument("--current-snapshot-sha256")
+    materialize.add_argument("--current-ontology-version")
     materialize.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.command == "propose-candidate":
         result = propose_candidate(args.candidate, args.catalog, args.proposal_id, args.db,
-                                   args.goals, args.max_directions)
+                                   args.goals, args.max_directions, args.engine)
         _write_json(args.output, result)
     elif args.command == "propose-material":
         result, packet = propose_material(args.material, args.catalog, args.proposal_id,
-                                          args.goals, args.max_directions)
+                                          args.goals, args.max_directions, args.engine)
         _write_json(args.output, result)
         _write_json(args.fact_review_output, packet)
     else:
         proposal = json.loads(args.proposal.read_text(encoding="utf-8"))
         selection = json.loads(args.selection.read_text(encoding="utf-8"))
         result = materialize_selection(proposal, selection, actor=args.actor,
-                                       expected_proposal_sha256=args.proposal_sha256)
+                                       expected_proposal_sha256=args.proposal_sha256,
+                                       current_snapshot_sha256=args.current_snapshot_sha256,
+                                       current_ontology_version=args.current_ontology_version)
         for profile in result["profiles"]:
             _write_json(args.output_dir / f"{profile['direction_id']}.json", profile)
         _write_json(args.output_dir / f"{result['portfolio']['portfolio_id']}.json",

@@ -1,7 +1,7 @@
 # 技术规格：Career Direction Engine V2
 
-状态：**设计规格，未实现。** 基线为 `9c5275e`（保守化后的 Career Hypothesis Generator V1）。
-2026-08-28 经 Codex 复核；§8.1 描述的是当前已提交状态。
+状态：**非市场 V2 主路径已实现；外部市场采集器尚未接入。** V1 catalog 仅保留兼容与
+provisional fallback；默认 CLI 使用 V2。2026-08-28 经 Codex 实现与回归验证。
 目标读者：实现者（Codex）与产品所有者。本文不改代码。
 
 ---
@@ -1042,6 +1042,9 @@ semantic_anchor_cache(pattern_id, fact_id, hit, model_version,
 6. `market_profile.py` + 获授权采集器：最后接入；此前市场轴按 N4 返回 null。
 
 **1–5 完成即可上线非市场版本**，市场轴以 `null` + `market_profile_unavailable` 呈现。
+
+实现状态（2026-08-28）：步骤 1–5 已完成；步骤 6 已实现结构化 JobCard 聚合与
+fail-closed MRP 接口，但没有绕过来源条款创建抓取器。没有获授权市场数据时继续按 N4 返回 null。
 
 ---
 

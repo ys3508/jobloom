@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1.0",
+  "ontology_version": "2026.08.0",
+  "query_templates": [{"template_id": "exact", "pattern": "\"{raw}\""}],
+  "surfaces": [
+    {"surface_id":"ts.research-data-analyst","raw":"Research Data Analyst","maps_to":[{"function_id":"fn.research-clinical-data","confidence":1.0,"assigned_by":"curated","confirmed_by_user":true}],"requires_domain_guard":false,"domain_guard_terms":[],"excluded_senses":[],"provenance":{"postings_seen":3,"distinct_employers":3}},
+    {"surface_id":"ts.research-analyst","raw":"Research Analyst","maps_to":[{"function_id":"fn.research-clinical-data","confidence":0.8,"assigned_by":"curated","confirmed_by_user":true,"guard_terms":["clinical","study","public health"]},{"function_id":"fn.pharma-insights","confidence":0.7,"assigned_by":"curated","confirmed_by_user":true,"guard_terms":["consumer insights","brand tracking"]}],"requires_domain_guard":true,"domain_guard_terms":["clinical","study","public health","consumer insights","brand tracking"],"excluded_senses":[{"sense":"equity_research","disambiguator_terms":["equity","sell-side","buy-side","securities"],"action":"fail"}],"provenance":{"postings_seen":3,"distinct_employers":3}},
+    {"surface_id":"ts.biostatistician","raw":"Biostatistician","maps_to":[{"function_id":"fn.biostatistical-analysis","confidence":1.0,"assigned_by":"curated","confirmed_by_user":true}],"requires_domain_guard":false,"domain_guard_terms":[],"excluded_senses":[],"provenance":{"postings_seen":3,"distinct_employers":3}},
+    {"surface_id":"ts.biostatistics-analyst","raw":"Biostatistics Analyst","maps_to":[{"function_id":"fn.biostatistical-analysis","confidence":1.0,"assigned_by":"curated","confirmed_by_user":true}],"requires_domain_guard":false,"domain_guard_terms":[],"excluded_senses":[],"provenance":{"postings_seen":3,"distinct_employers":3}},
+    {"surface_id":"ts.pharma-insights-analyst","raw":"Pharma Insights Analyst","maps_to":[{"function_id":"fn.pharma-insights","confidence":1.0,"assigned_by":"curated","confirmed_by_user":true}],"requires_domain_guard":false,"domain_guard_terms":[],"excluded_senses":[],"provenance":{"postings_seen":3,"distinct_employers":3}},
+    {"surface_id":"ts.data-analyst","raw":"Data Analyst","maps_to":[{"function_id":"fn.research-clinical-data","confidence":0.5,"assigned_by":"curated","confirmed_by_user":false},{"function_id":"fn.biostatistical-analysis","confidence":0.5,"assigned_by":"curated","confirmed_by_user":false}],"requires_domain_guard":true,"domain_guard_terms":["clinical","research","biostatistics"],"excluded_senses":[],"provenance":{"postings_seen":3,"distinct_employers":3}}
+  ]
+}

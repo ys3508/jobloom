@@ -93,6 +93,17 @@ class PatternMatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot exceed transferable"):
             MATCHER.validate_pattern(too_strong)
 
+    def test_semantic_cache_runs_once_per_model_version(self):
+        pattern = {"pattern_id":"pat.semantic", "type":"semantic_anchor", "lang":"en",
+                   "anchor":"research", "max_grade":"transferable", "requires_confirmation":True}
+        cache, calls = {}, []
+        resolver = lambda anchor, fact: calls.append((anchor, fact)) or True
+        MATCHER.resolve_semantic_cached(pattern, "f1", "text", "m1", cache, resolver)
+        MATCHER.resolve_semantic_cached(pattern, "f1", "text", "m1", cache, resolver)
+        self.assertEqual(len(calls), 1)
+        MATCHER.resolve_semantic_cached(pattern, "f1", "text", "m2", cache, resolver)
+        self.assertEqual(len(calls), 2)
+
 
 class CapabilityOntologyTests(unittest.TestCase):
     def setUp(self):

@@ -291,3 +291,17 @@ def capability(ontology: dict[str, Any], capability_id: str) -> dict[str, Any]:
 def function_node(ontology: dict[str, Any], function_id: str) -> dict[str, Any]:
     return next(item for item in ontology["function_nodes"]
                 if item["function_id"] == function_id)
+
+
+def calibrate(ontology: dict[str, Any], resumes: list[list[dict[str, Any]]]) -> dict[str, list[str]]:
+    if len(resumes) < 20:
+        raise ValueError("capability calibration requires at least 20 resumes")
+    dead, overbroad = [], []
+    for cap in ontology["capabilities"]:
+        if cap["layer"] != "SKILL": continue
+        hits = sum(any(pattern_matcher.match(pattern, fact)
+                       for pattern in cap["evidence_patterns"] for fact in facts)
+                   for facts in resumes)
+        if hits == 0: dead.append(cap["capability_id"])
+        if hits / len(resumes) > .80: overbroad.append(cap["capability_id"])
+    return {"dead_skill_ids": sorted(dead), "overbroad_skill_ids": sorted(overbroad)}

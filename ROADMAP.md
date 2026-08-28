@@ -150,8 +150,15 @@ on-the-job Python use merely because its fact was labeled `direct`.
 schema validation and a golden fact for every evidence pattern. `pattern_matcher.py` adds
 ordered token-run matching, controlled English inflection (`focus group` → `focus groups`),
 explicit variants, CJK substring matching, and fail-closed semantic-anchor rules. This is the
-foundation of module 1, not its completion: EvidenceUnit extraction and the V2 reconciliation
-pipeline still need to consume it before the V1 heuristic can be retired.
+foundation of module 1 rather than its completion at that commit; the following implementation
+milestone records when EvidenceUnit extraction and V2 reconciliation began consuming it.
+
+**Career Direction Engine V2 non-market path implemented 2026-08-28.** Confirmed facts now
+flow through EvidenceUnits, guarded quantity signals, typed capability relations, bottom-up
+FunctionNode hypotheses, independent direction axes, deterministic title resolution, convergence,
+hash-locked proposals, and the existing user-only materialization gate. Structured JobCards can
+be aggregated into fail-closed market profiles; no external collector is enabled without an
+authorized source, so unavailable market axes remain null by design.
 
 ## 2. One resume is not enough — Master → Variant → Tailored
 
