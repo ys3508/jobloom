@@ -20,6 +20,8 @@ User approval is required to enter `approved`. Use atomic acquisition to enter `
 
 Use `fill-only-execution.md` after acquisition. A fill session must share the active lease owner, preserve page checkpoints across a pause, and release to `waiting_for_user_answer`, `waiting_for_user_takeover`, or `waiting_for_submission_approval`. The fill engine never enters `submitting` or records submission evidence.
 
+`ready_to_fill` may return to `materials_in_progress`, and only from there: a resume bound in the wrong format, or superseded before any filling has begun, must be replaceable. Rebinding invalidates the old lock and clears `pre_submit_check_passed`, so the replacement is locked and rechecked like any other. Once a worker acquires the application the state is `filling`, and that door is shut.
+
 Entering `ready_to_fill` requires an active material lock for the application's bound, approved ResumeVersion and optional approved CoverLetterVersion. The lock must match every registered version, hash, and current snapshot. Acquisition repeats these checks; missing, revoked, rebound, modified, or wrongly scoped material cannot enter the fill queue.
 
 Generate and obtain user approval for the persisted summary in `pre-submission-review.md` before entering `pre_submit_ready`. A caller Boolean is not a check result. Reset and invalidate the review whenever the application returns to materials, filling, user-answer, failed, or takeover states.

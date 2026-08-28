@@ -47,7 +47,11 @@ TRANSITIONS = {
     "approved": {"materials_in_progress", "withdrawn"},
     "materials_in_progress": {"ready_to_fill", "waiting_for_user_answer", "withdrawn"},
     "waiting_for_user_answer": {"materials_in_progress", "ready_to_fill", "withdrawn"},
-    "ready_to_fill": {"filling", "withdrawn", "closed"},
+    # Back to material preparation is allowed only from ready_to_fill, before any worker
+    # has acquired the application: a resume bound in the wrong format or superseded before
+    # filling starts must be replaceable, and rebinding already invalidates the old lock.
+    # Once filling begins the state is `filling`, so this door is shut by then.
+    "ready_to_fill": {"filling", "materials_in_progress", "withdrawn", "closed"},
     "filling": {"waiting_for_user_answer", "waiting_for_submission_approval", "submission_failed", "waiting_for_user_takeover", "withdrawn"},
     "submission_failed": {"ready_to_fill", "waiting_for_user_takeover", "withdrawn"},
     "waiting_for_user_takeover": {"ready_to_fill", "waiting_for_submission_approval", "withdrawn", "closed"},

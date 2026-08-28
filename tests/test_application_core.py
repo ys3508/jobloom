@@ -65,11 +65,41 @@ class ApplicationCoreTests(unittest.TestCase):
         self.install_materials(application_id)
         CORE.transition(self.db, application_id, "ready_to_fill", "system", "materials_ready", at=AT)
 
-    def install_materials(self, application_id="app-1"):
+    def test_materials_can_be_replaced_before_filling_starts(self):
+        """A resume bound in the wrong format must be replaceable while nobody is filling."""
+        self.add_job_and_application()
+        self.move_to_ready()
+        CORE.transition(self.db, "app-1", "materials_in_progress", "system", "resume_format_changed",
+                        at=AT)
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'").fetchone()[0],
+            "materials_in_progress")
+        self.install_materials("app-1", suffix="-pdf")
+        CORE.transition(self.db, "app-1", "ready_to_fill", "system", "materials_ready", at=AT)
+        row = self.db.execute(
+            "SELECT state, resume_version_id FROM applications WHERE application_id='app-1'"
+        ).fetchone()
+        self.assertEqual(row["state"], "ready_to_fill")
+        self.assertEqual(row["resume_version_id"], "resume-app-1-pdf")
+        locks = self.db.execute(
+            "SELECT resume_version_id, invalidated_at FROM material_locks "
+            "WHERE application_id='app-1' ORDER BY locked_at").fetchall()
+        self.assertEqual(len(locks), 2)
+        self.assertIsNotNone(locks[0]["invalidated_at"], "the first lock is invalidated by rebinding")
+        self.assertIsNone(locks[1]["invalidated_at"])
+
+    def test_materials_cannot_be_replaced_once_a_worker_is_filling(self):
+        self.add_job_and_application()
+        self.move_to_ready()
+        CORE.acquire_next(self.db, "worker-1", at=AT)
+        with self.assertRaisesRegex(ValueError, "invalid transition"):
+            CORE.transition(self.db, "app-1", "materials_in_progress", "system", "too_late", at=AT)
+
+    def install_materials(self, application_id="app-1", suffix=""):
         root = Path(self.temp_dir.name)
-        source = root / f"{application_id}.txt"
+        source = root / f"{application_id}{suffix}.txt"
         source.write_text("Verified resume claim\n", encoding="utf-8")
-        version_id = f"resume-{application_id}"
+        version_id = f"resume-{application_id}{suffix}"
         RESUMES.register_version(self.db, root / "store", source, version_id, "master_source", "general", at=AT)
         fact = {
             "id": "fact-1", "type": "skill", "value": "Verified resume claim",
@@ -104,7 +134,7 @@ class ApplicationCoreTests(unittest.TestCase):
             )
         RESUMES.approve_version(self.db, version_id, candidate_path, manifest_path, "user", AT)
         RESUMES.bind_version(self.db, application_id, version_id, at=AT)
-        RESUMES.lock_materials(self.db, application_id, lock_id=f"lock-{application_id}", at=AT)
+        RESUMES.lock_materials(self.db, application_id, lock_id=f"lock-{application_id}{suffix}", at=AT)
 
     def move_to_pre_submit(self, application_id="app-1"):
         self.move_to_ready(application_id)
