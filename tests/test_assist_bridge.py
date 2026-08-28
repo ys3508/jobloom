@@ -255,6 +255,14 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn("are these results", panel)
         self.assertIn("hiring", panel, "employer and location come from the document title")
 
+    def test_the_reader_does_not_shadow_window_location(self):
+        # A local named `location` shadows window.location for the whole function, and the
+        # reader ends by reading location.href, so the injection threw and the panel could
+        # only report that the page returned no posting.
+        panel = self.sources["panel.js"]
+        self.assertNotIn("const location =", panel)
+        self.assertIn("window.location.href", panel)
+
     def test_reading_is_refused_before_the_grant(self):
         self.assertIn("page access not granted yet", self.sources["panel.js"])
 

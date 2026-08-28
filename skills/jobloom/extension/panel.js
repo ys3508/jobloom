@@ -126,15 +126,17 @@ function readVisiblePosting() {
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
   const title = (heading || documentMatch?.groups?.title || fromDocument).trim();
   const employer = documentMatch?.groups?.employer?.trim() || "";
-  const location = documentMatch?.groups?.location?.trim() || "";
+  // Not named `location`: that shadows window.location for the whole function, and the
+  // return below reads location.href.
+  const place = documentMatch?.groups?.location?.trim() || "";
   // A search page keeps the result list and the open posting in one container. When the
   // title appears inside the text, everything before it is the list, so drop it.
   if (title && matched === "main" || matched === "fallback_body") {
     const start = text.indexOf(title);
     if (title && start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
   }
-  return { url: location.href.split("?")[0], text: text.slice(0, 60000), title,
-           employer, location, container: matched };
+  return { url: window.location.href.split("?")[0], text: text.slice(0, 60000), title,
+           employer, location: place, container: matched };
 }
 
 $("read").addEventListener("click", async () => {
