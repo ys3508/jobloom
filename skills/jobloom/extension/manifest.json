@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "description": "Shows Jobloom's positioning for the job posting you are already looking at. Nothing runs until you press the button, and it never opens a page, navigates, or submits.",
   "permissions": [
-    "activeTab",
     "scripting",
     "sidePanel",
-    "storage"
+    "storage",
+    "activeTab"
   ],
   "host_permissions": [
     "http://127.0.0.1:8787/*"
@@ -20,5 +20,9 @@
   },
   "side_panel": {
     "default_path": "panel.html"
-  }
+  },
+  "optional_host_permissions": [
+    "https://www.linkedin.com/*",
+    "https://*.indeed.com/*"
+  ]
 }

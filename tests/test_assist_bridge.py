@@ -153,11 +153,26 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.sources = {name: (EXTENSION / name).read_text(encoding="utf-8")
                         for name in ("background.js", "panel.js")}
 
-    def test_it_asks_for_the_active_tab_only(self):
-        self.assertIn("activeTab", self.manifest["permissions"])
-        for permission in ("tabs", "webNavigation", "webRequest", "cookies", "<all_urls>"):
+    def test_it_never_asks_for_browsing_wide_permissions(self):
+        for permission in ("tabs", "webNavigation", "webRequest", "cookies", "history",
+                           "<all_urls>"):
             self.assertNotIn(permission, self.manifest["permissions"])
+
+    def test_page_access_is_optional_scoped_and_granted_by_the_user(self):
+        # Job-site access is not held at install time. It is an optional grant the user
+        # makes in Chrome's own dialog and can revoke, and it names two hosts, not the web.
         self.assertEqual(self.manifest["host_permissions"], ["http://127.0.0.1:8787/*"])
+        optional = self.manifest["optional_host_permissions"]
+        self.assertEqual(sorted(optional),
+                         ["https://*.indeed.com/*", "https://www.linkedin.com/*"])
+        for origin in optional:
+            self.assertNotIn("*://", origin, "job-site access must be https only")
+        panel = self.sources["panel.js"]
+        self.assertIn("chrome.permissions.request", panel)
+        self.assertIn("chrome.permissions.contains", panel)
+
+    def test_reading_is_refused_before_the_grant(self):
+        self.assertIn("page access not granted yet", self.sources["panel.js"])
 
     def test_it_cannot_reach_a_job_site_from_its_own_code(self):
         for name, source in self.sources.items():

@@ -32,6 +32,34 @@ $("save").addEventListener("click", async () => {
   checkHealth();
 });
 
+// activeTab is granted by clicking the toolbar action, which a click inside this panel is
+// not, and LinkedIn revokes it again on every in-app navigation. So page access is an
+// explicit, optional, revocable grant the user makes once in Chrome's own dialog.
+const JOB_HOSTS = ["https://www.linkedin.com/*", "https://*.indeed.com/*"];
+
+async function hasPageAccess() {
+  return chrome.permissions.contains({ origins: JOB_HOSTS });
+}
+
+async function refreshAccess() {
+  const granted = await hasPageAccess();
+  $("access-state").textContent = granted
+    ? "page access granted — revoke any time in chrome://extensions"
+    : "not granted; Jobloom cannot read a posting until you allow it";
+  $("grant").hidden = granted;
+  $("read").disabled = !granted;
+}
+
+$("grant").addEventListener("click", async () => {
+  // Must be called straight from the user's click for Chrome to show the dialog.
+  try {
+    await chrome.permissions.request({ origins: JOB_HOSTS });
+  } catch (error) {
+    $("access-state").textContent = String(error.message || error);
+  }
+  refreshAccess();
+});
+
 function tag(decision) {
   const cls = decision === "match" ? "match" : decision === "fail" ? "fail" : "review";
   return `<span class="tag ${cls}">${decision}</span>`;
@@ -98,6 +126,7 @@ $("read").addEventListener("click", async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("no active tab");
+    if (!(await hasPageAccess())) throw new Error("page access not granted yet");
     // activeTab is granted by the user's own click, and covers this tab only.
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -122,3 +151,4 @@ $("read").addEventListener("click", async () => {
 });
 
 loadSettings();
+refreshAccess();

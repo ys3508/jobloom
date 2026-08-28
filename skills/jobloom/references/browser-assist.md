@@ -25,8 +25,20 @@ traversed, or fetched.
   click, and a side panel that reads the open posting and renders the judgement.
 
 There is **no declared content script**. Nothing from this extension executes on a job site
-until the user presses *Read this posting*; that press grants `activeTab` and the reader is
-injected into that one tab for that one reading. A resident script would have been the
+until the user presses *Read this posting*, at which point the reader is injected into that
+one tab for that one reading.
+
+Page access is an **optional host permission**, not `activeTab`. `activeTab` is granted by
+clicking the toolbar action, which a click inside the side panel is not, and LinkedIn
+revokes it again on every in-app navigation — so it does not survive the way this panel is
+used. The honest alternative is to ask: the user grants access to `www.linkedin.com` and
+`*.indeed.com` once, in Chrome's own dialog, and can revoke it in `chrome://extensions`.
+
+This is genuinely broader than `activeTab`, and worth stating rather than glossing: the
+extension is permitted to read those two hosts whenever it runs. What keeps that from
+becoming collection is unchanged — no content script, so it only runs when the button is
+pressed; no navigation or polling, asserted by test; and the bridge stores nothing unless
+`--allow-store` is on. A resident script would have been the
 easier build, but it would also mean our code running on every job page the user visits,
 which is not what "only acts when the user asks" should mean.
 
@@ -42,7 +54,8 @@ itself out of are enforced on the bridge side:
 | A page cannot declare its own card reviewed | `build_card` forces `requirements_reviewed: false` |
 | Reading stores nothing | `/positioning` never writes; `/store` is a separate endpoint |
 | Browsing does not accumulate a job database | `--allow-store` is off by default |
-| Active tab only | `manifest.permissions` holds `activeTab`, not `tabs` or `<all_urls>` |
+| Job-site access is optional and revocable | `optional_host_permissions`; the user grants it in Chrome's dialog and can revoke it in `chrome://extensions` |
+| Access is scoped to two hosts over https | asserted by `test_page_access_is_optional_scoped_and_granted_by_the_user` |
 | Nothing runs before the user asks | no `content_scripts`; the reader is injected on the button press |
 | The extension cannot call a job site | `host_permissions` is the bridge alone |
 | No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |
