@@ -1073,13 +1073,13 @@ fail-closed MRP 接口，但没有绕过来源条款创建抓取器。没有获�
 | 14 | employer_support 计算 + 单雇主标记 | ✅ | `test_single_employer_terms_do_not_become_required` |
 | 15 | 无 goals → intent/growth 为 null | ✅ | `test_empty_goals_are_null_not_fifty` |
 | 16 | 空 goals 等同未提供 | ✅ | `test_empty_goals_are_null_not_fifty` |
-| 17 | avoid_roles 的方向不得 ready_now | ⛔ | 未覆盖：需要 goals 的 avoid 路径测试 |
+| 17 | avoid_roles 的方向不得 ready_now | ✅ | `test_user_excluded_direction_is_never_ready_now` |
 | 18 | 切换排序主键不改 axes 值 | ⛔ | 未覆盖：排序切换是 UI 层，尚无接口 |
 | 19 | 只够 2 个方向就返回 2 个 | ✅ | 真实数据验证（`fewer_directions_than_target`）+ 管线测试 |
 | 20 | 同 function 的两 title 合并 | ✅ | `test_two_titles_share_one_function` |
-| 21 | 展示方向两两 sim < 阈值 | ⚠️ | 间接覆盖：收敛逻辑有测试，无专项断言 |
-| 22 | 单事实占比过高 → 不超过 build_toward | ⛔ | 未覆盖 |
-| 23 | 无 material change 不触发重排 | ⚠️ | `evidence_unit_fingerprint` 已实现，无专项测试 |
+| 21 | 展示方向两两 sim < 阈值 | ✅ | `test_shown_directions_are_mutually_distinct` |
+| 22 | 单事实占比过高 → 不超过 build_toward | ✅ | `test_single_fact_dominance_caps_readiness` |
+| 23 | 无 material change 不触发重排 | ✅ | `test_identical_evidence_reproduces_the_same_proposal` + `test_new_evidence_changes_the_fingerprint` |
 | 24 | ontology_version 变化 → 拒绝 materialize | ✅ | `test_stale_snapshot_and_ontology_are_rejected` |
 | 25 | 提案哈希不符 → 拒绝 | ✅ | `test_materialization_keeps_existing_user_and_hash_gate` |
 | 26 | provisional 不可 materialize | ✅ | 既有回归 |
@@ -1095,12 +1095,13 @@ fail-closed MRP 接口，但没有绕过来源条款创建抓取器。没有获�
 | 36 | signals_fired 持久化并被 elicitation 引用 | ⚠️ | 持久化已覆盖，引用断言缺失 |
 | 37 | 四 gap 三布尔判定 | ✅ | `test_gap_truth_table` |
 | 38 | 新 title 只调一次模型 | ✅ | `test_semantic_cache_runs_once_per_model_version` |
-| 39 | 低置信映射不入 verified | ⛔ | 未覆盖 |
+| 39 | 低置信映射不入 verified | ✅ | `test_low_confidence_title_mapping_is_not_verified`（新增 `title_ontology.is_verified_mapping`）|
 | 40 | model_version 变化 → 缓存失效 | ✅ | `test_semantic_cache_runs_once_per_model_version` |
 
-**合计：29 ✅ / 5 ⚠️ 部分 / 6 ⛔ 未覆盖。**
-6 条未覆盖中，#18 依赖尚不存在的排序切换接口，其余 5 条（#17、#22、#39 及 #21/#23 的专项断言）
-是可以立即补的测试债。
+**合计：34 ✅ / 2 ⚠️ 部分 / 1 ⛔ 未覆盖（2026-08-28 第二轮后）。**
+仅剩 #18（切换排序主键不改 axes 值）未覆盖：`direction_axes.rank` 已支持 `by_evidence` /
+`by_market` / `by_intent` 三种主键，但还没有对外接口把选择暴露给用户，所以这个动作目前
+无处触发。#35、#36 的 elicitation 引用断言仍是部分覆盖。
 
 
 
