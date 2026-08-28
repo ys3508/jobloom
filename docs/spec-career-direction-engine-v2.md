@@ -502,8 +502,9 @@ S2 必须另外产生有类型的关系强度：
 {
   "fact_id": "fact-example-0003",
   "capability_id": "cap.survey_design",
-  "grade": "direct",
-  "grade_source": "pattern_hit",
+  "source_strength": "direct",
+  "relation_strength": "direct",
+  "relation_source": "pattern_hit",
   "pattern_id": "p2",
   "strength": 0.85,
   "signals_fired": ["quantified(+0.25)", "outcome_verb(+0.15)", "first_owner(+0.15)"],
@@ -515,7 +516,9 @@ S2 必须另外产生有类型的关系强度：
 （`plan holds fact IDs and reason codes only — never fact values`），
 文案在下游定制时即时生成，避免版本指针漂移。
 
-#### grade 用仓库的五级，不是三级（分歧处以仓库为准）
+#### 分档用仓库的五级，不是三级（分歧处以仓库为准）
+
+术语沿用 `70caacf` 的区分：`source_strength`（事实本身多硬，直取自 `candidate_facts`）与 `relation_strength`（该事实对该能力的支持有多强），硬约束 `relation_strength <= source_strength`。下文凡称 grade 一律指 `relation_strength`。
 
 外部评审提出 `DIRECT / TRANSFERABLE / ABSENT` 三级。**本规格不采纳**，理由是五级已在四处强制：
 
@@ -544,7 +547,7 @@ grade_factor = {direct: 1.0, strongly_related: 0.85, transferable: 0.6,
 
 #### strength：规则化，不用模型
 
-`strength` 回答"这条证据有多硬"，与 `grade` **全程正交**。
+`strength` 回答"这条证据有多硬"，与 `source_strength` / `relation_strength` **全程正交**。
 
 ```
 strength = clamp(0.30 + Σ signals, 0.0, 1.0)
@@ -561,13 +564,13 @@ signals（全部从事实文本规则抽取，每条必须可测）:
 
 **三条硬约束：**
 
-1. **低 strength 不降 grade，高 strength 不升 grade。** 一条软的 `direct` 仍是 `direct`，
+1. **低 strength 不降 relation_strength，高 strength 不升 relation_strength。** 一条软的 `direct` 仍是 `direct`，
    动作是 elicitation 而非降级；一条硬的 `transferable` 永远到不了 `direct`。
    这是"可迁移永不升级"在打分层不被 strength 偷绕的保证。
 2. **`signals_fired` 必须持久化**，喂给两处下游：
    - elicitation：`single_sentence_only` 触发且 `quantified` 未触发 → 追问话术能直接指出缺什么
    - 简历定制：优先摆高 strength 的事实，且知道它硬在哪
-3. **`grade_factor` 与 `strength` 是两个独立乘数**，不得与
+3. **`grade_factor`（由 `relation_strength` 决定）与 `strength` 是两个独立乘数**，不得与
    `career_direction_core.FACT_TYPE_STRENGTH_CAPS` 混为一谈——后者是按事实类型封顶
    `grade` 的上限，作用于 grade 轴；strength 作用于硬度轴。
    贡献值 = `sig.weight × grade_factor(grade) × strength`。
@@ -1193,29 +1196,28 @@ V1 为它新增了 `_effective_strength` 与 `source_evidence` 归并逻辑。
 1. **strength 的权重表是否就是产品价值观？**
    `quantified +0.25` 最重，理由是"带数字的成果最难编、最可查"。
    这张表一旦写进契约就应稳定，改动需版本化。
-3. **GPA 算不算 `quantified`？** 教育类事实的数字是成绩不是工作成果，
+2. **GPA 算不算 `quantified`？** 教育类事实的数字是成绩不是工作成果，
    本规格默认**不算**（列为假阳性），需确认。
 
 **Capability**
 
-4. **cap 是跨方向共享还是每 FunctionNode 一套？**
+3. **cap 是跨方向共享还是每 FunctionNode 一套？**
    本规格采纳**共享**（`cap.stats_analysis` 同时被生物统计与市场研究引用），
    这是"可迁移证据"能成立的前提，代价是需要全局唯一的 cap 词表与别名管理。
-5. **SKILL 层的目标规模？** 几百个是外部评审的估计；起步阶段先做多少个？
+4. **SKILL 层的目标规模？** 几百个是外部评审的估计；起步阶段先做多少个？
    建议先只覆盖当前组合的三个方向，用 20 份履历校准后再扩。
 
 **方向与展示**
 
-6. **证据只够 2 个方向时，展示 2 个还是降门槛凑 3 个？**（规格默认前者，测试 #19）
-7. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
+5. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
    （规格默认后者——隐藏等于静默丢弃，与项目原则冲突）
-8. **排序默认主键**：`readiness` 还是 `user_intent`？
+6. **排序默认主键**：`readiness` 还是 `user_intent`？
 
 **外部数据**
 
-9. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
+7. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
    本规格采纳外部评审的修正：只取职能骨架，**不用它们的 title 表**。
-10. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
+8. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
 
 ---
 
