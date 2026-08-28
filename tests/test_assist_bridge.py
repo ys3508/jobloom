@@ -376,22 +376,6 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn("chrome.permissions.request", panel)
         self.assertIn("chrome.permissions.contains", panel)
 
-    def test_the_reader_skips_the_sites_own_headings(self):
-        # The posting pane also holds a feedback prompt and section labels; the first
-        # heading is not the job title.
-        panel = self.sources["panel.js"]
-        self.assertIn("CHROME_HEADINGS", panel)
-        self.assertIn("are these results", panel)
-        self.assertIn("hiring", panel, "employer and location come from the document title")
-
-    def test_the_reader_does_not_shadow_window_location(self):
-        # A local named `location` shadows window.location for the whole function, and the
-        # reader ends by reading location.href, so the injection threw and the panel could
-        # only report that the page returned no posting.
-        panel = self.sources["panel.js"]
-        self.assertNotIn("const location =", panel)
-        self.assertIn("window.location.href", panel)
-
     def test_the_title_comes_from_the_link_to_the_open_posting(self):
         # Guessing at headings and excluding the site's own by name never finishes: two
         # attempts read the posting as "Are these results helpful?" and "See how you
