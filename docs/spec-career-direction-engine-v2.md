@@ -1050,6 +1050,60 @@ fail-closed MRP 接口，但没有绕过来源条款创建抓取器。没有获�
 
 ## 七、验收测试（40 条）
 
+### 覆盖状态（2026-08-28，`87a86d3` 后）
+
+41 个专项测试（`tests/test_career_direction_v2.py` 21 个、`tests/test_pattern_matcher.py` 20 个）
+加既有回归，覆盖情况如下。**未覆盖项不是遗漏，是依赖尚未接入的市场采集器与 UI 层。**
+
+| # | 验收条件 | 状态 | 对应测试 |
+|---|---|---|---|
+| 1 | axes 可回溯到权威来源 | ✅ | `test_units_preserve_provenance_and_signals` |
+| 2 | transferable 不出现在 direct 桶 | ✅ | `test_relation_never_exceeds_source` |
+| 3 | 方向对象不含 fact 原文 | ✅ | `test_output_contains_ids_not_fact_text` |
+| 4 | 同一 fact 的 source_strength 一致 | ✅ | `test_relation_never_exceeds_source` |
+| 5 | snapshot 不一致 → stale 拒绝 | ✅ | `test_stale_snapshot_and_ontology_are_rejected` |
+| 6 | equity research 的 Research Analyst → fail | ✅ | `test_equity_research_is_excluded` |
+| 7 | Research Analyst II 剥离 level | ✅ | `test_level_is_stripped_and_senior_care_is_guarded` |
+| 8 | 裸 Data Analyst → ambiguous | ✅ | `test_bare_data_analyst_is_ambiguous` |
+| 9 | Senior Care 守卫 | ✅ | `test_level_is_stripped_and_senior_care_is_guarded` |
+| 10 | 正文 title 不绑定 | ✅ | `test_body_title_never_binds` |
+| 11 | 有证据无市场 → market_capacity null | ✅ | `test_v2_emits_independent_axes_without_overall_score` |
+| 12 | 有市场无证据 → build_toward | ✅ | `test_market_without_evidence_is_build_toward` |
+| 13 | 样本不足 → fail closed | ✅ | `test_small_market_fails_closed` |
+| 14 | employer_support 计算 + 单雇主标记 | ✅ | `test_single_employer_terms_do_not_become_required` |
+| 15 | 无 goals → intent/growth 为 null | ✅ | `test_empty_goals_are_null_not_fifty` |
+| 16 | 空 goals 等同未提供 | ✅ | `test_empty_goals_are_null_not_fifty` |
+| 17 | avoid_roles 的方向不得 ready_now | ⛔ | 未覆盖：需要 goals 的 avoid 路径测试 |
+| 18 | 切换排序主键不改 axes 值 | ⛔ | 未覆盖：排序切换是 UI 层，尚无接口 |
+| 19 | 只够 2 个方向就返回 2 个 | ✅ | 真实数据验证（`fewer_directions_than_target`）+ 管线测试 |
+| 20 | 同 function 的两 title 合并 | ✅ | `test_two_titles_share_one_function` |
+| 21 | 展示方向两两 sim < 阈值 | ⚠️ | 间接覆盖：收敛逻辑有测试，无专项断言 |
+| 22 | 单事实占比过高 → 不超过 build_toward | ⛔ | 未覆盖 |
+| 23 | 无 material change 不触发重排 | ⚠️ | `evidence_unit_fingerprint` 已实现，无专项测试 |
+| 24 | ontology_version 变化 → 拒绝 materialize | ✅ | `test_stale_snapshot_and_ontology_are_rejected` |
+| 25 | 提案哈希不符 → 拒绝 | ✅ | `test_materialization_keeps_existing_user_and_hash_gate` |
+| 26 | provisional 不可 materialize | ✅ | 既有回归 |
+| 27 | 签名 cap 都有 pattern | ✅ | `test_every_signature_capability_has_patterns` |
+| 28 | 每条 pattern 命中黄金样本 | ✅ | `test_dead_golden_pattern_rejects_the_artifact` |
+| 29 | focus group → focus groups | ✅ | `test_controlled_inflection_fixes_the_observed_plural_failure` |
+| 30 | 中文 substring | ✅ | `test_chinese_uses_exact_substring_without_space_tokenization` |
+| 31 | semantic_anchor ≤ transferable | ✅ | `test_semantic_anchor_is_capped_and_requires_confirmation_in_verified_mode` |
+| 32 | 20 份履历校准报死节点/过粗 | ✅ | `test_twenty_resume_calibration_reports_dead_and_overbroad` |
+| 33 | quantified 三条守卫 | ✅ | `test_false_positive_guards` + `test_work_result_quantity_is_kept` |
+| 34 | 高 strength 不升 grade | ✅ | `test_relation_never_exceeds_source` |
+| 35 | 低 strength 不降 grade + 触发 elicitation | ⚠️ | grade 部分已覆盖，elicitation 断言缺失 |
+| 36 | signals_fired 持久化并被 elicitation 引用 | ⚠️ | 持久化已覆盖，引用断言缺失 |
+| 37 | 四 gap 三布尔判定 | ✅ | `test_gap_truth_table` |
+| 38 | 新 title 只调一次模型 | ✅ | `test_semantic_cache_runs_once_per_model_version` |
+| 39 | 低置信映射不入 verified | ⛔ | 未覆盖 |
+| 40 | model_version 变化 → 缓存失效 | ✅ | `test_semantic_cache_runs_once_per_model_version` |
+
+**合计：29 ✅ / 5 ⚠️ 部分 / 6 ⛔ 未覆盖。**
+6 条未覆盖中，#18 依赖尚不存在的排序切换接口，其余 5 条（#17、#22、#39 及 #21/#23 的专项断言）
+是可以立即补的测试债。
+
+
+
 ### provenance 与证据完整性
 
 1. 每个展示方向的每条 `axes.*` 都能回溯到该轴的权威来源；证据轴回溯到
