@@ -65,30 +65,48 @@ function tag(decision) {
   return `<span class="tag ${cls}">${decision}</span>`;
 }
 
+const VERDICT_TEXT = {
+  apply: ["Worth applying", "ok"],
+  review: ["Worth a look", "warn"],
+  stretch: ["A stretch", "warn"],
+  skip: ["Probably skip", "bad"]
+};
+
 function render(result) {
+  const [label, cls] = VERDICT_TEXT[result.verdict.call] || ["Unclear", "warn"];
+  $("verdict").className = `verdict ${cls}`;
+  $("verdict").innerHTML = `<strong>${label}</strong>
+    <span>${result.verdict.because}</span>
+    <span class="muted">${result.verdict.direction || "no direction"} ·
+      ${result.verdict.covered}/${result.verdict.stated} stated requirements met</span>`;
+
   $("job-title").textContent = result.job.title || "(title not read)";
   $("job-meta").textContent = [result.job.employer, result.job.location,
                                result.job.work_arrangement].filter(Boolean).join(" · ");
+
+  // What to emphasise: the requirement, and the work of yours that answers it.
+  $("lead").innerHTML = result.lead_with.map((item) => `
+    <li class="stack">
+      <span class="name"><strong>${item.requirement}</strong>
+        <span class="tag match">${item.strength}</span></span>
+      ${item.evidence.map((e) => `<span class="reasons">← ${e.text}</span>`).join("")}
+    </li>`).join("") || "<li class='muted'>nothing here resolves to your evidence</li>";
+
+  const required = result.gaps.filter((g) => g.obligation === "required");
+  const preferred = result.gaps.filter((g) => g.obligation !== "required");
+  $("gaps").innerHTML = [
+    ...required.map((g) => `<li><span class="tag bad">required</span>
+      <span class="name">${g.requirement}</span></li>`),
+    ...preferred.map((g) => `<li><span class="tag warn">preferred</span>
+      <span class="name">${g.requirement}<span class="reasons">not a reason to skip</span></span></li>`)
+  ].join("") || "<li class='muted'>nothing stated is missing</li>";
+
   $("directions").innerHTML = result.directions.map((d) => {
-    const reasons = [
-      ...(d.hard_failures || []),
-      ...(d.review_reasons || [])
-    ].slice(0, 3).join(", ");
-    const warn = (d.warning_terms_required || []).length
-      ? `required warning terms: ${d.warning_terms_required.join(", ")}`
-      : "";
-    return `<li>${tag(d.decision)}<span class="name">${d.name || d.direction_id}
-      <span class="reasons">${[reasons, warn].filter(Boolean).join(" — ")}</span></span>
+    const reasons = [...(d.hard_failures || []), ...(d.review_reasons || [])].slice(0, 3).join(", ");
+    return `<li><span class="tag ${d.decision === "match" ? "match" : d.decision === "fail" ? "bad" : "warn"}">${d.decision}</span>
+      <span class="name">${d.name || d.direction_id}<span class="reasons">${reasons}</span></span>
       <span class="score">${d.ranking_score ?? ""}</span></li>`;
   }).join("");
-  $("evidence").innerHTML = (result.evidence.matches || []).map((m) => {
-    const cls = m.strength === "none" ? "fail"
-      : (m.strength === "direct" || m.strength === "strongly_related") ? "match" : "review";
-    return `<li><span class="tag ${cls}">${m.strength}</span>
-      <span class="name">${m.requirement}</span></li>`;
-  }).join("") || "<li class='muted'>no stated requirements were read</li>";
-  $("gap").textContent = result.evidence.main_gap
-    ? `main gap: ${result.evidence.main_gap}` : "";
   $("notice").textContent = result.notice || "";
   $("result").hidden = false;
 }
@@ -116,7 +134,7 @@ function readVisiblePosting() {
   let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
   // The pane also holds the site's own headings — a feedback prompt, a section label — so
   // pick the first heading that reads like a job title rather than the first heading.
-  const CHROME_HEADINGS = /^(are these results|about the job|people also viewed|similar jobs|job search|meet the hiring|set alert|show more|premium)/i;
+  const CHROME_HEADINGS = /^(are these results|about the job|people (also viewed|you can)|similar jobs|job search|meet the hiring|set alert|show more|premium)/i;
   const heading = [...pane.querySelectorAll("h1, h2")]
     .map((node) => (node.innerText || "").trim())
     .find((value) => value.length > 2 && value.length < 140
@@ -124,14 +142,15 @@ function readVisiblePosting() {
   // LinkedIn writes "Employer hiring Title in Location" into the document title.
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
-  const title = (heading || documentMatch?.groups?.title || fromDocument).trim();
+  // The document title is the reliable source on LinkedIn; a heading inside the pane may
+  // belong to any of the site's own widgets, and blocklisting them never finishes.
+  const title = (documentMatch?.groups?.title || heading || fromDocument).trim();
   const employer = documentMatch?.groups?.employer?.trim() || "";
-  // Not named `location`: that shadows window.location for the whole function, and the
-  // return below reads location.href.
+  // Not named `location`: that shadows window.location for the whole function.
   const place = documentMatch?.groups?.location?.trim() || "";
   // A search page keeps the result list and the open posting in one container. When the
   // title appears inside the text, everything before it is the list, so drop it.
-  if (title && matched === "main" || matched === "fallback_body") {
+  if ((title && matched === "main") || matched === "fallback_body") {
     const start = text.indexOf(title);
     if (title && start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
   }

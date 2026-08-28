@@ -137,13 +137,50 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
         evaluation = evaluate_job.evaluate(candidate, {**card, "requirements_reviewed": True})
     except (ValueError, KeyError) as error:
         evaluation = {"eligibility": "unavailable", "reason": str(error)}
+    matches = (evaluation or {}).get("evidence_matches", [])
+    facts = {str(fact.get("id")): fact for fact in candidate.get("facts") or []}
+    covered, gaps = [], []
+    for match in matches:
+        supporting = [facts[fid] for fid in match.get("fact_ids") or [] if fid in facts]
+        if match["strength"] == "none" or not supporting:
+            preferred_only = match["requirement"] in (card.get("preferred_skills") or [])
+            gaps.append({"requirement": match["requirement"],
+                         "obligation": "preferred" if preferred_only else "required"})
+            continue
+        covered.append({
+            "requirement": match["requirement"], "strength": match["strength"],
+            # What to lead with: the requirement, and the work of the user's own that
+            # answers it. Values come from their own confirmed facts, never from the page.
+            "evidence": [{"fact_id": fact["id"],
+                          "text": str(fact.get("value", ""))[:180],
+                          "source_kind": fact.get("type")}
+                         for fact in supporting[:3]],
+        })
+    best = directions[0] if directions else None
+    blocking = [term for direction in directions
+                for term in direction.get("warning_terms_required", [])]
+    if best and best.get("decision") == "fail":
+        verdict, because = "skip", "no approved direction accepts this posting"
+    elif not covered:
+        verdict, because = "skip", "none of the stated requirements resolve to your evidence"
+    elif len(gaps) > len(covered):
+        verdict, because = "stretch", "more stated requirements are unmet than met"
+    elif blocking:
+        verdict, because = "review", f"required terms you have no evidence for: {', '.join(sorted(set(blocking))[:3])}"
+    else:
+        verdict, because = "apply", "your evidence covers most of what this posting states"
     return {
+        "verdict": {"call": verdict, "because": because,
+                    "direction": (best or {}).get("name"),
+                    "covered": len(covered), "stated": len(matches)},
+        "lead_with": covered,
+        "gaps": gaps,
         "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
                                                "work_arrangement", "employment_type",
                                                "sponsorship", "salary")},
         "directions": directions,
         "evidence": {
-            "matches": (evaluation or {}).get("evidence_matches", []),
+            "matches": matches,
             "main_gap": (evaluation or {}).get("main_gap"),
             "eligibility": (evaluation or {}).get("eligibility"),
             "match": (evaluation or {}).get("match"),

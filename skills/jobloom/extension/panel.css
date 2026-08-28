@@ -22,3 +22,12 @@ li:last-child { border-bottom:0; }
 .name { flex:1 1 auto; }
 .score { font-variant-numeric:tabular-nums; opacity:.7; font-size:12px; }
 .reasons { display:block; font-size:11px; opacity:.65; }
+
+.verdict { margin:14px 0 6px; padding:10px 12px; border-radius:8px; border:1px solid currentColor; }
+.verdict strong { display:block; font-size:15px; }
+.verdict span { display:block; font-size:12px; opacity:.85; margin-top:2px; }
+.verdict.ok { color:var(--ok); } .verdict.warn { color:var(--warn); } .verdict.bad { color:var(--bad); }
+.bad { color:var(--bad); } .warn { color:var(--warn); }
+li.stack { display:block; }
+li.stack .reasons { margin-top:3px; padding-left:10px; border-left:2px solid var(--line); }
+details { margin-top:18px; } summary { cursor:pointer; font-size:12px; opacity:.65; }

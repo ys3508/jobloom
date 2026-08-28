@@ -210,6 +210,27 @@ class ServerBoundaryTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_the_reading_answers_the_three_questions_a_user_has(self):
+        _, body = self.post("/positioning", PAGE)
+        self.assertIn(body["verdict"]["call"], {"apply", "review", "stretch", "skip"})
+        self.assertTrue(body["verdict"]["because"])
+        for item in body["lead_with"]:
+            self.assertTrue(item["evidence"], "a lead must name the work that supports it")
+        for gap in body["gaps"]:
+            self.assertIn(gap["obligation"], {"required", "preferred"})
+
+    def test_a_lead_quotes_the_users_own_fact_not_the_page(self):
+        # Every line the panel offers to lead with must be one of the user's own confirmed
+        # facts, identified by its fact id, not a sentence lifted off the posting.
+        candidate = json.loads(self.candidate_path.read_text(encoding="utf-8"))
+        by_id = {fact["id"]: str(fact["value"]) for fact in candidate["facts"]}
+        _, body = self.post("/positioning", PAGE)
+        self.assertTrue(body["lead_with"], "the fixture candidate should cover something")
+        for item in body["lead_with"]:
+            for evidence in item["evidence"]:
+                self.assertIn(evidence["fact_id"], by_id)
+                self.assertEqual(evidence["text"], by_id[evidence["fact_id"]][:180])
+
     def test_the_reading_says_it_is_a_draft_and_was_not_stored(self):
         _, body = self.post("/positioning", PAGE)
         self.assertIn("nothing was stored", body["notice"])
@@ -262,6 +283,18 @@ class ExtensionBoundaryTests(unittest.TestCase):
         panel = self.sources["panel.js"]
         self.assertNotIn("const location =", panel)
         self.assertIn("window.location.href", panel)
+
+    def test_the_reader_is_present_and_prefers_the_document_title(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("function readVisiblePosting", panel)
+        # LinkedIn writes "Employer hiring Title in Location"; a heading inside the pane can
+        # belong to any of the site's widgets, and blocklisting them never finishes.
+        self.assertIn("documentMatch?.groups?.title || heading", panel)
+
+    def test_the_panel_answers_rather_than_dumps(self):
+        panel = self.sources["panel.js"]
+        for key in ("verdict", "lead_with", "gaps"):
+            self.assertIn(key, panel)
 
     def test_reading_is_refused_before_the_grant(self):
         self.assertIn("page access not granted yet", self.sources["panel.js"])
