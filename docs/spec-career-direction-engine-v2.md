@@ -1043,8 +1043,21 @@ semantic_anchor_cache(pattern_id, fact_id, hit, model_version,
 
 **1–5 完成即可上线非市场版本**，市场轴以 `null` + `market_profile_unavailable` 呈现。
 
-实现状态（2026-08-28）：步骤 1–5 已完成；步骤 6 已实现结构化 JobCard 聚合与
-fail-closed MRP 接口，但没有绕过来源条款创建抓取器。没有获授权市场数据时继续按 N4 返回 null。
+实现状态（2026-08-28）：**步骤 1–6 全部完成**。
+
+S5 作为**聚合器**实现，不是抓取器。`market_profile.build_from_store` 只聚合本地已有的
+JobCard，且仅限来源登记在 `assets/market-sources.json` 中、写明 authorization_basis 的条目；
+未登记来源的 JobCard 一律排除并计入 `provenance.excluded`。默认登记表只有一条
+`user_reviewed`（用户自己在正常投递流程里审阅过的岗位）。
+
+`profiles_for_functions` 为每个 FunctionNode 产出一份 profile；样本不足时仍产出，
+带 `sufficient: false` 与原因码，市场轴按 N4 读作 null 而不是消失。
+CLI：`market_profile.py sources` / `build`，以及 `career_direction_core.py
+propose-candidate --with-market`。
+
+**仍缺的不是代码，是数据来源。** 规格 §5.3 已写死查询模板不构成对 LinkedIn、Indeed 或
+其他站点自动抓取的授权。要让市场轴真正启用，需要先取得一个合规来源
+（官方 API、雇主自有 feed、或获许可的数据集），把它登记进来源表。
 
 ---
 

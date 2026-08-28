@@ -340,7 +340,7 @@ def generate_v2_proposal(**kwargs: Any) -> dict[str, Any]:
 
 def propose_candidate(candidate_path: Path, catalog_path: Path, proposal_id: str, db_path: Path,
                       goals_path: Path | None = None, max_directions: int = 6,
-                      engine: str = "v2") -> dict[str, Any]:
+                      engine: str = "v2", with_market: bool = False) -> dict[str, Any]:
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
@@ -356,10 +356,24 @@ def propose_candidate(candidate_path: Path, catalog_path: Path, proposal_id: str
         raise ValueError("active CandidateSnapshot file hash mismatch")
     goals = json.loads(goals_path.read_text(encoding="utf-8")) if goals_path else None
     if engine == "v2":
+        market = None
+        if with_market:
+            import capability_ontology  # noqa: PLC0415  local: keeps the V1 path import-free
+            import market_profile
+            connection = sqlite3.connect(str(db_path))
+            connection.row_factory = sqlite3.Row
+            try:
+                market = market_profile.profiles_for_functions(
+                    connection, capability_ontology.load_ontology(),
+                    region={key: value for key, value in
+                            (("country", (candidate.get("search") or {}).get("countries", [None])[0]),)
+                            if value})
+            finally:
+                connection.close()
         return generate_v2_proposal(
             proposal_id=proposal_id, candidate=candidate, facts=candidate["facts"],
             mode="verified", snapshot_sha256=candidate_hash, goals=goals,
-            max_directions=max_directions,
+            max_directions=max_directions, market_profiles=market,
         )
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     return generate_proposal(proposal_id=proposal_id, candidate=candidate,
@@ -462,6 +476,9 @@ def main() -> None:
         command.add_argument("--engine", choices=("v2", "v1"), default="v2")
         command.add_argument("--output", required=True, type=Path)
         if name == "propose-candidate":
+            command.add_argument("--with-market", action="store_true",
+                                 help="aggregate authorized JobCards already held locally into "
+                                      "market profiles; axes stay null when the sample is short")
             command.add_argument("--candidate", required=True, type=Path)
             command.add_argument("--db", required=True, type=Path)
         else:
@@ -478,7 +495,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "propose-candidate":
         result = propose_candidate(args.candidate, args.catalog, args.proposal_id, args.db,
-                                   args.goals, args.max_directions, args.engine)
+                                   args.goals, args.max_directions, args.engine,
+                                   with_market=args.with_market)
         _write_json(args.output, result)
     elif args.command == "propose-material":
         result, packet = propose_material(args.material, args.catalog, args.proposal_id,

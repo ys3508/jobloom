@@ -1,0 +1,14 @@
+{
+  "schema_version": "0.1.0",
+  "note": "Sources whose terms permit programmatic collection. Empty by default: a source is added only after its authorization basis is recorded, and JobCards from an unlisted source never enter a market profile. Query templates describe search intent and are not an authorization to scrape any site.",
+  "sources": [
+    {
+      "source_id": "user_reviewed",
+      "name": "JobCards the user reviewed in this workspace",
+      "authorization_basis": "user_supplied",
+      "terms_url": null,
+      "recorded_at": "2026-08-28",
+      "notes": "Postings the user opened and had structured into a reviewed JobCard through the normal application flow. This is the user's own working data, not a collection feed, so volume is limited to what they actually looked at."
+    }
+  ]
+}

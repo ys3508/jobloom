@@ -3,7 +3,7 @@ import json
 import sys
 import sqlite3
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -310,6 +310,122 @@ class MarketThresholdTests(unittest.TestCase):
         self.assertFalse(profile["sample"]["sufficient"])
         self.assertIn("market_employers_below_minimum", profile["sample"]["insufficient_reasons"])
         self.assertIn("market_postings_below_minimum", profile["sample"]["insufficient_reasons"])
+
+
+
+
+class MarketCollectorTests(unittest.TestCase):
+    """S5 aggregates authorized JobCards already held locally; it does not collect."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("""CREATE TABLE jobs (job_id TEXT PRIMARY KEY, canonical_url TEXT,
+            employer TEXT, title TEXT, location TEXT, normalized_employer TEXT,
+            normalized_title TEXT, normalized_location TEXT, requisition_id TEXT,
+            description_sha256 TEXT, source TEXT, ats TEXT, job_card_json TEXT,
+            status TEXT, duplicate_of TEXT, created_at TEXT, updated_at TEXT)""")
+        self.addCleanup(self.db.close)
+        self.now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        self.registry = {"user_reviewed": {"source_id": "user_reviewed",
+                                           "authorization_basis": "user_supplied"}}
+
+    def insert(self, job_id, employer, *, source="user_reviewed", reviewed=True, days_ago=1,
+               title="Research Data Analyst", country="US", location="Boston, MA",
+               skills=("R",), sponsorship="unknown", salary=None, seniority="unknown"):
+        card = {"job_id": job_id, "canonical_url": f"https://example.com/{job_id}",
+                "employer": employer, "title": title, "country": country, "location": location,
+                "required_skills": list(skills), "required_certifications": [],
+                "requirements_reviewed": reviewed, "sponsorship": sponsorship,
+                "salary": salary, "seniority": seniority}
+        created = (self.now - timedelta(days=days_ago)).isoformat()
+        self.db.execute(
+            "INSERT INTO jobs (job_id, canonical_url, employer, title, location, "
+            "normalized_title, normalized_location, source, job_card_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, card["canonical_url"], employer, title, location, title.casefold(),
+             location.casefold().replace(",", ""), source, json.dumps(card), created))
+
+    def build(self, **kwargs):
+        options = {"profile_id": "m", "title_id": "t.x", "title_terms": ["research"],
+                   "region": {"country": "US"}, "sources": self.registry, "now": self.now}
+        options.update(kwargs)
+        return MARKET.build_from_store(self.db, **options)
+
+    def test_an_unlisted_source_contributes_nothing(self):
+        for index in range(12):
+            self.insert(f"ok-{index}", f"Emp {index}")
+        for index in range(30):
+            self.insert(f"scraped-{index}", f"Scraped {index}", source="some_job_board")
+        profile = self.build()
+        self.assertEqual(profile["sample"]["postings_after_dedupe"], 12)
+        self.assertEqual(profile["provenance"]["excluded"]["some_job_board"], 30)
+        self.assertEqual([s["source_id"] for s in profile["provenance"]["sources"]],
+                         ["user_reviewed"])
+
+    def test_a_source_without_an_authorization_basis_is_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sources.json"
+            path.write_text(json.dumps({"schema_version": "0.1.0", "sources": [
+                {"source_id": "board", "name": "A job board", "authorization_basis": "scraped",
+                 "terms_url": None, "recorded_at": "2026-08-28", "notes": ""}]}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "authorization basis"):
+                MARKET.load_sources(path)
+
+    def test_the_shipped_registry_lists_only_recorded_bases(self):
+        for source in MARKET.load_sources().values():
+            self.assertIn(source["authorization_basis"], MARKET.AUTHORIZATION_BASES)
+
+    def test_unreviewed_and_stale_cards_are_excluded_with_a_reason(self):
+        self.insert("reviewed", "Emp A")
+        self.insert("draft", "Emp B", reviewed=False)
+        self.insert("old", "Emp C", days_ago=200)
+        profile = self.build()
+        self.assertEqual(profile["sample"]["postings_after_dedupe"], 1)
+        self.assertEqual(profile["provenance"]["excluded"]["job_card_unreviewed"], 1)
+        self.assertEqual(profile["provenance"]["excluded"]["outside_window"], 1)
+
+    def test_stratum_filters_title_country_and_seniority(self):
+        self.insert("in", "Emp A")
+        self.insert("other-title", "Emp B", title="Warehouse Picker")
+        self.insert("other-country", "Emp C", country="CA")
+        profile = self.build()
+        self.assertEqual(profile["sample"]["postings_after_dedupe"], 1)
+        self.assertEqual(profile["provenance"]["excluded"]["outside_stratum"], 2)
+
+    def test_sponsorship_and_salary_come_from_the_cards(self):
+        for index in range(4):
+            self.insert(f"s-{index}", f"Emp {index}", sponsorship="supports",
+                        salary={"currency": "USD", "minimum": 60000, "maximum": 80000})
+        for index in range(4):
+            self.insert(f"n-{index}", f"Emp n{index}", sponsorship="does_not_support")
+        profile = self.build()
+        self.assertEqual(profile["sponsorship_distribution"]["supports"], 0.5)
+        self.assertEqual(profile["sponsorship_distribution"]["does_not_support"], 0.5)
+        self.assertEqual(profile["salary"]["currency"], "USD")
+        self.assertEqual(profile["salary"]["p50"], 70000)
+
+    def test_mixed_currencies_report_no_salary_rather_than_a_wrong_one(self):
+        self.insert("usd", "Emp A", salary={"currency": "USD", "minimum": 60000, "maximum": 60000})
+        self.insert("eur", "Emp B", salary={"currency": "EUR", "minimum": 60000, "maximum": 60000})
+        self.assertIsNone(self.build()["salary"])
+
+    def test_a_sufficient_local_sample_switches_the_market_axes_on(self):
+        for index in range(24):
+            self.insert(f"j-{index}", f"Emp {index % 10}", skills=("R", "SQL"))
+        profile = self.build()
+        self.assertTrue(profile["sample"]["sufficient"], profile["sample"]["insufficient_reasons"])
+        self.assertEqual({t["term"] for t in profile["required_terms"]}, {"R", "SQL"})
+
+    def test_every_function_gets_a_profile_even_with_no_postings(self):
+        ontology = ONTOLOGY.load_ontology()
+        profiles = MARKET.profiles_for_functions(
+            self.db, ontology, region={"country": "US"}, now=self.now)
+        self.assertEqual(set(profiles), {f["function_id"] for f in ontology["function_nodes"]})
+        for profile in profiles.values():
+            self.assertFalse(profile["sample"]["sufficient"])
+            self.assertIn("market_postings_below_minimum", profile["sample"]["insufficient_reasons"])
 
 
 
