@@ -54,6 +54,30 @@ def resolve(job: dict[str, Any], ontology: dict[str, Any] | None = None) -> dict
             "function_ids": sorted({m["function_id"] for m in eligible[:1]})}
 
 
+MIN_MAPPING_CONFIDENCE = 0.5
+MIN_MAPPING_EMPLOYERS = 3
+
+
+def is_verified_mapping(surface: dict[str, Any], mapping: dict[str, Any]) -> bool:
+    """Whether one title-to-function mapping may be used on the verified path.
+
+    A mapping proposed by the model on first sight of a title is a hypothesis. It
+    becomes usable when the user confirms it, or when enough distinct employers have
+    posted that title for the frequency itself to stand in for confirmation. Confidence
+    alone is not enough: a confident guess seen at two employers is still a guess.
+    """
+    if mapping.get("confirmed_by_user") is True:
+        return True
+    if float(mapping.get("confidence") or 0) < MIN_MAPPING_CONFIDENCE:
+        return False
+    employers = (surface.get("provenance") or {}).get("distinct_employers") or 0
+    return int(employers) >= MIN_MAPPING_EMPLOYERS
+
+
+def verified_mappings(surface: dict[str, Any]) -> list[dict[str, Any]]:
+    return [m for m in surface.get("maps_to", []) if is_verified_mapping(surface, m)]
+
+
 def titles_for(function_id: str, ontology: dict[str, Any] | None = None) -> list[str]:
     ontology = ontology or load()
     return [s["raw"] for s in ontology["surfaces"] if any(m["function_id"] == function_id and m["confidence"] >= .5 for m in s["maps_to"])]

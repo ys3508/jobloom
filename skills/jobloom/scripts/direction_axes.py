@@ -53,6 +53,18 @@ def build_direction(function: dict[str, Any], hypothesis: dict[str, Any], refs: 
         "career_growth": ({"value": growth, "unit": "0-100", "rule_id": "R-CG-01"} if growth is not None else {"value": None, "unit": "0-100", "null_reason": "career_goals_not_supplied", "rule_id": "R-CG-01"}),
         "visa_compatibility": {"value": visa, "unit": "enum", "rule_id": "R-VI-01"},
     }
+    signature = function["capability_signature"]
+    core_ids = [item["capability_id"] for item in signature if item.get("core")]
+    covered_ids = {ref["capability_id"] for ref in selected if ref["relation_strength"] != "none"}
+    unsupported_core = sorted(set(core_ids) - covered_ids)
+    coverage = {
+        "capability": {"required": len(signature), "covered": len(covered_ids & {i["capability_id"] for i in signature})},
+        "core_capability": {"required": len(core_ids), "covered": len(set(core_ids) & covered_ids)},
+        "domain": {"required": len(function.get("domains") or []),
+                   "covered": len({ref.get("domain") for ref in selected if ref.get("domain")})},
+        "seniority": {"band": function.get("seniority_band"), "candidate_band": hypothesis.get("seniority_band"),
+                      "delta": 0 if function.get("seniority_band") == hypothesis.get("seniority_band") else None},
+    }
     gate = []
     if diversity["distinct_facts"] < 3: gate.append("insufficient_fact_count")
     if diversity.get("employer_data_available") and diversity["distinct_employers"] < 2:
@@ -70,9 +82,13 @@ def build_direction(function: dict[str, Any], hypothesis: dict[str, Any], refs: 
     if no_evidence_market: reasons.append("no_candidate_evidence")
     return {"direction_id": f"dir-{function['function_id'][3:]}", "function_id": function["function_id"],
             "name": function["canonical_label"], "role_family": function["role_family"],
-            "supporting_fact_ids": hypothesis["supporting_fact_ids"], "evidence": {"by_strength": by_strength, "refs": selected, "gaps": reconciliation["gaps"], "diversity": diversity},
+            "supporting_fact_ids": hypothesis["supporting_fact_ids"], "evidence": {"by_strength": by_strength, "refs": selected, "gaps": reconciliation["gaps"],
+                         "diversity": diversity, "coverage": coverage,
+                         "unsupported_core_signals": unsupported_core},
             "axes": axes, "readiness": readiness, "review_reasons": sorted(set(reasons)),
-            "ranking": {"method": "lexicographic_v1", "key": [], "explanation": "readiness, user_intent, evidence_fit, market_capacity, direction_id"}}
+            "ranking": {"method": "lexicographic_v1",
+                        "key": ["readiness", "user_intent", "evidence_fit", "market_capacity", "direction_id"],
+                        "explanation": "readiness 先分档；user_intent 与 market_capacity 为 null 时排在有值项之后"}}
 
 
 def rank(directions: list[dict[str, Any]], mode: str = "by_intent") -> list[dict[str, Any]]:

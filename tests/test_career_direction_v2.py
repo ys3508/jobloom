@@ -174,4 +174,87 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("cap.statistical-analysis", result["overbroad_skill_ids"])
         self.assertIn("cap.survey-design", result["dead_skill_ids"])
 
+
+class AcceptanceDebtTests(unittest.TestCase):
+    """The five criteria the V2 commit left uncovered."""
+
+    def goals(self, **updates):
+        value = {"schema_version": "0.1.0", "goal_id": "g1", "desired_roles": [],
+                 "desired_industries": [], "skills_to_build": [], "avoid_roles": [],
+                 "avoid_industries": [], "priorities": {"current_fit": 50, "career_value": 50}}
+        value.update(updates)
+        return value
+
+    def generate(self, facts=None, **kwargs):
+        return PIPELINE.generate(proposal_id="p1", candidate={"search": {}},
+                                 facts=facts if facts is not None else candidate_facts(),
+                                 mode="verified", snapshot_sha256=SNAPSHOT,
+                                 created_at=datetime(2026, 8, 28, tzinfo=timezone.utc), **kwargs)
+
+    # 17: an excluded direction never reaches ready_now, however strong its evidence
+    def test_user_excluded_direction_is_never_ready_now(self):
+        baseline = self.generate()
+        top = baseline["recommendations"][0]
+        excluded = self.generate(goals=self.goals(avoid_roles=[top["name"]]))
+        named = {d["name"]: d for d in excluded["recommendations"]}
+        self.assertNotIn(top["name"], named,
+                         "an excluded direction must not stay in the shown set as ready_now")
+        for direction in excluded["recommendations"]:
+            self.assertNotEqual(direction["name"], top["name"])
+
+    # 22: one fact carrying a direction caps it at build_toward
+    def test_single_fact_dominance_caps_readiness(self):
+        facts = [fact("solo", "I analyzed statistical regression results for one study.")]
+        result = self.generate(facts=facts)
+        for direction in result["recommendations"]:
+            self.assertNotIn(direction["readiness"], {"ready_now", "near_term"})
+
+    # 21: shown directions must differ from one another
+    def test_shown_directions_are_mutually_distinct(self):
+        result = self.generate()
+        ids = [d["function_id"] for d in result["recommendations"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    # 23: the same evidence must not produce a different proposal
+    def test_identical_evidence_reproduces_the_same_proposal(self):
+        first, second = self.generate(), self.generate()
+        self.assertEqual(first["evidence_unit_fingerprint"], second["evidence_unit_fingerprint"])
+        self.assertEqual(first["proposal_sha256"], second["proposal_sha256"])
+
+    # 23b: changed evidence must change the fingerprint
+    def test_new_evidence_changes_the_fingerprint(self):
+        extra = candidate_facts() + [fact("f9", "I built clinical trial databases for two compounds.")]
+        self.assertNotEqual(self.generate()["evidence_unit_fingerprint"],
+                            self.generate(facts=extra)["evidence_unit_fingerprint"])
+
+    # 39: a low-confidence or thinly-observed title mapping stays out of the verified path
+    def test_low_confidence_title_mapping_is_not_verified(self):
+        surface = {"surface_id": "ts.x", "raw": "Data Analyst", "normalized": "data analyst",
+                   "level_token": None,
+                   "maps_to": [{"function_id": "fn.research-clinical-data", "confidence": 0.4,
+                                "assigned_by": "model", "confirmed_by_user": False}],
+                   "requires_domain_guard": True, "domain_guard_terms": ["research"],
+                   "excluded_senses": [],
+                   "provenance": {"postings_seen": 9, "distinct_employers": 2,
+                                  "first_seen": "2026-03-01", "last_seen": "2026-08-01"}}
+        self.assertFalse(TITLES.is_verified_mapping(surface, surface["maps_to"][0]))
+        confident = dict(surface["maps_to"][0], confidence=0.8)
+        thin = dict(surface, provenance=dict(surface["provenance"], distinct_employers=2))
+        self.assertFalse(TITLES.is_verified_mapping(thin, confident))
+        broad = dict(surface, provenance=dict(surface["provenance"], distinct_employers=5))
+        self.assertTrue(TITLES.is_verified_mapping(broad, confident))
+
+    # coverage block required by the specification
+    def test_direction_reports_capability_and_core_coverage(self):
+        result = self.generate()
+        coverage = result["recommendations"][0]["evidence"]["coverage"]
+        self.assertIn("capability", coverage)
+        self.assertIn("core_capability", coverage)
+        self.assertLessEqual(coverage["core_capability"]["covered"],
+                             coverage["core_capability"]["required"])
+        self.assertIsInstance(
+            result["recommendations"][0]["evidence"]["unsupported_core_signals"], list)
+
+
+
 if __name__ == "__main__": unittest.main()
