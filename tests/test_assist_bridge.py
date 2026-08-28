@@ -390,6 +390,33 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn('["covered", "Already covered and shown", "ok", "nothing to do", true]',
                       panel)
 
+    def test_all_requirement_detail_is_one_optional_drawer(self):
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        self.assertIn('<details id="classes-drawer">', html)
+        self.assertIn("逐条看：你有什么、缺什么", html)
+
+    def test_the_complete_collapsed_description_is_available_to_the_reader(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("current.textContent", panel)
+        self.assertIn("complete.length > visible.length", panel)
+
+    def test_a_new_posting_waits_for_the_detail_pane_to_match_its_id(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("requestAnimationFrame", panel)
+        self.assertIn("if (!reading.aligned)", panel)
+        self.assertIn("lastPostingKey = key", panel)
+        self.assertGreater(panel.index("lastPostingKey = key"), panel.index("render(body, page)"))
+
+    def test_following_errors_are_visible_and_old_reads_cannot_overwrite_new_ones(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("generation !== readGeneration", panel)
+        self.assertNotIn('if (!onlyIfChanged) $("status").textContent', panel)
+
+    def test_page_diagnostics_are_visible_without_a_console(self):
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        self.assertIn('id="page-diagnostics"', html)
+        self.assertIn('id="diagnostics"', html)
+
     def test_the_verdict_carries_counts_a_user_can_decide_on(self):
         panel = self.sources["panel.js"]
         for piece in ("to add", "required gap", "requirements met"):

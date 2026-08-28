@@ -100,7 +100,7 @@ function evidenceLine(e) {
   return `${where} · ${figure}`;
 }
 
-function render(result) {
+function render(result, page) {
   const [label, cls] = VERDICT_TEXT[result.verdict.call] || ["Unclear", "warn"];
   const groups = result.classified || {};
   const count = (key) => (groups[key] || []).length;
@@ -151,19 +151,44 @@ function render(result) {
       <span class="score">${d.ranking_score ?? ""}</span></li>`;
   }).join("");
   $("notice").textContent = result.notice || "";
+  const diagnostics = page?.diagnostics;
+  $("page-diagnostics").hidden = result.verdict.call !== "unreadable";
+  $("diagnostics").textContent = diagnostics
+    ? `${diagnostics.tried.join(" · ")} · ${diagnostics.chars} chars · ${diagnostics.opening}`
+    : "no page diagnostics returned";
   $("result").hidden = false;
 }
 
 // Injected into the tab only when the user presses the button. Nothing from this
 // extension runs on a job site before that press, and the injection reads the text the
 // page has already rendered — it does not fetch, follow, or expand anything.
-function readVisiblePosting() {
+async function readVisiblePosting() {
   // Finding the open posting by class name or by URL parameter has failed repeatedly, so
   // this looks for what the user can see instead: the Apply control belongs to the posting
   // and never to the list beside it, so the smallest block containing it and a description
   // is the posting. Every strategy reports itself, so a wrong reading says which one ran.
   const tried = [];
-  const bigEnough = (node) => node && (node.innerText || "").trim().length > 500;
+  const clean = (value) => (value || "").replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  const contentText = (node) => {
+    if (!node) return "";
+    const blocks = new Set(["ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "BR", "DIV",
+      "DL", "DT", "DD", "FIGCAPTION", "FOOTER", "H1", "H2", "H3", "H4", "H5",
+      "H6", "HEADER", "HR", "LI", "MAIN", "NAV", "OL", "P", "PRE", "SECTION", "UL"]);
+    const collect = (current) => {
+      if (current.nodeType === Node.TEXT_NODE) return current.textContent || "";
+      const body = [...current.childNodes].map(collect).join("");
+      return blocks.has(current.nodeName) ? `\n${body}\n` : body;
+    };
+    return clean(collect(node));
+  };
+  const visibleText = (node) => clean(node?.innerText || "");
+  const longerText = (node) => {
+    const visible = visibleText(node);
+    const complete = contentText(node);
+    return complete.length > visible.length ? complete : visible;
+  };
+  const bigEnough = (node) => node && longerText(node).length > 500;
 
   const climb = (node, label) => {
     let current = node;
@@ -174,53 +199,95 @@ function readVisiblePosting() {
     return null;
   };
 
-  let found = null;
-
-  // 1. The Apply control the user would press for the posting they are reading.
-  const controls = [...document.querySelectorAll("button, a")].filter((node) => {
-    const label = (node.innerText || node.getAttribute("aria-label") || "").trim();
-    return /^(apply|easy apply|save)\b/i.test(label);
-  });
-  tried.push(`apply_controls:${controls.length}`);
-  for (const control of controls) {
-    found = climb(control, "apply_control");
-    if (found) break;
-  }
-
-  // 2. The link to the job the URL says is open.
-  const currentId = new URLSearchParams(location.search).get("currentJobId")
+  const currentQueryId = new URLSearchParams(location.search).get("currentJobId");
+  const currentId = currentQueryId
     || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
   tried.push(`current_id:${currentId || "none"}`);
-  if (!found && currentId) {
-    found = climb(document.querySelector(`a[href*="/jobs/view/${currentId}"]`), "current_job_link");
-  }
-
-  // 3. Named containers, then the page itself.
-  if (!found) {
-    for (const selector of [".jobs-search__job-details--wrapper", ".jobs-details__main-content",
-                            ".jobs-details", ".job-view-layout", "#jobsearch-ViewjobPaneWrapper",
-                            ".jobsearch-JobComponent", "main"]) {
-      const node = document.querySelector(selector);
-      if (bigEnough(node)) { found = { pane: node, matched: selector }; break; }
-    }
-  }
-  if (!found) found = { pane: document.body, matched: "fallback_body" };
-
-  const { pane } = found;
-  let matched = found.matched;
-  let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
-
-  // The page's own name for this job: the link to it, or the first heading in the block.
-  let heading = "";
-  if (currentId) {
+  const findLinkTitle = () => {
+    if (!currentId) return "";
     const link = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
-    heading = ((link?.closest("h1, h2, h3")?.innerText) || link?.innerText || "").trim().split("\n")[0];
+    return clean(link?.closest("h1, h2, h3")?.innerText || link?.innerText || "").split("\n")[0];
+  };
+
+  const inspect = () => {
+    let found = null;
+    const controls = [...document.querySelectorAll("button, a")].filter((node) => {
+      const label = clean(node.innerText || node.getAttribute("aria-label") || "");
+      return /^(apply|easy apply|save)\b/i.test(label);
+    });
+    const semanticDescriptions = [".jobs-description", "[class*='jobs-description']",
+      "[id*='job-details']", "[aria-label*='job description' i]"]
+      .flatMap((selector) => [...document.querySelectorAll(selector)]).filter(bigEnough);
+    for (const description of semanticDescriptions) {
+      let current = description;
+      while (current && current !== document.body) {
+        if (controls.some((control) => current.contains(control))) {
+          found = { pane: current, matched: "description_with_apply" };
+          break;
+        }
+        current = current.parentElement;
+      }
+      if (found) break;
+    }
+    if (!found) {
+      for (const control of controls) {
+        found = climb(control, "apply_control");
+        if (found) break;
+      }
+    }
+    if (!found && currentId) {
+      found = climb(document.querySelector(`a[href*="/jobs/view/${currentId}"]`), "current_job_link");
+    }
+    if (!found) {
+      for (const selector of [".jobs-search__job-details--wrapper", ".jobs-details__main-content",
+                              ".jobs-details", ".job-view-layout", "#jobsearch-ViewjobPaneWrapper",
+                              ".jobsearch-JobComponent", "main"]) {
+        const node = document.querySelector(selector);
+        if (bigEnough(node)) { found = { pane: node, matched: selector }; break; }
+      }
+    }
+    if (!found) found = { pane: document.body, matched: "fallback_body" };
+
+    const expectedTitle = findLinkTitle();
+    const headings = [...found.pane.querySelectorAll("h1, h2")]
+      .map((node) => clean(node.innerText).split("\n")[0])
+      .filter((value) => value.length > 2 && value.length < 140 && !value.endsWith("?"));
+    const heading = headings.find((value) => expectedTitle &&
+      (value.includes(expectedTitle) || expectedTitle.includes(value))) || headings[0] || "";
+    const titleMatches = expectedTitle && headings.some((value) =>
+      value.includes(expectedTitle) || expectedTitle.includes(value));
+    return { ...found, expectedTitle, heading,
+      aligned: currentQueryId ? Boolean(titleMatches) : true };
+  };
+
+  // History changes before LinkedIn finishes replacing the detail pane. Wait for paint,
+  // and accept the pane only when its heading agrees with the link for currentJobId.
+  let reading = inspect();
+  let frames = 0;
+  while (!reading.aligned && frames < 60) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    reading = inspect();
+    frames += 1;
   }
-  if (!heading) {
-    heading = [...pane.querySelectorAll("h1, h2")]
-      .map((node) => (node.innerText || "").trim().split("\n")[0])
-      .find((value) => value.length > 2 && value.length < 140 && !value.endsWith("?")) || "";
+  tried.push(`render_frames:${frames}`);
+  tried.push(`aligned:${reading.aligned}`);
+  if (!reading.aligned) {
+    return { stale: true, postingId: currentId || "", url: window.location.href,
+      diagnostics: { tried, chars: 0, opening: "detail pane did not reach the current job" } };
   }
+
+  const { pane } = reading;
+  let matched = reading.matched;
+  const descriptionSelectors = [".jobs-description", "[class*='jobs-description']",
+    "[id*='job-details']", "[aria-label*='job description' i]"];
+  const descriptions = descriptionSelectors.flatMap((selector) =>
+    [...pane.querySelectorAll(selector)]).filter(bigEnough);
+  const description = descriptions.sort((a, b) => longerText(b).length - longerText(a).length)[0];
+  let text = longerText(description || pane);
+  if (description) matched += "+description";
+
+  // The page's own name for this job comes first from the current-id link.
+  const heading = reading.expectedTitle || reading.heading;
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
   const title = (documentMatch?.groups?.title || heading || fromDocument).trim();
@@ -236,7 +303,8 @@ function readVisiblePosting() {
     url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
     title, employer, location: place, container: matched,
     // Enough for one screenshot to say what happened, instead of a console session.
-    diagnostics: { tried, chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
+    diagnostics: { tried: [...tried, `description_candidates:${descriptions.length}`],
+      chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
   };
 }
 
@@ -244,21 +312,23 @@ function readVisiblePosting() {
 // they are not. The listener is scoped to the tab they are on, runs only while this panel
 // is open, and reads nothing until the posting they are looking at actually changes.
 let lastPostingKey = "";
+let readGeneration = 0;
 
 async function readPosting({ onlyIfChanged = false } = {}) {
   if (!state.token || !(await hasPageAccess())) return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
   if (!onlyIfChanged) { $("status").textContent = "reading the open posting…"; }
+  const generation = ++readGeneration;
   try {
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId: tab.id }, func: readVisiblePosting
     });
     const page = injected?.result;
+    if (page?.stale) throw new Error("the new posting is still rendering; choose it again");
     if (!page?.text) throw new Error("this page did not return a posting");
     const key = page.postingId || page.url;
     if (onlyIfChanged && key === lastPostingKey) return;
-    lastPostingKey = key;
     const response = await fetch(`${state.endpoint}/positioning`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
@@ -266,11 +336,12 @@ async function readPosting({ onlyIfChanged = false } = {}) {
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || `bridge returned ${response.status}`);
-    $("status").textContent = page.container.startsWith("current_job_pane")
-      ? "" : `read from ${page.container}`;
-    render(body);
+    if (generation !== readGeneration) return;
+    $("status").textContent = `read from ${page.container}`;
+    render(body, page);
+    lastPostingKey = key;
   } catch (error) {
-    if (!onlyIfChanged) $("status").textContent = String(error.message || error);
+    if (generation === readGeneration) $("status").textContent = String(error.message || error);
   }
 }
 
