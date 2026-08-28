@@ -21,11 +21,17 @@ the proposal.
 
 - **Current Fit** is deterministic weighted evidence coverage. `direct`, `strongly_related`,
   `transferable`, and `mention_only` evidence contribute at decreasing strength. Missing core
-  signals are returned as `core_gaps`.
-- **Career Value** is computed only when the user supplies `career-goals` containing desired
+  signals are returned as `core_gaps`. In V1 this is explicitly a provisional heuristic, not a
+  decision-grade fit score. Unverified material is capped at `transferable` and can never receive
+  high confidence. Verified summary text, unclassified resume claims, and skill lists are capped
+  at `mention_only`; education, certifications, and experience headers are capped at
+  `strongly_related`. Every cap is visible as declared versus effective strength.
+- **Career Value** is computed only when the user supplies non-empty `career-goals` containing desired
   roles, industries, skills to build, avoided roles/industries, and the Current Fit/Career Value
   priority split. With no goals, Career Value is `null`; the engine never infers aspiration from
-  resume wording.
+  resume wording. An untouched empty goal template is treated exactly like no goals. Goal terms
+  match complete normalized controlled phrases only; token subsets such as `data`, `analyst`, or
+  `research` do not match longer titles. Unresolved positive goals are surfaced for review.
 - **Overall score** applies the user's declared priority split. Without goals it equals Current
   Fit. Scores rank proposals; they are not interview probabilities.
 - **Confidence** describes evidence breadth, not certainty of getting a job.
@@ -90,7 +96,7 @@ immutable approval boundary.
 - Uploaded files, review packets, proposals, and materialized profiles belong under `.jobloom/`
   or another private ignored directory.
 - The default catalog and goal template contain no candidate data and are safe to track.
-- PDF extraction prefers `pdftotext` and falls back to `pypdf`. Encrypted or image-only PDFs
+- PDF extraction prefers `pdftotext` and falls back to the declared `pypdf` dependency. Encrypted or image-only PDFs
   fail with a clear request for an unlocked or OCR/text-based source.
 - A malformed catalog, goal file, proposal hash, selection, or weight total fails closed.
 - Provisional proposals can never be materialized.

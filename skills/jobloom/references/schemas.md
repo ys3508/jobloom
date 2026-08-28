@@ -26,11 +26,13 @@ Provisional proposals are never adoptable. A verified proposal uses only confirm
 CandidateFacts and contains, for every catalog archetype, Current Fit, optional Career Value,
 confidence, tier, supporting fact IDs, per-signal evidence strength, core gaps, an exact
 SearchDirection profile, and its SHA-256. Raw CandidateFact values are not copied into the
-proposal.
+proposal. V1 scores carry `score_status: provisional_heuristic` and `decision_grade: false`.
+Per-signal provenance records both declared and effective strength so source-type safety caps are
+auditable.
 
-Career Value is null unless a user-authored career-goals object supplies desired roles,
-industries, skills to build, avoided roles/industries, and Current Fit/Career Value priorities
-totaling 100. The suggested portfolio is advisory; only an exact user-reviewed selection can be
+Career Value is null unless a user-authored career-goals object contains at least one non-empty
+goal list and Current Fit/Career Value priorities totaling 100. The suggested portfolio is
+advisory; only an exact user-reviewed selection can be
 materialized, and ordinary SearchDirection/SearchPortfolio registration and approval remain
 mandatory afterward. See `career-direction-engine.md`.
 

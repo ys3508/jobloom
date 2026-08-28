@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -62,10 +63,16 @@ def extract_pdf(path: Path) -> str:
         raise RuntimeError(
             "PDF ingestion requires either the 'pdftotext' command or the pypdf package"
         ) from error
-    reader = PdfReader(path)
-    if reader.is_encrypted:
-        raise ValueError("encrypted PDFs must be unlocked before candidate ingestion")
-    pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
+    pypdf_logger = logging.getLogger("pypdf")
+    previous_level = pypdf_logger.level
+    try:
+        pypdf_logger.setLevel(logging.ERROR)
+        reader = PdfReader(path)
+        if reader.is_encrypted:
+            raise ValueError("encrypted PDFs must be unlocked before candidate ingestion")
+        pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
+    finally:
+        pypdf_logger.setLevel(previous_level)
     text = "\n\f\n".join(pages)
     if not text.strip():
         raise ValueError("PDF contains no extractable text; OCR or a text-based source is required")

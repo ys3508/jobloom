@@ -39,6 +39,17 @@ STRENGTH_FACTORS = {
     "direct": 1.0, "strongly_related": 0.85, "transferable": 0.6,
     "mention_only": 0.35, "none": 0.0,
 }
+# Until the Evidence Graph carries typed capability relationships, source type limits how
+# strongly a text hit may support a direction. A summary, skill list, or course certificate is
+# useful discovery evidence, but is not equivalent to demonstrated work.
+FACT_TYPE_STRENGTH_CAPS = {
+    "professional_summary": "mention_only",
+    "resume_claim": "mention_only",
+    "skill": "mention_only",
+    "certification": "strongly_related",
+    "education": "strongly_related",
+    "experience_header": "strongly_related",
+}
 
 
 def canonical_hash(value: Any) -> str:
@@ -124,7 +135,8 @@ def validate_goals(goals: dict[str, Any] | None) -> dict[str, Any] | None:
     for key in GOAL_KEYS - {"schema_version", "goal_id", "priorities"}:
         result[key] = _bounded_strings(goals[key], f"career_goals.{key}")
     result["priorities"] = dict(priorities)
-    return result
+    goal_lists = GOAL_KEYS - {"schema_version", "goal_id", "priorities"}
+    return result if any(result[key] for key in goal_lists) else None
 
 
 def _usable_facts(facts: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
@@ -135,22 +147,33 @@ def _usable_facts(facts: list[dict[str, Any]], mode: str) -> list[dict[str, Any]
             and fact.get("evidence_strength") in EVIDENCE_ORDER]
 
 
-def _signal_match(term: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+def _effective_strength(fact: dict[str, Any], mode: str) -> str:
+    declared = fact["evidence_strength"]
+    cap = "transferable" if mode == "provisional" else FACT_TYPE_STRENGTH_CAPS.get(
+        str(fact.get("type") or "experience_claim"), "direct")
+    return min((declared, cap), key=lambda strength: EVIDENCE_ORDER[strength])
+
+
+def _signal_match(term: str, facts: list[dict[str, Any]], mode: str) -> dict[str, Any]:
     matches = [fact for fact in facts if fact_supports(term, fact)]
     if not matches:
-        return {"term": term, "strength": "none", "fact_ids": []}
-    best = max((fact["evidence_strength"] for fact in matches),
+        return {"term": term, "strength": "none", "fact_ids": [], "source_evidence": []}
+    effective = [(fact, _effective_strength(fact, mode)) for fact in matches]
+    best = max((strength for _, strength in effective),
                key=lambda strength: EVIDENCE_ORDER[strength])
     return {"term": term, "strength": best,
-            "fact_ids": sorted(fact["id"] for fact in matches
-                               if fact["evidence_strength"] == best)}
+            "fact_ids": sorted(fact["id"] for fact, strength in effective if strength == best),
+            "source_evidence": sorted(({
+                "fact_id": fact["id"],
+                "fact_type": str(fact.get("type") or "experience_claim"),
+                "declared_strength": fact["evidence_strength"],
+                "effective_strength": strength,
+            } for fact, strength in effective if strength == best), key=lambda item: item["fact_id"])}
 
 
 def _text_matches(needle: str, values: list[str]) -> bool:
-    wanted = set(direction_core._tokens(needle))
-    return bool(wanted) and any(wanted <= set(direction_core._tokens(value))
-                                or set(direction_core._tokens(value)) <= wanted
-                                for value in values if direction_core._tokens(value))
+    wanted = direction_core._tokens(needle)
+    return bool(wanted) and any(wanted == direction_core._tokens(value) for value in values)
 
 
 def _career_value(archetype: dict[str, Any], goals: dict[str, Any] | None) -> int | None:
@@ -166,9 +189,11 @@ def _career_value(archetype: dict[str, Any], goals: dict[str, Any] | None) -> in
         *[(item, skill_space) for item in goals["skills_to_build"]],
     ]
     matched = sum(_text_matches(item, space) for item, space in positives)
-    base = round(100 * matched / len(positives)) if positives else 50
     avoid_hits = sum(_text_matches(item, role_space) for item in goals["avoid_roles"])
     avoid_hits += sum(_text_matches(item, industry_space) for item in goals["avoid_industries"])
+    if not positives:
+        return 0 if avoid_hits else None
+    base = round(100 * matched / len(positives))
     return max(0, base - 35 * avoid_hits)
 
 
@@ -189,11 +214,11 @@ def _criteria(candidate: dict[str, Any], industries: list[str]) -> dict[str, Any
 
 
 def _score(archetype: dict[str, Any], facts: list[dict[str, Any]], goals: dict[str, Any] | None,
-           candidate: dict[str, Any], proposal_id: str) -> dict[str, Any]:
+           candidate: dict[str, Any], proposal_id: str, mode: str) -> dict[str, Any]:
     evidence = []
     earned = total = 0.0
     for signal in archetype["evidence_signals"]:
-        match = _signal_match(signal["term"], facts)
+        match = _signal_match(signal["term"], facts, mode)
         match.update({"weight": signal["weight"], "core": signal["core"]})
         evidence.append(match)
         total += signal["weight"]
@@ -207,8 +232,14 @@ def _score(archetype: dict[str, Any], facts: list[dict[str, Any]], goals: dict[s
     fact_ids = sorted({fact_id for item in supported for fact_id in item["fact_ids"]})
     strong_count = sum(EVIDENCE_ORDER[item["strength"]] >= EVIDENCE_ORDER["strongly_related"]
                        for item in supported)
-    confidence = "high" if strong_count >= 5 and len(fact_ids) >= 3 else (
-        "medium" if len(supported) >= 2 and len(fact_ids) >= 2 else "low")
+    core = [item for item in evidence if item["core"]]
+    strong_core = sum(EVIDENCE_ORDER[item["strength"]] >= EVIDENCE_ORDER["strongly_related"]
+                      for item in core)
+    direct_core = sum(item["strength"] == "direct" for item in core)
+    core_ratio = strong_core / len(core) if core else 0
+    confidence = "high" if (mode == "verified" and strong_count >= 5
+                             and len(fact_ids) >= 3 and direct_core == len(core)) else (
+        "medium" if len(supported) >= 2 and len(fact_ids) >= 2 and core_ratio >= 0.5 else "low")
     tier = "primary" if overall >= 70 else ("adjacent" if overall >= 45 else (
         "exploratory" if overall >= 20 else "insufficient_evidence"))
     direction_id = f"auto-{proposal_id}-{archetype['archetype_id']}"
@@ -230,7 +261,8 @@ def _score(archetype: dict[str, Any], facts: list[dict[str, Any]], goals: dict[s
     return {
         "archetype_id": archetype["archetype_id"], "name": archetype["name"],
         "tier": tier, "current_fit": current_fit, "career_value": career_value,
-        "overall_score": overall, "confidence": confidence,
+        "overall_score": overall, "score_status": "provisional_heuristic",
+        "decision_grade": False, "confidence": confidence,
         "supporting_fact_ids": fact_ids,
         "evidence": evidence,
         "core_gaps": [item["term"] for item in evidence
@@ -265,7 +297,8 @@ def generate_proposal(*, proposal_id: str, candidate: dict[str, Any], facts: lis
     catalog = validate_catalog(catalog)
     goals = validate_goals(goals)
     usable = _usable_facts(facts, mode)
-    scored = [_score(item, usable, goals, candidate, proposal_id) for item in catalog["archetypes"]]
+    scored = [_score(item, usable, goals, candidate, proposal_id, mode)
+              for item in catalog["archetypes"]]
     scored.sort(key=lambda item: (-item["overall_score"], -item["current_fit"], item["archetype_id"]))
     recommendations = [item for item in scored
                        if item["current_fit"] > 0 or (item["career_value"] or 0) > 0][:max_directions]
@@ -289,6 +322,10 @@ def generate_proposal(*, proposal_id: str, candidate: dict[str, Any], facts: lis
         "review_required": True,
         "review_reasons": (["user_must_choose_directions_and_weights"]
                            + ([] if goals else ["career_goals_not_supplied"])
+                           + (["career_goals_unresolved"] if goals and any(
+                               goals[key] for key in ("desired_roles", "desired_industries",
+                                                      "skills_to_build")) and not any(
+                               (item["career_value"] or 0) > 0 for item in recommendations) else [])
                            + (["candidate_facts_require_confirmation"] if mode == "provisional" else [])
                            + (["no_supported_direction_in_catalog"] if not recommendations else [])),
     }

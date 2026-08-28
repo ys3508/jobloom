@@ -243,10 +243,11 @@ Which resolves to a recommendation: `Apply Now` / `Apply as Stretch` / `Good Bri
 **Direction proposal implemented 2026-08-28.** Uploaded PDF/DOCX/TXT/Markdown material now
 produces provisional, non-adoptable direction recommendations plus a fact-review packet. A
 confirmed CandidateSnapshot produces hash-locked, evidence-explained direction profiles with
-Current Fit; explicit user career goals add Career Value and a user-selected weighting can be
+provisional evidence-coverage heuristic; explicit non-empty user career goals add Career Value and a user-selected weighting can be
 materialized into the existing SearchDirection/SearchPortfolio approval flow. This implements
-direction discovery and approval boundaries. Per-job bridge-role labels still belong to the
-later JD recommendation layer.
+direction discovery and approval boundaries, not decision-grade direction ranking. Per-job
+bridge-role labels, typed evidence graphs, market capacity, and narrative coherence still belong
+to later layers.
 
 ## 6. Resume Space Optimizer — decide who earns a line
 
