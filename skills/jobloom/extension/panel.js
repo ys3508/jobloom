@@ -10,7 +10,13 @@ async function loadSettings() {
   if (saved.token) state.token = saved.token;
   $("endpoint").value = state.endpoint;
   $("token").value = state.token;
-  checkHealth();
+  // Setup only asks for attention while something is missing.
+  $("setup").open = !state.token;
+  await checkHealth();
+  // Opening this panel is the user asking, so read the posting they already have open
+  // rather than making them press a second button for the same intent. Nothing else
+  // triggers a read: no navigation hook, no polling, no reading of tabs they did not open.
+  if (state.token && await hasPageAccess()) readPosting();
 }
 
 async function checkHealth() {
@@ -29,7 +35,9 @@ $("save").addEventListener("click", async () => {
   state.endpoint = $("endpoint").value.trim().replace(/\/$/, "");
   state.token = $("token").value.trim();
   await chrome.storage.local.set({ endpoint: state.endpoint, token: state.token });
-  checkHealth();
+  await checkHealth();
+  $("setup").open = false;
+  if (await hasPageAccess()) readPosting();
 });
 
 // activeTab is granted by clicking the toolbar action, which a click inside this panel is
@@ -57,7 +65,8 @@ $("grant").addEventListener("click", async () => {
   } catch (error) {
     $("access-state").textContent = String(error.message || error);
   }
-  refreshAccess();
+  await refreshAccess();
+  if (state.token) readPosting();
 });
 
 const VERDICT_TEXT = {
@@ -167,7 +176,7 @@ function readVisiblePosting() {
            employer, location: place, container: matched };
 }
 
-$("read").addEventListener("click", async () => {
+async function readPosting() {
   $("status").textContent = "reading the open posting…";
   $("result").hidden = true;
   try {
@@ -195,7 +204,9 @@ $("read").addEventListener("click", async () => {
   } catch (error) {
     $("status").textContent = String(error.message || error);
   }
-});
+}
+
+$("read").addEventListener("click", readPosting);
 
 loadSettings();
 refreshAccess();

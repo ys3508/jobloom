@@ -38,3 +38,7 @@ details { margin-top:18px; } summary { cursor:pointer; font-size:12px; opacity:.
 .group ul, .group li { color:inherit; }
 .advice { font-size:12px; opacity:.75; margin:0 0 6px; }
 .group .name strong { color:inherit; }
+
+#setup { margin-bottom:6px; }
+#setup summary { font-size:12px; opacity:.6; }
+#setup[open] { border-bottom:1px solid var(--line); padding-bottom:10px; }

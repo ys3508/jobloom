@@ -10,8 +10,10 @@ Boundaries enforced here rather than trusted to the extension:
 
 - Loopback only. The server refuses to bind anything but 127.0.0.1, so nothing on the
   network can reach it.
-- A shared token, generated per run and printed once. Without it every request is refused,
-  so another page in the same browser cannot call it.
+- A shared token, kept in the private root at 0600 and reused across restarts, so it is
+  pasted into the panel once rather than after every start. Without it every request is
+  refused, so another page in the same browser cannot call the bridge. `--rotate-token`
+  replaces it when it has been shown to someone.
 - Read-only by default. Storing a JobCard is a separate, explicitly enabled endpoint,
   because the difference between "help me read this page" and "keep a copy of every page I
   scrolled past" is the difference between assistance and collection.
@@ -45,6 +47,28 @@ from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 LOOPBACK = "127.0.0.1"
 MAX_PAGE_TEXT = 60_000
 SUPPORTED_HOSTS = ("linkedin.com", "indeed.com")
+
+
+TOKEN_FILENAME = "assist-token"
+
+
+def load_or_create_token(private_root: Path, *, rotate: bool = False) -> str:
+    """One token per install, not per run.
+
+    Rotating on every start meant re-pasting into the panel after each restart, which is
+    friction with no security to show for it: the token exists to stop other pages in the
+    browser calling the bridge, and that does not need it to change.
+    """
+    path = private_root / TOKEN_FILENAME
+    if not rotate and path.is_file():
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    token = secrets.token_urlsafe(24)
+    private_root.mkdir(parents=True, exist_ok=True)
+    path.write_text(token + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return token
 
 
 class BridgeError(Exception):
@@ -354,11 +378,19 @@ def main() -> None:
     parser.add_argument("--allow-store", action="store_true",
                         help="permit the extension to store a job card the user reviewed; "
                              "off by default so browsing never accumulates a job database")
+    parser.add_argument("--private-root", type=Path,
+                        help="where the token is kept; defaults to the database's directory")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="replace the stored token, for when it has been shown to someone")
     args = parser.parse_args()
+    private_root = args.private_root or args.db.resolve().parent
+    token = load_or_create_token(private_root, rotate=args.rotate_token)
     server = serve(db_path=args.db, candidate_path=args.candidate, port=args.port,
-                   allow_store=args.allow_store)
+                   allow_store=args.allow_store, token=token)
     print(json.dumps({"listening": f"http://{LOOPBACK}:{args.port}",
-                      "token": Handler.token, "store_enabled": args.allow_store}, indent=2))
+                      "token": token, "token_file": str(private_root / TOKEN_FILENAME),
+                      "token_reused": not args.rotate_token,
+                      "store_enabled": args.allow_store}, indent=2))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

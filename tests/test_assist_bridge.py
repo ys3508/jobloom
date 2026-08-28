@@ -149,6 +149,28 @@ class PostingSectionTests(unittest.TestCase):
 
 
 
+class TokenTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_the_token_survives_a_restart(self):
+        # Rotating on every start meant re-pasting into the panel each time, which is
+        # friction with no security to show for it.
+        first = BRIDGE.load_or_create_token(self.root)
+        self.assertEqual(first, BRIDGE.load_or_create_token(self.root))
+
+    def test_rotation_is_available_when_the_token_has_been_seen(self):
+        first = BRIDGE.load_or_create_token(self.root)
+        self.assertNotEqual(first, BRIDGE.load_or_create_token(self.root, rotate=True))
+
+    def test_the_token_file_is_not_world_readable(self):
+        BRIDGE.load_or_create_token(self.root)
+        mode = (self.root / BRIDGE.TOKEN_FILENAME).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+
 class ServerBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -324,6 +346,15 @@ class ExtensionBoundaryTests(unittest.TestCase):
         # them is what turns a positioning tool into a keyword counter.
         for key in ("hidden_strength", "evidence_gap", "transferable", "real_gap"):
             self.assertIn(key, panel)
+
+    def test_opening_the_panel_reads_without_a_second_press(self):
+        # Opening the panel is the user asking. Making them press a button for the same
+        # intent is friction, not a boundary — the boundary is that nothing else triggers
+        # a read: no navigation hook, no polling, no tab they did not open.
+        panel = self.sources["panel.js"]
+        self.assertIn("if (state.token && await hasPageAccess()) readPosting();", panel)
+        self.assertNotIn("chrome.tabs.onUpdated", panel)
+        self.assertNotIn("chrome.webNavigation", panel)
 
     def test_reading_is_refused_before_the_grant(self):
         self.assertIn("page access not granted yet", self.sources["panel.js"])

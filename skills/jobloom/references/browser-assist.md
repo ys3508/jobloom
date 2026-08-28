@@ -68,13 +68,25 @@ fails if `chrome.tabs.create`, `location.assign`, `.click()`, `setInterval` or
 ## Running it
 
 ```bash
-python3 skills/jobloom/scripts/assist_bridge.py \
-  --db .jobloom/jobloom.db --candidate .jobloom/candidate-v15.json
+./skills/jobloom/scripts/start-assist.sh
 ```
 
-It prints the port and the token. Load `skills/jobloom/extension/` through
-`chrome://extensions` → Developer mode → Load unpacked, open the side panel from the
-toolbar, paste the token, and press **Read this posting** on a job page you have open.
+**Start it once and leave it running.** The token lives in `.jobloom/assist-token` at 0600
+and is reused across restarts, so the panel is configured one time rather than after every
+start; `--rotate-token` replaces it if it has been shown to anyone. Restarting is only
+needed when this code changes, which is a development concern and not something a user of
+the tool should ever do.
+
+Load `skills/jobloom/extension/` through `chrome://extensions` → Developer mode → Load
+unpacked. Open the side panel from the toolbar, grant page access once, paste the token
+once. After that, opening the panel on a job page reads it: opening the panel *is* the
+request, and asking for a second press for the same intent is friction, not a boundary.
+The boundary is that nothing else triggers a read — there is no navigation hook, no
+polling, and no reading of a tab the user did not open. **Re-read this posting** is there
+for when the site swaps the posting under the panel without a page load.
+
+To have it running whenever the machine is on, wrap `start-assist.sh` in a macOS
+LaunchAgent or the equivalent; nothing in the bridge needs a terminal.
 
 Add `--allow-store` only when you intend to keep a job you have reviewed. Without it the
 assistant reads and forgets, which is the difference between help and collection.
