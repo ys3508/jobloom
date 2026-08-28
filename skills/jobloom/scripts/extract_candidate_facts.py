@@ -51,12 +51,25 @@ def extract_docx(path: Path) -> str:
 
 def extract_pdf(path: Path) -> str:
     executable = shutil.which("pdftotext")
-    if not executable:
-        raise RuntimeError("PDF ingestion requires the 'pdftotext' command; provide DOCX, TXT, or Markdown instead")
-    with tempfile.TemporaryDirectory(prefix="jobloom-resume-") as temp_dir:
-        output = Path(temp_dir) / "resume.txt"
-        subprocess.run([executable, "-layout", str(path), str(output)], check=True, capture_output=True)
-        return output.read_text(encoding="utf-8", errors="replace")
+    if executable:
+        with tempfile.TemporaryDirectory(prefix="jobloom-resume-") as temp_dir:
+            output = Path(temp_dir) / "resume.txt"
+            subprocess.run([executable, "-layout", str(path), str(output)], check=True, capture_output=True)
+            return output.read_text(encoding="utf-8", errors="replace")
+    try:
+        from pypdf import PdfReader
+    except ImportError as error:
+        raise RuntimeError(
+            "PDF ingestion requires either the 'pdftotext' command or the pypdf package"
+        ) from error
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        raise ValueError("encrypted PDFs must be unlocked before candidate ingestion")
+    pages = [page.extract_text(extraction_mode="layout") or "" for page in reader.pages]
+    text = "\n\f\n".join(pages)
+    if not text.strip():
+        raise ValueError("PDF contains no extractable text; OCR or a text-based source is required")
+    return text
 
 
 def extract_text(path: Path) -> str:

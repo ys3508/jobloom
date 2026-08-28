@@ -1,0 +1,10 @@
+{
+  "portfolio_id": "reviewed-career-portfolio-v1",
+  "name": "Reviewed career directions",
+  "allocations": [
+    {
+      "archetype_id": "research-clinical-data",
+      "weight_percent": 100
+    }
+  ]
+}

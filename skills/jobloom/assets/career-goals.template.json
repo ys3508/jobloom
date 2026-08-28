@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1.0",
+  "goal_id": "career-goals-v1",
+  "desired_roles": [],
+  "desired_industries": [],
+  "skills_to_build": [],
+  "avoid_roles": [],
+  "avoid_industries": [],
+  "priorities": {
+    "current_fit": 60,
+    "career_value": 40
+  }
+}

@@ -240,6 +240,14 @@ Healthcare AI Analyst            Current Fit 53   Career Value 96
 Which resolves to a recommendation: `Apply Now` / `Apply as Stretch` / `Good Bridge Role` /
 `High Match but Wrong Direction` / `Skip`.
 
+**Direction proposal implemented 2026-08-28.** Uploaded PDF/DOCX/TXT/Markdown material now
+produces provisional, non-adoptable direction recommendations plus a fact-review packet. A
+confirmed CandidateSnapshot produces hash-locked, evidence-explained direction profiles with
+Current Fit; explicit user career goals add Career Value and a user-selected weighting can be
+materialized into the existing SearchDirection/SearchPortfolio approval flow. This implements
+direction discovery and approval boundaries. Per-job bridge-role labels still belong to the
+later JD recommendation layer.
+
 ## 6. Resume Space Optimizer — decide who earns a line
 
 A full history (Pittsburgh, DOHMH, Columbia, AstraZeneca, Shanghai Jiao Tong, INNSCI, Animal
@@ -272,5 +280,5 @@ Recorded so the gap is explicit, not to imply the current design is wrong.
 | 2. Master → Variant → Tailored | `resume_versions` with `master_source` / `direction` kinds and three source modes | Variants are static once approved; nothing re-ranks a variant's contents per JD |
 | 3. Evidence Guardrail | claims manifest + `BaselinePlan` (fact IDs, reason codes, no promotion of evidence strength) | Governs *approval*, not composition: no per-bullet evidence/confidence/transformation record, and no generation-time BLOCKED |
 | 4. Gap taxonomy | `evaluate_job.py` returns eligibility, a match category, ≤3 reasons | No hidden-strength / resume-gap / evidence-gap / skill-gap split |
-| 5. Career Direction Engine | `SearchDirection` + weighted portfolio + routing | One axis only: there is no Career Value score and no bridge-role recommendation |
+| 5. Career Direction Engine | automatic material/candidate proposals + `SearchDirection` + weighted portfolio + routing | Direction-level Current Fit/Career Value is implemented; per-job bridge-role recommendations remain missing |
 | 6. Space Optimizer | one-page gate on `rendered_page_count` | Enforces the limit, does not help allocate it — no marginal value, no line budget |

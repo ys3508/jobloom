@@ -11,6 +11,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 
 - For candidate onboarding, read `references/facts-and-evidence.md`.
 - For private backend initialization, component status, MVP readiness, or remaining user steps, read `references/mvp-readiness.md` and `references/schemas.md`.
+- For automatic career-direction proposals after material upload, read `references/career-direction-engine.md`, `references/facts-and-evidence.md`, `references/search-directions.md`, and `references/schemas.md`.
 - For search-direction configuration, resume adaptation planning, or change review, read `references/search-directions.md`, `references/job-evaluation.md`, `references/facts-and-evidence.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For cover-letter registration, approval, application scoping, or binding, read `references/cover-letter-versions.md`, `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
@@ -80,20 +81,22 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 
 ## Search directions and adaptation plans
 
-1. Register each structured direction from `assets/search-direction.template.json`. Individual drafts are inert routing components, not the user's approval surface.
-2. Build one weighted `SearchPortfolio` from `assets/search-portfolio.template.json`. It may contain multiple exact direction hashes; IDs must be unique and integer weights must total 100.
-3. Show the complete portfolio and its exact SHA-256 once. Only actor `user` may approve that hash. Portfolio approval atomically approves its draft member directions; never request separate approvals for the same reviewed portfolio.
-4. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside a direction belonging to the active approved portfolio and whose deterministic evaluation is eligible for `broad` or `precision` action.
-5. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
-6. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged portfolio direction, unchanged JobCard, and an approved unchanged base resume.
-7. `direct_reuse` creates no file. For generated `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent. A user-provided direction resume uses `--source-mode user_provided` and must not claim a plan or parent.
-8. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
-9. Use `register-variant` when one user-provided resume serves several directions. Its weights are the resume's own split and are independent of the portfolio's; read them with `variant_allocation_status`. One user approval covers every member or none of them.
-10. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
-11. Read `warning_keywords` as obligation-scoped: mandatory in the posting demotes, preferred costs nothing. Never let a title match alone reach `match` when the candidate's facts cover fewer than half the stated requirements.
-12. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
-13. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
-14. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
+1. After material upload, use `career_direction_core.py propose-material` for immediate provisional suggestions and a fact-review packet. Never adopt these suggestions before the facts are confirmed. After CandidateSnapshot registration, use `propose-candidate`; Career Value remains null unless the user supplies explicit goals.
+2. Have the user review the exact proposal hash, choose directions, and set weights totaling 100. `materialize-selection --actor user` emits immutable profiles and a portfolio but does not register or approve them.
+3. Register each structured direction from the materialized output or `assets/search-direction.template.json`. Individual drafts are inert routing components, not the user's approval surface.
+4. Build one weighted `SearchPortfolio` from the materialized output or `assets/search-portfolio.template.json`. It may contain multiple exact direction hashes; IDs must be unique and integer weights must total 100.
+5. Show the complete portfolio and its exact SHA-256 once. Only actor `user` may approve that hash. Portfolio approval atomically approves its draft member directions; never request separate approvals for the same reviewed portfolio.
+6. Generate a resume adaptation plan only for a user-reviewed JobCard whose title is inside a direction belonging to the active approved portfolio and whose deterministic evaluation is eligible for `broad` or `precision` action.
+7. Review the value-free plan: base version, evidence IDs and strengths, reordered/emphasized facts, supported terminology, transferable-only terms, unsupported terms, and fixed forbidden transformations.
+8. User approval requires actor `user`, the exact plan SHA-256, the same candidate profile hash, unchanged portfolio direction, unchanged JobCard, and an approved unchanged base resume.
+9. `direct_reuse` creates no file. For generated `direction`, `lightweight`, or `precision`, prepare the physical resume outside the registry, then register it with the approved plan ID and exact base parent. A user-provided direction resume uses `--source-mode user_provided` and must not claim a plan or parent.
+10. Review the rendered file and claims manifest separately before ResumeVersion approval. Plan approval never approves resume bytes.
+11. Use `register-variant` when one user-provided resume serves several directions. Its weights are the resume's own split and are independent of the portfolio's; read them with `variant_allocation_status`. One user approval covers every member or none of them.
+12. Revoking the active portfolio invalidates its plans and active material locks. Do not select, bind, or lock a master resume once portfolio enforcement is initialized.
+13. Read `warning_keywords` as obligation-scoped: mandatory in the posting demotes, preferred costs nothing. Never let a title match alone reach `match` when the candidate's facts cover fewer than half the stated requirements.
+14. Persist every routed JobCard with `record_routing`. Routing runs before allocation; only `match` and `review` enter the review pool, and a portfolio weight never rescues a hard-filter failure. Read deficits from `portfolio_allocation_status`, never from a hand-assembled list.
+15. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
+16. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
 
 ## Cover-letter versions
 
