@@ -32,6 +32,7 @@ def load(name):
 
 
 BRIDGE = load("assist_bridge")
+SECTIONS = load("posting_sections")
 RESUMES = load("resume_core")
 EXTENSION = ROOT / "skills" / "jobloom" / "extension"
 
@@ -71,6 +72,81 @@ class CardBuildingTests(unittest.TestCase):
         card = BRIDGE.build_card(PAGE)
         self.assertEqual(card["title"], "Clinical Research Data Analyst")
         self.assertEqual(card["required_skills"], ["R", "SAS", "Epic"])
+
+
+
+MGB_POSTING = """Computational Research Associate
+Massachusetts General Hospital
+
+Key Responsibilities
+- Conducting gene-environment interaction analyses in biobank datasets
+
+Required
+- Bachelor's or master's degree in genetic epidemiology, statistics, or a related field
+- Strong programming skills in R and/or Python and comfort with Linux/shell scripting
+- Excellent written and verbal communication skills
+
+Preferred
+- Experience with biomedical cloud computing environments (e.g., Terra, DNAnexus)
+
+Compensation
+Salary beginning at a minimum of $55,000 per year and a maximum of $60,000 per year.
+
+Remote Type
+Hybrid
+
+EEO Statement
+An Equal Opportunity Employer."""
+
+
+class PostingSectionTests(unittest.TestCase):
+    """A posting states its sections under headings; the extractor reads, it does not guess."""
+
+    def test_sections_are_read_from_their_headings(self):
+        sections = SECTIONS.split_sections(MGB_POSTING)
+        self.assertEqual(len(sections["required_skills"]), 3)
+        self.assertEqual(len(sections["preferred_skills"]), 1)
+        self.assertTrue(sections["responsibilities"])
+
+    def test_a_closing_heading_ends_a_section(self):
+        sections = SECTIONS.split_sections(MGB_POSTING)
+        joined = " ".join(sections["compensation_structure"])
+        self.assertNotIn("Equal Opportunity", joined)
+
+    def test_hybrid_wins_over_the_word_remote_in_a_label(self):
+        # "Remote Type / Hybrid" must not read as a remote role.
+        self.assertEqual(SECTIONS.extract(MGB_POSTING)["work_arrangement"], "hybrid")
+
+    def test_a_minimum_and_maximum_are_read_as_a_range(self):
+        salary = SECTIONS.extract(MGB_POSTING)["salary"]
+        self.assertEqual((salary["minimum"], salary["maximum"]), (55000, 60000))
+
+    def test_a_bare_small_number_is_not_a_salary(self):
+        self.assertIsNone(SECTIONS.extract("Coffee costs $6 a day.").get("salary"))
+
+    def test_requirement_sentences_are_distilled_into_matchable_terms(self):
+        # A twenty-word sentence resolves to no evidence, so the line is reduced to the
+        # controlled terms it actually names.
+        card = SECTIONS.extract(MGB_POSTING)
+        self.assertIn("R", card["required_skills"])
+        self.assertIn("Python", card["required_skills"])
+        self.assertIn("Linux", card["required_skills"])
+        self.assertIn("Terra", card["preferred_skills"])
+
+    def test_the_stated_lines_are_kept_beside_the_distilled_terms(self):
+        card = SECTIONS.extract(MGB_POSTING)
+        self.assertEqual(len(card["required_skills_stated"]), 3)
+
+    def test_a_requirement_nothing_recognised_is_reported_not_dropped(self):
+        card = SECTIONS.extract(MGB_POSTING)
+        unrecognised = card["extraction"]["unrecognised_requirements"]["required_skills"]
+        self.assertTrue(any("degree" in line for line in unrecognised))
+
+    def test_sponsorship_refusal_is_read_but_never_invented(self):
+        self.assertEqual(SECTIONS.extract("We are unable to sponsor visas.")["sponsorship"],
+                         "does_not_support")
+        self.assertEqual(SECTIONS.extract(MGB_POSTING)["sponsorship"], "unknown")
+
 
 
 class ServerBoundaryTests(unittest.TestCase):

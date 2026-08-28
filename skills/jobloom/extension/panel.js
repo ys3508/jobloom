@@ -98,8 +98,10 @@ function render(result) {
 // page has already rendered — it does not fetch, follow, or expand anything.
 function readVisiblePosting() {
   const CONTAINERS = [
+    ".jobs-search__job-details--wrapper",
     ".jobs-search__job-details--container",
     ".jobs-details__main-content",
+    ".jobs-details",
     ".job-view-layout",
     "#jobsearch-ViewjobPaneWrapper",
     ".jobsearch-JobComponent",
@@ -111,13 +113,16 @@ function readVisiblePosting() {
     const node = document.querySelector(selector);
     if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
   }
+  let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
   const heading = pane.querySelector("h1, h2");
-  return {
-    url: location.href.split("?")[0],
-    text: (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim().slice(0, 60000),
-    title: (heading?.innerText || document.title || "").trim(),
-    container: matched
-  };
+  const title = (heading?.innerText || document.title || "").trim();
+  // A search page keeps the result list and the open posting in one container. When the
+  // title appears inside the text, everything before it is the list, so drop it.
+  if (title && matched === "main" || matched === "fallback_body") {
+    const start = text.indexOf(title);
+    if (title && start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
+  }
+  return { url: location.href.split("?")[0], text: text.slice(0, 60000), title, container: matched };
 }
 
 $("read").addEventListener("click", async () => {

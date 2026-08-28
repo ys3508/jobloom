@@ -79,6 +79,29 @@ toolbar, paste the token, and press **Read this posting** on a job page you have
 Add `--allow-store` only when you intend to keep a job you have reviewed. Without it the
 assistant reads and forgets, which is the difference between help and collection.
 
+## From page text to a JobCard
+
+The page arrives as prose, so `posting_sections.py` turns it into fields by rule:
+
+1. **Sections.** A controlled set of headings — *Required*, *Preferred*, *Responsibilities*,
+   *Compensation* and their common variants — opens a section, and the lines beneath belong
+   to it until the next heading. A second set (*EEO*, *About us*, *Physical requirements*)
+   closes one without opening another.
+2. **Distillation.** A requirement is written as a sentence, but evidence resolves per
+   capability, so a twenty-word line would match nothing and read as a gap the candidate
+   does not have. Each line is reduced to the terms it names, from two controlled sources:
+   `TOOL_TERMS`, and the capability patterns already in the ontology.
+3. **What nothing recognised is reported.** Lines that yield no term are listed under
+   `extraction.unrecognised_requirements`. A requirement nobody parsed is not the same as a
+   requirement nobody has, and the card says which it was.
+4. **The stated lines are kept** in `required_skills_stated` beside the distilled terms, so
+   the reduction can always be checked against what the posting actually said.
+
+Two ordering rules exist because postings say both things at once: *hybrid* is tested
+before *remote*, since a hybrid posting almost always carries the label "Remote Type"
+directly above the word Hybrid; and a stated minimum and maximum are read as a range before
+a bare figure is.
+
 ## What is not verified
 
 The container selectors in the injected reader have not been checked against the live sites

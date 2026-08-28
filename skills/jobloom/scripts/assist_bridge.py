@@ -37,6 +37,7 @@ if SCRIPT_DIR not in sys.path:
 import direction_core  # noqa: E402
 import evaluate_job  # noqa: E402
 import ingest_job  # noqa: E402
+import posting_sections  # noqa: E402
 import resume_core  # noqa: E402
 
 LOOPBACK = "127.0.0.1"
@@ -83,6 +84,10 @@ def build_card(page: dict[str, Any]) -> dict[str, Any]:
     if not url.startswith("https://"):
         raise BridgeError("page_url_not_https")
     card = ingest_job.build_card(text, url, "text")
+    # The page arrives as prose. Section extraction turns the parts the posting states
+    # outright into JobCard fields; anything the caller supplied explicitly still wins,
+    # because that came from the page's own markup rather than from reading its text.
+    card.update(posting_sections.extract(text, title=page.get("title")))
     for key in ("title", "employer", "location", "country", "work_arrangement",
                 "employment_type", "seniority", "sponsorship"):
         value = page.get(key)
