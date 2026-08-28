@@ -169,17 +169,22 @@ TOOL 层不进本体，是这套设计不膨胀的关键：它可以无限增长
 
 ### 2.4 Capability schema
 
+版本化制品固定为 `skills/jobloom/assets/capability-ontology.json`；每条 pattern 的黄金事实
+固定为独立的 `skills/jobloom/assets/capability-pattern-golden.json`。两个文件必须携带相同的
+`ontology_version`，加载任一个时同时校验另一个，禁止只更新一侧。
+
 ```json
 {
   "capability_id": "cap.survey_design",
   "layer": "SKILL",
   "canonical_label": "Survey and focus-group design",
+  "aliases": ["Primary research design"],
   "rollup_to": ["cap.market_research"],
   "evidence_patterns": [
-    {"pattern_id": "p1", "type": "token_run", "lang": "en", "tokens": ["focus", "group"], "inflect": true},
-    {"pattern_id": "p2", "type": "token_run", "lang": "en", "tokens": ["survey", "design"], "inflect": true},
-    {"pattern_id": "p3", "type": "substring", "lang": "zh", "text": "焦点小组"},
-    {"pattern_id": "p4", "type": "semantic_anchor", "anchor": "designed and ran structured research",
+    {"pattern_id": "pat.focus-group", "type": "token_run", "lang": "en", "tokens": ["focus", "group"], "inflect": true},
+    {"pattern_id": "pat.survey-design", "type": "token_run", "lang": "en", "tokens": ["survey", "design"], "inflect": true},
+    {"pattern_id": "pat.focus-group-zh", "type": "substring", "lang": "zh", "text": "焦点小组"},
+    {"pattern_id": "pat.structured-research", "type": "semantic_anchor", "lang": "en", "anchor": "designed and ran structured research",
      "max_grade": "transferable", "requires_confirmation": true}
   ]
 }
@@ -248,21 +253,21 @@ fact_supports("焦点小组", {"value": "我负责焦点小组与问卷设计"})
 
 ```json
 {
-  "ontology_version": "2026.09.0",
+  "ontology_version": "2026.08.0",
   "sources": [
     {"source_id": "onet", "name": "O*NET 31.0 Database", "license": "CC BY 4.0",
      "url": "https://www.onetcenter.org/database.html",
      "version_url": "https://www.onetcenter.org/db_releases.html",
      "license_url": "https://www.onetcenter.org/license_db.html",
-     "attribution_required": true, "retrieved_at": "2026-09-01"},
+     "attribution_required": true, "retrieved_at": "2026-08-28"},
     {"source_id": "esco", "name": "ESCO v1.2.1",
      "license": "Commission Decision 2011/833/EU reuse terms; attribution required",
      "url": "https://esco.ec.europa.eu/",
      "version_url": "https://esco.ec.europa.eu/en/about-esco/escopedia/escopedia/esco-versions",
      "license_url": "https://esco.ec.europa.eu/en/about-esco/faq?page=1",
-     "attribution_required": true, "retrieved_at": "2026-09-01"},
+     "attribution_required": true, "retrieved_at": "2026-08-28"},
     {"source_id": "jobloom", "name": "Jobloom curated", "license": "proprietary",
-     "retrieved_at": "2026-09-01"}
+     "retrieved_at": "2026-08-28"}
   ]
 }
 ```
@@ -291,7 +296,7 @@ fact_supports("焦点小组", {"value": "我负责焦点小组与问卷设计"})
   ],
   "provenance": {"postings_seen": 1203, "distinct_employers": 214,
                  "first_seen": "2026-03-11", "last_seen": "2026-08-27",
-                 "ontology_version": "2026.09.0"}
+                 "ontology_version": "2026.08.0"}
 }
 ```
 
@@ -1029,15 +1034,14 @@ semantic_anchor_cache(pattern_id, fact_id, hit, model_version,
 
 ### 6.4 实施顺序
 
-1. 两个可并行的基础模块：
-   - `evidence_units.py` + `facet_taxonomy.py`（S1/S2）——无外部依赖，可独立测试
-   - `title_ontology.py`（S4）——含规范化与消歧，是 top-down 路径的地基
-2. `career_hypothesis.py`（S3）——依赖证据基础模块
-3. `direction_axes.py`（S6，先实现不依赖市场的四轴）
-4. `career_direction_pipeline.py`（S7）——串起 1–3，此时已可替换 V1 的 verified 路径
-5. `market_profile.py` + 采集器（S5）——最后，因为它需要真实 JD 积累
+1. `capability_ontology.py` + `pattern_matcher.py`：冻结共享 schema，先解决屈折与 CJK。
+2. `evidence_units.py` + `quantity_extractor.py`：建立可溯源单元与规则化 strength 信号。
+3. `career_hypothesis.py` + `direction_axes.py`：聚类并先实现非市场轴。
+4. `title_surface.py` + `title_ontology.py`：接入 top-down title 解析与确定性查询。
+5. `career_direction_pipeline.py`：串起 1–4，替换 V1 verified 路径。
+6. `market_profile.py` + 获授权采集器：最后接入；此前市场轴按 N4 返回 null。
 
-**1–4 完成即可上线**，市场轴以 `null` + `market_profile_unavailable` 呈现，符合 N4。
+**1–5 完成即可上线非市场版本**，市场轴以 `null` + `market_profile_unavailable` 呈现。
 
 ---
 
@@ -1189,35 +1193,32 @@ V1 为它新增了 `_effective_strength` 与 `source_evidence` 归并逻辑。
 **PR-2 宁缺毋滥。** 只有两个方向达到展示门槛时就展示两个，
 返回 `fewer_directions_than_target` 并触发 elicitation，**不得降低门槛凑到三个**。
 
-### 8.3b 必须由产品所有者拍板的决定
+### 8.3b 本阶段新增的固化规则
 
-**证据与打分**
+**PR-3 strength 规则版本化。** §3.3b 的首版权重作为
+`strength_rule_version` 的显式配置；后续校准只能发布新版本，不得静默改值。
 
-1. **strength 的权重表是否就是产品价值观？**
-   `quantified +0.25` 最重，理由是"带数字的成果最难编、最可查"。
-   这张表一旦写进契约就应稳定，改动需版本化。
-2. **GPA 算不算 `quantified`？** 教育类事实的数字是成绩不是工作成果，
-   本规格默认**不算**（列为假阳性），需确认。
+**PR-4 工作成果量化的边界。** GPA、毕业年份和课程编号不算工作成果的
+`quantified` 信号；可作为教育事实保存，但不增加工作证据 strength。
 
-**Capability**
+**PR-5 Capability 全局共享。** Capability 跨 FunctionNode 共用，ID、canonical label 与
+alias 全局唯一；这是可迁移证据成立的基础，不按方向复制节点。
 
-3. **cap 是跨方向共享还是每 FunctionNode 一套？**
-   本规格采纳**共享**（`cap.stats_analysis` 同时被生物统计与市场研究引用），
-   这是"可迁移证据"能成立的前提，代价是需要全局唯一的 cap 词表与别名管理。
-4. **SKILL 层的目标规模？** 几百个是外部评审的估计；起步阶段先做多少个？
-   建议先只覆盖当前组合的三个方向，用 20 份履历校准后再扩。
+**PR-6 初始规模。** 首版只覆盖当前三个核心方向，用至少 20 份履历与后续 MRP 校准后再扩。
+
+### 8.4 仍需产品所有者拍板的决定
 
 **方向与展示**
 
-5. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
+1. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
    （规格默认后者——隐藏等于静默丢弃，与项目原则冲突）
-6. **排序默认主键**：`readiness` 还是 `user_intent`？
+2. **排序默认主键**：`readiness` 还是 `user_intent`？
 
 **外部数据**
 
-7. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
+3. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
    本规格采纳外部评审的修正：只取职能骨架，**不用它们的 title 表**。
-8. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
+4. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
 
 ---
 

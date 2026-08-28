@@ -145,6 +145,14 @@ need a designed decomposition policy, and fact strength is only as trustworthy a
 annotation. In particular, a course certificate must not silently stand in for demonstrated
 on-the-job Python use merely because its fact was labeled `direct`.
 
+**Capability foundation implemented 2026-08-28.** A versioned, globally shared
+`Capability` / `FunctionNode` ontology now covers the initial three core directions, with strict
+schema validation and a golden fact for every evidence pattern. `pattern_matcher.py` adds
+ordered token-run matching, controlled English inflection (`focus group` → `focus groups`),
+explicit variants, CJK substring matching, and fail-closed semantic-anchor rules. This is the
+foundation of module 1, not its completion: EvidenceUnit extraction and the V2 reconciliation
+pipeline still need to consume it before the V1 heuristic can be retired.
+
 ## 2. One resume is not enough — Master → Variant → Tailored
 
 The output of a real session is not a resume. It is:

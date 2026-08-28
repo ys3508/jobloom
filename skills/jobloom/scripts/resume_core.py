@@ -20,18 +20,15 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 from _common import require_table  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 
 
 RESUME_KINDS = {"master_source", "direction", "lightweight", "precision"}
 RESUME_STATUSES = {"draft", "approved", "revoked", "superseded"}
 SOURCE_MODES = {"generated", "direction_baseline", "user_provided"}
-EVIDENCE_RANK = {
-    "none": 0,
-    "mention_only": 1,
-    "transferable": 2,
-    "strongly_related": 3,
-    "direct": 4,
-}
+# Backward-compatible name for callers that imported the old local constant.
+# The object itself is owned by evidence_matcher and has one definition only.
+EVIDENCE_RANK = EVIDENCE_ORDER
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 

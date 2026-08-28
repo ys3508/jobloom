@@ -1,0 +1,184 @@
+{
+  "schema_version": "0.1.0",
+  "ontology_version": "2026.08.0",
+  "capabilities": [
+    {
+      "capability_id": "cap.domain.research-data",
+      "layer": "DOMAIN",
+      "canonical_label": "Research data",
+      "aliases": ["Research and clinical data"],
+      "rollup_to": [],
+      "evidence_patterns": []
+    },
+    {
+      "capability_id": "cap.domain.statistical-analytics",
+      "layer": "DOMAIN",
+      "canonical_label": "Statistical analytics",
+      "aliases": ["Biostatistical analytics"],
+      "rollup_to": [],
+      "evidence_patterns": []
+    },
+    {
+      "capability_id": "cap.domain.pharma-insights",
+      "layer": "DOMAIN",
+      "canonical_label": "Pharmaceutical insights",
+      "aliases": ["Life-sciences commercial insights"],
+      "rollup_to": [],
+      "evidence_patterns": []
+    },
+    {
+      "capability_id": "cap.research-data-management",
+      "layer": "SKILL",
+      "canonical_label": "Research data management",
+      "aliases": ["Clinical research data management"],
+      "rollup_to": ["cap.domain.research-data"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.research-data-management", "type": "token_run", "lang": "en", "tokens": ["research", "data", "management"], "inflect": true},
+        {"pattern_id": "pat.clinical-trial-data", "type": "token_run", "lang": "en", "tokens": ["clinical", "trial", "data"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.statistical-analysis",
+      "layer": "SKILL",
+      "canonical_label": "Statistical analysis",
+      "aliases": ["Applied statistical analysis"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.statistical-analytics", "cap.domain.pharma-insights"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.statistical-analysis", "type": "token_run", "lang": "en", "tokens": ["statistical", "analysis"], "inflect": true},
+        {"pattern_id": "pat.regression-analysis", "type": "token_run", "lang": "en", "tokens": ["regression", "analysis"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.statistical-programming",
+      "layer": "SKILL",
+      "canonical_label": "Statistical programming",
+      "aliases": ["Statistical computing"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.statistical-analytics"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.r-programming", "type": "token_run", "lang": "en", "tokens": ["R"], "inflect": false},
+        {"pattern_id": "pat.sas-programming", "type": "token_run", "lang": "en", "tokens": ["SAS"], "inflect": false},
+        {"pattern_id": "pat.python-programming", "type": "token_run", "lang": "en", "tokens": ["Python"], "inflect": false}
+      ]
+    },
+    {
+      "capability_id": "cap.data-querying",
+      "layer": "SKILL",
+      "canonical_label": "Data querying",
+      "aliases": ["Database querying"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.statistical-analytics", "cap.domain.pharma-insights"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.sql", "type": "token_run", "lang": "en", "tokens": ["SQL"], "inflect": false}
+      ]
+    },
+    {
+      "capability_id": "cap.research-design",
+      "layer": "SKILL",
+      "canonical_label": "Research design",
+      "aliases": ["Study design"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.statistical-analytics"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.study-design", "type": "token_run", "lang": "en", "tokens": ["study", "design"], "inflect": true},
+        {"pattern_id": "pat.research-protocol", "type": "token_run", "lang": "en", "tokens": ["research", "protocol"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.survey-design",
+      "layer": "SKILL",
+      "canonical_label": "Survey and focus-group design",
+      "aliases": ["Primary research design"],
+      "rollup_to": ["cap.domain.pharma-insights"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.focus-group", "type": "token_run", "lang": "en", "tokens": ["focus", "group"], "inflect": true},
+        {"pattern_id": "pat.survey-design", "type": "token_run", "lang": "en", "tokens": ["survey", "design"], "inflect": true},
+        {"pattern_id": "pat.focus-group-zh", "type": "substring", "lang": "zh", "text": "焦点小组"}
+      ]
+    },
+    {
+      "capability_id": "cap.stakeholder-reporting",
+      "layer": "SKILL",
+      "canonical_label": "Stakeholder reporting",
+      "aliases": ["Stakeholder communication"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.pharma-insights"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.stakeholder-presentation", "type": "token_run", "lang": "en", "tokens": ["stakeholder", "presentation"], "inflect": true},
+        {"pattern_id": "pat.presented-findings", "type": "token_run", "lang": "en", "tokens": ["present", "finding"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.workflow-automation",
+      "layer": "SKILL",
+      "canonical_label": "Data workflow automation",
+      "aliases": ["Research workflow automation"],
+      "rollup_to": ["cap.domain.research-data", "cap.domain.statistical-analytics"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.bash-script", "type": "token_run", "lang": "en", "tokens": ["Bash", "script"], "inflect": true},
+        {"pattern_id": "pat.shell-scripting", "type": "token_run", "lang": "en", "tokens": ["shell", "scripting"], "inflect": true},
+        {"pattern_id": "pat.data-pipeline", "type": "token_run", "lang": "en", "tokens": ["data", "pipeline"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.clinical-study-operations",
+      "layer": "SKILL",
+      "canonical_label": "Clinical study operations",
+      "aliases": ["Clinical research operations"],
+      "rollup_to": ["cap.domain.research-data"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.clinical-trial", "type": "token_run", "lang": "en", "tokens": ["clinical", "trial"], "inflect": true},
+        {"pattern_id": "pat.clinical-research", "type": "token_run", "lang": "en", "tokens": ["clinical", "research"], "inflect": true}
+      ]
+    },
+    {
+      "capability_id": "cap.pharma-market-analysis",
+      "layer": "SKILL",
+      "canonical_label": "Pharmaceutical market analysis",
+      "aliases": ["Life-sciences market analysis"],
+      "rollup_to": ["cap.domain.pharma-insights"],
+      "evidence_patterns": [
+        {"pattern_id": "pat.pharma-market", "type": "token_run", "lang": "en", "tokens": ["pharmaceutical", "market"], "inflect": true, "variants": ["pharma market"]},
+        {"pattern_id": "pat.competitive-intelligence", "type": "token_run", "lang": "en", "tokens": ["competitive", "intelligence"], "inflect": true}
+      ]
+    }
+  ],
+  "function_nodes": [
+    {
+      "function_id": "fn.research-clinical-data",
+      "canonical_label": "Research and clinical data analysis",
+      "parents": [],
+      "role_family": "analytics.research_data",
+      "source_refs": [{"source_id": "jobloom", "code": "research-clinical-data", "confidence": "curated"}],
+      "capability_signature": [
+        {"capability_id": "cap.research-data-management", "weight": 9, "core": true},
+        {"capability_id": "cap.clinical-study-operations", "weight": 8, "core": true},
+        {"capability_id": "cap.statistical-analysis", "weight": 7, "core": true},
+        {"capability_id": "cap.data-querying", "weight": 5, "core": false},
+        {"capability_id": "cap.stakeholder-reporting", "weight": 4, "core": false}
+      ]
+    },
+    {
+      "function_id": "fn.biostatistical-analysis",
+      "canonical_label": "Biostatistical analysis",
+      "parents": [],
+      "role_family": "analytics.biostatistics",
+      "source_refs": [{"source_id": "jobloom", "code": "biostatistics", "confidence": "curated"}],
+      "capability_signature": [
+        {"capability_id": "cap.statistical-analysis", "weight": 10, "core": true},
+        {"capability_id": "cap.statistical-programming", "weight": 9, "core": true},
+        {"capability_id": "cap.research-design", "weight": 7, "core": true},
+        {"capability_id": "cap.data-querying", "weight": 4, "core": false}
+      ]
+    },
+    {
+      "function_id": "fn.pharma-insights",
+      "canonical_label": "Pharmaceutical commercial insights",
+      "parents": [],
+      "role_family": "analytics.pharma_commercial",
+      "source_refs": [{"source_id": "jobloom", "code": "pharma-commercial-analytics", "confidence": "curated"}],
+      "capability_signature": [
+        {"capability_id": "cap.pharma-market-analysis", "weight": 10, "core": true},
+        {"capability_id": "cap.survey-design", "weight": 8, "core": true},
+        {"capability_id": "cap.stakeholder-reporting", "weight": 7, "core": true},
+        {"capability_id": "cap.statistical-analysis", "weight": 6, "core": false}
+      ]
+    }
+  ]
+}

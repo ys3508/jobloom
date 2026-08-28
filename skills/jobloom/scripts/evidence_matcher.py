@@ -23,6 +23,17 @@ EVIDENCE_ORDER = {
     "direct": 4,
 }
 
+# Numeric contribution factors share the same five-level vocabulary.  Keep the
+# ordering and factors together so routing, resume claims, and career discovery
+# cannot silently drift into separate evidence scales.
+STRENGTH_FACTORS = {
+    "direct": 1.0,
+    "strongly_related": 0.85,
+    "transferable": 0.6,
+    "mention_only": 0.35,
+    "none": 0.0,
+}
+
 # Deliberately small and curated. Add domain aliases here with regression tests; do not
 # use fuzzy matching for evidence decisions.
 TOKEN_ALIASES = {

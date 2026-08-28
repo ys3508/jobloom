@@ -1,0 +1,28 @@
+{
+  "schema_version": "0.1.0",
+  "ontology_version": "2026.08.0",
+  "samples": [
+    {"pattern_id": "pat.bash-script", "facts": ["Wrote Bash scripts to automate repeatable jobs."]},
+    {"pattern_id": "pat.clinical-research", "facts": ["Supported clinical research projects."]},
+    {"pattern_id": "pat.clinical-trial", "facts": ["Coordinated clinical trials across two sites."]},
+    {"pattern_id": "pat.clinical-trial-data", "facts": ["Validated clinical trial data before analysis."]},
+    {"pattern_id": "pat.competitive-intelligence", "facts": ["Prepared competitive intelligence for a launch team."]},
+    {"pattern_id": "pat.data-pipeline", "facts": ["Executed and monitored data pipelines."]},
+    {"pattern_id": "pat.focus-group", "facts": ["Led focus groups for product research."]},
+    {"pattern_id": "pat.focus-group-zh", "facts": ["我负责焦点小组与问卷设计。"]},
+    {"pattern_id": "pat.pharma-market", "facts": ["Analyzed the pharma market for a strategy project."]},
+    {"pattern_id": "pat.presented-findings", "facts": ["Presented findings to the research team."]},
+    {"pattern_id": "pat.python-programming", "facts": ["Programming: R, SAS, SQL, SPSS, Python"]},
+    {"pattern_id": "pat.r-programming", "facts": ["Programming: R, SAS, SQL, SPSS, Python"]},
+    {"pattern_id": "pat.regression-analysis", "facts": ["Performed regression analyses in R."]},
+    {"pattern_id": "pat.research-data-management", "facts": ["Built a research data management workflow."]},
+    {"pattern_id": "pat.research-protocol", "facts": ["Drafted research protocols and analysis plans."]},
+    {"pattern_id": "pat.sas-programming", "facts": ["Programming: R, SAS, SQL, SPSS, Python"]},
+    {"pattern_id": "pat.shell-scripting", "facts": ["Used shell scripting for scheduled workflows."]},
+    {"pattern_id": "pat.sql", "facts": ["Queried study tables using SQL."]},
+    {"pattern_id": "pat.stakeholder-presentation", "facts": ["Delivered stakeholder presentations on study results."]},
+    {"pattern_id": "pat.statistical-analysis", "facts": ["Conducted statistical analyses for research studies."]},
+    {"pattern_id": "pat.study-design", "facts": ["Developed study designs and sampling plans."]},
+    {"pattern_id": "pat.survey-design", "facts": ["Led survey design and interview-guide development."]}
+  ]
+}

@@ -18,7 +18,7 @@ if SCRIPT_DIR not in sys.path:
 import direction_core  # noqa: E402
 import extract_candidate_facts  # noqa: E402
 import resume_core  # noqa: E402
-from evidence_matcher import EVIDENCE_ORDER, fact_supports  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER, STRENGTH_FACTORS, fact_supports  # noqa: E402
 
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "assets" / "career-direction-catalog.json"
@@ -35,10 +35,6 @@ GOAL_KEYS = {
     "skills_to_build", "avoid_roles", "avoid_industries", "priorities",
 }
 PRIORITY_KEYS = {"current_fit", "career_value"}
-STRENGTH_FACTORS = {
-    "direct": 1.0, "strongly_related": 0.85, "transferable": 0.6,
-    "mention_only": 0.35, "none": 0.0,
-}
 # Until the Evidence Graph carries typed capability relationships, source type limits how
 # strongly a text hit may support a direction. A summary, skill list, or course certificate is
 # useful discovery evidence, but is not equivalent to demonstrated work.
