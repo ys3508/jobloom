@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Jobloom</title>
+<link rel="stylesheet" href="panel.css">
+<main>
+  <header>
+    <h1>Jobloom</h1>
+    <p id="scope">Reads only the posting you have open. It does not browse, apply, or submit.</p>
+  </header>
+
+  <section id="setup">
+    <label>Bridge <input id="endpoint" type="url" value="http://127.0.0.1:8787" spellcheck="false"></label>
+    <label>Token <input id="token" type="password" placeholder="printed when the bridge starts" spellcheck="false"></label>
+    <button id="save">Save</button>
+    <p id="health" class="muted"></p>
+  </section>
+
+  <button id="read" class="primary">Read this posting</button>
+  <p id="status" class="muted"></p>
+
+  <section id="result" hidden>
+    <h2 id="job-title"></h2>
+    <p id="job-meta" class="muted"></p>
+
+    <h3>Directions</h3>
+    <ul id="directions"></ul>
+
+    <h3>Evidence</h3>
+    <ul id="evidence"></ul>
+    <p id="gap" class="muted"></p>
+
+    <p class="notice" id="notice"></p>
+  </section>
+</main>
+<script src="panel.js"></script>

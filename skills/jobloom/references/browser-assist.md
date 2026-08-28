@@ -1,0 +1,76 @@
+# Browser assist
+
+Covers the platforms that have no open interface and forbid collection. It works because
+the subject of every sentence is the user: they browse, they open a posting, they click
+apply. The assistant reads what is already on their screen and answers questions about it.
+
+## What makes this different from collection
+
+| | Browser assist | Background collection (out of scope, §5.3) |
+|---|---|---|
+| Who opens the page | The user, with their own hands | The program, in batches |
+| Whose session | The user's, already signed in | Simulated or automated |
+| Reach | The one page the user is looking at | Systematic traversal |
+| Platform controls | Untouched; ordinary browsing | Rate limits and bot checks worked around |
+
+The test is a single sentence: **the extension never does something the user is not
+already doing.** A posting they have not opened is never touched. Nothing is discovered,
+traversed, or fetched.
+
+## Parts
+
+- `scripts/assist_bridge.py` — a loopback HTTP server that answers from the local
+  registries. Started by the user, holds a token printed once per run.
+- `extension/` — Manifest V3 extension: a content script that reads the open posting only
+  when asked, a service worker that opens the panel on a toolbar click, and a side panel
+  that renders the judgement.
+
+## Boundaries, and where each is enforced
+
+Boundaries live in code, not in a promise, and the ones the extension could otherwise talk
+itself out of are enforced on the bridge side:
+
+| Rule | Enforced by |
+|---|---|
+| Loopback only | `assist_bridge.LOOPBACK`; the server binds nothing else |
+| Callers must hold this run's token | `Handler.do_POST`, generated per run by `secrets` |
+| A page cannot declare its own card reviewed | `build_card` forces `requirements_reviewed: false` |
+| Reading stores nothing | `/positioning` never writes; `/store` is a separate endpoint |
+| Browsing does not accumulate a job database | `--allow-store` is off by default |
+| Active tab only | `manifest.permissions` holds `activeTab`, not `tabs` or `<all_urls>` |
+| The extension cannot call a job site | `host_permissions` is the bridge alone |
+| No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |
+| No automatic submission | the whole product; the assistant stops where filling stops |
+
+That last table row is a test, not a convention: `test_it_never_navigates_paginates_or_clicks_for_the_user`
+fails if `chrome.tabs.create`, `location.assign`, `.click()`, `setInterval` or
+`MutationObserver` ever appear in the extension.
+
+## Running it
+
+```bash
+python3 skills/jobloom/scripts/assist_bridge.py \
+  --db .jobloom/jobloom.db --candidate .jobloom/candidate-v15.json
+```
+
+It prints the port and the token. Load `skills/jobloom/extension/` through
+`chrome://extensions` → Developer mode → Load unpacked, open the side panel from the
+toolbar, paste the token, and press **Read this posting** on a job page you have open.
+
+Add `--allow-store` only when you intend to keep a job you have reviewed. Without it the
+assistant reads and forgets, which is the difference between help and collection.
+
+## What is not verified
+
+The container selectors in `content.js` have not been checked against the live sites and
+will drift when either redesigns. The failure mode is deliberately soft: if no container
+matches, the script falls back to the page's own visible text and the panel says the pane
+was not recognised. Reading whole-page text rather than parsing per-field selectors is the
+reason a redesign degrades the reading instead of breaking the extension.
+
+## What this does not do
+
+It does not find jobs. Discovery on these platforms would mean traversal, which is the
+line this design exists to stay on the right side of. Jobs arrive through the channels in
+`market-sources.json` and through the user's own browsing; the assistant makes the second
+of those cheaper, not automatic.

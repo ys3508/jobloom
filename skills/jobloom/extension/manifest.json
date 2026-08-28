@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Jobloom assist",
+  "version": "0.1.0",
+  "description": "Shows Jobloom's positioning for the job posting you are already looking at. It never opens a page, never navigates, and never submits.",
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
+  "host_permissions": ["http://127.0.0.1:8787/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Read this posting with Jobloom" },
+  "side_panel": { "default_path": "panel.html" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.linkedin.com/jobs/*",
+        "https://*.indeed.com/viewjob*",
+        "https://*.indeed.com/jobs*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -98,6 +98,19 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 15. Keyword and title terms are routing hints only. They must never become a CandidateFact, a resume claim, or supported terminology in an adaptation plan.
 16. Give each approved direction one standing one-page baseline resume through `direction_baseline`. Generate its BaselinePlan, have the user approve the exact plan hash, then register and have the user approve the rendered file separately. Never select baseline content by keyword-matching the direction profile.
 
+## Browser assist
+
+1. The subject of every action is the user. The extension reads the posting they already
+   have open and never opens, navigates, paginates, or submits one.
+2. Start `assist_bridge.py` yourself; it binds loopback and prints a per-run token. Callers
+   without that token are refused.
+3. A card built from a page is always `requirements_reviewed: false`. A page cannot declare
+   its own card reviewed.
+4. Reading stores nothing. `--allow-store` is off by default, so browsing never accumulates
+   a job database; enable it only for a job the user reviewed and wants kept.
+5. Discovery is not part of this. Jobs arrive through registered sources or the user's own
+   browsing. See `references/browser-assist.md`.
+
 ## Cover-letter versions
 
 1. Register a reusable template or an application-specific letter with `cover_letter_core.py`. Registration copies exact bytes into the private store and creates a draft.
