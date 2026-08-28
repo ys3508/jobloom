@@ -1,9 +1,28 @@
-"""Aggregate authorized structured JobCards into fail-closed market profiles."""
+"""Aggregate authorized structured JobCards into fail-closed market profiles.
+
+Thresholds are set so the market half of the engine can actually switch on for a narrow
+title in one metro, while a single employer's stack can never become a direction's core
+requirement. A ratio alone does not achieve the second: with five employers, two naming a
+term is already 0.40 support. So a term must clear an absolute employer count as well, and
+the ratio it must clear rises as the sample shrinks.
+"""
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from typing import Any
+
+
+MIN_POSTINGS = 20
+MIN_EMPLOYERS = 8
+# Below this many employers each one swings the ratio too far, so the bar rises.
+ROBUST_EMPLOYERS = 15
+REQUIRED_SUPPORT = 0.30
+REQUIRED_SUPPORT_SMALL_SAMPLE = 0.40
+PREFERRED_SUPPORT = 0.15
+# A term named by fewer employers than this is one shop's stack, whatever the ratio says.
+MIN_EMPLOYERS_PER_TERM = 3
+SINGLE_EMPLOYER_RISK = 0.30
 
 
 def aggregate(cards: list[dict[str, Any]], *, profile_id: str, title_id: str,
@@ -22,21 +41,28 @@ def aggregate(cards: list[dict[str, Any]], *, profile_id: str, title_id: str,
     for card, employer in zip(deduped, employers):
         terms = {str(x).strip() for x in (card.get("required_skills") or []) + (card.get("required_certifications") or []) if str(x).strip()}
         for term in terms: term_posts[term] += 1; term_employers[term].add(employer)
+    required_ratio = (REQUIRED_SUPPORT if distinct >= ROBUST_EMPLOYERS
+                      else REQUIRED_SUPPORT_SMALL_SAMPLE)
     required, preferred = [], []
     for term in sorted(term_posts, key=str.casefold):
-        es = len(term_employers[term]) / distinct if distinct else 0
+        naming = len(term_employers[term])
+        es = naming / distinct if distinct else 0
         ps = term_posts[term] / len(deduped) if deduped else 0
-        item = {"term": term, "employer_support": round(es, 3), "posting_support": round(ps, 3), "obligation": "required"}
-        if es >= .30: required.append(item)
-        elif es >= .15: preferred.append(item)
+        item = {"term": term, "employer_support": round(es, 3), "posting_support": round(ps, 3),
+                "naming_employers": naming, "obligation": "required"}
+        if es >= required_ratio and naming >= MIN_EMPLOYERS_PER_TERM:
+            required.append(item)
+        elif es >= PREFERRED_SUPPORT:
+            preferred.append({**item, "obligation": "preferred"})
     reasons = []
-    if len(deduped) < 25: reasons.append("market_postings_below_minimum")
-    if distinct < 10: reasons.append("market_employers_below_minimum")
+    if len(deduped) < MIN_POSTINGS: reasons.append("market_postings_below_minimum")
+    if distinct < MIN_EMPLOYERS: reasons.append("market_employers_below_minimum")
     return {"schema_version": "0.1.0", "profile_id": profile_id, "title_id": title_id,
             "region": region, "seniority_band": seniority_band, "window": window,
             "sample": {"postings_collected": len(cards), "postings_after_dedupe": len(deduped),
                        "distinct_employers": distinct, "max_employer_share": round(max_share, 3),
-                       "single_employer_risk": max_share > .30, "sufficient": not reasons,
+                       "single_employer_risk": max_share > SINGLE_EMPLOYER_RISK,
+                       "required_support_threshold": required_ratio, "sufficient": not reasons,
                        "insufficient_reasons": reasons},
             "required_terms": required, "preferred_terms": preferred,
             "sponsorship_distribution": {"supports": 0.0, "does_not_support": 0.0, "unknown": 1.0}}

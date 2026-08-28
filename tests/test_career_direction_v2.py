@@ -257,4 +257,60 @@ class AcceptanceDebtTests(unittest.TestCase):
 
 
 
+
+class MarketThresholdTests(unittest.TestCase):
+    """Sample floors and the absolute employer count behind term selection."""
+
+    def card(self, index, employer, skills):
+        return {"canonical_url": f"https://example.com/{index}", "employer": employer,
+                "title": "Research Data Analyst", "location": "Boston, MA",
+                "required_skills": skills, "required_certifications": []}
+
+    def profile(self, cards):
+        return MARKET.aggregate(cards, profile_id="m", title_id="t.x", region={"country": "US"},
+                                seniority_band="ic_2", window={"days": 90})
+
+    def test_one_employers_stack_never_becomes_a_core_requirement(self):
+        cards = [self.card(i, "Mega Hospital", ["Epic", "SQL"]) for i in range(20)]
+        cards += [self.card(100 + i, f"Lab {i}", ["R", "SQL"]) for i in range(5)]
+        profile = self.profile(cards)
+        self.assertFalse(profile["sample"]["sufficient"])
+        self.assertTrue(profile["sample"]["single_employer_risk"])
+        self.assertNotIn("Epic", [term["term"] for term in profile["required_terms"]])
+
+    def test_ratio_alone_cannot_carry_a_term_past_the_employer_floor(self):
+        # Two of five employers is 0.40 support, over the ratio and under the count.
+        cards = [self.card(i, f"Emp {i % 5}", ["Tableau"] if i % 5 < 2 else ["R"])
+                 for i in range(20)]
+        profile = self.profile(cards)
+        tableau = next(t for t in profile["required_terms"] + profile["preferred_terms"]
+                       if t["term"] == "Tableau")
+        self.assertGreaterEqual(tableau["employer_support"], MARKET.REQUIRED_SUPPORT)
+        self.assertLess(tableau["naming_employers"], MARKET.MIN_EMPLOYERS_PER_TERM)
+        self.assertNotIn("Tableau", [term["term"] for term in profile["required_terms"]])
+
+    def test_small_employer_pool_raises_the_required_ratio(self):
+        cards = [self.card(i, f"Emp {i // 2}", ["R"] + (["SAS"] if i < 8 else []))
+                 for i in range(22)]
+        profile = self.profile(cards)
+        self.assertTrue(profile["sample"]["sufficient"])
+        self.assertEqual(profile["sample"]["required_support_threshold"],
+                         MARKET.REQUIRED_SUPPORT_SMALL_SAMPLE)
+
+    def test_narrow_title_can_now_reach_sufficiency(self):
+        # 21 postings across 9 employers: below the old 25/10 floor, above the new one.
+        cards = [self.card(i, f"Emp {i % 9}", ["R"]) for i in range(21)]
+        profile = self.profile(cards)
+        self.assertTrue(profile["sample"]["sufficient"])
+        self.assertEqual(profile["sample"]["insufficient_reasons"], [])
+
+    def test_below_the_floor_still_fails_closed(self):
+        cards = [self.card(i, f"Emp {i}", ["R"]) for i in range(7)]
+        profile = self.profile(cards)
+        self.assertFalse(profile["sample"]["sufficient"])
+        self.assertIn("market_employers_below_minimum", profile["sample"]["insufficient_reasons"])
+        self.assertIn("market_postings_below_minimum", profile["sample"]["insufficient_reasons"])
+
+
+
 if __name__ == "__main__": unittest.main()

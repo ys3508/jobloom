@@ -925,7 +925,7 @@ rank_key(d) = (
 
 ### 5.2 聚合规则（确定性）
 
-1. **最低样本量**：`postings_after_dedupe >= 25` **且** `distinct_employers >= 10`。
+1. **最低样本量**：`postings_after_dedupe >= 20` **且** `distinct_employers >= 8`（PR-8）。
    任一不满足 → `sufficient: false`，`market_capacity`/`accessibility` 返回 `null`。
 2. **时间窗口**：默认 90 天滚动。窗口内不足则**不得**自动放宽——放宽必须显式传参
    并记入 `window.widened_from`。
@@ -939,7 +939,7 @@ rank_key(d) = (
    `single_employer_risk: true`，提醒该 profile 的容量统计仍可能受单一雇主影响。
    > 这正是"把某一家公司的技术栈误认为方向核心要求"的防线：
    > Epic/Clarity/Caboodle 在一家医院系统的 20 条 JD 里都出现 ≠ 这是该方向的核心要求。
-5. **term 入选门槛**：`employer_support >= 0.30` 才进 `required_terms`；
+5. **term 入选门槛**：`employer_support >= 0.30` **且** 至少 3 家不同雇主提名才进 `required_terms`；雇主数 < 15 时比例升至 0.40（PR-8）；
    `0.15 ≤ employer_support < 0.30` 进 `preferred_terms`；低于 0.15 丢弃。
 6. **分层**：region × seniority_band 各自独立成 profile，**不得跨层合并**。
 7. **obligation** 直接沿用 `direction_core.MANDATORY_OBLIGATION_FIELDS` 的判定：
@@ -1264,19 +1264,25 @@ alias 全局唯一；这是可迁移证据成立的基础，不按方向复制�
 
 **PR-6 初始规模。** 首版只覆盖当前三个核心方向，用至少 20 份履历与后续 MRP 校准后再扩。
 
+**PR-7 外部职业分类只引用不导入**（2026-08-28）。O\*NET 与 ESCO 不批量导入。
+FunctionNode 可携带 `source_refs`，但只有对照官方 release 核实过的编码才写入，
+**不得凭记忆填写**；复制其任何字段都必须补署名。理由与重新评估的触发条件见
+`references/external-taxonomy-policy.md`。
+
+**PR-8 市场样本门槛与 term 绝对下限**（2026-08-28）。样本下限 **20 帖 / 8 家雇主**
+（原 25/10 对单一都市区的窄 title 过高，会让市场轴长期为 null）。
+term 进入 `required_terms` 需**同时**满足 `employer_support ≥ 0.30` 与
+**至少 3 家不同雇主提名**；雇主数 < 15 时比例要求升至 0.40。
+比例在小样本下不可靠——5 家雇主里 2 家就是 0.40——**绝对下限才是抗单雇主污染的实际防线**。
+
 ### 8.4 仍需产品所有者拍板的决定
 
 **方向与展示**
 
 1. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
    （规格默认后者——隐藏等于静默丢弃，与项目原则冲突）
-2. **排序默认主键**：`readiness` 还是 `user_intent`？
+2. **排序默认主键**：`readiness` 还是 `user_intent`？（`direction_axes.rank` 三种主键都已实现，缺的是暴露给用户的接口）
 
-**外部数据**
-
-3. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
-   本规格采纳外部评审的修正：只取职能骨架，**不用它们的 title 表**。
-4. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
 
 ---
 
