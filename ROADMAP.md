@@ -109,6 +109,33 @@ Then a JD asking for `stakeholder presentation` resolves to INNSCI evidence, and
 for `clinical trial data` resolves to AstraZeneca — mechanically, not by re-reading a resume.
 This bank becomes Jobloom's bottom-level source of truth.
 
+### Known defect: skill matching is implemented twice and disagrees
+
+Found on the first real posting (2026-08-28, MGB Computational Research Associate). The same
+requirement list, measured against the same fact library, gets two different answers:
+
+| Requirement | `direction_core` coverage | `evaluate_job._match_skill` |
+|---|---|---|
+| `R` | covered | `strength: none` |
+| `Python` | covered | `strength: none` |
+
+- `direction_core` pools every token from every fact and asks whether all of the requirement's
+  tokens appear anywhere in that pool. Too loose: a token from an unrelated fact counts.
+- `evaluate_job._match_skill` requires a fact's whole `value` string, or one of its `keywords`,
+  to equal the requirement exactly. Too strict: a fact whose value is
+  `Programming: R, SAS, SQL, SPSS, Python` never matches `Python`, so the evaluator reported
+  `main_gap: R` for a candidate whose entire career is built on R.
+- Neither stems: `statistics` does not match `statistical`, and the fact library is full of
+  `statistical`.
+
+This is finding 2 of the original code review — one rule, two implementations, already drifted —
+reappearing in the filtering layer. It is also why module 1 matters: the fix is not a better
+string comparison but a real skill layer with curated terms and aliases, so a requirement
+resolves to evidence instead of to a substring.
+
+Until it is fixed, treat both coverage numbers as unreliable and read
+`required_skill_evidence` per requirement rather than the ratio.
+
 ## 2. One resume is not enough — Master → Variant → Tailored
 
 The output of a real session is not a resume. It is:
