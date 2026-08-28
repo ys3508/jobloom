@@ -316,8 +316,9 @@ class ExtensionBoundaryTests(unittest.TestCase):
                         for name in ("background.js", "panel.js")}
 
     def test_it_never_asks_for_browsing_wide_permissions(self):
-        for permission in ("tabs", "webNavigation", "webRequest", "cookies", "history",
-                           "<all_urls>"):
+        # webNavigation is held deliberately: it is the only event that reports a
+        # same-document navigation, which is how these sites change the open posting.
+        for permission in ("tabs", "webRequest", "cookies", "history", "<all_urls>"):
             self.assertNotIn(permission, self.manifest["permissions"])
 
     def test_page_access_is_optional_scoped_and_granted_by_the_user(self):
@@ -371,7 +372,6 @@ class ExtensionBoundaryTests(unittest.TestCase):
         panel = self.sources["panel.js"]
         html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
         self.assertNotIn('id="read"', html)
-        self.assertNotIn("chrome.webNavigation", panel)
 
     def test_reading_is_refused_before_the_grant(self):
         # Every read path, including the one that follows the user to a new posting, goes
@@ -396,14 +396,20 @@ class ExtensionBoundaryTests(unittest.TestCase):
             for token in forbidden:
                 self.assertNotIn(token, source, f"{name} must not contain {token}")
 
-    def test_following_the_user_is_scoped_to_the_tab_they_are_on(self):
-        # Reading the posting they just clicked is following them, not leading them — but
-        # only for the tab they are actually on, and only while this panel is open.
+    def test_following_the_user_uses_the_event_that_actually_fires(self):
+        # LinkedIn swaps postings with pushState. tabs.onUpdated does not report a
+        # same-document navigation, so the panel never heard the user move.
         panel = self.sources["panel.js"]
-        self.assertIn("chrome.tabs.onUpdated.addListener", panel)
-        self.assertIn("if (active?.id !== tabId) return;", panel)
-        self.assertIn("onlyIfChanged", panel,
-                      "an unchanged posting must not be re-read")
+        self.assertIn("chrome.webNavigation.onHistoryStateUpdated.addListener", panel)
+        self.assertIn("webNavigation", self.manifest["permissions"])
+
+    def test_following_the_user_is_scoped_to_the_tab_and_sites_involved(self):
+        panel = self.sources["panel.js"]
+        self.assertIn('hostSuffix: "linkedin.com"', panel)
+        self.assertIn('hostSuffix: "indeed.com"', panel)
+        self.assertIn("if (active?.id !== details.tabId) return;", panel)
+        self.assertIn("details.frameId !== 0", panel, "top frame only")
+        self.assertIn("onlyIfChanged", panel, "an unchanged posting must not be re-read")
 
     def test_nothing_runs_on_a_job_site_unless_the_panel_is_open(self):
         # No declared content script, so no code of ours executes on a job page on its own.
@@ -411,8 +417,9 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertNotIn("content_scripts", self.manifest)
         panel = self.sources["panel.js"]
         self.assertIn("chrome.scripting.executeScript", panel)
-        self.assertNotIn("chrome.tabs.onUpdated", self.sources["background.js"],
-                         "the always-running worker must not watch tabs")
+        for watcher in ("chrome.tabs.onUpdated", "chrome.webNavigation"):
+            self.assertNotIn(watcher, self.sources["background.js"],
+                             "the always-running worker must watch nothing")
 
     def test_injection_targets_the_active_tab_only(self):
         panel = self.sources["panel.js"]

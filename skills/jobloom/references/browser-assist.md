@@ -23,6 +23,12 @@ changes, scoped to the tab they are on and only while the panel is open. Followi
 is not the same as going somewhere they are not. Asking them to press a button to confirm
 an intent they just expressed by clicking is friction, so there is no button.
 
+Following needs `webNavigation`. These sites change the open posting with
+`history.pushState`, and a same-document navigation is not reported by `tabs.onUpdated` —
+only `onHistoryStateUpdated` sees it. The permission is held for that one event, filtered
+by host to the two job sites, then to the active tab and the top frame. Banning it on the
+name alone is what left the panel unable to notice the user had moved.
+
 ## Parts
 
 - `scripts/assist_bridge.py` — a loopback HTTP server that answers from the local
@@ -63,7 +69,8 @@ itself out of are enforced on the bridge side:
 | Job-site access is optional and revocable | `optional_host_permissions`; the user grants it in Chrome's dialog and can revoke it in `chrome://extensions` |
 | Access is scoped to two hosts over https | asserted by `test_page_access_is_optional_scoped_and_granted_by_the_user` |
 | Nothing runs unless the panel is open | no `content_scripts`; every read starts from the panel |
-| The tab listener never fires for another tab | `if (active?.id !== tabId) return;` |
+| Following is limited to the two job sites | `webNavigation` listeners carry a `hostSuffix` filter |
+| The listener never fires for another tab or a subframe | `active?.id !== details.tabId`, `frameId !== 0` |
 | An unchanged posting is not re-read | `onlyIfChanged` against the last posting id |
 | The extension cannot call a job site | `host_permissions` is the bridge alone |
 | No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |

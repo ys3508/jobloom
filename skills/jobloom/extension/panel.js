@@ -213,12 +213,20 @@ async function readPosting({ onlyIfChanged = false } = {}) {
   }
 }
 
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (!changeInfo.url) return;
-  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (active?.id !== tabId) return;   // never a tab the user is not on
-  readPosting({ onlyIfChanged: true });
-});
+// LinkedIn swaps postings with history.pushState, which is a same-document navigation:
+// tabs.onUpdated does not report it, so the panel never heard the user move. The event
+// that does report it is onHistoryStateUpdated, filtered here to the two job sites and
+// then to the tab the user is actually on.
+const followUser = (details) => {
+  if (details.frameId !== 0) return;              // top frame only
+  chrome.tabs.query({ active: true, currentWindow: true }).then(([active]) => {
+    if (active?.id !== details.tabId) return;     // never a tab the user is not on
+    readPosting({ onlyIfChanged: true });
+  });
+};
+const JOB_URL_FILTER = { url: [{ hostSuffix: "linkedin.com" }, { hostSuffix: "indeed.com" }] };
+chrome.webNavigation.onHistoryStateUpdated.addListener(followUser, JOB_URL_FILTER);
+chrome.webNavigation.onCompleted.addListener(followUser, JOB_URL_FILTER);
 
 loadSettings();
 refreshAccess();
