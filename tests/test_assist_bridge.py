@@ -151,7 +151,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads((EXTENSION / "manifest.json").read_text(encoding="utf-8"))
         self.sources = {name: (EXTENSION / name).read_text(encoding="utf-8")
-                        for name in ("content.js", "background.js", "panel.js")}
+                        for name in ("background.js", "panel.js")}
 
     def test_it_asks_for_the_active_tab_only(self):
         self.assertIn("activeTab", self.manifest["permissions"])
@@ -173,11 +173,19 @@ class ExtensionBoundaryTests(unittest.TestCase):
             for token in forbidden:
                 self.assertNotIn(token, source, f"{name} must not contain {token}")
 
-    def test_reading_happens_only_when_the_user_asks(self):
-        content = self.sources["content.js"]
-        self.assertIn("jobloom:read-visible-posting", content)
-        self.assertIn("chrome.runtime.onMessage.addListener", content)
-        self.assertNotIn("document.addEventListener(\"load\"", content)
+    def test_nothing_runs_on_a_job_site_until_the_user_presses_the_button(self):
+        # No declared content script means no code of ours executes on a job page at all
+        # until the button is pressed and activeTab is granted by that press.
+        self.assertNotIn("content_scripts", self.manifest)
+        panel = self.sources["panel.js"]
+        self.assertIn("chrome.scripting.executeScript", panel)
+        self.assertIn('$("read").addEventListener', panel)
+
+    def test_injection_targets_the_active_tab_only(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("active: true, currentWindow: true", panel)
+        self.assertNotIn("allFrames: true", panel)
+        self.assertNotIn("chrome.tabs.query({})", panel)
 
 
 if __name__ == "__main__":

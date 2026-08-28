@@ -21,9 +21,14 @@ traversed, or fetched.
 
 - `scripts/assist_bridge.py` — a loopback HTTP server that answers from the local
   registries. Started by the user, holds a token printed once per run.
-- `extension/` — Manifest V3 extension: a content script that reads the open posting only
-  when asked, a service worker that opens the panel on a toolbar click, and a side panel
-  that renders the judgement.
+- `extension/` — Manifest V3 extension: a service worker that opens the panel on a toolbar
+  click, and a side panel that reads the open posting and renders the judgement.
+
+There is **no declared content script**. Nothing from this extension executes on a job site
+until the user presses *Read this posting*; that press grants `activeTab` and the reader is
+injected into that one tab for that one reading. A resident script would have been the
+easier build, but it would also mean our code running on every job page the user visits,
+which is not what "only acts when the user asks" should mean.
 
 ## Boundaries, and where each is enforced
 
@@ -38,6 +43,7 @@ itself out of are enforced on the bridge side:
 | Reading stores nothing | `/positioning` never writes; `/store` is a separate endpoint |
 | Browsing does not accumulate a job database | `--allow-store` is off by default |
 | Active tab only | `manifest.permissions` holds `activeTab`, not `tabs` or `<all_urls>` |
+| Nothing runs before the user asks | no `content_scripts`; the reader is injected on the button press |
 | The extension cannot call a job site | `host_permissions` is the bridge alone |
 | No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |
 | No automatic submission | the whole product; the assistant stops where filling stops |
@@ -62,8 +68,8 @@ assistant reads and forgets, which is the difference between help and collection
 
 ## What is not verified
 
-The container selectors in `content.js` have not been checked against the live sites and
-will drift when either redesigns. The failure mode is deliberately soft: if no container
+The container selectors in the injected reader have not been checked against the live sites
+and will drift when either redesigns. The failure mode is deliberately soft: if no container
 matches, the script falls back to the page's own visible text and the panel says the pane
 was not recognised. Reading whole-page text rather than parsing per-field selectors is the
 reason a redesign degrades the reading instead of breaking the extension.

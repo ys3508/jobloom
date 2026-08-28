@@ -101,7 +101,8 @@ The script implements only rules defined in `references/schemas.md`. Do not sile
 ## Browser assist
 
 1. The subject of every action is the user. The extension reads the posting they already
-   have open and never opens, navigates, paginates, or submits one.
+   have open and never opens, navigates, paginates, or submits one. It declares no content
+   script: nothing runs on a job site until the user presses the button.
 2. Start `assist_bridge.py` yourself; it binds loopback and prints a per-run token. Callers
    without that token are refused.
 3. A card built from a page is always `requirements_reviewed: false`. A page cannot declare

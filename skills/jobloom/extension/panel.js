@@ -65,24 +65,56 @@ function render(result) {
   $("result").hidden = false;
 }
 
+// Injected into the tab only when the user presses the button. Nothing from this
+// extension runs on a job site before that press, and the injection reads the text the
+// page has already rendered — it does not fetch, follow, or expand anything.
+function readVisiblePosting() {
+  const CONTAINERS = [
+    ".jobs-search__job-details--container",
+    ".jobs-details__main-content",
+    ".job-view-layout",
+    "#jobsearch-ViewjobPaneWrapper",
+    ".jobsearch-JobComponent",
+    "main"
+  ];
+  let pane = document.body;
+  let matched = "fallback_body";
+  for (const selector of CONTAINERS) {
+    const node = document.querySelector(selector);
+    if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
+  }
+  const heading = pane.querySelector("h1, h2");
+  return {
+    url: location.href.split("?")[0],
+    text: (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim().slice(0, 60000),
+    title: (heading?.innerText || document.title || "").trim(),
+    container: matched
+  };
+}
+
 $("read").addEventListener("click", async () => {
   $("status").textContent = "reading the open posting…";
   $("result").hidden = true;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    // The user's current tab is the only page this extension ever reads.
-    const page = await chrome.tabs.sendMessage(tab.id, { type: "jobloom:read-visible-posting" });
-    if (!page?.ok) throw new Error(page?.error || "this page did not return a posting");
+    if (!tab?.id) throw new Error("no active tab");
+    // activeTab is granted by the user's own click, and covers this tab only.
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: readVisiblePosting
+    });
+    const page = injected?.result;
+    if (!page?.text) throw new Error("this page did not return a posting");
     const response = await fetch(`${state.endpoint}/positioning`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
-      body: JSON.stringify(page.page)
+      body: JSON.stringify(page)
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || `bridge returned ${response.status}`);
-    $("status").textContent = page.page.container === "fallback_body"
-      ? "read from the whole page; the posting pane was not recognised"
-      : "";
+    $("status").textContent = page.container === "fallback_body"
+      ? `read the whole page; the posting pane was not recognised (${page.text.length} chars)`
+      : `read from ${page.container}`;
     render(body);
   } catch (error) {
     $("status").textContent = String(error.message || error);
