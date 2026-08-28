@@ -210,6 +210,32 @@ class ServerBoundaryTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_a_requirement_is_sorted_into_the_move_it_calls_for(self):
+        _, body = self.post("/positioning", PAGE)
+        self.assertEqual(sorted(body["classified"]), sorted(BRIDGE.CLASSES))
+        seen = [item for items in body["classified"].values() for item in items]
+        self.assertEqual(len(seen), len(body["evidence"]["matches"]),
+                         "every stated requirement lands in exactly one class")
+
+    def test_evidence_the_resume_does_not_carry_is_a_hidden_strength_not_a_gap(self):
+        # The fixture resume carries no claims manifest, so nothing is on the resume and
+        # supported requirements must read as work to add, never as work not done.
+        _, body = self.post("/positioning", PAGE)
+        for item in body["classified"]["hidden_strength"]:
+            self.assertTrue(item["evidence"])
+            self.assertFalse(any(e["on_resume"] for e in item["evidence"]))
+        for item in body["classified"]["real_gap"]:
+            self.assertEqual(item["evidence"], [],
+                             "a real gap has no supporting evidence at all")
+
+    def test_transferable_evidence_never_lands_in_a_direct_class(self):
+        facts = [{"id": "f-near", "type": "experience_claim", "value": "SQL",
+                  "status": "confirmed", "locked": False,
+                  "evidence_strength": "transferable", "keywords": []}]
+        match = {"requirement": "SQL", "strength": "transferable", "fact_ids": ["f-near"]}
+        result = BRIDGE.classify_requirement(match, {"f-near": facts[0]}, set(), preferred=False)
+        self.assertEqual(result["class"], "transferable")
+
     def test_the_reading_answers_the_three_questions_a_user_has(self):
         _, body = self.post("/positioning", PAGE)
         self.assertIn(body["verdict"]["call"], {"apply", "review", "stretch", "skip"})
@@ -293,7 +319,10 @@ class ExtensionBoundaryTests(unittest.TestCase):
 
     def test_the_panel_answers_rather_than_dumps(self):
         panel = self.sources["panel.js"]
-        for key in ("verdict", "lead_with", "gaps"):
+        self.assertIn("verdict", panel)
+        # The four classes must stay apart in the view as well as in the engine: merging
+        # them is what turns a positioning tool into a keyword counter.
+        for key in ("hidden_strength", "evidence_gap", "transferable", "real_gap"):
             self.assertIn(key, panel)
 
     def test_reading_is_refused_before_the_grant(self):

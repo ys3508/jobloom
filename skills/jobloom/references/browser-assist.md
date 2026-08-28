@@ -79,6 +79,28 @@ toolbar, paste the token, and press **Read this posting** on a job page you have
 Add `--allow-store` only when you intend to keep a job you have reviewed. Without it the
 assistant reads and forgets, which is the difference between help and collection.
 
+## What the panel answers
+
+A keyword counter tells you how many of a posting's terms your resume contains and offers
+to raise the number. That advice is the same whichever term is missing, which is why it
+rewards padding: it cannot tell work you did but left off a page from work you never did.
+
+The panel keeps four cases apart, because each asks for a different move:
+
+| | Case | What it means | The move |
+|---|---|---|---|
+| 🟢 | `hidden_strength` | Confirmed in your facts, absent from the resume this direction uses | Add it. It is your own work |
+| 🟡 | `evidence_gap` | On the resume, but with no figure or outcome | Strengthen it |
+| 🔵 | `transferable` | Adjacent work, not the same thing | Say it as adjacent. It never becomes direct |
+| 🔴 | `real_gap` | Nothing in your facts supports it | Leave it out. A stretch is honest, an invention is not |
+
+The split needs one thing a resume-only tool cannot have: **which of the user's facts the
+approved resume actually carries**, read from its claims manifest. Without that set,
+`hidden_strength` and `real_gap` are indistinguishable — both look like a missing keyword.
+
+`transferable` is decided before anything else can promote it, so the ordering itself
+carries the rule that transferable evidence never becomes direct experience.
+
 ## From page text to a JobCard
 
 The page arrives as prose, so `posting_sections.py` turns it into fields by rule:

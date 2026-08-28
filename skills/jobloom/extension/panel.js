@@ -60,11 +60,6 @@ $("grant").addEventListener("click", async () => {
   refreshAccess();
 });
 
-function tag(decision) {
-  const cls = decision === "match" ? "match" : decision === "fail" ? "fail" : "review";
-  return `<span class="tag ${cls}">${decision}</span>`;
-}
-
 const VERDICT_TEXT = {
   apply: ["Worth applying", "ok"],
   review: ["Worth a look", "warn"],
@@ -72,34 +67,48 @@ const VERDICT_TEXT = {
   skip: ["Probably skip", "bad"]
 };
 
+// Four ways a requirement can stand, each asking for a different move. A keyword counter
+// merges them and so rewards padding; keeping them apart is the point of this panel.
+const CLASS_VIEW = [
+  ["hidden_strength", "You have done this — the resume does not show it", "ok",
+   "add it; this is your own confirmed work"],
+  ["evidence_gap", "Shown, but thin", "warn",
+   "no figure or outcome attached; worth strengthening"],
+  ["transferable", "Related, not the same thing", "warn",
+   "say it as adjacent work — it never becomes direct experience"],
+  ["real_gap", "You have not done this", "bad",
+   "leave it out; a stretch is honest, an invention is not"],
+  ["covered", "Covered and already shown", "ok", "nothing to do"]
+];
+
 function render(result) {
   const [label, cls] = VERDICT_TEXT[result.verdict.call] || ["Unclear", "warn"];
   $("verdict").className = `verdict ${cls}`;
   $("verdict").innerHTML = `<strong>${label}</strong>
     <span>${result.verdict.because}</span>
     <span class="muted">${result.verdict.direction || "no direction"} ·
-      ${result.verdict.covered}/${result.verdict.stated} stated requirements met</span>`;
+      your resume carries ${result.resume_shows} of your facts</span>`;
 
   $("job-title").textContent = result.job.title || "(title not read)";
   $("job-meta").textContent = [result.job.employer, result.job.location,
                                result.job.work_arrangement].filter(Boolean).join(" · ");
 
-  // What to emphasise: the requirement, and the work of yours that answers it.
-  $("lead").innerHTML = result.lead_with.map((item) => `
-    <li class="stack">
-      <span class="name"><strong>${item.requirement}</strong>
-        <span class="tag match">${item.strength}</span></span>
-      ${item.evidence.map((e) => `<span class="reasons">← ${e.text}</span>`).join("")}
-    </li>`).join("") || "<li class='muted'>nothing here resolves to your evidence</li>";
-
-  const required = result.gaps.filter((g) => g.obligation === "required");
-  const preferred = result.gaps.filter((g) => g.obligation !== "required");
-  $("gaps").innerHTML = [
-    ...required.map((g) => `<li><span class="tag bad">required</span>
-      <span class="name">${g.requirement}</span></li>`),
-    ...preferred.map((g) => `<li><span class="tag warn">preferred</span>
-      <span class="name">${g.requirement}<span class="reasons">not a reason to skip</span></span></li>`)
-  ].join("") || "<li class='muted'>nothing stated is missing</li>";
+  $("classes").innerHTML = CLASS_VIEW.map(([key, heading, tone, advice]) => {
+    const items = (result.classified || {})[key] || [];
+    if (!items.length) return "";
+    return `<section class="group ${tone}">
+      <h3>${heading}</h3>
+      <p class="advice">${advice}</p>
+      <ul>${items.map((item) => `
+        <li class="stack">
+          <span class="name"><strong>${item.requirement}</strong>
+            <span class="tag ${item.obligation === "required" ? "bad" : "warn"}">${item.obligation}</span></span>
+          ${item.evidence.map((e) => `<span class="reasons">
+            ${e.on_resume ? "on your resume" : "not on this resume"} ·
+            ${e.quantified ? "has a figure" : "no figure"} — ${e.text}</span>`).join("")}
+        </li>`).join("")}</ul>
+    </section>`;
+  }).join("") || "<p class='muted'>this posting stated no requirements we could read</p>";
 
   $("directions").innerHTML = result.directions.map((d) => {
     const reasons = [...(d.hard_failures || []), ...(d.review_reasons || [])].slice(0, 3).join(", ");

@@ -38,7 +38,9 @@ import direction_core  # noqa: E402
 import evaluate_job  # noqa: E402
 import ingest_job  # noqa: E402
 import posting_sections  # noqa: E402
+import quantity_extractor  # noqa: E402
 import resume_core  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 
 LOOPBACK = "127.0.0.1"
 MAX_PAGE_TEXT = 60_000
@@ -102,6 +104,66 @@ def build_card(page: dict[str, Any]) -> dict[str, Any]:
     return card
 
 
+# Four ways a requirement can stand, and each one asks for a different move. Merging them
+# into "keywords you are missing" is what makes a keyword counter reward padding: it cannot
+# tell work you did but left off a page from work you never did.
+CLASSES = ("covered", "hidden_strength", "transferable", "evidence_gap", "real_gap")
+
+
+def resume_fact_ids(connection: sqlite3.Connection) -> set[str]:
+    """Fact IDs the user's approved direction resume actually carries.
+
+    A requirement met by a fact the resume never mentions is a hidden strength: real, and
+    addable, because it is the user's own confirmed work. Without this set the engine
+    cannot tell that apart from something they simply worded badly.
+    """
+    covered: set[str] = set()
+    for row in connection.execute(
+        "SELECT claims_manifest_path FROM resume_versions "
+        "WHERE status='approved' AND kind='direction' AND claims_manifest_path IS NOT NULL"
+    ):
+        path = Path(row["claims_manifest_path"] or "")
+        if not path.is_file():
+            continue
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        covered.update(str(fact_id) for claim in manifest.get("claims", [])
+                       for fact_id in claim.get("fact_ids", []))
+    return covered
+
+
+def classify_requirement(match: dict[str, Any], facts: dict[str, Any],
+                         on_resume: set[str], *, preferred: bool) -> dict[str, Any]:
+    """Sort one stated requirement into the move it calls for."""
+    supporting = [facts[fid] for fid in match.get("fact_ids") or [] if fid in facts]
+    strength = match.get("strength", "none")
+    if strength == "none" or not supporting:
+        kind = "real_gap"
+    elif EVIDENCE_ORDER[strength] < EVIDENCE_ORDER["strongly_related"]:
+        # Transferable and mention-only stay where they are. Nothing downstream may read
+        # them as direct experience, whatever else is true of the posting.
+        kind = "transferable"
+    elif not any(fact["id"] in on_resume for fact in supporting):
+        kind = "hidden_strength"
+    elif not any(quantity_extractor.is_quantified(str(fact.get("value", "")))
+                 for fact in supporting):
+        kind = "evidence_gap"
+    else:
+        kind = "covered"
+    return {
+        "requirement": match["requirement"],
+        "class": kind,
+        "strength": strength,
+        "obligation": "preferred" if preferred else "required",
+        "evidence": [{"fact_id": fact["id"], "text": str(fact.get("value", ""))[:180],
+                      "on_resume": fact["id"] in on_resume,
+                      "quantified": quantity_extractor.is_quantified(str(fact.get("value", "")))}
+                     for fact in supporting[:3]],
+    }
+
+
 def positioning(card: dict[str, Any], candidate: dict[str, Any],
                 connection: sqlite3.Connection) -> dict[str, Any]:
     """What the side panel shows: which direction, what evidence, what is missing.
@@ -139,34 +201,34 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
         evaluation = {"eligibility": "unavailable", "reason": str(error)}
     matches = (evaluation or {}).get("evidence_matches", [])
     facts = {str(fact.get("id")): fact for fact in candidate.get("facts") or []}
-    covered, gaps = [], []
-    for match in matches:
-        supporting = [facts[fid] for fid in match.get("fact_ids") or [] if fid in facts]
-        if match["strength"] == "none" or not supporting:
-            preferred_only = match["requirement"] in (card.get("preferred_skills") or [])
-            gaps.append({"requirement": match["requirement"],
-                         "obligation": "preferred" if preferred_only else "required"})
-            continue
-        covered.append({
-            "requirement": match["requirement"], "strength": match["strength"],
-            # What to lead with: the requirement, and the work of the user's own that
-            # answers it. Values come from their own confirmed facts, never from the page.
-            "evidence": [{"fact_id": fact["id"],
-                          "text": str(fact.get("value", ""))[:180],
-                          "source_kind": fact.get("type")}
-                         for fact in supporting[:3]],
-        })
+    on_resume = resume_fact_ids(connection)
+    preferred_terms = set(card.get("preferred_skills") or [])
+    classified = [classify_requirement(match, facts, on_resume,
+                                       preferred=match["requirement"] in preferred_terms)
+                  for match in matches]
+    buckets = {name: [item for item in classified if item["class"] == name] for name in CLASSES}
+    covered = buckets["covered"] + buckets["hidden_strength"] + buckets["evidence_gap"]
+    gaps = buckets["real_gap"]
+    required_gaps = [item for item in gaps if item["obligation"] == "required"]
     best = directions[0] if directions else None
     blocking = [term for direction in directions
                 for term in direction.get("warning_terms_required", [])]
     if best and best.get("decision") == "fail":
         verdict, because = "skip", "no approved direction accepts this posting"
-    elif not covered:
+    elif not covered and not buckets["transferable"]:
         verdict, because = "skip", "none of the stated requirements resolve to your evidence"
-    elif len(gaps) > len(covered):
-        verdict, because = "stretch", "more stated requirements are unmet than met"
+    elif len(required_gaps) > len(covered):
+        verdict, because = "stretch", (
+            f"{len(required_gaps)} required things you have no evidence for, "
+            f"against {len(covered)} you do")
     elif blocking:
-        verdict, because = "review", f"required terms you have no evidence for: {', '.join(sorted(set(blocking))[:3])}"
+        verdict, because = "review", (
+            "required terms you have no evidence for: "
+            + ", ".join(sorted(set(blocking))[:3]))
+    elif buckets["hidden_strength"]:
+        verdict, because = "apply", (
+            f"{len(buckets['hidden_strength'])} of these you have done but this resume "
+            "does not show — add them before applying")
     else:
         verdict, because = "apply", "your evidence covers most of what this posting states"
     return {
@@ -175,6 +237,8 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
                     "covered": len(covered), "stated": len(matches)},
         "lead_with": covered,
         "gaps": gaps,
+        "classified": {name: buckets[name] for name in CLASSES},
+        "resume_shows": len(on_resume),
         "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
                                                "work_arrangement", "employment_type",
                                                "sponsorship", "salary")},

@@ -31,3 +31,10 @@ li:last-child { border-bottom:0; }
 li.stack { display:block; }
 li.stack .reasons { margin-top:3px; padding-left:10px; border-left:2px solid var(--line); }
 details { margin-top:18px; } summary { cursor:pointer; font-size:12px; opacity:.65; }
+
+.group { margin:16px 0; padding-left:10px; border-left:3px solid currentColor; }
+.group h3 { margin:0 0 2px; opacity:1; color:inherit; }
+.group.ok { color:var(--ok); } .group.warn { color:var(--warn); } .group.bad { color:var(--bad); }
+.group ul, .group li { color:inherit; }
+.advice { font-size:12px; opacity:.75; margin:0 0 6px; }
+.group .name strong { color:inherit; }
