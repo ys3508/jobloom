@@ -128,6 +128,27 @@ approved resume actually carries**, read from its claims manifest. Without that 
 `transferable` is decided before anything else can promote it, so the ordering itself
 carries the rule that transferable evidence never becomes direct experience.
 
+## What the verdict is, and is not
+
+Three separate things were collapsed into one call, and each collapse produced a wrong
+answer:
+
+- **A page that gave up no requirements is not a job to skip.** Saying "probably skip"
+  there passes a parsing failure off as a judgement about the user. It now says it could
+  not read the posting.
+- **A direction that does not accept the posting is not a reason not to apply.** Whether
+  the user can do the job is a question about their evidence; whether it sits inside a
+  registered direction is a question about how they are budgeting applications. Letting the
+  second answer the first turned a genomics role they match well into "skip" because its
+  title was not on a list. It now reads as worth a look, and says the direction may want
+  widening.
+- **A capability's name is not a requirement.** `Statistical programming` is this
+  ontology's label, not something a posting asked for. Emitting it as a requirement and
+  then failing to find those two words in the user's facts invented a gap — which is how
+  someone whose whole career is R came up short of a skill R is. Matched capabilities are
+  kept for routing under `required_skills_capabilities`; only terms the posting actually
+  names are judged.
+
 ## Finding the posting on a search page
 
 LinkedIn's search view holds the result list and the open posting in one tree, and puts the

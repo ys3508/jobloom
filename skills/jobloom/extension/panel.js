@@ -72,7 +72,9 @@ const VERDICT_TEXT = {
   apply: ["Worth applying", "ok"],
   review: ["Worth a look", "warn"],
   stretch: ["A stretch", "warn"],
-  skip: ["Probably skip", "bad"]
+  skip: ["Probably skip", "bad"],
+  // Not a judgement about the user: the page simply did not give up its requirements.
+  unreadable: ["Could not read this posting", "warn"]
 };
 
 // Four ways a requirement can stand, each asking for a different move. A keyword counter

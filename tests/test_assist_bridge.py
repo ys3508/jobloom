@@ -43,9 +43,9 @@ PAGE = {
     "location": "Boston, MA",
     "country": "US",
     "required_skills": ["R", "SAS", "Epic"],
-    "text": ("Clinical Research Data Analyst at Example Health System. Manage clinical "
-             "trial data, run statistical analysis in R and SAS, support investigators. "
-             "Required: R, SAS, Epic."),
+    "text": ("Clinical Research Data Analyst at Example Health System.\n\n"
+             "Required\n- Manage clinical trial data using R and SAS\n"
+             "- Experience with Epic reporting\n"),
 }
 
 
@@ -123,6 +123,22 @@ class PostingSectionTests(unittest.TestCase):
 
     def test_a_bare_small_number_is_not_a_salary(self):
         self.assertIsNone(SECTIONS.extract("Coffee costs $6 a day.").get("salary"))
+
+    def test_a_capability_name_is_never_offered_as_a_requirement(self):  # noqa: D401
+        # "Statistical programming" is this ontology's name for a capability, not something
+        # the posting asked for. Judging the user against it invents a requirement and then
+        # fails them on it — which is how someone who has R comes up short of a skill R is.
+        card = SECTIONS.extract(MGB_POSTING)
+        for term in card["required_skills"] + card.get("preferred_skills", []):
+            self.assertNotEqual(term, "Statistical programming")
+            self.assertNotEqual(term, "Data workflow automation")
+
+    def test_a_matched_capability_is_kept_for_routing_not_for_judging(self):
+        distilled = SECTIONS.distill_terms(
+            ["Strong programming skills in R and/or Python and comfort with Linux/shell scripting"])
+        self.assertIn("R", distilled["terms"])
+        self.assertTrue(all(term.startswith("cap.") for term in distilled["capabilities"]))
+        self.assertFalse(any(term.startswith("cap.") for term in distilled["terms"]))
 
     def test_requirement_sentences_are_distilled_into_matchable_terms(self):
         # A twenty-word sentence resolves to no evidence, so the line is reduced to the
@@ -275,9 +291,35 @@ class ServerBoundaryTests(unittest.TestCase):
         result = BRIDGE.classify_requirement(match, {"f-near": facts[0]}, set(), preferred=False)
         self.assertEqual(result["class"], "transferable")
 
+    def test_a_page_that_gave_up_no_requirements_is_not_a_verdict(self):
+        # Saying "skip" here would pass off a parsing failure as a judgement about the user.
+        _, body = self.post("/positioning", {**PAGE, "required_skills": [],
+                                             "text": "Jobs\nBoston, MA\n99+ results\n" * 30})
+        self.assertEqual(body["verdict"]["call"], "unreadable")
+        self.assertEqual(body["lead_with"], [])
+        self.assertIn("nothing was read", body["notice"])
+
+    def test_a_direction_that_does_not_accept_it_is_not_a_reason_to_skip(self):
+        # Whether the user can do the job is about their evidence. Whether it sits in a
+        # registered direction is about how they budget applications. The second must not
+        # answer the first.
+        page = {**PAGE, "title": "Computational Scientist I",
+                "text": "Computational Scientist I\n\nRequired\n- Programming in R and SAS\n"}
+        _, body = self.post("/positioning", page)
+        directions = body["directions"]
+        if directions and all(d["decision"] == "fail" for d in directions):
+            self.assertNotEqual(body["verdict"]["call"], "skip")
+            self.assertIn("outside the directions", body["verdict"]["because"])
+        else:
+            # No approved portfolio in this fixture, so the case cannot arise here; the
+            # rule is still asserted where it lives.
+            self.assertIn("outside the directions",
+                          (SCRIPTS / "assist_bridge.py").read_text(encoding="utf-8"))
+
     def test_the_reading_answers_the_three_questions_a_user_has(self):
         _, body = self.post("/positioning", PAGE)
-        self.assertIn(body["verdict"]["call"], {"apply", "review", "stretch", "skip"})
+        self.assertIn(body["verdict"]["call"],
+                      {"apply", "review", "stretch", "skip", "unreadable"})
         self.assertTrue(body["verdict"]["because"])
         for item in body["lead_with"]:
             self.assertTrue(item["evidence"], "a lead must name the work that supports it")

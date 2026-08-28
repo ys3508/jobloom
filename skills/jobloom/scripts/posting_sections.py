@@ -174,12 +174,14 @@ def distill_terms(lines: list[str], *, ontology: dict[str, Any] | None = None) -
     """
     ontology = ontology or capability_ontology.load_ontology()
     terms: list[str] = []
+    capabilities: list[str] = []
     unrecognised: list[str] = []
     for line in lines:
         found: list[str] = []
         for tool in TOOL_TERMS:
             if re.search(rf"(?<![A-Za-z0-9+#]){re.escape(tool)}(?![A-Za-z0-9+#])", line, re.I):
                 found.append(tool)
+        matched_capability = False
         for capability in ontology["capabilities"]:
             if capability["layer"] != "SKILL":
                 continue
@@ -187,17 +189,22 @@ def distill_terms(lines: list[str], *, ontology: dict[str, Any] | None = None) -
                 if pattern["type"] == "semantic_anchor":
                     continue
                 if pattern_matcher.match(pattern, {"value": line}):
-                    found.append(capability["canonical_label"])
+                    # The capability's own name is ours, not the posting's. Judging the
+                    # candidate against "Statistical programming" when the posting said
+                    # "programming skills in R" invents a requirement and then fails them
+                    # on it, which is how someone who has R ends up short of a skill R is.
+                    capabilities.append(capability["capability_id"])
+                    matched_capability = True
                     break
-        if found:
-            terms.extend(found)
-        else:
+        terms.extend(found)
+        if not found and not matched_capability:
             unrecognised.append(line)
     ordered: list[str] = []
     for term in terms:
         if term not in ordered:
             ordered.append(term)
-    return {"terms": ordered, "unrecognised": unrecognised}
+    return {"terms": ordered, "capabilities": sorted(set(capabilities)),
+            "unrecognised": unrecognised}
 
 
 def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
@@ -211,6 +218,8 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
         distilled[key] = distill_terms(sections[key])
         fields[key] = distilled[key]["terms"]
         fields[f"{key}_stated"] = sections[key]
+        if distilled[key]["capabilities"]:
+            fields[f"{key}_capabilities"] = distilled[key]["capabilities"]
     for key in ("responsibilities", "compensation_structure"):
         if sections[key]:
             fields[key] = sections[key]

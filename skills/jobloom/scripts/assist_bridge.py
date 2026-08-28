@@ -250,14 +250,42 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     best = directions[0] if directions else None
     blocking = [term for direction in directions
                 for term in direction.get("warning_terms_required", [])]
-    if best and best.get("decision") == "fail":
-        verdict, because = "skip", "no approved direction accepts this posting"
-    elif not covered and not buckets["transferable"]:
+    # A posting nobody could read is not a posting nobody should apply to. Saying "skip"
+    # here passes off a parsing failure as a judgement about the user.
+    stated = ((card.get("required_skills_stated") or [])
+              + (card.get("preferred_skills_stated") or [])
+              + (card.get("responsibilities") or []))
+    if not stated:
+        return {
+            "verdict": {"call": "unreadable",
+                        "because": "this page did not give up a requirements section, "
+                                   "so there is nothing here to judge you against",
+                        "direction": None, "covered": 0, "stated": 0},
+            "lead_with": [], "gaps": [], "classified": {name: [] for name in CLASSES},
+            "resume_shows": len(on_resume),
+            "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
+                                                   "work_arrangement", "employment_type",
+                                                   "sponsorship", "salary")},
+            "directions": directions,
+            "evidence": {"matches": [], "main_gap": None, "eligibility": None,
+                         "match": None, "action": None},
+            "notice": "nothing was read from this page and nothing was stored",
+        }
+    # Whether the user can do this job is a question about their evidence. Whether it sits
+    # inside a registered direction is a question about how they are budgeting applications.
+    # Letting the second answer the first is how a genomics role they are well matched to
+    # comes back as "skip" because its title was not on a list.
+    outside_directions = bool(best) and best.get("decision") == "fail"
+    if not covered and not buckets["transferable"]:
         verdict, because = "skip", "none of the stated requirements resolve to your evidence"
     elif len(required_gaps) > len(covered):
         verdict, because = "stretch", (
             f"{len(required_gaps)} required things you have no evidence for, "
             f"against {len(covered)} you do")
+    elif outside_directions:
+        verdict, because = "review", (
+            "your evidence fits, but this sits outside the directions you registered — "
+            "worth a look, and worth asking whether the direction should widen")
     elif blocking:
         verdict, because = "review", (
             "required terms you have no evidence for: "
