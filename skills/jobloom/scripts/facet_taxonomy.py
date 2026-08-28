@@ -59,8 +59,7 @@ def assign_capabilities(
                     cap_strength = weaker(cap_strength, "transferable")
                 pattern_cap = pattern.get("max_grade", "direct")
                 relation = weaker(unit["source_strength"], cap_strength, pattern_cap)
-                matched_term = (" ".join(pattern["tokens"]) if pattern["type"] == "token_run"
-                                else pattern.get("text") or pattern.get("anchor"))
+                matched_term = pattern_matcher.pattern_term(pattern)
                 refs.append({
                     "unit_id": unit["unit_id"], "fact_id": unit["fact_id"],
                     "snapshot_sha256": unit["snapshot_sha256"],

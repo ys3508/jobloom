@@ -16,7 +16,8 @@ from typing import Any, Iterable
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-from evidence_matcher import EVIDENCE_ORDER, TOKEN_ALIASES  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER, TOKEN_ALIASES, tokens as _tokens  # noqa: E402
+import fact_structure  # noqa: E402
 
 
 PATTERN_TYPES = {"token_run", "substring", "semantic_anchor"}
@@ -38,11 +39,6 @@ COMMON_IRREGULAR_FORMS = {
     "person": {"people"},
     "criterion": {"criteria"},
 }
-
-
-def _tokens(value: str) -> list[str]:
-    raw = re.findall(r"[^\W_]+(?:[+#]+)?", str(value).casefold())
-    return [TOKEN_ALIASES.get(token, token) for token in raw]
 
 
 def _surfaces(fact: dict[str, Any] | str) -> list[str]:
@@ -72,19 +68,44 @@ def _inflected_forms(base: str) -> set[str]:
     return forms
 
 
-def _token_matches(expected: str, observed: str, *, inflect: bool) -> bool:
-    expected = TOKEN_ALIASES.get(expected.casefold(), expected.casefold())
+MATCH_MODES = {"exact", "prefix", "lemma"}
+
+
+def _token_spec(token: Any) -> tuple[str, str]:
+    """A pattern token is either a bare string or {"token": ..., "match": ...}."""
+    if isinstance(token, str):
+        return token.strip().casefold(), "exact"
+    if not isinstance(token, dict) or set(token) - {"token", "match"} or "token" not in token:
+        raise ValueError("pattern token must be a string or {token, match}")
+    surface = token["token"]
+    if not isinstance(surface, str) or not surface.strip():
+        raise ValueError("pattern token requires non-empty text")
+    mode = token.get("match", "exact")
+    if mode not in MATCH_MODES:
+        raise ValueError("pattern token match mode is unsupported")
+    return surface.strip().casefold(), mode
+
+
+def _token_matches(expected: Any, observed: str, *, inflect: bool) -> bool:
+    surface, mode = _token_spec(expected)
+    surface = TOKEN_ALIASES.get(surface, surface)
     observed = TOKEN_ALIASES.get(observed.casefold(), observed.casefold())
-    return observed == expected or (inflect and observed in _inflected_forms(expected))
+    if mode == "prefix":
+        # Controlled compound-root expansion: "data" reaches database/dataset, and the
+        # widening is declared per token so it can never be switched on globally.
+        return observed.startswith(surface)
+    if mode == "lemma":
+        return observed in _inflected_forms(surface)
+    return observed == surface or (inflect and observed in _inflected_forms(surface))
 
 
-def _variant_token_runs(pattern: dict[str, Any]) -> list[list[str]]:
-    runs = [[str(token).casefold() for token in pattern["tokens"]]]
+def _variant_token_runs(pattern: dict[str, Any]) -> list[list[Any]]:
+    runs: list[list[Any]] = [list(pattern["tokens"])]
     for variant in pattern.get("variants", []):
         if isinstance(variant, str):
             run = _tokens(variant)
         elif isinstance(variant, list):
-            run = [str(token).casefold() for token in variant]
+            run = list(variant)
         else:
             raise ValueError("token_run variants must be strings or token lists")
         if not run:
@@ -93,14 +114,32 @@ def _variant_token_runs(pattern: dict[str, Any]) -> list[list[str]]:
     return runs
 
 
-def _contains_token_run(surface: str, wanted: list[str], *, inflect: bool) -> bool:
-    available = _tokens(surface)
+def _contiguous(segment: list[str], wanted: list[Any], *, inflect: bool) -> bool:
     width = len(wanted)
     return any(
         all(_token_matches(expected, observed, inflect=inflect)
-            for expected, observed in zip(wanted, available[start:start + width]))
-        for start in range(len(available) - width + 1)
+            for expected, observed in zip(wanted, segment[start:start + width]))
+        for start in range(len(segment) - width + 1)
     )
+
+
+def _co_occurs(segment: list[str], wanted: list[Any], *, inflect: bool) -> bool:
+    return all(any(_token_matches(expected, observed, inflect=inflect) for observed in segment)
+               for expected in wanted)
+
+
+def _contains_token_run(surface: str, wanted: list[Any], *, inflect: bool) -> bool:
+    """Order-free inside one prose clause; contiguous everywhere else.
+
+    A statement may reorder its own words, so requiring adjacency inside prose loses
+    real evidence.  A list row is a set of unrelated cells, so adjacency is the only
+    thing stopping a pattern from stitching two of them together.  The structure is
+    decided by `fact_structure`, never by the fact's `type`.
+    """
+    described = fact_structure.describe(surface)
+    order_free = described["structure"] == "PROSE"
+    checker = _co_occurs if order_free else _contiguous
+    return any(checker(segment, wanted, inflect=inflect) for segment in described["segments"])
 
 
 def validate_pattern(pattern: dict[str, Any]) -> dict[str, Any]:
@@ -128,12 +167,15 @@ def validate_pattern(pattern: dict[str, Any]) -> dict[str, Any]:
         if lang == "zh":
             raise ValueError("Chinese evidence patterns must use substring matching")
         tokens = pattern.get("tokens")
-        if (not isinstance(tokens, list) or not tokens
-                or any(not isinstance(token, str) or not token.strip() for token in tokens)):
+        if not isinstance(tokens, list) or not tokens:
             raise ValueError("token_run pattern requires non-empty tokens")
         if not isinstance(pattern.get("inflect", False), bool):
             raise ValueError("token_run inflect must be Boolean")
-        value["tokens"] = [token.strip().casefold() for token in tokens]
+        normalized = []
+        for token in tokens:
+            surface, mode = _token_spec(token)
+            normalized.append(surface if mode == "exact" else {"token": surface, "match": mode})
+        value["tokens"] = normalized
         value["inflect"] = pattern.get("inflect", False)
         _variant_token_runs(value)
     elif pattern_type == "substring":
@@ -158,6 +200,16 @@ def validate_pattern(pattern: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("semantic_anchor must require confirmation")
         value["anchor"] = anchor.strip()
     return value
+
+
+def pattern_term(pattern: dict[str, Any]) -> str:
+    """Human-readable term for one pattern, safe now that tokens may carry match modes."""
+    pattern = validate_pattern(pattern)
+    if pattern["type"] == "token_run":
+        return " ".join(_token_spec(token)[0] for token in pattern["tokens"])
+    if pattern["type"] == "substring":
+        return pattern["text"]
+    return pattern["anchor"]
 
 
 def match(
