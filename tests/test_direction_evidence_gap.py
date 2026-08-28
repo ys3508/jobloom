@@ -59,7 +59,8 @@ def profile(**updates):
 def candidate(**updates):
     auth = {"country": "US", "authorized_now": True, "sponsorship_now": False,
             "sponsorship_future": False, "employer_action_required": False, "confirmed": True}
-    facts = [{"id": "fact-tools", "value": "R",
+    facts = [{"id": "fact-tools", "value": "R", "status": "confirmed",
+              "evidence_strength": "direct",
               "keywords": ["SAS", "SQL", "statistical", "analysis", "data", "cleaning",
                            "management", "quality", "control", "research", "clinical",
                            "trial", "database", "visualization"]}]
@@ -159,6 +160,30 @@ class EvidenceSupportTests(unittest.TestCase):
         for reason in result["review_reasons"] + result["hard_failures"] + result["notes"]:
             for term in EHR_STACK:
                 self.assertNotIn(term.casefold(), reason.casefold())
+
+    def test_invalid_evidence_strength_fails_closed_without_crashing(self):
+        bad = candidate(facts=[{
+            "id": "bad", "value": "R", "status": "confirmed",
+            "evidence_strength": "unknown",
+        }])
+        result = route(cand=bad, required_skills=["R", "SAS", "SQL"])
+        self.assertEqual(result["ranking_signals"]["required_skills_covered_by_facts"], 0)
+
+    def test_iso_timestamp_expiry_is_supported(self):
+        timestamped = candidate(facts=[{
+            "id": "future", "value": "R", "status": "confirmed",
+            "evidence_strength": "direct", "expires_at": "2099-08-24T00:00:00Z",
+        }])
+        result = route(cand=timestamped, required_skills=["R", "SAS", "SQL"])
+        self.assertTrue(result["required_skill_evidence"][0]["covered_by_candidate_fact"])
+
+    def test_malformed_expiry_fails_closed_without_crashing(self):
+        bad = candidate(facts=[{
+            "id": "bad-date", "value": "R", "status": "confirmed",
+            "evidence_strength": "direct", "expires_at": "not-a-date",
+        }])
+        result = route(cand=bad, required_skills=["R", "SAS", "SQL"])
+        self.assertFalse(result["required_skill_evidence"][0]["covered_by_candidate_fact"])
 
 
 class ProfileCompatibilityTests(unittest.TestCase):

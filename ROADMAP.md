@@ -109,7 +109,7 @@ Then a JD asking for `stakeholder presentation` resolves to INNSCI evidence, and
 for `clinical trial data` resolves to AstraZeneca — mechanically, not by re-reading a resume.
 This bank becomes Jobloom's bottom-level source of truth.
 
-### Known defect: skill matching is implemented twice and disagrees
+### Unified implementation; the real skill layer is still missing
 
 Found on the first real posting (2026-08-28, MGB Computational Research Associate). The same
 requirement list, measured against the same fact library, gets two different answers:
@@ -133,8 +133,17 @@ reappearing in the filtering layer. It is also why module 1 matters: the fix is 
 string comparison but a real skill layer with curated terms and aliases, so a requirement
 resolves to evidence instead of to a substring.
 
-Until it is fixed, treat both coverage numbers as unreliable and read
-`required_skill_evidence` per requirement rather than the ratio.
+Resolved 2026-08-28 by introducing one shared evidence resolver used by both routing and job
+evaluation. It matches normalized requirement tokens within a single fact (never across the
+global fact pool), preserves evidence strength and fact IDs, prefers exact terms when evidence
+strength ties, and uses only explicit curated aliases such as `statistics` / `statistical`.
+Fuzzy matching remains intentionally disallowed. Add new aliases only with regression tests.
+
+This closes the contradictory implementations, not module 1 itself. Remaining limitations are
+explicit: connective words such as `and` still participate in matching, compound capabilities
+need a designed decomposition policy, and fact strength is only as trustworthy as its source
+annotation. In particular, a course certificate must not silently stand in for demonstrated
+on-the-job Python use merely because its fact was labeled `direct`.
 
 ## 2. One resume is not enough — Master → Variant → Tailored
 

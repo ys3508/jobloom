@@ -5,18 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
 from pathlib import Path
 from typing import Any
+import sys
 
-
-EVIDENCE_ORDER = {
-    "none": 0,
-    "mention_only": 1,
-    "transferable": 2,
-    "strongly_related": 3,
-    "direct": 4,
-}
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from evidence_matcher import (  # noqa: E402
+    EVIDENCE_ORDER, expired_or_invalid, match_requirement, related_facts,
+)
 
 
 def _require(mapping: dict[str, Any], keys: list[str], label: str) -> None:
@@ -43,37 +41,15 @@ def validate_inputs(candidate: dict[str, Any], job: dict[str, Any]) -> None:
             raise ValueError(f"invalid evidence strength: {fact['evidence_strength']}")
 
 
-def _expired(value: str | None) -> bool:
-    return bool(value and date.fromisoformat(value) < date.today())
-
-
-def _fact_terms(fact: dict[str, Any]) -> set[str]:
-    terms = {str(fact["value"]).strip().casefold()}
-    terms.update(str(item).strip().casefold() for item in fact.get("keywords", []))
-    return {term for term in terms if term}
-
-
 def _match_skill(skill: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
-    wanted = skill.strip().casefold()
-    matches = []
-    for fact in facts:
-        if fact["status"] not in {"confirmed", "locked"} or _expired(fact.get("expires_at")):
-            continue
-        if wanted in _fact_terms(fact):
-            matches.append(fact)
-    if not matches:
-        return {"requirement": skill, "strength": "none", "fact_ids": []}
-    best_strength = max(matches, key=lambda fact: EVIDENCE_ORDER[fact["evidence_strength"]])["evidence_strength"]
-    fact_ids = [fact["id"] for fact in matches if fact["evidence_strength"] == best_strength]
-    return {"requirement": skill, "strength": best_strength, "fact_ids": fact_ids}
+    return match_requirement(skill, facts)
 
 
 def _fact_issue(skill: str, facts: list[dict[str, Any]]) -> str | None:
-    wanted = skill.strip().casefold()
-    related = [fact for fact in facts if wanted in _fact_terms(fact)]
+    related = related_facts(skill, facts)
     if any(fact.get("status") == "conflicting" for fact in related):
         return f"candidate_evidence_conflict:{skill}"
-    if any(fact.get("status") == "stale" or _expired(fact.get("expires_at")) for fact in related):
+    if any(fact.get("status") == "stale" or expired_or_invalid(fact.get("expires_at")) for fact in related):
         return f"candidate_evidence_stale:{skill}"
     return None
 
@@ -104,7 +80,7 @@ def evaluate(candidate: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     elif search.get("countries") and job["country"] not in search["countries"]:
         failures.append("country_outside_search_scope")
     if job["country"] == auth["country"]:
-        if not auth["confirmed"] or _expired(auth.get("expires_at")):
+        if not auth["confirmed"] or expired_or_invalid(auth.get("expires_at")):
             uncertainties.append("work_authorization_stale_or_unconfirmed")
         elif not auth["authorized_now"]:
             failures.append("not_authorized_to_work_now")

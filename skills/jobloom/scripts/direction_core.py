@@ -19,6 +19,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import evaluate_job  # noqa: E402
 import resume_core  # noqa: E402
+from evidence_matcher import match_requirement  # noqa: E402
 from _common import require_table  # noqa: E402
 
 
@@ -1449,15 +1450,14 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
                                               ("summary", "responsibilities", "required_skills")),
     }
     # The title is excluded from the advanced scan or every HEOR target title self-demotes.
-    fact_terms = {token for fact in candidate.get("facts") or []
-                  for token in _tokens(str(fact.get("value", "")) + " " + " ".join(fact.get("keywords") or []))}
     for obligation, field in (("required", "required_skills"), ("preferred", "preferred_skills")):
         for phrase in ADVANCED_METHOD_TERMS + ADVANCED_DATA_ASSET_TERMS:
             needle = _tokens(phrase)
             if _token_run(needle, tokens_by_field.get(field, [])) >= 0:
                 signal_hits["advanced_requirement"].append({
                     "term": phrase, "field": field, "obligation": obligation,
-                    "covered_by_candidate_fact": all(token in fact_terms for token in needle),
+                    "covered_by_candidate_fact": match_requirement(
+                        phrase, candidate.get("facts") or [])["strength"] != "none",
                 })
 
     seniority_assessment = _seniority(tokens_by_field, job)
@@ -1609,10 +1609,12 @@ def route_job(profile: dict[str, Any], candidate: dict[str, Any], job: dict[str,
     # against the fact library, and a thin library is a reason to look, not to discard.
     required_skill_evidence = []
     for requirement in job.get("required_skills") or []:
-        needle = _tokens(str(requirement))
+        evidence_match = match_requirement(str(requirement), candidate.get("facts") or [])
         required_skill_evidence.append({
             "requirement": str(requirement),
-            "covered_by_candidate_fact": bool(needle) and all(token in fact_terms for token in needle),
+            "covered_by_candidate_fact": evidence_match["strength"] != "none",
+            "strength": evidence_match["strength"],
+            "fact_ids": evidence_match["fact_ids"],
         })
     covered_requirements = sum(1 for item in required_skill_evidence
                                if item["covered_by_candidate_fact"])

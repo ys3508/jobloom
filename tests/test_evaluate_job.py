@@ -90,6 +90,45 @@ class EvaluateJobTests(unittest.TestCase):
         self.assertEqual(result["action"], "review")
         self.assertEqual(result["main_gap"], "Rust")
 
+    def test_skill_inside_a_fact_list_is_supported(self):
+        profile = candidate()
+        profile["facts"] = [{
+            "id": "f-programming", "value": "Programming: R, SAS, SQL, SPSS, Python",
+            "keywords": ["Programming: R, SAS, SQL, SPSS, Python"],
+            "evidence_strength": "direct", "status": "locked",
+        }]
+        posting = job()
+        posting["required_skills"] = ["R", "Python"]
+        result = MODULE.evaluate(profile, posting)
+        self.assertEqual([item["strength"] for item in result["evidence_matches"]],
+                         ["direct", "direct"])
+        self.assertIsNone(result["main_gap"])
+
+    def test_requirement_tokens_cannot_be_combined_across_facts(self):
+        profile = candidate()
+        profile["facts"] = [
+            {"id": "f-data", "value": "data", "keywords": [],
+             "evidence_strength": "direct", "status": "locked"},
+            {"id": "f-cleaning", "value": "cleaning", "keywords": [],
+             "evidence_strength": "direct", "status": "locked"},
+        ]
+        posting = job()
+        posting["required_skills"] = ["data cleaning"]
+        result = MODULE.evaluate(profile, posting)
+        self.assertEqual(result["evidence_matches"][0]["strength"], "none")
+        self.assertEqual(result["main_gap"], "data cleaning")
+
+    def test_curated_morphology_alias_resolves_to_evidence(self):
+        profile = candidate()
+        profile["facts"] = [{
+            "id": "f-statistics", "value": "statistical modeling", "keywords": [],
+            "evidence_strength": "strongly_related", "status": "confirmed",
+        }]
+        posting = job()
+        posting["required_skills"] = ["statistics"]
+        result = MODULE.evaluate(profile, posting)
+        self.assertEqual(result["evidence_matches"][0]["strength"], "strongly_related")
+
     def test_duplicate_is_hard_failure(self):
         posting = job()
         posting["already_applied"] = True
