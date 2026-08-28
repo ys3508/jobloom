@@ -247,6 +247,14 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn("chrome.permissions.request", panel)
         self.assertIn("chrome.permissions.contains", panel)
 
+    def test_the_reader_skips_the_sites_own_headings(self):
+        # The posting pane also holds a feedback prompt and section labels; the first
+        # heading is not the job title.
+        panel = self.sources["panel.js"]
+        self.assertIn("CHROME_HEADINGS", panel)
+        self.assertIn("are these results", panel)
+        self.assertIn("hiring", panel, "employer and location come from the document title")
+
     def test_reading_is_refused_before_the_grant(self):
         self.assertIn("page access not granted yet", self.sources["panel.js"])
 

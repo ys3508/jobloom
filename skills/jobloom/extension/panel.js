@@ -114,15 +114,27 @@ function readVisiblePosting() {
     if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
   }
   let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
-  const heading = pane.querySelector("h1, h2");
-  const title = (heading?.innerText || document.title || "").trim();
+  // The pane also holds the site's own headings — a feedback prompt, a section label — so
+  // pick the first heading that reads like a job title rather than the first heading.
+  const CHROME_HEADINGS = /^(are these results|about the job|people also viewed|similar jobs|job search|meet the hiring|set alert|show more|premium)/i;
+  const heading = [...pane.querySelectorAll("h1, h2")]
+    .map((node) => (node.innerText || "").trim())
+    .find((value) => value.length > 2 && value.length < 140
+                     && !value.endsWith("?") && !CHROME_HEADINGS.test(value));
+  // LinkedIn writes "Employer hiring Title in Location" into the document title.
+  const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
+  const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
+  const title = (heading || documentMatch?.groups?.title || fromDocument).trim();
+  const employer = documentMatch?.groups?.employer?.trim() || "";
+  const location = documentMatch?.groups?.location?.trim() || "";
   // A search page keeps the result list and the open posting in one container. When the
   // title appears inside the text, everything before it is the list, so drop it.
   if (title && matched === "main" || matched === "fallback_body") {
     const start = text.indexOf(title);
     if (title && start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
   }
-  return { url: location.href.split("?")[0], text: text.slice(0, 60000), title, container: matched };
+  return { url: location.href.split("?")[0], text: text.slice(0, 60000), title,
+           employer, location, container: matched };
 }
 
 $("read").addEventListener("click", async () => {
