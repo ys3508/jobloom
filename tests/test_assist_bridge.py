@@ -171,6 +171,17 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(mode, 0o600)
 
 
+class StartupTests(unittest.TestCase):
+    """Starting twice is common; a stack trace is never the right answer to it."""
+
+    def test_health_reports_the_code_the_bridge_is_running(self):
+        self.assertRegex(BRIDGE.source_fingerprint(), r"^[0-9a-f]{12}$")
+
+    def test_the_fingerprint_follows_the_files_behaviour_depends_on(self):
+        self.assertIn("assist_bridge.py", BRIDGE.VERSIONED_SOURCES)
+        self.assertIn("posting_sections.py", BRIDGE.VERSIONED_SOURCES)
+
+
 class ServerBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -209,6 +220,12 @@ class ServerBoundaryTests(unittest.TestCase):
                 return response.status, json.load(response)
         except urllib.error.HTTPError as error:
             return error.code, json.load(error)
+
+    def test_health_lets_a_second_start_tell_stale_from_current(self):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/health")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.load(response)
+        self.assertEqual(body["source_fingerprint"], BRIDGE.source_fingerprint())
 
     def test_the_server_binds_loopback_only(self):
         self.assertEqual(self.server.server_address[0], BRIDGE.LOOPBACK)

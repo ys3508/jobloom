@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import secrets
 import sqlite3
 import sys
@@ -50,6 +51,18 @@ SUPPORTED_HOSTS = ("linkedin.com", "indeed.com")
 
 
 TOKEN_FILENAME = "assist-token"
+# The files whose behaviour a running bridge has baked in. Reported so a start attempt can
+# say "an older copy is serving" instead of "nothing to do", which is the wrong answer when
+# this code has moved since that copy began.
+VERSIONED_SOURCES = ("assist_bridge.py", "posting_sections.py", "evidence_matcher.py")
+
+
+def source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for name in VERSIONED_SOURCES:
+        path = Path(__file__).resolve().parent / name
+        digest.update(path.read_bytes() if path.is_file() else b"")
+    return digest.hexdigest()[:12]
 
 
 def load_or_create_token(private_root: Path, *, rotate: bool = False) -> str:
@@ -303,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
-            self._send(200, {"status": "ok", "store_enabled": self.allow_store})
+            self._send(200, {"status": "ok", "store_enabled": self.allow_store,
+                             "source_fingerprint": source_fingerprint()})
             return
         self._send(404, {"error": "unknown_endpoint"})
 
@@ -370,6 +384,18 @@ def serve(*, db_path: Path, candidate_path: Path, port: int, allow_store: bool,
     return ThreadingHTTPServer((LOOPBACK, port), Handler)
 
 
+def _running_bridge(port: int) -> dict[str, Any] | None:
+    """The health of whatever holds the port, when it is an assist bridge."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{LOOPBACK}:{port}/health", timeout=2) as response:
+            body = json.load(response)
+    except (urllib.error.URLError, ValueError, OSError):
+        return None
+    return body if body.get("status") == "ok" else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
@@ -385,8 +411,31 @@ def main() -> None:
     args = parser.parse_args()
     private_root = args.private_root or args.db.resolve().parent
     token = load_or_create_token(private_root, rotate=args.rotate_token)
-    server = serve(db_path=args.db, candidate_path=args.candidate, port=args.port,
-                   allow_store=args.allow_store, token=token)
+    try:
+        server = serve(db_path=args.db, candidate_path=args.candidate, port=args.port,
+                       allow_store=args.allow_store, token=token)
+    except OSError as error:
+        # A stack trace here says nothing useful: the port is either held by an older copy
+        # of this bridge, which is fine to leave alone, or by something else, which the
+        # user has to decide about.
+        if getattr(error, "errno", None) != 48:
+            raise
+        running = _running_bridge(args.port)
+        current = source_fingerprint()
+        if running is None:
+            detail, code = "another program holds this port; stop it or pass --port", 1
+        elif running.get("source_fingerprint") == current:
+            detail, code = "this bridge is already serving on this port; nothing to do", 0
+        else:
+            detail, code = ("an older copy of this bridge is serving; stop it and start "
+                            "again to pick up the current code"), 1
+        print(json.dumps({
+            "error": "port_in_use", "port": args.port, "detail": detail,
+            "running_fingerprint": (running or {}).get("source_fingerprint"),
+            "current_fingerprint": current,
+            "stop_it_with": f"lsof -ti:{args.port} | xargs kill",
+        }, indent=2))
+        raise SystemExit(code)
     print(json.dumps({"listening": f"http://{LOOPBACK}:{args.port}",
                       "token": token, "token_file": str(private_root / TOKEN_FILENAME),
                       "token_reused": not args.rotate_token,
