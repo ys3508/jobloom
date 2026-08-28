@@ -17,6 +17,12 @@ The test is a single sentence: **the extension never does something the user is 
 already doing.** A posting they have not opened is never touched. Nothing is discovered,
 traversed, or fetched.
 
+That sentence also settles what the panel *should* do. Clicking a different posting in the
+list is the user moving, so the panel follows: it re-reads when the posting under it
+changes, scoped to the tab they are on and only while the panel is open. Following someone
+is not the same as going somewhere they are not. Asking them to press a button to confirm
+an intent they just expressed by clicking is friction, so there is no button.
+
 ## Parts
 
 - `scripts/assist_bridge.py` — a loopback HTTP server that answers from the local
@@ -56,7 +62,9 @@ itself out of are enforced on the bridge side:
 | Browsing does not accumulate a job database | `--allow-store` is off by default |
 | Job-site access is optional and revocable | `optional_host_permissions`; the user grants it in Chrome's dialog and can revoke it in `chrome://extensions` |
 | Access is scoped to two hosts over https | asserted by `test_page_access_is_optional_scoped_and_granted_by_the_user` |
-| Nothing runs before the user asks | no `content_scripts`; the reader is injected on the button press |
+| Nothing runs unless the panel is open | no `content_scripts`; every read starts from the panel |
+| The tab listener never fires for another tab | `if (active?.id !== tabId) return;` |
+| An unchanged posting is not re-read | `onlyIfChanged` against the last posting id |
 | The extension cannot call a job site | `host_permissions` is the bridge alone |
 | No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |
 | No automatic submission | the whole product; the assistant stops where filling stops |
@@ -79,11 +87,11 @@ the tool should ever do.
 
 Load `skills/jobloom/extension/` through `chrome://extensions` → Developer mode → Load
 unpacked. Open the side panel from the toolbar, grant page access once, paste the token
-once. After that, opening the panel on a job page reads it: opening the panel *is* the
-request, and asking for a second press for the same intent is friction, not a boundary.
-The boundary is that nothing else triggers a read — there is no navigation hook, no
-polling, and no reading of a tab the user did not open. **Re-read this posting** is there
-for when the site swaps the posting under the panel without a page load.
+once. After that, opening the panel on a job page reads it, and clicking a different
+posting re-reads it. The boundary is not "no listeners" but "nowhere the user is not": the
+listener is scoped to the active tab, does nothing when the posting has not changed, and
+there is no polling and no reading of a tab the user did not open. When the site
+swaps the posting under the panel, it re-reads on its own.
 
 To have it running whenever the machine is on, wrap `start-assist.sh` in a macOS
 LaunchAgent or the equivalent; nothing in the bridge needs a terminal.
@@ -112,6 +120,19 @@ approved resume actually carries**, read from its claims manifest. Without that 
 
 `transferable` is decided before anything else can promote it, so the ordering itself
 carries the rule that transferable evidence never becomes direct experience.
+
+## Finding the posting on a search page
+
+LinkedIn's search view holds the result list and the open posting in one tree, and puts the
+search — not the job — in the document title. Neither a selector list nor the document
+title identifies the posting there.
+
+What does identify it is the URL: `currentJobId` names the job the user has open. The
+posting is the part of the page that links to it, so the reader finds
+`a[href*="/jobs/view/<currentJobId>"]` and walks up to the container that holds the
+description. That works without knowing any of the site's class names, which is what makes
+it survive a redesign. The selector list stays as a fallback, and reading the whole page
+stays as the last resort, with the panel saying which happened.
 
 ## From page text to a JobCard
 

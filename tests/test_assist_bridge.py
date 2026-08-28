@@ -364,17 +364,20 @@ class ExtensionBoundaryTests(unittest.TestCase):
         for key in ("hidden_strength", "evidence_gap", "transferable", "real_gap"):
             self.assertIn(key, panel)
 
-    def test_opening_the_panel_reads_without_a_second_press(self):
-        # Opening the panel is the user asking. Making them press a button for the same
-        # intent is friction, not a boundary — the boundary is that nothing else triggers
-        # a read: no navigation hook, no polling, no tab they did not open.
+    def test_the_panel_needs_no_button_to_stay_current(self):
+        # Opening the panel is the request, and clicking a different posting is the next
+        # one. A button asking the user to repeat an intent they already expressed is
+        # friction, so there is none.
         panel = self.sources["panel.js"]
-        self.assertIn("if (state.token && await hasPageAccess()) readPosting();", panel)
-        self.assertNotIn("chrome.tabs.onUpdated", panel)
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        self.assertNotIn('id="read"', html)
         self.assertNotIn("chrome.webNavigation", panel)
 
     def test_reading_is_refused_before_the_grant(self):
-        self.assertIn("page access not granted yet", self.sources["panel.js"])
+        # Every read path, including the one that follows the user to a new posting, goes
+        # through this guard.
+        self.assertIn("if (!state.token || !(await hasPageAccess())) return;",
+                      self.sources["panel.js"])
 
     def test_it_cannot_reach_a_job_site_from_its_own_code(self):
         for name, source in self.sources.items():
@@ -383,20 +386,33 @@ class ExtensionBoundaryTests(unittest.TestCase):
                 self.assertNotIn(f"fetch('https://{host}", source, name)
 
     def test_it_never_navigates_paginates_or_clicks_for_the_user(self):
+        # The boundary is about not going where the user is not. Sending them somewhere,
+        # opening something, pressing something on their behalf, or waking up on a timer
+        # all cross it.
         forbidden = ("chrome.tabs.create", "chrome.tabs.update", "location.assign",
                      "location.replace", "window.open", ".click()", "form.submit",
-                     "setInterval", "MutationObserver")
+                     "setInterval", "setTimeout", "MutationObserver")
         for name, source in self.sources.items():
             for token in forbidden:
                 self.assertNotIn(token, source, f"{name} must not contain {token}")
 
-    def test_nothing_runs_on_a_job_site_until_the_user_presses_the_button(self):
-        # No declared content script means no code of ours executes on a job page at all
-        # until the button is pressed and activeTab is granted by that press.
+    def test_following_the_user_is_scoped_to_the_tab_they_are_on(self):
+        # Reading the posting they just clicked is following them, not leading them — but
+        # only for the tab they are actually on, and only while this panel is open.
+        panel = self.sources["panel.js"]
+        self.assertIn("chrome.tabs.onUpdated.addListener", panel)
+        self.assertIn("if (active?.id !== tabId) return;", panel)
+        self.assertIn("onlyIfChanged", panel,
+                      "an unchanged posting must not be re-read")
+
+    def test_nothing_runs_on_a_job_site_unless_the_panel_is_open(self):
+        # No declared content script, so no code of ours executes on a job page on its own.
+        # Every read starts from the panel, which only exists while the user has it open.
         self.assertNotIn("content_scripts", self.manifest)
         panel = self.sources["panel.js"]
         self.assertIn("chrome.scripting.executeScript", panel)
-        self.assertIn('$("read").addEventListener', panel)
+        self.assertNotIn("chrome.tabs.onUpdated", self.sources["background.js"],
+                         "the always-running worker must not watch tabs")
 
     def test_injection_targets_the_active_tab_only(self):
         panel = self.sources["panel.js"]

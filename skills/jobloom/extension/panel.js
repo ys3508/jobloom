@@ -16,7 +16,7 @@ async function loadSettings() {
   // Opening this panel is the user asking, so read the posting they already have open
   // rather than making them press a second button for the same intent. Nothing else
   // triggers a read: no navigation hook, no polling, no reading of tabs they did not open.
-  if (state.token && await hasPageAccess()) readPosting();
+  readPosting();
 }
 
 async function checkHealth() {
@@ -37,7 +37,7 @@ $("save").addEventListener("click", async () => {
   await chrome.storage.local.set({ endpoint: state.endpoint, token: state.token });
   await checkHealth();
   $("setup").open = false;
-  if (await hasPageAccess()) readPosting();
+  readPosting();
 });
 
 // activeTab is granted by clicking the toolbar action, which a click inside this panel is
@@ -55,7 +55,6 @@ async function refreshAccess() {
     ? "page access granted — revoke any time in chrome://extensions"
     : "not granted; Jobloom cannot read a posting until you allow it";
   $("grant").hidden = granted;
-  $("read").disabled = !granted;
 }
 
 $("grant").addEventListener("click", async () => {
@@ -66,7 +65,7 @@ $("grant").addEventListener("click", async () => {
     $("access-state").textContent = String(error.message || error);
   }
   await refreshAccess();
-  if (state.token) readPosting();
+  readPosting();
 });
 
 const VERDICT_TEXT = {
@@ -133,63 +132,72 @@ function render(result) {
 // extension runs on a job site before that press, and the injection reads the text the
 // page has already rendered — it does not fetch, follow, or expand anything.
 function readVisiblePosting() {
-  const CONTAINERS = [
-    ".jobs-search__job-details--wrapper",
-    ".jobs-search__job-details--container",
-    ".jobs-details__main-content",
-    ".jobs-details",
-    ".job-view-layout",
-    "#jobsearch-ViewjobPaneWrapper",
-    ".jobsearch-JobComponent",
-    "main"
-  ];
-  let pane = document.body;
-  let matched = "fallback_body";
-  for (const selector of CONTAINERS) {
-    const node = document.querySelector(selector);
-    if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
+  // LinkedIn's search view keeps the list and the open posting in one tree, and its
+  // document title is the search, not the job. The posting is the part that links to the
+  // job the URL says is current, so find that link and read its container.
+  const currentId = new URLSearchParams(location.search).get("currentJobId")
+    || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
+  let pane = null;
+  let matched = "";
+  if (currentId) {
+    const anchor = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
+    let node = anchor;
+    while (node && node !== document.body) {
+      if ((node.innerText || "").trim().length > 600) { pane = node; matched = "current_job_pane"; break; }
+      node = node.parentElement;
+    }
   }
+  if (!pane) {
+    for (const selector of [".jobs-search__job-details--wrapper", ".jobs-details__main-content",
+                            ".jobs-details", ".job-view-layout", "#jobsearch-ViewjobPaneWrapper",
+                            ".jobsearch-JobComponent", "main"]) {
+      const node = document.querySelector(selector);
+      if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
+    }
+  }
+  if (!pane) { pane = document.body; matched = "fallback_body"; }
+
   let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
-  // The pane also holds the site's own headings — a feedback prompt, a section label — so
-  // pick the first heading that reads like a job title rather than the first heading.
-  const CHROME_HEADINGS = /^(are these results|about the job|people (also viewed|you can)|similar jobs|job search|meet the hiring|set alert|show more|premium)/i;
+  const CHROME_HEADINGS = /^(are these results|about the job|people (also viewed|you can)|similar jobs|job search|meet the hiring|set alert|show more|premium|jobs? you)/i;
   const heading = [...pane.querySelectorAll("h1, h2")]
     .map((node) => (node.innerText || "").trim())
     .find((value) => value.length > 2 && value.length < 140
                      && !value.endsWith("?") && !CHROME_HEADINGS.test(value));
-  // LinkedIn writes "Employer hiring Title in Location" into the document title.
+  // The standalone job view puts "Employer hiring Title in Location" in the document
+  // title; the search view puts the search there, so it is only trusted when it parses.
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
-  // The document title is the reliable source on LinkedIn; a heading inside the pane may
-  // belong to any of the site's own widgets, and blocklisting them never finishes.
   const title = (documentMatch?.groups?.title || heading || fromDocument).trim();
   const employer = documentMatch?.groups?.employer?.trim() || "";
   // Not named `location`: that shadows window.location for the whole function.
   const place = documentMatch?.groups?.location?.trim() || "";
-  // A search page keeps the result list and the open posting in one container. When the
-  // title appears inside the text, everything before it is the list, so drop it.
-  if ((title && matched === "main") || matched === "fallback_body") {
-    const start = text.indexOf(title);
-    if (title && start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
+  if (matched === "main" || matched === "fallback_body") {
+    const start = title ? text.indexOf(title) : -1;
+    if (start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
   }
-  return { url: window.location.href.split("?")[0], text: text.slice(0, 60000), title,
-           employer, location: place, container: matched };
+  return { url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
+           title, employer, location: place, container: matched };
 }
 
-async function readPosting() {
-  $("status").textContent = "reading the open posting…";
-  $("result").hidden = true;
+// Following the user to the posting they just clicked is not the same as going somewhere
+// they are not. The listener is scoped to the tab they are on, runs only while this panel
+// is open, and reads nothing until the posting they are looking at actually changes.
+let lastPostingKey = "";
+
+async function readPosting({ onlyIfChanged = false } = {}) {
+  if (!state.token || !(await hasPageAccess())) return;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+  if (!onlyIfChanged) { $("status").textContent = "reading the open posting…"; }
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) throw new Error("no active tab");
-    if (!(await hasPageAccess())) throw new Error("page access not granted yet");
-    // activeTab is granted by the user's own click, and covers this tab only.
     const [injected] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: readVisiblePosting
+      target: { tabId: tab.id }, func: readVisiblePosting
     });
     const page = injected?.result;
     if (!page?.text) throw new Error("this page did not return a posting");
+    const key = page.postingId || page.url;
+    if (onlyIfChanged && key === lastPostingKey) return;
+    lastPostingKey = key;
     const response = await fetch(`${state.endpoint}/positioning`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
@@ -197,16 +205,20 @@ async function readPosting() {
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || `bridge returned ${response.status}`);
-    $("status").textContent = page.container === "fallback_body"
-      ? `read the whole page; the posting pane was not recognised (${page.text.length} chars)`
-      : `read from ${page.container}`;
+    $("status").textContent = page.container.startsWith("current_job_pane")
+      ? "" : `read from ${page.container}`;
     render(body);
   } catch (error) {
-    $("status").textContent = String(error.message || error);
+    if (!onlyIfChanged) $("status").textContent = String(error.message || error);
   }
 }
 
-$("read").addEventListener("click", readPosting);
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (active?.id !== tabId) return;   // never a tab the user is not on
+  readPosting({ onlyIfChanged: true });
+});
 
 loadSettings();
 refreshAccess();
