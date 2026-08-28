@@ -70,6 +70,31 @@ An application cannot enter `ready_to_fill`, be acquired by a fill worker, enter
 
 Record `prepared`, `locked`, and `submitted` usage separately. Never place resume content or CandidateFact values in event metadata.
 
+## Resume variants
+
+A SearchPortfolio allocates the user's applications across every direction they pursue. A
+**ResumeVariant** allocates one resume's own share across the subset of directions it can
+honestly answer. These are two separate weightings over the same directions and they do not
+have to agree: a portfolio may send 20% of applications to consulting while a healthcare
+research resume covers no consulting at all.
+
+Register a variant with one user-provided file and a coverage list of one to twenty
+directions, each naming its exact approved profile SHA-256 and a weight; weights must total
+100. Registration creates **one immutable ResumeVersion per covered direction** from the same
+bytes, each with its own physical snapshot, all sharing `variant_id` and `source_mode:
+user_provided`. Selection, binding, locking, and readiness stay per-direction and unchanged —
+a variant is an approval and coverage object, not a new resume kind.
+
+Approval is one user action over the exact coverage hash. Every member still runs the full
+per-version approval: active user-registered candidate snapshot, unchanged direction profile,
+and a claims manifest whose every claim resolves to an available fact. If any member fails,
+none is approved and the manifest snapshots written before the failure are removed. Revoking
+the variant revokes every member with it, so coverage cannot outlive the variant.
+
+`variant_allocation_status` reports rolling deficits over the variant's own directions and
+weights, from the same persisted review pool `portfolio_allocation_status` reads. A direction
+the resume does not cover is not the variant's business and never appears in its targets.
+
 ## Private storage
 
 Keep the database, resume snapshots, claims manifests, and CandidateFact artifacts under `.jobloom/`. They contain personal data and must not be committed by default.

@@ -1897,6 +1897,39 @@ def portfolio_allocation_status(connection: sqlite3.Connection,
 
 
 
+def variant_allocation_status(connection: sqlite3.Connection, variant_id: str,
+                              window_size: int = DEFAULT_POOL_WINDOW) -> dict[str, Any]:
+    """Deficits for one resume variant, over its own directions and its own weights.
+
+    Same rolling pool as `portfolio_allocation_status`, restricted to the directions this
+    resume actually covers: the portfolio says how the user's applications are split overall,
+    the variant says how this one resume's share of them is split.
+    """
+    require_table(connection, "resume_variants")
+    variant = connection.execute(
+        "SELECT * FROM resume_variants WHERE variant_id=?", (variant_id,)).fetchone()
+    if not variant or variant["status"] != "approved":
+        raise ValueError("approved resume variant not found")
+    allocations = [
+        {"direction_id": row["direction_id"], "weight_percent": row["weight_percent"]}
+        for row in connection.execute(
+            "SELECT direction_id, weight_percent FROM resume_variant_directions "
+            "WHERE variant_id=? ORDER BY direction_id", (variant_id,))
+    ]
+    covered = {item["direction_id"] for item in allocations}
+    pool = [record for record in review_pool(connection, window_size)
+            if record["direction_id"] in covered]
+    targets = rolling_allocation_targets(
+        allocations, [record["direction_id"] for record in pool], window_size)
+    return {
+        "variant_id": variant_id, "window_size": window_size, "pool_size": len(pool),
+        "targets": targets,
+        "underfilled_directions": [item["direction_id"] for item in targets if item["deficit"] > 0],
+        "investigation_required_job_ids": sorted(
+            {record["job_id"] for record in pool if record["investigation_required"]}),
+    }
+
+
 def _base_resume(connection: sqlite3.Connection, direction_id: str) -> sqlite3.Row:
     row = connection.execute("""
         SELECT * FROM resume_versions

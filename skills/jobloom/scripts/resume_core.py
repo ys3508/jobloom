@@ -136,6 +136,28 @@ def initialize(connection: sqlite3.Connection) -> None:
             metadata_json TEXT NOT NULL,
             FOREIGN KEY (version_id) REFERENCES resume_versions(version_id)
         );
+
+        CREATE TABLE IF NOT EXISTS resume_variants (
+            variant_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            coverage_json TEXT NOT NULL,
+            coverage_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            revoked_at TEXT,
+            status_reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS resume_variant_directions (
+            variant_id TEXT NOT NULL,
+            direction_id TEXT NOT NULL,
+            profile_sha256 TEXT NOT NULL,
+            weight_percent INTEGER NOT NULL,
+            PRIMARY KEY (variant_id, direction_id),
+            FOREIGN KEY (variant_id) REFERENCES resume_variants(variant_id)
+        );
     """)
     lock_columns = {row[1] for row in connection.execute("PRAGMA table_info(material_locks)")}
     if "cover_letter_file_sha256" not in lock_columns:
@@ -153,6 +175,8 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE resume_versions ADD COLUMN baseline_plan_id TEXT")
     if "rendered_page_count" not in version_columns:
         connection.execute("ALTER TABLE resume_versions ADD COLUMN rendered_page_count INTEGER")
+    if "variant_id" not in version_columns:
+        connection.execute("ALTER TABLE resume_versions ADD COLUMN variant_id TEXT")
     connection.commit()
 
 
@@ -486,7 +510,7 @@ def verify_version_file(row: sqlite3.Row) -> None:
             raise ValueError("claims manifest snapshot hash mismatch")
 
 
-def approve_version(
+def _approve_version(
     connection: sqlite3.Connection,
     version_id: str,
     candidate_path: Path,
@@ -561,9 +585,25 @@ def approve_version(
     """, (candidate_hash, str(manifest_snapshot), manifest_hash, timestamp, actor,
           rendered_page_count, version_id))
     _event(connection, version_id, actor, "approved", "claims_and_file_verified", at=at)
-    connection.commit()
     return {"version_id": version_id, "status": "approved", "candidate_profile_sha256": candidate_hash,
-            "claims_manifest_sha256": manifest_hash, "file_sha256": row["file_sha256"]}
+            "claims_manifest_sha256": manifest_hash, "file_sha256": row["file_sha256"],
+            "claims_manifest_path": str(manifest_snapshot)}
+
+
+def approve_version(
+    connection: sqlite3.Connection,
+    version_id: str,
+    candidate_path: Path,
+    manifest_path: Path,
+    actor: str,
+    at: datetime | None = None,
+    rendered_page_count: int | None = None,
+) -> dict[str, Any]:
+    """Approve one ResumeVersion. A variant approves its members in one transaction instead."""
+    result = _approve_version(connection, version_id, candidate_path, manifest_path, actor,
+                             at, rendered_page_count)
+    connection.commit()
+    return result
 
 
 def revoke_version(
@@ -598,6 +638,212 @@ def revoke_version(
     _event(connection, version_id, actor, "revoked", reason, at=at)
     connection.commit()
     return {"version_id": version_id, "status": "revoked"}
+
+
+VARIANT_COVERAGE_KEYS = {"direction_id", "profile_sha256", "weight_percent"}
+
+
+def validate_variant_coverage(coverage: Any) -> list[dict[str, Any]]:
+    """One resume, several directions, its own weights.
+
+    A portfolio allocates applications across every direction the user pursues. A variant
+    allocates one resume's own attention across the subset it can honestly answer, so the two
+    weightings are separate and need not agree.
+    """
+    if not isinstance(coverage, list) or not 1 <= len(coverage) <= 20:
+        raise ValueError("resume variant coverage requires between one and twenty directions")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total = 0
+    for entry in coverage:
+        if not isinstance(entry, dict) or set(entry) != VARIANT_COVERAGE_KEYS:
+            raise ValueError("resume variant coverage entry has missing or unknown fields")
+        direction_id = entry["direction_id"]
+        _require_safe_id(direction_id, "direction_id")
+        if direction_id in seen:
+            raise ValueError("resume variant coverage direction IDs must be unique")
+        seen.add(direction_id)
+        digest = entry["profile_sha256"]
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)):
+            raise ValueError("resume variant coverage requires a lowercase SHA-256")
+        weight = entry["weight_percent"]
+        if isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 100:
+            raise ValueError("resume variant weight_percent must be an integer from 1 to 100")
+        total += weight
+        normalized.append({"direction_id": direction_id, "profile_sha256": digest,
+                           "weight_percent": weight})
+    if total != 100:
+        raise ValueError("resume variant weights must total 100")
+    return sorted(normalized, key=lambda item: item["direction_id"])
+
+
+def _member_version_id(variant_id: str, direction_id: str) -> str:
+    version_id = f"{variant_id}--{direction_id}"
+    if not SAFE_ID.fullmatch(version_id):
+        raise ValueError("variant and direction IDs are too long to form a member version ID")
+    return version_id
+
+
+def register_variant(
+    connection: sqlite3.Connection,
+    variant_id: str,
+    name: str,
+    coverage: list[dict[str, Any]],
+    source_file: Path,
+    store: Path,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Register one user-provided resume as a draft member version per covered direction.
+
+    Every member is a physical snapshot of the same bytes, so each direction keeps its own
+    immutable artifact and every downstream selection, binding and lock stays per-direction.
+    """
+    _require_safe_id(variant_id, "variant_id")
+    if not isinstance(name, str) or not name.strip() or len(name) > 200:
+        raise ValueError("resume variant name is required and must be bounded")
+    value = validate_variant_coverage(coverage)
+    if connection.execute(
+        "SELECT 1 FROM resume_variants WHERE variant_id=?", (variant_id,)
+    ).fetchone():
+        raise ValueError("resume variant already exists")
+    # A variant is defined in terms of directions, so the registry is a hard dependency.
+    require_table(connection, "search_directions")
+    for entry in value:
+        # Raises unless the direction is user-approved and inside the active portfolio.
+        direction_row = _active_direction(connection, entry["direction_id"])
+        if direction_row["profile_sha256"] != entry["profile_sha256"]:
+            raise ValueError(f"covered direction profile has moved: {entry['direction_id']}")
+    digest = canonical_hash(value)
+    timestamp = (at or now_utc()).isoformat()
+    members = []
+    try:
+        connection.execute("""
+            INSERT INTO resume_variants (
+                variant_id, name, coverage_json, coverage_sha256, status, created_at
+            ) VALUES (?, ?, ?, ?, 'draft', ?)
+        """, (variant_id, name.strip(), json.dumps(value, sort_keys=True, separators=(",", ":")),
+              digest, timestamp))
+        for entry in value:
+            connection.execute("""
+                INSERT INTO resume_variant_directions (
+                    variant_id, direction_id, profile_sha256, weight_percent
+                ) VALUES (?, ?, ?, ?)
+            """, (variant_id, entry["direction_id"], entry["profile_sha256"],
+                  entry["weight_percent"]))
+            version_id = _member_version_id(variant_id, entry["direction_id"])
+            register_version(
+                connection, version_id=version_id, source_file=source_file, kind="direction",
+                direction=entry["direction_id"], store=store, at=at, source_mode="user_provided",
+            )
+            connection.execute(
+                "UPDATE resume_versions SET variant_id=? WHERE version_id=?",
+                (variant_id, version_id))
+            members.append(version_id)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        for version_id in members:
+            directory = store.resolve() / version_id
+            for path in sorted(directory.glob("*")) if directory.exists() else []:
+                path.unlink()
+            if directory.exists():
+                directory.rmdir()
+        raise
+    return {"variant_id": variant_id, "status": "draft", "coverage_sha256": digest,
+            "member_version_ids": members}
+
+
+def approve_variant(
+    connection: sqlite3.Connection,
+    variant_id: str,
+    candidate_path: Path,
+    manifest_path: Path,
+    actor: str,
+    expected_coverage_sha256: str,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Approve every member of a variant in one transaction, or none of them.
+
+    Each member still runs the full per-version approval: active candidate snapshot, unchanged
+    direction profile, and a claims manifest whose every claim resolves to an available fact.
+    """
+    if actor != "user":
+        raise ValueError("resume variant approval requires the user actor")
+    row = connection.execute(
+        "SELECT * FROM resume_variants WHERE variant_id=?", (variant_id,)).fetchone()
+    if not row or row["status"] != "draft":
+        raise ValueError("draft resume variant not found")
+    if row["coverage_sha256"] != expected_coverage_sha256:
+        raise ValueError("resume variant coverage hash does not match user-reviewed content")
+    if canonical_hash(json.loads(row["coverage_json"])) != row["coverage_sha256"]:
+        raise ValueError("stored resume variant coverage hash is invalid")
+    members = [item["version_id"] for item in connection.execute(
+        "SELECT version_id FROM resume_versions WHERE variant_id=? ORDER BY version_id",
+        (variant_id,))]
+    if not members:
+        raise ValueError("resume variant has no member versions")
+    written: list[Path] = []
+    timestamp = (at or now_utc()).isoformat()
+    try:
+        results = []
+        for version_id in members:
+            result = _approve_version(connection, version_id, candidate_path, manifest_path,
+                                      actor, at)
+            written.append(Path(result["claims_manifest_path"]))
+            results.append(result)
+        connection.execute("""
+            UPDATE resume_variants SET status='approved', approved_at=?, approved_by=?,
+                status_reason='user_approved' WHERE variant_id=?
+        """, (timestamp, actor, variant_id))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        for path in written:
+            if path.exists():
+                path.chmod(0o600)
+                path.unlink()
+        raise
+    return {"variant_id": variant_id, "status": "approved",
+            "coverage_sha256": row["coverage_sha256"],
+            "approved_version_ids": members,
+            "candidate_profile_sha256": results[0]["candidate_profile_sha256"]}
+
+
+def revoke_variant(
+    connection: sqlite3.Connection,
+    variant_id: str,
+    actor: str,
+    reason: str,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Revoke a variant and every approved member with it, so coverage cannot outlive it."""
+    if actor != "user":
+        raise ValueError("resume variant revocation requires the user actor")
+    if not reason.strip():
+        raise ValueError("revocation reason is required")
+    row = connection.execute(
+        "SELECT * FROM resume_variants WHERE variant_id=?", (variant_id,)).fetchone()
+    if not row or row["status"] != "approved":
+        raise ValueError("approved resume variant not found")
+    timestamp = (at or now_utc()).isoformat()
+    revoked = []
+    for item in connection.execute(
+        "SELECT version_id FROM resume_versions WHERE variant_id=? AND status='approved' "
+        "ORDER BY version_id", (variant_id,)
+    ).fetchall():
+        connection.execute("""
+            UPDATE resume_versions SET status='revoked', revoked_at=?, status_reason=?
+            WHERE version_id=?
+        """, (timestamp, reason.strip(), item["version_id"]))
+        _event(connection, item["version_id"], actor, "revoked", "variant_revoked", at=at)
+        revoked.append(item["version_id"])
+    connection.execute("""
+        UPDATE resume_variants SET status='revoked', revoked_at=?, status_reason=?
+        WHERE variant_id=?
+    """, (timestamp, reason.strip(), variant_id))
+    connection.commit()
+    return {"variant_id": variant_id, "status": "revoked", "revoked_version_ids": revoked}
 
 
 def select_approved(connection: sqlite3.Connection, direction: str, kind: str | None = None) -> dict[str, Any] | None:
@@ -780,6 +1026,21 @@ def main() -> None:
     lock.add_argument("--application-id", required=True)
     lock.add_argument("--actor", default="system")
     lock.add_argument("--lock-id")
+    register_variant_parser = commands.add_parser("register-variant")
+    register_variant_parser.add_argument("--file", required=True, type=Path)
+    register_variant_parser.add_argument("--variant-id", required=True)
+    register_variant_parser.add_argument("--name", required=True)
+    register_variant_parser.add_argument("--coverage", required=True, type=Path)
+    approve_variant_parser = commands.add_parser("approve-variant")
+    approve_variant_parser.add_argument("--variant-id", required=True)
+    approve_variant_parser.add_argument("--candidate", required=True, type=Path)
+    approve_variant_parser.add_argument("--manifest", required=True, type=Path)
+    approve_variant_parser.add_argument("--actor", required=True)
+    approve_variant_parser.add_argument("--expected-coverage-sha256", required=True)
+    revoke_variant_parser = commands.add_parser("revoke-variant")
+    revoke_variant_parser.add_argument("--variant-id", required=True)
+    revoke_variant_parser.add_argument("--actor", required=True)
+    revoke_variant_parser.add_argument("--reason", required=True)
     commands.add_parser("status")
     args = parser.parse_args()
     args.db.parent.mkdir(parents=True, exist_ok=True)
@@ -798,6 +1059,15 @@ def main() -> None:
                                  args.actor, rendered_page_count=args.rendered_page_count)
     elif args.command == "revoke":
         result = revoke_version(connection, args.version_id, args.actor, args.reason)
+    elif args.command == "register-variant":
+        coverage = json.loads(args.coverage.read_text(encoding="utf-8"))
+        result = register_variant(connection, args.variant_id, args.name,
+                                  coverage.get("coverage", coverage), args.file, store)
+    elif args.command == "approve-variant":
+        result = approve_variant(connection, args.variant_id, args.candidate, args.manifest,
+                                 args.actor, args.expected_coverage_sha256)
+    elif args.command == "revoke-variant":
+        result = revoke_variant(connection, args.variant_id, args.actor, args.reason)
     elif args.command == "select":
         result = select_approved(connection, args.direction, args.kind)
     elif args.command == "bind":
