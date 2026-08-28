@@ -114,180 +114,245 @@ V2 不推翻 V1，而是把 V1 的"预设 catalog → 对事实打分"降级为�
 
 ---
 
-## 二、Title Ontology
+## 二、Capability 层与 Title Ontology
+
+> 本章为**合并稿**：三表分离、资历正交、title surface 频次溯源、capability 三层、
+> 规则化 strength 来自第二轮外部评审；五级证据分档、绑定字段作用域、样本充分性
+> 来自本仓库现有强制机制。分歧处以仓库为准，逐条注明。
 
 ### 2.1 为什么必须有
 
-现状：`career-direction-catalog.json` 的 `target_titles` 是**手写字符串数组**，
-`direction_core.GROUP_FIELDS["target_titles"] = {"title"}` 只做 token 序列匹配。
-后果有三：
+`career-direction-catalog.json` 的 `target_titles` 是手写字符串数组，
+`direction_core.GROUP_FIELDS["target_titles"] = {"title"}` 只做 token 序列匹配。后果：
 
-1. `Computational Research Associate` 不在任何列表里 → 只能靠 discovery 关键词救回 review
-   （已在真实岗位上观察到）。
+1. `Computational Research Associate` 不在任何列表里 → 只能靠 discovery 关键词救回 review（真实岗位上已观察到）。
 2. `Research Analyst II` 与 `Research Analyst` 是两条独立字符串，无规范化关系。
-3. 无法从方向**确定性地**生成搜索查询，只能靠人或模型现编。
+3. 无法从方向**确定性地**生成搜索查询。
+4. title 命中与"是否真的合适"混为一谈。
 
-### 2.2 数据结构
+**核心分工**：title 只负责**够到**岗位；是否合适由 capability 对账决定。
 
-单独的版本化制品：`skills/jobloom/assets/title-ontology/<version>/ontology.json`
+### 2.2 四张分离的表
+
+```
+Capability          ← 本体骨架，手工维护 + 数据校准，SKILL 层几百个量级
+FunctionNode        ← 职能节点，DAG（允许多父），引用 Capability 构成 signature
+TitleSurface        ← 市场真实出现过的脏标题串，由抓取数据增长，频次即置信度
+SeniorityLadder     ← 资历刻度，与职能正交，跨职能复用
+```
+
+### 2.3 Capability 三层
+
+粒度不是"选一个刻度"，而是**分层承担不同职责**：
+
+| 层 | 量级 | 是否本体节点 | 职责 |
+|---|---|---|---|
+| `DOMAIN` | 几十 | 是 | 给方向命名、算大类覆盖。**不参与精确对账** |
+| `SKILL` | 几百 | 是 | `capability_signature` 列的东西，**对账的唯一单位** |
+| `TOOL / EVIDENCE` | 无限 | **否** | `SPSS`、`17% 增长`、`focus groups`——只存在于 `evidence_patterns` 里，是数据不是节点 |
+
+TOOL 层不进本体，是这套设计不膨胀的关键：它可以无限增长而本体结构不动。
+
+**SKILL 的准入判据（硬性）**：
+> 一个 SKILL 必须能被至少一条 `evidence_pattern` 从真实事实文本里判命中。
+
+判不出来的要么太抽象（`战略思维`——没有任何 token 能命中），要么其实是 DOMAIN。
+这条判据同时挡住"太细"（`SPSS 里的卡方检验`不单列，它只是 `stats_analysis` 的一条 pattern）
+与"太粗"两端。
+
+**粒度的数据校准（非拍脑袋）**：
+- 拿 ≥20 份真实履历跑一遍
+- 从未被任何履历命中的 SKILL = 死节点 → 删除
+- 命中率 > 80% 的 SKILL = 太粗（人人都有则不区分方向）→ 拆分
+- 补充判据：一个 SKILL 的粒度合适，当且仅当它能出现在 ≥3 家不同雇主的 JD 中
+  （由 MRP 提供），**且**能被 ≥2 条来自不同经历的事实支撑。两侧都可测。
+
+### 2.4 Capability schema
 
 ```json
 {
-  "schema_version": "0.1.0",
-  "ontology_version": "2026.08.0",
-  "sources": [
-    {
-      "source_id": "onet",
-      "name": "O*NET 31.0 Database",
-      "license": "CC BY 4.0",
-      "url": "https://www.onetcenter.org/database.html",
-      "version_url": "https://www.onetcenter.org/db_releases.html",
-      "license_url": "https://www.onetcenter.org/license_db.html",
-      "retrieved_at": "2026-08-28",
-      "coverage": "US occupations, SOC-aligned"
-    },
-    {
-      "source_id": "esco",
-      "name": "ESCO v1.2.1",
-      "license": "Commission Decision 2011/833/EU reuse terms; attribution required",
-      "url": "https://esco.ec.europa.eu/",
-      "version_url": "https://esco.ec.europa.eu/en/about-esco/escopedia/escopedia/esco-versions",
-      "license_url": "https://esco.ec.europa.eu/en/about-esco/faq?page=1",
-      "retrieved_at": "2026-08-28",
-      "coverage": "EU occupations and skills"
-    },
-    {
-      "source_id": "jobloom",
-      "name": "Jobloom curated",
-      "license": "proprietary",
-      "retrieved_at": "2026-08-28",
-      "coverage": "healthcare / research / life-sciences analytics refinements"
-    }
-  ],
-  "occupations": [
-    {
-      "occupation_id": "occ.research-data-analysis",
-      "role_family": "analytics.research_data",
-      "source_refs": [
-        {"source_id": "jobloom", "code": "jobloom.research-data-analysis", "confidence": "curated"}
-      ],
-      "titles": [
-        {
-          "title_id": "title.research-data-analyst",
-          "canonical_title": "Research Data Analyst",
-          "function": "data_analysis",
-          "domain_qualifiers": ["research"],
-          "seniority": "individual_contributor",
-          "seniority_rank": 2,
-          "variants": [
-            {"surface": "Research Data Analyst", "kind": "canonical"},
-            {"surface": "Research Analyst II", "kind": "leveled", "level_token": "II"},
-            {"surface": "Data Analyst, Research", "kind": "inverted"},
-            {"surface": "Research Data Specialist", "kind": "synonym"}
-          ],
-          "requires_domain_guard": true,
-          "domain_guard_terms": ["research", "study", "clinical", "academic", "public health"],
-          "excluded_senses": [
-            {
-              "surface": "Research Analyst",
-              "sense": "equity_research",
-              "disambiguator_terms": ["equity", "sell-side", "buy-side", "securities", "coverage universe"],
-              "action": "fail"
-            },
-            {
-              "surface": "Research Analyst",
-              "sense": "market_research",
-              "disambiguator_terms": ["focus group", "survey panel", "brand tracking", "consumer insights"],
-              "action": "review"
-            }
-          ],
-          "adjacent_titles": [
-            {"title_id": "title.clinical-research-data-analyst", "relation": "specialization", "distance": 1},
-            {"title_id": "title.data-analyst", "relation": "generalization", "distance": 1},
-            {"title_id": "title.biostatistician", "relation": "sibling", "distance": 2}
-          ],
-          "search_query_templates": [
-            {"template_id": "exact", "pattern": "\"{canonical_title}\"", "engines": ["linkedin", "indeed"]},
-            {"template_id": "domain_qualified", "pattern": "\"{canonical_title}\" {domain_guard}", "engines": ["linkedin", "indeed"]},
-            {"template_id": "skill_discovery", "pattern": "{domain_guard} \"{skill_a}\" \"{skill_b}\" analyst", "engines": ["linkedin"]}
-          ]
-        }
-      ]
-    }
-  ],
-  "alias_index": [
-    {
-      "surface": "data analyst",
-      "resolves_to": ["title.data-analyst", "title.research-data-analyst", "title.clinical-data-analyst"],
-      "resolution": "ambiguous",
-      "requires_domain_guard": true
-    }
+  "capability_id": "cap.survey_design",
+  "layer": "SKILL",
+  "canonical_label": "Survey and focus-group design",
+  "rollup_to": ["cap.market_research"],
+  "evidence_patterns": [
+    {"pattern_id": "p1", "type": "token_run", "lang": "en", "tokens": ["focus", "group"], "inflect": true},
+    {"pattern_id": "p2", "type": "token_run", "lang": "en", "tokens": ["survey", "design"], "inflect": true},
+    {"pattern_id": "p3", "type": "substring", "lang": "zh", "text": "焦点小组"},
+    {"pattern_id": "p4", "type": "semantic_anchor", "anchor": "designed and ran structured research",
+     "max_grade": "transferable", "requires_confirmation": true}
   ]
 }
 ```
 
-### 2.3 规范化算法（确定性）
+**对账靠 pattern，不靠 id 相等。** 这一条与仓库现状一致：
+`evidence_matcher.fact_supports` 本来就是拿要求的 token 去事实文本里找，
+**不要求事实携带分类标签**。抽取阶段只需存原始事实与 token，分类推迟到对账时，且多路 OR。
 
-```
-normalize_title(raw_title) -> TitleResolution
-  1. surface  := casefold(raw); 折叠多空格；去尾随标点
-  2. 先执行非职级语义守卫：若职级词与 `SENIORITY_GUARD_FOLLOWERS` 中的后继词组成
-       受保护短语（例如 `senior care`），则将该 token 标为 protected，不得剥离
-  3. 仅剥离未受保护的 level token：正则
-       ^(sr|senior|jr|junior)\b 或 \b(i|ii|iii|iv|v|1|2|3|4)$
-       → level_token；剥离结果为 base_surface
-  4. 在 alias_index 精确查 base_surface
-       命中 resolution="unique"    → 绑定该 title_id
-       命中 resolution="ambiguous" → 进入 5
-       未命中                      → 进入 6
-  5. 歧义消解：仅用 domain_guard_terms 在 **JobCard 结构化字段**中判定
-       （title / summary / responsibilities / required_skills / employer）
-       恰好一个 title 的 guard 命中 → 绑定
-       零个或多个命中               → TitleResolution.status = "ambiguous"，方向不得自动匹配
-  6. 未知 title：不猜测。status = "unmapped"，记录 surface 供 ontology 扩展审阅
-  7. excluded_senses：若 disambiguator_terms 命中，按 action 返回 fail / review，
-       **优先于**任何正向绑定
+### 2.5 ⚠ 两个必须先解决的实现障碍（实测）
+
+这两条是拿真实数据打出来的，**不解决则 pattern 机制不成立**：
+
+**障碍 1 — 无词干还原，示例 pattern 当场失效。**
+
+```python
+fact = {"value": "…after leading 2 focus groups and analyzing market data for 3 drugs."}
+fact_supports("focus group",  fact)   # False   ← 事实里是 groups
+fact_supports("focus groups", fact)   # True
 ```
 
-### 2.4 防"正文出现即误判为职位名"
+外部评审给的示例 pattern 正是 `focus group`，在候选人真实事实上**不命中**。
+`evidence_matcher.tokens` 只有一张两条目的 `TOKEN_ALIASES`（statistics/statistical），
+没有任何屈折处理。
 
-现有 `direction_core` 已经把 `target_titles` 的字段作用域锁死在 `title`
-（`GROUP_FIELDS`），正文里的 title 只会触发 `contextual_title_reference_only`。
-**V2 必须保持这条，并额外要求：**
+> **规格要求**：`evidence_pattern` 不得直接复用 `fact_supports`。
+> 新增 `pattern_matcher.py`，支持 `inflect: true`（受控的复数/时态归一，
+> 不是通用词干器）与显式 `variants` 数组。所有 pattern 在 CI 中必须跑一遍
+> "对至少一条黄金样本事实命中"的断言，否则视为死 pattern 并拒绝入库。
 
-- ontology 解析只读 `job.title`；`summary`/`responsibilities` 仅用于**消歧**，
-  不得用于**绑定**。
-- 归并到规格层的一条规则：`bind_from ⊆ {title}`，`disambiguate_from ⊆ ROUTING_FIELDS`，
-  两个集合在代码常量中分开定义，禁止从 ontology JSON 配置。（与 `GROUP_FIELDS` 同理由：
-  数据不得给自己扩权。）
+**障碍 2 — CJK 分词失效。**
 
-### 2.5 确定性查询生成
+```python
+tokens("焦点小组 问卷设计")        # ['焦点小组', '问卷设计']   ← 靠空格才分开
+tokens("我负责焦点小组与问卷设计")   # ['我负责焦点小组与问卷设计'] ← 整串一个 token
+fact_supports("焦点小组", {"value": "我负责焦点小组与问卷设计"})   # False
+```
+
+`re.findall(r"[^\W_]+…")` 对中文不切分。
+
+> **规格要求**：`evidence_pattern` 必须带 `lang`。
+> `lang: "zh"` 走 `type: "substring"` 精确子串路径，不走 token 路径。
+> 混合语言事实按 pattern 的 lang 分别匹配，结果取 OR。
+
+### 2.6 FunctionNode schema
+
+```json
+{
+  "function_id": "fn.quant_market_research",
+  "canonical_label": "Quantitative market research",
+  "parents": ["fn.market_research"],
+  "role_family": "analytics.market_research",
+  "source_refs": [
+    {"source_id": "onet", "code": "13-1161.00", "confidence": "broader"},
+    {"source_id": "esco", "code": "http://data.europa.eu/esco/occupation/…", "confidence": "narrower"}
+  ],
+  "capability_signature": [
+    {"capability_id": "cap.survey_design",         "weight": 9, "core": true},
+    {"capability_id": "cap.stats_analysis",        "weight": 8, "core": true},
+    {"capability_id": "cap.stakeholder_reporting", "weight": 5, "core": false}
+  ]
+}
+```
+
+**O\*NET / ESCO 的用法（采纳外部评审的修正）**：只取其**职能骨架**作为 FunctionNode 的
+种子与 `source_refs`，**不直接使用它们的 title 表**——那是学术分类，不是招聘市场用词。
+市场用词由 TitleSurface 从真实 JD 里长出来。
+
+### 2.7 TitleSurface schema（数据驱动增长）
+
+```json
+{
+  "surface_id": "ts.research-analyst-ii",
+  "raw": "Research Analyst II",
+  "normalized": "research analyst",
+  "level_token": "II",
+  "maps_to": [
+    {"function_id": "fn.quant_market_research", "confidence": 0.6, "assigned_by": "model", "confirmed_by_user": false},
+    {"function_id": "fn.research_data_analysis", "confidence": 0.4, "assigned_by": "model", "confirmed_by_user": false}
+  ],
+  "requires_domain_guard": true,
+  "domain_guard_terms": ["research", "study", "clinical", "academic", "public health"],
+  "excluded_senses": [
+    {"sense": "equity_research", "disambiguator_terms": ["equity", "sell-side", "securities"], "action": "fail"},
+    {"sense": "market_research", "disambiguator_terms": ["brand tracking", "consumer insights"], "action": "review"}
+  ],
+  "provenance": {"postings_seen": 1203, "distinct_employers": 214,
+                 "first_seen": "2026-03-11", "last_seen": "2026-08-27",
+                 "ontology_version": "2026.09.0"}
+}
+```
+
+**增长与模型使用（采纳）**：新 raw title 进来 → 规则归一化 → 命中已有 surface 则只累加频次；
+未命中则进待映射队列，**此时且仅此时**调用一次模型给候选 `maps_to` + 置信度，
+结果写入缓存**永不再调用**。低置信度（< 0.5）或 `distinct_employers < 3` 的映射
+挂起，不参与 verified 路径。
+
+> **与 N3 的对齐**：模型输出落在受控 `function_id` 枚举内、带 `assigned_by:"model"`、
+> 不参与任何分数、用户可否决。满足不变量。
+
+### 2.8 SeniorityLadder（正交）
+
+```json
+{
+  "ladder": [
+    {"band": "intern",     "rank": 0, "surface_tokens": ["intern", "co-op", "实习"]},
+    {"band": "ic_1",       "rank": 1, "surface_tokens": ["i", "1", "associate", "junior", "jr"]},
+    {"band": "ic_2",       "rank": 2, "surface_tokens": ["ii", "2"]},
+    {"band": "ic_3",       "rank": 3, "surface_tokens": ["iii", "3", "senior", "sr", "资深"]},
+    {"band": "lead",       "rank": 4, "surface_tokens": ["lead", "staff", "principal"]}
+  ]
+}
+```
+
+资历与职能**正交**，避免 `Research Analyst I/II/III` 变成三条独立记录。
+
+### 2.9 规范化与消歧（确定性，顺序不可调换）
+
+```
+normalize_title(raw) -> TitleResolution
+  1. casefold、折叠空格、去尾随标点
+  2. ★ 先跑领域守卫：direction_core.SENIORITY_GUARD_FOLLOWERS
+       "Senior Care Coordinator" 中的 senior 是领域词，不是职级 —— 命中则不剥离
+  3. 剥离 level token（依 SeniorityLadder.surface_tokens）→ level_token + base_surface
+  4. TitleSurface 精确查 base_surface
+       唯一映射（confidence ≥ 0.5 且 confirmed 或 employers ≥ 3）→ 绑定
+       多映射 / 低置信                                        → ambiguous
+       未命中                                                → unmapped，进待映射队列
+  5. 歧义消解：仅用 domain_guard_terms 判定，恰好一个 function 命中才绑定
+  6. excluded_senses 优先于任何正向绑定，按 action 返回 fail / review
+```
+
+**步骤 2 必须先于步骤 3**，否则现有 `Senior Care` 守卫失效（见 E4）。
+
+### 2.10 绑定的字段作用域（不可从数据配置）
+
+```
+bind_from        = {"title"}                 # 代码常量
+disambiguate_from = ROUTING_FIELDS           # 代码常量
+```
+
+与 `direction_core.GROUP_FIELDS` 同理由：**数据不得给自己扩权**。
+正文里出现 `Clinical Data Analyst` 只产生 `contextual_title_reference_only`，永不绑定。
+
+### 2.11 确定性查询生成
 
 ```
 generate_queries(direction) -> Query[]
-  for title in direction.bound_titles (按 seniority_rank 升序, title_id 字典序):
-    for template in title.search_query_templates (按 template_id 字典序):
-      slots := {canonical_title, domain_guard := title.domain_guard_terms[0],
-                skill_a, skill_b := direction 的 top-2 evidence-backed skill terms}
-      if 任一 slot 缺失 → 跳过该 template（不填默认值）
-      yield Query(query_id = sha256(pattern|slots)[:16], text = render(template, slots),
-                  engine = template.engines[i], provenance = {title_id, template_id, ontology_version})
+  surfaces := 反查所有 maps_to ∋ direction.function_id 的 TitleSurface
+              （按 postings_seen 降序、surface_id 字典序）
+  for surface in surfaces[:cfg.MAX_SURFACES]:
+    for template in query_templates (按 template_id 字典序):
+      slots := {raw, domain_guard, skill_a, skill_b := 该方向证据支撑最强的两个 SKILL 标签}
+      if 任一 slot 缺失 → 跳过（不填默认值）
+      yield Query(query_id=sha256(pattern|slots)[:16], text=render(...),
+                  provenance={surface_id, template_id, ontology_version})
 ```
 
-**模型不参与查询串生成。** 查询是 ontology × 模板 × 证据支撑技能的纯函数，
-可复现、可 diff、可回归测试。
+**方向 → 搜索词全程不经过模型**，是 ontology × 模板 × 证据支撑技能的纯函数。
 
-### 2.6 七个易误判 edge case
+### 2.12 易误判 edge cases
 
-| # | 场景 | 期望行为 |
+| # | 场景 | 期望 |
 |---|---|---|
-| E1 | `Research Analyst` 在投行 JD 中（equity research） | `excluded_senses.equity_research` 命中 → **fail**，不进池 |
-| E2 | `Research Analyst II` | 剥离 level token `II` → 绑定 `title.research-data-analyst`；`seniority_rank` 由 level 提升一档，若超出用户 band → `seniority_outside_portfolio` |
-| E3 | `Data Analyst`（无任何领域词） | `alias_index` 标 ambiguous + `requires_domain_guard` → 无 guard 命中则 `ambiguous`，只能进 review，永不 auto-match |
-| E4 | JD 标题 `Senior Care Coordinator` | 现有 `SENIORITY_GUard_FOLLOWERS["senior"] ∋ "care"` 必须继续生效——`senior` 是领域词不是职级。ontology 的 level 剥离**必须在**该守卫之后执行 |
-| E5 | JD 正文写 "you will partner with our Clinical Data Analyst team"，标题是 `Office Coordinator` | 绑定只读 title → 不绑定；正文命中只产生 `contextual_title_reference_only`（现有行为，必须保留） |
-| E6 | `Biostatistician I` vs `Biostatistics Analyst` | 两者均绑到 `occ.biostatistics`，但 `title_id` 不同；去重发生在 **occupation × facet 签名**层，不在字符串层 |
-| E7 | `Clinical Data Manager`（CDM，EDC/CTMS 岗）vs `Clinical Data Analyst` | 不同 `function`（`data_operations` vs `data_analysis`）；`excluded_senses` 不适用，靠 function facet 区分，且 `warning_keywords` 命中 EDC/CTMS 时按义务降级 |
+| E1 | `Research Analyst` 在投行 JD 中 | `excluded_senses.equity_research` → **fail** |
+| E2 | `Research Analyst II` | level `II` 剥离 → 绑定 + `band: ic_2`；超出用户 band 则 `seniority_outside_portfolio` |
+| E3 | `Data Analyst` 无领域词 | `ambiguous`，只能 review，永不 auto-match |
+| E4 | `Senior Care Coordinator` | 守卫先于剥离 → `senior` 不作职级 |
+| E5 | 正文出现 `Clinical Data Analyst`，标题不是 | 不绑定，只 `contextual_title_reference_only` |
+| E6 | `Biostatistician` vs `Biostatistics Analyst` | 同 `function_id`，去重发生在 function × facet 层，不在字符串层 |
+| E7 | `Clinical Data Manager`(EDC/CTMS) vs `Clinical Data Analyst` | 不同 capability_signature；`warning_keywords` 按义务降级 |
+| E8 | pattern `focus group`，事实写 `focus groups` | `inflect: true` 必须命中；无屈折处理则视为规格缺陷（见 2.5） |
+| E9 | 中文 pattern 对无空格中文事实 | 走 substring 路径命中；走 token 路径视为缺陷 |
 
 ---
 
@@ -405,6 +470,128 @@ S2 必须另外产生有类型的关系强度：
 | **计算结果**（确定性函数） | 全部 `axes.*`、`diversity`、`coverage`、`readiness`、`ranking` | 必须可由输入重算复现；须带 `rule_id` |
 | **用户输入** | `career_goals`（desired/avoid/priorities）、方向选择、weights、facet 确认 | 缺失时相关轴为 `null` + `null_reason`，**禁止填默认值** |
 | **模型提议 + 规则校验** | 未命中单元的 facet 标签、簇命名、elicitation 问题措辞 | 落受控枚举、写 `proposed_by:"model"`、不参与计算、用户可否决 |
+
+### 3.3b Evidence Ref、strength 与四种 gap（合并稿）
+
+#### EvidenceRef
+
+```json
+{
+  "fact_id": "fact-0077",
+  "capability_id": "cap.survey_design",
+  "grade": "direct",
+  "grade_source": "pattern_hit",
+  "pattern_id": "p2",
+  "strength": 0.85,
+  "signals_fired": ["quantified(+0.25)", "outcome_verb(+0.15)", "first_owner(+0.15)"],
+  "rationale_ref": {"snapshot_sha256": "206d89bb…", "fact_id": "fact-0077"}
+}
+```
+
+**只存指针与分级，不存生成好的文案。** 与现有 BaselinePlan 同规矩
+（`plan holds fact IDs and reason codes only — never fact values`），
+文案在下游定制时即时生成，避免版本指针漂移。
+
+#### grade 用仓库的五级，不是三级（分歧处以仓库为准）
+
+外部评审提出 `DIRECT / TRANSFERABLE / ABSENT` 三级。**本规格不采纳**，理由是五级已在四处强制：
+
+| 强制点 | 作用 |
+|---|---|
+| `candidate_core.py:173` | 事实注册拒绝未知强度值 |
+| `resume_core.py:484` | claims manifest 拒绝声明超过其支撑事实的强度 |
+| `evaluate_job.py:141` | `supported` 阈值 = `strongly_related` 及以上 |
+| `evidence_matcher.EVIDENCE_ORDER` | 路由与评估共用 |
+
+塌成三级要么再造第四套证据词汇（本项目的复发性缺陷），要么迁移已 locked 的事实。
+`mention_only` 正是给技能清单类事实封顶用的，`strongly_related` 是"没有抬高"的分界线，
+两级都承重。
+
+> **顺带修复**：`resume_core.EVIDENCE_RANK` 与 `evidence_matcher.EVIDENCE_ORDER`
+> 是同一张表定义了两遍、内容完全相同。应合并到 `evidence_matcher`，
+> 正合"三处共用一个定义"的原则。
+
+外部评审 `TRANSFERABLE=0.5` 的洞见（"可迁移永不升级"要在算分时落地而非事后提醒）
+**予以保留**，映射到仓库既有的 `STRENGTH_FACTORS`：
+
+```
+grade_factor = {direct: 1.0, strongly_related: 0.85, transferable: 0.6,
+                mention_only: 0.35, none: 0.0}
+```
+
+#### strength：规则化，不用模型
+
+`strength` 回答"这条证据有多硬"，与 `grade` **全程正交**。
+
+```
+strength = clamp(0.30 + Σ signals, 0.0, 1.0)
+
+signals（全部从事实文本规则抽取，每条必须可测）:
+  quantified            +0.25   数字 + 单位/百分号，且邻近成果动词
+  outcome_verb          +0.15   提升/交付/主导/发布 vs 参与/协助/负责
+  scope                 +0.10   团队规模、预算、受众、地域
+  first_owner           +0.15   "我主导" vs "团队完成"
+  duration              +0.05   有时间跨度
+  recency               +0.05 / -0.10   近 3 年 / 超 8 年
+  single_sentence_only  -0.15   无展开
+```
+
+**三条硬约束：**
+
+1. **低 strength 不降 grade，高 strength 不升 grade。** 一条软的 `direct` 仍是 `direct`，
+   动作是 elicitation 而非降级；一条硬的 `transferable` 永远到不了 `direct`。
+   这是"可迁移永不升级"在打分层不被 strength 偷绕的保证。
+2. **`signals_fired` 必须持久化**，喂给两处下游：
+   - elicitation：`single_sentence_only` 触发且 `quantified` 未触发 → 追问话术能直接指出缺什么
+   - 简历定制：优先摆高 strength 的事实，且知道它硬在哪
+3. **`grade_factor` 与 `strength` 是两个独立乘数**，不得与
+   `career_direction_core.FACT_TYPE_STRENGTH_CAPS` 混为一谈——后者是按事实类型封顶
+   `grade` 的上限，作用于 grade 轴；strength 作用于硬度轴。
+   贡献值 = `sig.weight × grade_factor(grade) × strength`。
+
+#### `quantified` 抽取需单独护栏（实测有假阳性）
+
+该信号权重最大，错了会系统性歪。在真实事实库上跑正则 `\d[\d,\.]*\s*[%+]?`，
+以下全部是**假阳性**：
+
+```
+['2023']            <- Columbia University in the City of New York May 2023        （毕业年份）
+['1','2','1','2']   <- Applied Regression 1& 2, Data Science 1&2                   （课程编号）
+['4.0']             <- Master of Public Health …: GPA 4.0                          （成绩，非工作成果）
+```
+
+外部评审提了两条守卫（日期数字、数字离成果太远），**实测还需要第三条**：
+课程/项目编号枚举（`Regression 1& 2`）。
+
+> **规格要求**：`quantity_extractor.py` 独立成模块，带标注样本回归测试，
+> 三条守卫各有测试：日期、距离、编号枚举。它是 strength 里唯一"错了会系统性歪"的环节。
+
+#### 四种 gap：三个布尔分完四类
+
+| kind | 事实库有 | 简历有 | 已量化 | 下游动作 |
+|---|---|---|---|---|
+| `hidden_strength` | ✓ | ✗ | — | 加进简历（合法，是你说过的话） |
+| `resume_gap` | ✓ | ✓ | — | 改写法，**不加事实** |
+| `evidence_gap` | ✓ | ✓ | ✗ | 触发定向 elicitation |
+| `real_gap` | ✗ | ✗ | — | 标 STRETCH，**绝不填补** |
+
+判定全确定性：`fact_store_hit × resume_hit × quantified` 三个布尔。
+唯一需要模型的是 `semantic_anchor` 那一路 pattern，其余全规则。
+
+> **`resume_hit` 的数据来源**：当前 ResumeVersion 的 claims manifest
+> （`resume_core.validate_claims_manifest` 已保证每条 claim 都映射到 fact_ids）。
+> 无已批准简历时 `resume_hit` 为 null，`hidden_strength` 与 `resume_gap` 无法区分，
+> 合并为 `not_yet_presented`。
+
+#### semantic_anchor 的约束（唯一的模型路径）
+
+```
+type: "semantic_anchor" 的 pattern 必须满足：
+  max_grade ≤ "transferable"          # 语义邻近永远到不了 direct/strongly_related
+  requires_confirmation = true        # verified 模式下未经用户确认不计入
+  结果写缓存（pattern_id × fact_id → hit/miss），永不重复调用模型
+  缓存条目带 model_version；model_version 变化即失效重算
+```
 
 ### 3.4 八轴定义
 
@@ -545,6 +732,44 @@ def evidence_gate(d, cfg):
        d.evidence.by_strength["strongly_related"] == []:        reasons.append("no_direct_or_strong_evidence")
     return reasons          # 非空 → readiness 不得高于 "build_toward"
 ```
+
+### 4.5b Capability 对账循环（核心）
+
+```
+def reconcile_capabilities(function_node, facts, resume_claims):
+    refs, gaps = [], []
+    for sig in function_node.capability_signature:
+        cap = ontology.capability(sig.capability_id)
+        hits = []
+        for pattern in cap.evidence_patterns:
+            for fact in facts:
+                if pattern_matcher.match(pattern, fact):            # 多路 OR
+                    grade = min(fact.evidence_strength, pattern.max_grade or "direct")
+                    hits.append(EvidenceRef(fact_id=fact.id, capability_id=cap.id,
+                                            grade=grade, pattern_id=pattern.id,
+                                            strength=strength_score(fact),
+                                            signals_fired=fired(fact)))
+        if hits:
+            refs.extend(hits)
+        else:
+            gaps.append(classify_gap(cap, facts, resume_claims))     # 见 §3.3b 四分类
+
+    weighted_fit = (Σ sig.weight × grade_factor(best_grade(cap)) × best_strength(cap)
+                    for sig in signature) / Σ sig.weight
+    return refs, gaps, weighted_fit
+```
+
+`weighted_fit` 是 `derived: true / not_authoritative: true`，
+`by_strength` 分桶与 `refs` 必须同时持久化，不得只留这一个数（N2）。
+
+**CI 断言（防静默 bug）**：
+
+```
+{cap for fn in function_nodes for cap in fn.capability_signature}
+  ∩ {cap for cap in capabilities if not cap.evidence_patterns}  ==  ∅
+```
+
+签名里引用了一个没有任何 pattern 的 cap，它将**永远 ABSENT**——是个不会报错的静默缺陷。
 
 ### 4.6 Readiness 分档（不是分数）
 
@@ -738,6 +963,10 @@ skills/jobloom/scripts/
   career_direction_pipeline.py S7  编排、去重、收敛、elicitation
   career_intent.py             —   career_goals 校验与意图轴
   career_heuristic_catalog.py  —   V1 catalog，降级为冷启动路径
+  capability_ontology.py       S2/S6 Capability 三层 + FunctionNode + capability_signature
+  pattern_matcher.py           S2  evidence_pattern 匹配（屈折 / CJK / semantic_anchor 缓存）
+  quantity_extractor.py        S1  strength 的 quantified 信号，独立护栏与回归样本
+  title_surface.py             S4  脏标题表面表，频次增长与待映射队列
 ```
 
 `career_direction_core.py` 保留为 **CLI 门面**（薄封装），不再承载算法。
@@ -760,6 +989,14 @@ direction_proposals(proposal_id PK, snapshot_sha256, ontology_version, mode,
                     content_json, content_sha256, created_at)
 direction_proposal_axes(proposal_id, direction_id, axis, value_json, null_reason,
                         rule_id, PRIMARY KEY(proposal_id, direction_id, axis))
+capabilities(capability_id PK, layer, canonical_label, rollup_to_json, patterns_json,
+             ontology_version)
+function_nodes(function_id PK, canonical_label, parents_json, role_family,
+               source_refs_json, capability_signature_json, ontology_version)
+title_surfaces(surface_id PK, raw, normalized, level_token, maps_to_json,
+               guards_json, excluded_senses_json, provenance_json, ontology_version)
+semantic_anchor_cache(pattern_id, fact_id, hit, model_version,
+                      PRIMARY KEY(pattern_id, fact_id, model_version))
 ```
 
 **不改动**任何现有表。`search_directions` / `search_portfolios` 的审批边界原样保留。
@@ -778,7 +1015,7 @@ direction_proposal_axes(proposal_id, direction_id, axis, value_json, null_reason
 
 ---
 
-## 七、验收测试（26 条）
+## 七、验收测试（40 条）
 
 ### provenance 与证据完整性
 
@@ -830,6 +1067,30 @@ direction_proposal_axes(proposal_id, direction_id, axis, value_json, null_reason
 25. `materialize_selection` 收到与 `content_sha256` 不符的提案 → 拒绝（现有行为，回归保护）。
 26. provisional 提案在任何 actor 下都不可 materialize（现有行为，回归保护）。
 
+### Capability 与 pattern
+
+27. 每个 `capability_signature` 引用的 cap 都至少挂一条 `evidence_pattern`（CI 断言，交集为空）。
+28. 每条 `evidence_pattern` 至少命中一条黄金样本事实；从不命中的 pattern 拒绝入库。
+29. pattern `focus group` 必须命中事实文本 `focus groups`（`inflect: true` 回归）。
+30. 中文 pattern `焦点小组` 必须命中无空格中文事实 `我负责焦点小组与问卷设计`（substring 路径回归）。
+31. `semantic_anchor` 命中的 grade 永远 ≤ `transferable`；verified 模式下未经用户确认不计入。
+32. 20 份履历回归：从未被命中的 SKILL 报为死节点；命中率 > 80% 的 SKILL 报为过粗。
+
+### strength 与 gap
+
+33. `quantified` 不得被毕业年份（`May 2023`）、课程编号（`Regression 1& 2`）、GPA（`4.0`）触发。
+34. 一条 `strength=0.95` 的 `transferable` 证据，其 grade 仍为 `transferable`（不得升级）。
+35. 一条 `strength=0.30` 的 `direct` 证据，其 grade 仍为 `direct`，且触发 elicitation 而非降级。
+36. `signals_fired` 必须持久化，且 elicitation 问题能引用具体未触发的 signal。
+37. 四种 gap 由 `fact_store_hit × resume_hit × quantified` 三布尔唯一确定；
+    无已批准简历时 `hidden_strength` 与 `resume_gap` 合并为 `not_yet_presented`。
+
+### Title Surface 增长
+
+38. 新 raw title 首次出现时模型被调用一次；第二次出现命中缓存，模型调用次数为 0。
+39. `maps_to` 置信度 < 0.5 或 `distinct_employers < 3` 的映射不参与 verified 路径。
+40. `model_version` 变化 → `semantic_anchor` 缓存失效并重算。
+
 ---
 
 ## 八、结论
@@ -874,37 +1135,69 @@ V1 为它新增了 `_effective_strength` 与 `source_evidence` 归并逻辑。
 
 ### 8.2 最先应该实现的 3 个模块
 
-1. **并行建设两组基础模块**：
-   - `title_ontology.py`（S4）——是确定性查询、title 消歧与 top-down 去重的地基；
-   - `evidence_units.py` + `facet_taxonomy.py`（S1/S2）——把事实变成可聚类、可溯源的
-     单元，是修复危险问题 #4 的正解。
-   二者没有相互依赖，不应人为串行；后续对账层同时依赖两者。
-2. **`career_hypothesis.py` + ontology reconciliation（S3/S4 对账）** —— 生成并交汇
-   bottom-up 与 top-down 候选，产出带 provenance 的方向假设。
-3. **`direction_axes.py`（S6 的非市场四轴）** —— 立刻消除 `overall_score` 压平，
-   把 `evidence_fit` / `career_distance` / `narrative_coherence` / `user_intent`
-   分开存储。此模块可在无市场数据时独立上线。
+**顺序有依赖，不可调换。**
 
-市场采集（S5）**排在最后**：它需要真实 JD 积累，且在样本不足时按 N4 返回 null 即可。
+1. **`capability_ontology.py` + `pattern_matcher.py`**
+   先冻结 `capability_signature` 的 schema —— 它同时是本体表字段、对账目标、gap 判据，
+   三处共用一个定义，一改三处全动。`pattern_matcher` 必须先解决 §2.5 的两个障碍
+   （屈折、CJK），否则整套 pattern 机制在真实数据上不成立。
+2. **`evidence_units.py` + `quantity_extractor.py`**
+   把事实变成可对账、可溯源的单元，并把 strength 里唯一会系统性歪的环节
+   （量化抽取）单独护栏化。这是 ROADMAP 模块 1 的实际落地。
+3. **`direction_axes.py`（非市场四轴）**
+   立刻消除 `overall_score` 压平，把 `evidence_fit` / `career_distance` /
+   `narrative_coherence` / `user_intent` 分开存储。可在无市场数据时独立上线。
 
-### 8.3 已固化的产品规则
+`title_ontology.py` 紧随其后（依赖 1）；`market_profile.py` 与采集器**排在最后**
+——TitleSurface 的频次增长和 MRP 都依赖真实抓取量，而仓库目前**没有可用的抓取器**
+（`ingest_job` 对 Workday 这类 SPA 无效）。在那之前按 N4 返回 `null` + 原因码。
 
-1. **概述词不等于直接经验**：简历概述句里单独出现一个领域词，最多形成
-   `mention_only` / contextual 关系；只有同一事实内存在具体行动、对象或产出，且受控规则
-   能把它绑定到该能力时，才可形成 `direct`。用户对具体经历的一次确认可持久化复用，
-   不得在每个岗位上重复询问。
-2. **方向数量宁缺毋滥**：证据只支持 2 个方向时展示 2 个，并给出
-   `fewer_directions_than_target`；不得降低证据门槛凑够 3 个。
+### 8.3 必须由产品所有者拍板的决定
 
-### 8.4 仍需产品所有者拍板的决定
+**证据与打分**
 
-1. **Career Value 的最低输入要求**：要不要强制用户至少填 `desired_roles` 或
-   `skills_to_build` 之一，否则整个意图轴为 null？
-2. **市场样本门槛**：25 条 / 10 家雇主是否合适？门槛越高越可信、越容易 null。
-3. **Ontology 的来源与许可**：是否采用 O*NET（数据库为 CC BY 4.0，需署名）与
-   ESCO（适用 Commission Decision 2011/833/EU 的复用与署名要求）？
-   自建部分的维护责任归谁？版本更新频率？
-4. **用户明确排除的高证据方向如何呈现**：完全隐藏，还是展示但标 `user_excluded`？
-   （本规格默认后者——隐藏等于静默丢弃，与项目原则冲突。）
-5. **排序默认主键**：默认按 `readiness` 还是按 `user_intent`？
-6. **`career_distance` 的度量单位**：facet 跳数是否足够，还是需要引入"预计准备时间"？
+1. **简历概述句里出现一个领域词，算不算该领域的 `direct` 证据？**
+   Codex 已用 `FACT_TYPE_STRENGTH_CAPS` 打补丁，但强度仍是按事实类型批量推断，
+   不是该事实与该能力的真实关系。
+2. **strength 的权重表是否就是产品价值观？**
+   `quantified +0.25` 最重，理由是"带数字的成果最难编、最可查"。
+   这张表一旦写进契约就应稳定，改动需版本化。
+3. **GPA 算不算 `quantified`？** 教育类事实的数字是成绩不是工作成果，
+   本规格默认**不算**（列为假阳性），需确认。
+
+**Capability**
+
+4. **cap 是跨方向共享还是每 FunctionNode 一套？**
+   本规格采纳**共享**（`cap.stats_analysis` 同时被生物统计与市场研究引用），
+   这是"可迁移证据"能成立的前提，代价是需要全局唯一的 cap 词表与别名管理。
+5. **SKILL 层的目标规模？** 几百个是外部评审的估计；起步阶段先做多少个？
+   建议先只覆盖当前组合的三个方向，用 20 份履历校准后再扩。
+
+**方向与展示**
+
+6. **证据只够 2 个方向时，展示 2 个还是降门槛凑 3 个？**（规格默认前者，测试 #19）
+7. **用户明确排除的高证据方向：隐藏还是标 `user_excluded` 展示？**
+   （规格默认后者——隐藏等于静默丢弃，与项目原则冲突）
+8. **排序默认主键**：`readiness` 还是 `user_intent`？
+
+**外部数据**
+
+9. **是否采用 O\*NET（CC BY 4.0，需署名）与 ESCO 作为 FunctionNode 种子？**
+   本规格采纳外部评审的修正：只取职能骨架，**不用它们的 title 表**。
+10. **市场样本门槛 25 条 / 10 家雇主是否合适？** 越高越可信、越容易 null。
+
+---
+
+## 九、合并来源记录
+
+本规格是三方输入的合并，冲突处的裁决依据记录如下，便于后续追溯。
+
+| 来源 | 采纳内容 |
+|---|---|
+| 本仓库现有实现 | 五级证据分档及其四处强制点、绑定字段作用域属于代码、`ROUTING_DENYLIST`、`actor=user` + 精确哈希审批边界、provisional/verified 区分、`SENIORITY_GUARD_FOLLOWERS` 执行顺序 |
+| 外部评审（第一轮） | 三表分离、资历梯正交、TitleSurface 频次溯源、模型一次即缓存、"title 只用来够到岗位，capability 决定合适"、先冻结 capability schema |
+| 外部评审（第二轮） | Capability 三层（DOMAIN/SKILL/TOOL）、SKILL 准入判据、对账靠 pattern 不靠 id、规则化 strength + `signals_fired`、四 gap 三布尔判定、量化抽取单独护栏、CI 断言签名 cap ∩ 无 pattern cap = ∅ |
+| 本规格独有 | MRP 的样本充分性与单雇主污染防线、八轴 + `null_reason` 纪律、lexicographic 排序与 `ranking_explanation`、迁移映射表、实测发现的两个 pattern 障碍（屈折、CJK）与量化假阳性第三条守卫 |
+
+**明确未采纳**：三级证据分档（`DIRECT/TRANSFERABLE/ABSENT`）——与仓库四处强制冲突，
+改为映射到既有五级的 `grade_factor`，保留其"可迁移永不升级要在算分时落地"的洞见。
