@@ -196,7 +196,7 @@ TOOL 层不进本体，是这套设计不膨胀的关键：它可以无限增长
 **障碍 1 — 无词干还原，示例 pattern 当场失效。**
 
 ```python
-fact = {"value": "…after leading 2 focus groups and analyzing market data for 3 drugs."}
+fact = {"value": "…led focus groups and analysed market data for three products."}
 fact_supports("focus group",  fact)   # False   ← 事实里是 groups
 fact_supports("focus groups", fact)   # True
 ```
@@ -240,6 +240,29 @@ fact_supports("焦点小组", {"value": "我负责焦点小组与问卷设计"})
     {"capability_id": "cap.survey_design",         "weight": 9, "core": true},
     {"capability_id": "cap.stats_analysis",        "weight": 8, "core": true},
     {"capability_id": "cap.stakeholder_reporting", "weight": 5, "core": false}
+  ]
+}
+```
+
+**来源版本与许可**（由 Codex 在 `70caacf` 中校正，勿改回旧版本号）：
+
+```json
+{
+  "ontology_version": "2026.09.0",
+  "sources": [
+    {"source_id": "onet", "name": "O*NET 31.0 Database", "license": "CC BY 4.0",
+     "url": "https://www.onetcenter.org/database.html",
+     "version_url": "https://www.onetcenter.org/db_releases.html",
+     "license_url": "https://www.onetcenter.org/license_db.html",
+     "attribution_required": true, "retrieved_at": "2026-09-01"},
+    {"source_id": "esco", "name": "ESCO v1.2.1",
+     "license": "Commission Decision 2011/833/EU reuse terms; attribution required",
+     "url": "https://esco.ec.europa.eu/",
+     "version_url": "https://esco.ec.europa.eu/en/about-esco/escopedia/escopedia/esco-versions",
+     "license_url": "https://esco.ec.europa.eu/en/about-esco/faq?page=1",
+     "attribution_required": true, "retrieved_at": "2026-09-01"},
+    {"source_id": "jobloom", "name": "Jobloom curated", "license": "proprietary",
+     "retrieved_at": "2026-09-01"}
   ]
 }
 ```
@@ -477,14 +500,14 @@ S2 必须另外产生有类型的关系强度：
 
 ```json
 {
-  "fact_id": "fact-0077",
+  "fact_id": "fact-example-0003",
   "capability_id": "cap.survey_design",
   "grade": "direct",
   "grade_source": "pattern_hit",
   "pattern_id": "p2",
   "strength": 0.85,
   "signals_fired": ["quantified(+0.25)", "outcome_verb(+0.15)", "first_owner(+0.15)"],
-  "rationale_ref": {"snapshot_sha256": "206d89bb…", "fact_id": "fact-0077"}
+  "rationale_ref": {"snapshot_sha256": "aaaaaaaa…", "fact_id": "fact-example-0003"}
 }
 ```
 
@@ -555,9 +578,9 @@ signals（全部从事实文本规则抽取，每条必须可测）:
 以下全部是**假阳性**：
 
 ```
-['2023']            <- Columbia University in the City of New York May 2023        （毕业年份）
+['2023']            <- State University, City May 2023                            （毕业年份）
 ['1','2','1','2']   <- Applied Regression 1& 2, Data Science 1&2                   （课程编号）
-['4.0']             <- Master of Public Health …: GPA 4.0                          （成绩，非工作成果）
+['4.0']             <- Master of Public Health, State University: GPA 4.0          （成绩，非工作成果）
 ```
 
 外部评审提了两条守卫（日期数字、数字离成果太远），**实测还需要第三条**：
@@ -1152,14 +1175,22 @@ V1 为它新增了 `_effective_strength` 与 `source_evidence` 归并逻辑。
 ——TitleSurface 的频次增长和 MRP 都依赖真实抓取量，而仓库目前**没有可用的抓取器**
 （`ingest_job` 对 Workday 这类 SPA 无效）。在那之前按 N4 返回 `null` + 原因码。
 
-### 8.3 必须由产品所有者拍板的决定
+### 8.3a 已固化的产品规则（不再是开放问题）
+
+以下两条已由产品所有者确认并在 `70caacf` 中写入规格，实现时按规则执行，不得重新讨论：
+
+**PR-1 概述词不等于直接经验。** 简历概述句里单独出现一个领域词，最多形成
+`relation_strength: mention_only`，永远不得单独构成该能力的 `direct` 证据。
+需要 `direct` 必须有独立的、描述实际工作的事实支撑。
+
+**PR-2 宁缺毋滥。** 只有两个方向达到展示门槛时就展示两个，
+返回 `fewer_directions_than_target` 并触发 elicitation，**不得降低门槛凑到三个**。
+
+### 8.3b 必须由产品所有者拍板的决定
 
 **证据与打分**
 
-1. **简历概述句里出现一个领域词，算不算该领域的 `direct` 证据？**
-   Codex 已用 `FACT_TYPE_STRENGTH_CAPS` 打补丁，但强度仍是按事实类型批量推断，
-   不是该事实与该能力的真实关系。
-2. **strength 的权重表是否就是产品价值观？**
+1. **strength 的权重表是否就是产品价值观？**
    `quantified +0.25` 最重，理由是"带数字的成果最难编、最可查"。
    这张表一旦写进契约就应稳定，改动需版本化。
 3. **GPA 算不算 `quantified`？** 教育类事实的数字是成绩不是工作成果，
