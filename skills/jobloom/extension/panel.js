@@ -158,61 +158,86 @@ function render(result) {
 // extension runs on a job site before that press, and the injection reads the text the
 // page has already rendered — it does not fetch, follow, or expand anything.
 function readVisiblePosting() {
-  // LinkedIn's search view keeps the list and the open posting in one tree, and its
-  // document title is the search, not the job. The posting is the part that links to the
-  // job the URL says is current, so find that link and read its container.
+  // Finding the open posting by class name or by URL parameter has failed repeatedly, so
+  // this looks for what the user can see instead: the Apply control belongs to the posting
+  // and never to the list beside it, so the smallest block containing it and a description
+  // is the posting. Every strategy reports itself, so a wrong reading says which one ran.
+  const tried = [];
+  const bigEnough = (node) => node && (node.innerText || "").trim().length > 500;
+
+  const climb = (node, label) => {
+    let current = node;
+    while (current && current !== document.body) {
+      if (bigEnough(current)) return { pane: current, matched: label };
+      current = current.parentElement;
+    }
+    return null;
+  };
+
+  let found = null;
+
+  // 1. The Apply control the user would press for the posting they are reading.
+  const controls = [...document.querySelectorAll("button, a")].filter((node) => {
+    const label = (node.innerText || node.getAttribute("aria-label") || "").trim();
+    return /^(apply|easy apply|save)\b/i.test(label);
+  });
+  tried.push(`apply_controls:${controls.length}`);
+  for (const control of controls) {
+    found = climb(control, "apply_control");
+    if (found) break;
+  }
+
+  // 2. The link to the job the URL says is open.
   const currentId = new URLSearchParams(location.search).get("currentJobId")
     || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
-  let pane = null;
-  let matched = "";
-  if (currentId) {
-    const anchor = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
-    let node = anchor;
-    while (node && node !== document.body) {
-      if ((node.innerText || "").trim().length > 600) { pane = node; matched = "current_job_pane"; break; }
-      node = node.parentElement;
-    }
+  tried.push(`current_id:${currentId || "none"}`);
+  if (!found && currentId) {
+    found = climb(document.querySelector(`a[href*="/jobs/view/${currentId}"]`), "current_job_link");
   }
-  if (!pane) {
+
+  // 3. Named containers, then the page itself.
+  if (!found) {
     for (const selector of [".jobs-search__job-details--wrapper", ".jobs-details__main-content",
                             ".jobs-details", ".job-view-layout", "#jobsearch-ViewjobPaneWrapper",
                             ".jobsearch-JobComponent", "main"]) {
       const node = document.querySelector(selector);
-      if (node && (node.innerText || "").trim().length > 400) { pane = node; matched = selector; break; }
+      if (bigEnough(node)) { found = { pane: node, matched: selector }; break; }
     }
   }
-  if (!pane) { pane = document.body; matched = "fallback_body"; }
+  if (!found) found = { pane: document.body, matched: "fallback_body" };
 
+  const { pane } = found;
+  let matched = found.matched;
   let text = (pane.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
-  // The title is whatever the page itself calls the job the URL says is open: the text of
-  // the link to it, or the heading wrapping that link. Guessing at headings and excluding
-  // the site's own by name never finishes — the last two attempts read the posting as
-  // "Are these results helpful?" and "See how you compare to others who clicked apply".
+
+  // The page's own name for this job: the link to it, or the first heading in the block.
   let heading = "";
   if (currentId) {
     const link = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
-    const wrapper = link?.closest("h1, h2, h3");
-    heading = (wrapper?.innerText || link?.innerText || "").trim().split("\n")[0];
+    heading = ((link?.closest("h1, h2, h3")?.innerText) || link?.innerText || "").trim().split("\n")[0];
   }
   if (!heading) {
-    heading = [...pane.querySelectorAll("h1")]
+    heading = [...pane.querySelectorAll("h1, h2")]
       .map((node) => (node.innerText || "").trim().split("\n")[0])
       .find((value) => value.length > 2 && value.length < 140 && !value.endsWith("?")) || "";
   }
-  // The standalone job view puts "Employer hiring Title in Location" in the document
-  // title; the search view puts the search there, so it is only trusted when it parses.
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
   const title = (documentMatch?.groups?.title || heading || fromDocument).trim();
   const employer = documentMatch?.groups?.employer?.trim() || "";
   // Not named `location`: that shadows window.location for the whole function.
   const place = documentMatch?.groups?.location?.trim() || "";
+
   if (matched === "main" || matched === "fallback_body") {
     const start = title ? text.indexOf(title) : -1;
     if (start > 200) { text = text.slice(start); matched += "+sliced_at_title"; }
   }
-  return { url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
-           title, employer, location: place, container: matched };
+  return {
+    url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
+    title, employer, location: place, container: matched,
+    // Enough for one screenshot to say what happened, instead of a console session.
+    diagnostics: { tried, chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
+  };
 }
 
 // Following the user to the posting they just clicked is not the same as going somewhere
