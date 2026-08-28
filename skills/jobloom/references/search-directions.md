@@ -38,6 +38,8 @@ Seniority is read as title tokens with domain guards, so `Senior Care`, `Lead Ge
 
 Apply routing before portfolio allocation. Use the portfolio weights over a rolling pool of about twenty jobs entering review, not as a daily quota. Sponsorship is a core ranking signal: explicit support is strongest, historical support is next, unknown remains eligible for investigation, and explicit non-support fails when the candidate will require sponsorship.
 
+`ranking_score` is an anchored additive score, not a percentage. It starts at `RANKING_BASE` (100), which means "nothing known for or against", and every signal moves it from there: sponsorship `+10 x priority` (0-4), positive keywords `+2` each to a cap of 5, analytics duties `+1` each to a cap of 5, negative keywords `-3` each to a cap of 5, a career-growth ceiling `-15`, duty demotion `-10` per step to a cap of 2, a mandatory advanced requirement `-5`, a required warning term `-6` each to a cap of 3, and an unsupported title match `-12`. The full range is 15 to 155, but 155 needs explicit sponsorship support: a posting that states nothing about sponsorship is capped at 135. Compare scores only within the same sponsorship state.
+
 ## Persisted routing records
 
 `record_routing` routes one JobCard against one approved direction and stores the decision with the exact JobCard hash, direction profile hash, and active portfolio ID. It is idempotent per job, direction, and JobCard hash: re-recording an unchanged card returns the stored record. A changed JobCard invalidates the previous record for that job and direction with reason `job_card_changed` rather than mutating it, so history stays append-only and auditable.

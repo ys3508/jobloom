@@ -129,6 +129,14 @@ A variant must also re-rank internally per JD:
 | Clinical / pharma | AstraZeneca ↑, INNSCI ↑, Shanghai Jiao Tong ↓ |
 | Healthcare AI | Pittsburgh quantitative methods ↑, SQL/Python/AI evidence ↑ |
 
+**Cardinality is the concrete gap.** A portfolio's weights say what share of *applications*
+go to each direction. A resume variant has its own, different split: one Resume A covers
+several directions at once, with its own internal ranking of them. These are two separate
+allocations over the same directions and they do not have to agree. Today
+`resume_versions.direction` is a single column, so a resume belongs to exactly one direction
+and the same file must be registered once per direction to cover several. A variant needs to
+be its own object, bound to a *set* of directions with its own weights.
+
 ## 3. Evidence Guardrail — every rewritten line knows where its evidence came from
 
 The recurring questions in a real session were: *can this be written? is the 17% real? was
