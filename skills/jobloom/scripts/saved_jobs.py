@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jobs the user looked at and kept for later, recorded before any application exists.
+"""Jobs the user looked at, kept for later, or applied to outside this system.
 
 A skip leaves no trace, and that is deliberate rather than a gap to fill: skipping a job
 means moving to the next one, so a button labelled "do not apply" would be pressed by
@@ -14,6 +14,19 @@ Kept jobs are not applications. An application record describes what happened af
 something was sent; a kept job has no after. They live in separate tables and are joined on
 the job's own URL when the tracker is built, so a job that is later applied to is reported
 once from each side rather than counted twice.
+
+`applied` here is the user saying they applied. It is **not** the `submitted` state in
+`application_core`, which requires positive submission evidence — a confirmation page, a
+confirmation id, an account record — and a material lock. Nothing here has seen any of
+that. The two must never be read as the same claim, so this one is reported as
+self-reported wherever it is shown.
+
+Recording it at all exists because applications made by hand are otherwise invisible: the
+tracker derived "Applied" by joining the applications table, so a job applied to outside
+the fill flow stayed "Saved" forever and the funnel collected nothing. Every question this
+project has deferred — what `ranking_score` drives, whether an "apply within N days"
+interval exists, whether the tailoring suggestion fires too often — waits on reply data
+that cannot start accumulating until the applying is recorded at all.
 """
 
 from __future__ import annotations
@@ -30,10 +43,17 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import application_core  # noqa: E402
+import outcome_core  # noqa: E402
 
-SCHEMA_VERSION = "0.1.0"
-# One decision, because it is the only one a person would press a button for.
-DECISIONS = {"later"}
+SCHEMA_VERSION = "0.2.0"
+# Two decisions worth a press. A skip still records nothing: skipping a job means moving to
+# the next one, so a control meaning "do not apply" would be pressed by nobody.
+LATER, APPLIED = "later", "applied"
+DECISIONS = {LATER, APPLIED}
+# Borrowed rather than redefined, so the two halves of the funnel cannot drift apart. The
+# `outcome_records` table itself cannot be reused: it has a foreign key to an application,
+# and an application made by hand has no row there.
+OUTCOMES = outcome_core.OUTCOME_TYPES
 MAX_TEXT = 500
 MAX_REASON = 1_000
 
@@ -58,6 +78,9 @@ def initialize(connection: sqlite3.Connection) -> None:
             posted_at TEXT,
             deadline TEXT,
             decision TEXT NOT NULL,
+            applied_at TEXT,
+            outcome TEXT,
+            outcome_at TEXT,
             reason TEXT,
             decided_by TEXT NOT NULL,
             decided_at TEXT NOT NULL,
@@ -106,27 +129,59 @@ def save(connection: sqlite3.Connection, card: dict[str, Any], *, actor: str,
     ats = (card.get("extraction") or {}).get("ats") or {}
     timestamp = (at or now_utc()).isoformat()
     existing = connection.execute(
-        "SELECT decided_at FROM saved_jobs WHERE job_url=?", (url,)).fetchone()
+        "SELECT decided_at, applied_at FROM saved_jobs WHERE job_url=?", (url,)).fetchone()
     decided_at = existing["decided_at"] if existing else timestamp
+    # When the user first said they applied. A second press does not move it, and going back
+    # to "later" does not erase it: an application already made is not undone by a change of
+    # mind about the next one.
+    applied_at = (existing["applied_at"] if existing else None)
+    if decision == APPLIED and not applied_at:
+        applied_at = timestamp
     connection.execute("""
         INSERT INTO saved_jobs (job_url, title, employer, location, country, work_arrangement,
-            employment_type, source, ats, apply_url, posted_at, deadline, decision, reason,
-            decided_by, decided_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            employment_type, source, ats, apply_url, posted_at, deadline, decision, applied_at,
+            reason, decided_by, decided_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_url) DO UPDATE SET
             title=excluded.title, employer=excluded.employer, location=excluded.location,
             country=excluded.country, work_arrangement=excluded.work_arrangement,
             employment_type=excluded.employment_type, source=excluded.source, ats=excluded.ats,
             apply_url=excluded.apply_url, posted_at=excluded.posted_at, deadline=excluded.deadline,
-            decision=excluded.decision, reason=excluded.reason, updated_at=excluded.updated_at
+            decision=excluded.decision, applied_at=excluded.applied_at,
+            reason=excluded.reason, updated_at=excluded.updated_at
     """, (url, title, employer, _text(card.get("location")), _text(card.get("country")),
           _text(card.get("work_arrangement")), _text(card.get("employment_type")),
           _text(card.get("source")), _text(card.get("ats")), _text(ats.get("apply_url")),
-          posted_at, deadline, decision, _text(reason, MAX_REASON), _text(actor),
+          posted_at, deadline, decision, applied_at, _text(reason, MAX_REASON), _text(actor),
           decided_at, timestamp))
     connection.commit()
     return {"job_url": url, "decision": decision, "decided_at": decided_at,
-            "updated": bool(existing)}
+            "applied_at": applied_at, "updated": bool(existing)}
+
+
+def record_outcome(connection: sqlite3.Connection, job_url: str, outcome: str,
+                   *, at: datetime | None = None) -> dict[str, Any]:
+    """What came back. The vocabulary is `outcome_core`'s, so the two halves of the funnel
+    describe the same things by the same names.
+
+    Only a job the user said they applied to can have an outcome. A reply to an application
+    that was never recorded is a bookkeeping gap, not a reply to a job merely kept.
+    """
+    if outcome not in OUTCOMES:
+        raise ValueError(f"outcome must be one of: {', '.join(sorted(OUTCOMES))}")
+    url = application_core.canonicalize_url(_text(job_url))
+    row = connection.execute(
+        "SELECT decision FROM saved_jobs WHERE job_url=?", (url,)).fetchone()
+    if row is None:
+        raise ValueError("no saved job with that URL")
+    if row["decision"] != APPLIED:
+        raise ValueError("an outcome belongs to a job you applied to; mark it applied first")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE saved_jobs SET outcome=?, outcome_at=?, updated_at=? WHERE job_url=?",
+        (outcome, timestamp, timestamp, url))
+    connection.commit()
+    return {"job_url": url, "outcome": outcome, "outcome_at": timestamp}
 
 
 def forget(connection: sqlite3.Connection, job_url: str) -> dict[str, Any]:
@@ -146,8 +201,8 @@ def days_open(posted_at: str | None, today: date | None = None) -> int | None:
     return max(0, ((today or now_utc().date()) - opened).days)
 
 
-def _applied_urls(connection: sqlite3.Connection) -> set[str]:
-    """Saved jobs that now have an application, so neither side double-counts them."""
+def _tracked_application_urls(connection: sqlite3.Connection) -> set[str]:
+    """Saved jobs that also have an application record, so neither side double-counts them."""
     found = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'").fetchone()
     if not found:
@@ -158,7 +213,7 @@ def _applied_urls(connection: sqlite3.Connection) -> set[str]:
 
 
 def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -> list[dict[str, Any]]:
-    applied = _applied_urls(connection)
+    tracked = _tracked_application_urls(connection)
     rows = []
     for row in connection.execute("SELECT * FROM saved_jobs ORDER BY decided_at, job_url"):
         rows.append({
@@ -176,7 +231,18 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
             "days_open": days_open(row["posted_at"], today),
             # Only when the employer stated one. Blank means unstated, never "no deadline".
             "deadline": row["deadline"],
-            "current_status": "Applied" if row["job_url"] in applied else "Saved",
+            # Derived from both halves. Deriving it only from the applications table left a
+            # job applied to by hand reading "Saved" forever, which is most of them.
+            "current_status": ("Applied" if row["decision"] == APPLIED
+                                            or row["job_url"] in tracked else "Saved"),
+            # Whether the applying was seen or only stated. `application_core`'s `submitted`
+            # requires positive submission evidence; this does not, and must not borrow its
+            # authority.
+            "applied_evidence": ("tracked application" if row["job_url"] in tracked
+                                 else "self-reported" if row["decision"] == APPLIED else ""),
+            "applied_at": row["applied_at"],
+            "outcome": row["outcome"],
+            "outcome_at": row["outcome_at"],
             "reason": row["reason"],
         })
     return rows
@@ -185,10 +251,17 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
 def status(connection: sqlite3.Connection, *, today: date | None = None) -> dict[str, Any]:
     rows = tracker_rows(connection, today=today)
     ages = [row["days_open"] for row in rows if row["days_open"] is not None]
+    replies = [row["outcome"] for row in rows if row["outcome"]]
+    applied = [row for row in rows if row["current_status"] == "Applied"]
     return {
         "schema_version": SCHEMA_VERSION,
         "saved": len(rows),
-        "since_applied": sum(1 for row in rows if row["current_status"] == "Applied"),
+        "applied": len(applied),
+        # Counted over applications, not over everything kept, and only over the ones whose
+        # outcome is known. An unanswered application and one never followed up look alike
+        # from here, so they are not merged into a rate.
+        "with_recorded_outcome": len(replies),
+        "outcomes": {name: replies.count(name) for name in sorted(set(replies))},
         "with_stated_deadline": sum(1 for row in rows if row["deadline"]),
         "median_days_open": sorted(ages)[len(ages) // 2] if ages else None,
     }
@@ -205,6 +278,10 @@ def main() -> None:
     save_parser.add_argument("--job-card", required=True, type=Path)
     save_parser.add_argument("--actor", required=True)
     save_parser.add_argument("--reason")
+    save_parser.add_argument("--decision", default=LATER, choices=sorted(DECISIONS))
+    outcome_parser = commands.add_parser("outcome")
+    outcome_parser.add_argument("--job-url", required=True)
+    outcome_parser.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
     forget_parser = commands.add_parser("forget")
     forget_parser.add_argument("--job-url", required=True)
     list_parser = commands.add_parser("list")
@@ -218,7 +295,9 @@ def main() -> None:
             result = {"status": "initialized"}
         elif args.command == "save":
             result = save(connection, json.loads(args.job_card.read_text(encoding="utf-8")),
-                          actor=args.actor, reason=args.reason)
+                          actor=args.actor, reason=args.reason, decision=args.decision)
+        elif args.command == "outcome":
+            result = record_outcome(connection, args.job_url, args.outcome)
         elif args.command == "forget":
             result = forget(connection, args.job_url)
         elif args.command == "status":
