@@ -409,6 +409,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
     def test_a_new_posting_waits_for_the_detail_pane_to_match_its_id(self):
         panel = self.sources["panel.js"]
         self.assertIn("requestAnimationFrame", panel)
+        self.assertIn("frames < 300", panel)
         self.assertIn("if (!reading.aligned)", panel)
         self.assertIn('found = climb(current, "current_job_with_apply")', panel)
         self.assertIn("Boolean(alignedLink)", panel)
@@ -418,6 +419,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
     def test_following_errors_are_visible_and_old_reads_cannot_overwrite_new_ones(self):
         panel = self.sources["panel.js"]
         self.assertIn("generation !== readGeneration", panel)
+        self.assertIn("waiting for the selected posting", panel)
         self.assertNotIn('if (!onlyIfChanged) $("status").textContent', panel)
 
     def test_page_diagnostics_are_visible_without_a_console(self):

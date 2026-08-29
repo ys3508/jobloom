@@ -292,7 +292,7 @@ async function readVisiblePosting() {
   // and accept the pane only when its heading agrees with the link for currentJobId.
   let reading = inspect();
   let frames = 0;
-  while (!reading.aligned && frames < 60) {
+  while (!reading.aligned && frames < 300) {
     await new Promise((resolve) => requestAnimationFrame(resolve));
     reading = inspect();
     frames += 1;
@@ -352,7 +352,8 @@ async function readPosting({ onlyIfChanged = false } = {}) {
   if (!state.token || !(await hasPageAccess())) return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
-  if (!onlyIfChanged) { $("status").textContent = "reading the open posting…"; }
+  $("status").textContent = onlyIfChanged
+    ? "waiting for the selected posting…" : "reading the open posting…";
   const generation = ++readGeneration;
   try {
     const [injected] = await chrome.scripting.executeScript({
@@ -362,7 +363,10 @@ async function readPosting({ onlyIfChanged = false } = {}) {
     if (page?.stale) throw new Error("the new posting is still rendering; choose it again");
     if (!page?.text) throw new Error("this page did not return a posting");
     const key = page.postingId || page.url;
-    if (onlyIfChanged && key === lastPostingKey) return;
+    if (onlyIfChanged && key === lastPostingKey) {
+      $("status").textContent = "";
+      return;
+    }
     const response = await fetch(`${state.endpoint}/positioning`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
