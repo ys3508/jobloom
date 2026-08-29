@@ -35,9 +35,13 @@ def main() -> None:
     parser.add_argument("--profile", required=True, type=Path)
     parser.add_argument("--jobs", required=True, type=Path,
                         help="one JobCard JSON file, a JSON list/cards object, or a directory")
+    parser.add_argument("--mine-aliases", action="store_true",
+                        help="measure corpus-written subphrases for dead non-title terms")
     args = parser.parse_args()
     profile = json.loads(args.profile.read_text(encoding="utf-8"))
-    result = direction_core.calibrate_direction_keywords(profile, load_jobs(args.jobs))
+    jobs = load_jobs(args.jobs)
+    result = (direction_core.mine_direction_aliases(profile, jobs) if args.mine_aliases
+              else direction_core.calibrate_direction_keywords(profile, jobs))
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
