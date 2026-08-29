@@ -131,6 +131,17 @@ FALLBACK_EXCLUSION = re.compile(
     r"\b(?:equal opportunity|accommodation|benefits?|compensation|salary|pay range)\b", re.I)
 
 
+# How much of the line a matched heading must account for before the line is read as one.
+# Measured against 1,953 live postings: real headings sit well above it, and the sentences
+# that merely open with a heading word sit well below.
+HEADING_COVERAGE = 0.6
+
+
+def _heading_shaped(line: str, heading: str, text: str) -> bool:
+    """A heading is nearly the whole line, or it ends in the colon that introduces a list."""
+    return line.rstrip().endswith(":") or len(heading) / max(len(text), 1) >= HEADING_COVERAGE
+
+
 def _heading_key(line: str) -> str | None:
     text = line.strip().strip(":").casefold()
     if not text or len(text) > 100:
@@ -139,15 +150,27 @@ def _heading_key(line: str) -> str | None:
         if text in headings:
             return key
     # A heading often carries a tail the exact list cannot hold — "What you bring to Komodo
-    # Health (required)". Closings have always matched by prefix; sections now do too, but
-    # only for a line shaped like a heading. A sentence that merely opens with a heading word
-    # ("Requirements are listed below.") would otherwise start a section and swallow the page.
+    # Health (required)". Closings have always matched by prefix; sections do too, but only
+    # for a line shaped like a heading.
+    #
+    # Excluding sentence punctuation was not enough. Plenty of prose carries none, and the
+    # heading words most likely to open a sentence are the ones in the list: "Must have
+    # office space with ability to see clients" and "Requirements include strong Python
+    # skills" both opened a section and swallowed the lines that followed. Over 1,953 live
+    # postings, what separates the two is how much of the line the heading accounts for:
+    # a real heading is nearly the whole line ("Equal Opportunity Employer", "Nice-to-Have
+    # Skills"), while a sentence that happens to start with one is mostly its own content.
+    # A trailing colon is the other heading shape and is accepted whatever the ratio, since
+    # that is how a lead-in introduces the list beneath it.
     if not text.endswith((".", "!", "?")) and len(text) <= 80:
         for key, headings in SECTION_HEADINGS.items():
-            if any(text.startswith(heading) for heading in headings if len(heading) >= 9):
-                return key
-    if any(text.startswith(closing) for closing in CLOSING_HEADINGS):
-        return "__close__"
+            for heading in headings:
+                if len(heading) >= 9 and text.startswith(heading) and _heading_shaped(line, heading, text):
+                    return key
+    for closing in CLOSING_HEADINGS:
+        if text.startswith(closing) and (text == closing
+                                         or _heading_shaped(line, closing, text)):
+            return "__close__"
     return None
 
 

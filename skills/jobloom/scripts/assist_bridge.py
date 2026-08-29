@@ -450,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/positioning":
                 self._send(200, self._positioning(payload))
             elif self.path == "/save":
-                body = self._save(payload)
+                self._send(200, self._save(payload))
             elif self.path == "/store":
                 self._send(200, self._store(payload))
             else:

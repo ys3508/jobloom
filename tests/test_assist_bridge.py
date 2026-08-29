@@ -344,6 +344,22 @@ class ServerBoundaryTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, json.load(error)
 
+    def test_save_answers_the_request(self):
+        # It did not. `/save` produced its result and never sent it, so the browser waited
+        # on a response that never came — and the tests missed it because they exercised
+        # `saved_jobs.save` directly and never the endpoint. Storing is off in this fixture,
+        # so the refusal is what comes back; what matters is that something does.
+        status, body = self.post("/save", {"job_card": {
+            "canonical_url": "https://jobs.example.com/1", "title": "Analyst",
+            "employer": "Acme"}})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "storing_disabled")
+
+    def test_save_refuses_a_payload_without_a_job_card(self):
+        status, body = self.post("/save", {"actor": "user"})
+        self.assertIn(status, {400, 403})
+        self.assertTrue(body["error"])
+
     def test_health_lets_a_second_start_tell_stale_from_current(self):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/health")
         with urllib.request.urlopen(request, timeout=10) as response:
