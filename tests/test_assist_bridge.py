@@ -385,6 +385,12 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn('link?.closest("h1, h2, h3")', panel)
         self.assertNotIn("CHROME_HEADINGS", panel, "no blocklist of the site's own headings")
 
+    def test_linkedin_random_classes_do_not_hide_the_current_job_metadata(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("linkedInMatch", panel)
+        self.assertIn("headerText", panel)
+        self.assertIn("work_arrangement: workArrangement", panel)
+
     def test_nothing_to_act_on_does_not_get_a_screen(self):
         panel = self.sources["panel.js"]
         self.assertIn('["covered", "Already covered and shown", "ok", "nothing to do", true]',
@@ -404,6 +410,8 @@ class ExtensionBoundaryTests(unittest.TestCase):
         panel = self.sources["panel.js"]
         self.assertIn("requestAnimationFrame", panel)
         self.assertIn("if (!reading.aligned)", panel)
+        self.assertIn('found = climb(current, "current_job_with_apply")', panel)
+        self.assertIn("Boolean(alignedLink)", panel)
         self.assertIn("lastPostingKey = key", panel)
         self.assertGreater(panel.index("lastPostingKey = key"), panel.index("render(body, page)"))
 

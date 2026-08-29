@@ -169,7 +169,8 @@ async function readVisiblePosting() {
   // is the posting. Every strategy reports itself, so a wrong reading says which one ran.
   const tried = [];
   const clean = (value) => (value || "").replace(/\u00a0/g, " ")
-    .replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    .replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n").trim();
   const contentText = (node) => {
     if (!node) return "";
     const blocks = new Set(["ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "BR", "DIV",
@@ -203,10 +204,18 @@ async function readVisiblePosting() {
   const currentId = currentQueryId
     || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
   tried.push(`current_id:${currentId || "none"}`);
-  const findLinkTitle = () => {
-    if (!currentId) return "";
-    const link = document.querySelector(`a[href*="/jobs/view/${currentId}"]`);
-    return clean(link?.closest("h1, h2, h3")?.innerText || link?.innerText || "").split("\n")[0];
+  const currentLinks = () => currentId
+    ? [...document.querySelectorAll(`a[href*="/jobs/view/${currentId}"]`)] : [];
+  const linkTitle = (link) => clean(
+    link?.closest("h1, h2, h3")?.innerText || link?.innerText || "").split("\n")[0];
+  const semanticDescriptions = () => {
+    const named = [".jobs-description", "[class*='jobs-description']",
+      "[id*='job-details']", "[aria-label*='job description' i]"]
+      .flatMap((selector) => [...document.querySelectorAll(selector)]).filter(bigEnough);
+    const headed = [...document.querySelectorAll("h1, h2, h3, h4, h5, h6")]
+      .filter((node) => /^(about the job|job description)$/i.test(clean(node.innerText)))
+      .map((node) => climb(node, "description_heading")?.pane).filter(Boolean);
+    return [...new Set([...named, ...headed])];
   };
 
   const inspect = () => {
@@ -215,10 +224,30 @@ async function readVisiblePosting() {
       const label = clean(node.innerText || node.getAttribute("aria-label") || "");
       return /^(apply|easy apply|save)\b/i.test(label);
     });
-    const semanticDescriptions = [".jobs-description", "[class*='jobs-description']",
-      "[id*='job-details']", "[aria-label*='job description' i]"]
-      .flatMap((selector) => [...document.querySelectorAll(selector)]).filter(bigEnough);
-    for (const description of semanticDescriptions) {
+    const links = currentLinks();
+    let alignedLink = null;
+    let alignedHeader = null;
+
+    // LinkedIn now renders the title as a plain p > a, not a heading. The current job is
+    // ready only when its current-id link and Apply control share the small detail header.
+    // Before that happens their first common ancestor is the whole search layout.
+    for (const control of controls) {
+      let current = control;
+      while (current && current !== document.body) {
+        const link = links.find((candidate) => current.contains(candidate));
+        if (link && longerText(current).length < 2000) {
+          alignedLink = link;
+          alignedHeader = current;
+          found = climb(current, "current_job_with_apply");
+          break;
+        }
+        current = current.parentElement;
+      }
+      if (alignedLink) break;
+    }
+
+    for (const description of semanticDescriptions()) {
+      if (found) break;
       let current = description;
       while (current && current !== document.body) {
         if (controls.some((control) => current.contains(control))) {
@@ -248,16 +277,15 @@ async function readVisiblePosting() {
     }
     if (!found) found = { pane: document.body, matched: "fallback_body" };
 
-    const expectedTitle = findLinkTitle();
+    const expectedTitle = linkTitle(alignedLink || links[0]);
     const headings = [...found.pane.querySelectorAll("h1, h2")]
       .map((node) => clean(node.innerText).split("\n")[0])
       .filter((value) => value.length > 2 && value.length < 140 && !value.endsWith("?"));
     const heading = headings.find((value) => expectedTitle &&
       (value.includes(expectedTitle) || expectedTitle.includes(value))) || headings[0] || "";
-    const titleMatches = expectedTitle && headings.some((value) =>
-      value.includes(expectedTitle) || expectedTitle.includes(value));
     return { ...found, expectedTitle, heading,
-      aligned: currentQueryId ? Boolean(titleMatches) : true };
+      headerText: longerText(alignedHeader),
+      aligned: currentQueryId ? Boolean(alignedLink) : true };
   };
 
   // History changes before LinkedIn finishes replacing the detail pane. Wait for paint,
@@ -278,10 +306,7 @@ async function readVisiblePosting() {
 
   const { pane } = reading;
   let matched = reading.matched;
-  const descriptionSelectors = [".jobs-description", "[class*='jobs-description']",
-    "[id*='job-details']", "[aria-label*='job description' i]"];
-  const descriptions = descriptionSelectors.flatMap((selector) =>
-    [...pane.querySelectorAll(selector)]).filter(bigEnough);
+  const descriptions = semanticDescriptions().filter((node) => pane.contains(node));
   const description = descriptions.sort((a, b) => longerText(b).length - longerText(a).length)[0];
   let text = longerText(description || pane);
   if (description) matched += "+description";
@@ -290,10 +315,19 @@ async function readVisiblePosting() {
   const heading = reading.expectedTitle || reading.heading;
   const fromDocument = (document.title || "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
   const documentMatch = fromDocument.match(/^(?<employer>.+?)\s+hiring\s+(?<title>.+?)\s+in\s+(?<location>.+)$/i);
-  const title = (documentMatch?.groups?.title || heading || fromDocument).trim();
-  const employer = documentMatch?.groups?.employer?.trim() || "";
+  const linkedInMatch = fromDocument.match(/^(?<title>.+?)\s*\|\s*(?<employer>[^|]+)$/);
+  const title = (documentMatch?.groups?.title || heading || linkedInMatch?.groups?.title
+    || fromDocument).trim();
+  const employer = (documentMatch?.groups?.employer || linkedInMatch?.groups?.employer || "").trim();
   // Not named `location`: that shadows window.location for the whole function.
-  const place = documentMatch?.groups?.location?.trim() || "";
+  const headerLines = clean(reading.headerText).split("\n").filter(Boolean);
+  const titleLine = headerLines.findIndex((line) => line.includes(title) || title.includes(line));
+  const place = (documentMatch?.groups?.location
+    || (titleLine >= 0 ? headerLines[titleLine + 1]?.split(" · ")[0] : "") || "").trim();
+  const headerLower = reading.headerText.toLowerCase();
+  const workArrangement = /\bhybrid\b/.test(headerLower) ? "hybrid"
+    : /\b(on-site|onsite|on site)\b/.test(headerLower) ? "on_site"
+    : /\bremote\b/.test(headerLower) ? "remote" : "";
 
   if (matched === "main" || matched === "fallback_body") {
     const start = title ? text.indexOf(title) : -1;
@@ -301,7 +335,7 @@ async function readVisiblePosting() {
   }
   return {
     url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
-    title, employer, location: place, container: matched,
+    title, employer, location: place, work_arrangement: workArrangement, container: matched,
     // Enough for one screenshot to say what happened, instead of a console session.
     diagnostics: { tried: [...tried, `description_candidates:${descriptions.length}`],
       chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
