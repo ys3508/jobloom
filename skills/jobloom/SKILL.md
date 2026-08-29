@@ -16,6 +16,9 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For resume registration, approval, selection, or application material locking, read `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For cover-letter registration, approval, application scoping, or binding, read `references/cover-letter-versions.md`, `references/resume-versions.md`, `references/facts-and-evidence.md`, and `references/schemas.md`.
 - For job ingestion, filtering, or recommendations, read `references/job-evaluation.md` and `references/schemas.md`.
+- For pulling postings from company ATS public job-board APIs, or for registering an ATS source, read `references/ats-sources.md`, `references/job-evaluation.md`, and `references/schemas.md`.
+- For ordering the review queue after a pull, run `scripts/review_queue.py`; it ranks on evidence coverage, never on `ranking_score`, and the reason is recorded in its module docstring.
+- Before trusting `ranking_score`, or before adding a direction keyword group, read `references/known-liabilities.md`.
 - For application questions or answer reuse, read `references/answers-and-authorization.md` and `references/schemas.md`.
 - For application state, deduplication, recovery, or submission evidence, read `references/application-state.md` and `references/schemas.md`.
 - For browser form observation, deterministic fill actions, checkpoints, pauses, or recovery, read `references/fill-only-execution.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, `references/cover-letter-versions.md`, and `references/schemas.md`.
