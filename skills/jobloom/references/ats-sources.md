@@ -31,6 +31,9 @@ payload that came back, not against recollection of the documentation.
 **Workday is deliberately absent.** Its tenant job feeds are a POST to an internal
 endpoint that is not published for outside consumption, and an adapter for it would be a
 scraper wearing an API's clothes. Workday employers stay a manual `ingest_job.py` URL.
+How that slice gets covered is an open policy decision, not a missing adapter — see
+[`docs/adr-workday-coverage.md`](../../../docs/adr-workday-coverage.md). Do not resolve it
+by adding an adapter.
 **Workable is absent** for a narrower reason: its per-account endpoint could not be
 verified against a live board, and an unverified endpoint in a shipped adapter is worse
 than no adapter.
