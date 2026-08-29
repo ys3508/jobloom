@@ -498,6 +498,7 @@ class Handler(BaseHTTPRequestHandler):
             saved_jobs.initialize(connection)
             return saved_jobs.save(connection, card,
                                    actor=str(payload.get("actor") or "user"),
+                                   decision=str(payload.get("decision") or saved_jobs.LATER),
                                    reason=payload.get("reason"))
         except ValueError as error:
             raise BridgeError(str(error)) from error

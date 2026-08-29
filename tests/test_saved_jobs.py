@@ -19,6 +19,7 @@ def load_script(name):
 
 SAVED = load_script("saved_jobs")
 APPLICATIONS = load_script("application_core")
+OUTCOMES = load_script("outcome_core")
 AT = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
 TODAY = date(2026, 8, 29)
 
@@ -110,6 +111,60 @@ class PostingDateTests(unittest.TestCase):
         self.assertIsNone(SAVED.days_open(None, TODAY))
 
 
+class AppliedTests(unittest.TestCase):
+    """Applications made by hand were invisible: the tracker derived "Applied" by joining
+    the applications table, so a job applied to outside the fill flow stayed "Saved"
+    forever and the funnel collected nothing."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        SAVED.initialize(self.db)
+        self.addCleanup(self.db.close)
+
+    def test_saying_you_applied_is_recorded_as_yours_not_as_evidence(self):
+        # `application_core`'s `submitted` requires a confirmation page or an account
+        # record. Nothing here has seen any of that, and the row says which claim it is.
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["current_status"], "Applied")
+        self.assertEqual(row["applied_evidence"], "self-reported")
+        self.assertEqual(row["applied_at"], AT.isoformat())
+
+    def test_the_apply_time_is_the_first_one_and_survives_a_change_of_mind(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        later = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.LATER, at=later)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        # An application already made is not undone by a change of mind about the next one.
+        self.assertEqual(row["applied_at"], AT.isoformat())
+
+    def test_an_outcome_belongs_to_something_you_applied_to(self):
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        with self.assertRaises(ValueError) as caught:
+            SAVED.record_outcome(self.db, "https://jobs.example.com/1", "interview", at=AT)
+        self.assertIn("mark it applied first", str(caught.exception))
+
+    def test_an_outcome_is_recorded_and_reported(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        SAVED.record_outcome(self.db, "https://jobs.example.com/1", "interview", at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["outcome"], "interview")
+        self.assertEqual(SAVED.status(self.db, today=TODAY)["outcomes"], {"interview": 1})
+
+    def test_the_outcome_vocabulary_is_the_one_the_funnel_already_uses(self):
+        # Borrowed rather than redefined, so the two halves cannot drift apart. The
+        # `outcome_records` table itself cannot be reused: it has a foreign key to an
+        # application, and an application made by hand has no row there.
+        self.assertEqual(SAVED.OUTCOMES, OUTCOMES.OUTCOME_TYPES)
+        with self.assertRaises(ValueError):
+            SAVED.record_outcome(self.db, "https://jobs.example.com/1", "ghosted", at=AT)
+
+    def test_a_skip_still_records_nothing(self):
+        with self.assertRaises(ValueError):
+            SAVED.save(self.db, card(), actor="user", decision="skipped", at=AT)
+
+
 class ApplicationJoinTests(unittest.TestCase):
     """A kept job and an application are different records about one job. They are joined on
     the posting's URL so the two sheets add up without counting it twice."""
@@ -125,6 +180,15 @@ class ApplicationJoinTests(unittest.TestCase):
     def test_a_kept_job_reads_as_saved_until_it_has_an_application(self):
         SAVED.save(self.db, card(), actor="user", at=AT)
         self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["current_status"], "Saved")
+
+    def test_a_tracked_application_is_named_apart_from_a_self_report(self):
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        job = {"job_id": "job-2", "canonical_url": "https://jobs.example.com/1",
+               "employer": "Acme Health", "title": "Clinical Data Analyst"}
+        APPLICATIONS.ingest_job(self.db, job, at=AT)
+        APPLICATIONS.create_application(self.db, "app-2", "job-2", at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["applied_evidence"], "tracked application")
 
     def test_a_kept_job_that_was_applied_to_says_so(self):
         SAVED.save(self.db, card(), actor="user", at=AT)
@@ -151,7 +215,7 @@ class StatusTests(unittest.TestCase):
         SAVED.save(db, card(url="https://jobs.example.com/2"), actor="user", at=AT)
         summary = SAVED.status(db, today=TODAY)
         self.assertEqual(summary["saved"], 2)
-        self.assertEqual(summary["since_applied"], 0)
+        self.assertEqual(summary["applied"], 0)
         self.assertEqual(summary["median_days_open"], 28)
 
 

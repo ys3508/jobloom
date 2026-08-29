@@ -28,7 +28,8 @@ const I18N = {
     bestDirection: "Best-matching direction: {name}", tailorApply: "Tailor & apply", tailorApplySub: "Edit resume first",
     applyAsIs: "Apply as-is", applyAsIsSub: "Apply directly",
     saveLater: "Save for later", saveLaterSub: "Not now — keep it",
-    saved: "Saved to your tracker", saveFailed: "Could not save — is storing enabled?",
+    saved: "Saved to your tracker", loggedApplied: "Logged as applied — yours to confirm, not observed",
+    saveFailed: "Could not save — is storing enabled?",
     storedNotice: "Kept in your local tracker. Nothing else was stored.",
     drawer: "See details: what you have and what is missing", otherDirections: "Other directions considered",
     readingDetails: "Page reading details", hiddenTitle: "You've done this — not on your resume",
@@ -66,7 +67,8 @@ const I18N = {
     partialMessage: "我只读到了这个岗位的一部分，所以没有作出判断。请打开完整岗位详情页再试。", evidenceUnavailableMessage: "经历库为空或暂时不可用，所以没有判断这个岗位。请先导入简历或经历再试。", bestDirection: "最匹配方向：{name}",
     tailorApply: "精投", tailorApplySub: "改简历再投", applyAsIs: "广投", applyAsIsSub: "直接投",
     saveLater: "先存着", saveLaterSub: "现在不投，留着",
-    saved: "已存入你的记录表", saveFailed: "没能存上——本地服务开了写入吗？",
+    saved: "已存入你的记录表", loggedApplied: "已记为已投——这是你的声明，系统没有核实",
+    saveFailed: "没能存上——本地服务开了写入吗？",
     storedNotice: "已存入本地记录表。除此之外没有保存任何内容。",
     drawer: "逐条看：你有什么、缺什么", otherDirections: "其他考虑过的方向", readingDetails: "页面读取详情",
     hiddenTitle: "你做过、但简历没写", hiddenAdvice: "补进简历，这是你已确认做过的事", gapTitle: "你还没做过", gapAdvice: "不要硬写；如实当作岗位挑战",
@@ -335,7 +337,7 @@ let lastReading = null;
 // job means moving to the next one, so a button meaning "do not apply" would be pressed by
 // nobody. The other two record an intention the user then carries out on the job site
 // themselves, and nothing here applies on their behalf.
-async function saveForLater() {
+async function recordDecision(decision) {
   if (!lastReading?.job || !lastReading?.page?.url) return;
   const job = lastReading.job;
   const response = await fetch(`${state.endpoint}/save`, {
@@ -343,6 +345,7 @@ async function saveForLater() {
     headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
     body: JSON.stringify({
       actor: "user",
+      decision,
       job_card: {
         canonical_url: lastReading.page.url, title: job.title, employer: job.employer,
         location: job.location, country: job.country,
@@ -365,10 +368,13 @@ document.querySelectorAll("#actions button").forEach((button) => {
       candidate.classList.toggle("selected", selected);
       candidate.setAttribute("aria-pressed", String(selected));
     });
-    if (button.dataset.choice !== "later") return;
+    // Both apply buttons record that the user is applying, because they will do it on the
+    // job site and nothing here can watch them. It is their assertion, filed as theirs —
+    // never the `submitted` state, which needs a confirmation page behind it.
+    const decision = button.dataset.choice === "later" ? "later" : "applied";
     try {
-      await saveForLater();
-      $("status").textContent = t("saved");
+      await recordDecision(decision);
+      $("status").textContent = t(decision === "later" ? "saved" : "loggedApplied");
       // The panel promises nothing is stored. Once something is, it has to say so.
       $("notice").textContent = t("storedNotice");
     } catch (error) {
