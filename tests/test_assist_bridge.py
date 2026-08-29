@@ -98,6 +98,17 @@ Hybrid
 EEO Statement
 An Equal Opportunity Employer."""
 
+BU_GENOMICS_POSTING = """About the job
+In a Highly Collaborative Environment, The Successful Applicant Will
+- Implement computational analysis strategies for next generation sequencing (NGS), DNA-genome, transcriptomic, epigenomic, and proteomics data.
+- Direct the development and maintenance of genome-wide association and genomic analysis pipelines.
+- Collaborate in interpretation of data and preparation of manuscripts, grants, and presentations.
+- Prepare tables and figures for manuscripts that report analysis results.
+Required Skills
+Strong programming and analytic skills in R and Python or Perl, strong scientific writing skills, and three years relevant work or graduate education experience.
+Biological/Statistical knowledge preferred but not required.
+Equal Opportunity Employer"""
+
 
 class PostingSectionTests(unittest.TestCase):
     """A posting states its sections under headings; the extractor reads, it does not guess."""
@@ -167,6 +178,22 @@ class PostingSectionTests(unittest.TestCase):
         self.assertEqual(card["extraction"]["strategy"], "job_description_fallback")
         self.assertEqual(len(card["required_skills_stated"]), 2)
         self.assertIn("R", card["required_skills"])
+
+    def test_bu_successful_applicant_section_is_read_as_full_responsibilities(self):
+        card = SECTIONS.extract(BU_GENOMICS_POSTING)
+        self.assertEqual(card["extraction"]["read_status"], "complete")
+        self.assertGreaterEqual(len(card["responsibilities"]), 4)
+        self.assertIn("genome-wide association", " ".join(card["responsibilities"]))
+        self.assertIn("transcriptomic", " ".join(card["responsibilities"]))
+        self.assertTrue(any("preferred but not required" in line
+                            for line in card["preferred_skills_stated"]))
+        self.assertFalse(any("preferred but not required" in line
+                             for line in card["required_skills_stated"]))
+
+    def test_one_requirements_line_is_partial_not_a_successful_read(self):
+        card = SECTIONS.extract(
+            "Required Skills\nStrong programming and analytic skills in R and Python or Perl.")
+        self.assertEqual(card["extraction"]["read_status"], "partial")
 
     def test_navigation_chrome_is_not_mistaken_for_fallback_requirements(self):
         card = SECTIONS.extract("Jobs\nBoston, MA\n99+ results\n" * 30)
@@ -436,13 +463,13 @@ class ExtensionBoundaryTests(unittest.TestCase):
 
     def test_nothing_to_act_on_does_not_get_a_screen(self):
         panel = self.sources["panel.js"]
-        self.assertIn('["covered", "已经覆盖", "ok", "简历已有对应证据", true]',
+        self.assertIn('["covered", "coveredTitle", "ok", "coveredAdvice", true]',
                       panel)
 
     def test_all_requirement_detail_is_one_optional_drawer(self):
         html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
         self.assertIn('<details id="classes-drawer">', html)
-        self.assertIn("逐条看：你有什么、缺什么", html)
+        self.assertIn('data-i18n="drawer"', html)
 
     def test_the_complete_collapsed_description_is_available_to_the_reader(self):
         panel = self.sources["panel.js"]
@@ -503,7 +530,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
         panel = self.sources["panel.js"]
         self.assertIn("还没写具体成果/数字", panel)
         self.assertIn("对照了这些技能", panel)
-        self.assertNotIn("Worth a look", panel)
+        self.assertIn('review: "Worth a look"', panel)
         self.assertNotIn("Routing detail", panel)
         self.assertNotIn("direction.decision", panel)
         self.assertNotIn("direction.direction_id", panel)
@@ -517,13 +544,23 @@ class ExtensionBoundaryTests(unittest.TestCase):
                    'id="classes-drawer"']
         positions = [html.index(token) for token in ordered]
         self.assertEqual(positions, sorted(positions))
-        for label in ("精投", "广投", "不投", "逐条看：你有什么、缺什么"):
-            self.assertIn(label, html)
+        for key in ("tailorApply", "applyAsIs", "skip", "drawer"):
+            self.assertIn(f'data-i18n="{key}"', html)
 
     def test_unreadable_state_is_one_human_sentence_without_zero_counts(self):
         panel = self.sources["panel.js"]
         self.assertIn("这个岗位页面的格式我暂时读不了，换成打开岗位详情页再试。", panel)
-        self.assertIn('$("actions").hidden = unreadable', panel)
+        self.assertIn('$("actions").hidden = unavailable', panel)
+
+    def test_language_defaults_to_english_and_persists_the_user_choice(self):
+        panel = self.sources["panel.js"]
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        self.assertIn('language: "en"', panel)
+        self.assertIn('chrome.storage.local.set({ language: state.language })', panel)
+        self.assertIn('id="language"', html)
+        for wording in ("Worth applying", "Worth a look", "Not a fit",
+                        "Tailor & apply", "Apply as-is", "You've done this — not on your resume"):
+            self.assertIn(wording, panel)
 
     def test_the_panel_answers_rather_than_dumps(self):
         panel = self.sources["panel.js"]

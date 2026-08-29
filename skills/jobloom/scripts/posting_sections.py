@@ -39,6 +39,8 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
     "responsibilities": (
         "responsibilities", "key responsibilities", "what you'll do", "what you will do",
         "the role", "duties", "essential functions", "job summary", "position overview",
+        "the successful applicant will",
+        "in a highly collaborative environment, the successful applicant will",
     ),
     "compensation_structure": ("compensation", "salary", "pay", "pay range", "benefits"),
 }
@@ -73,7 +75,7 @@ SPONSORSHIP_NEGATIVE = ("not able to sponsor", "unable to sponsor", "no sponsors
 SPONSORSHIP_POSITIVE = ("visa sponsorship", "will sponsor", "sponsorship available",
                         "we sponsor", "h-1b sponsorship")
 MAX_ITEMS = 40
-MAX_ITEM_CHARS = 300
+MAX_ITEM_CHARS = 1_000
 REQUIREMENT_CUE = re.compile(
     r"\b(?:require(?:d|s|ments?)?|qualifications?|experience|skills?|degree|"
     r"proficien(?:t|cy)|knowledge|ability|years?|must|preferred|familiar(?:ity)?|"
@@ -84,7 +86,7 @@ FALLBACK_EXCLUSION = re.compile(
 
 def _heading_key(line: str) -> str | None:
     text = line.strip().strip(":").casefold()
-    if not text or len(text) > 60:
+    if not text or len(text) > 100:
         return None
     for key, headings in SECTION_HEADINGS.items():
         if text in headings:
@@ -101,6 +103,9 @@ def split_sections(text: str) -> dict[str, list[str]]:
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line:
+            continue
+        if re.search(r"\b(?:we are an )?equal opportunity employer\b|\bVEVRAA\b", line, re.I):
+            current = None
             continue
         key = _heading_key(line)
         if key == "__close__":
@@ -251,6 +256,20 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
             sections["required_skills"] = fallback["required_skills"]
             sections["preferred_skills"] = fallback["preferred_skills"]
             extraction_strategy = "job_description_fallback"
+    # Employers often put a final "preferred but not required" sentence inside the
+    # Required Skills block. Its own wording wins over the surrounding heading; treating
+    # it as mandatory manufactures a hard gap the employer explicitly denied.
+    expanded_required = [piece.strip() for line in sections["required_skills"]
+                         for piece in re.split(r"(?<=[.!?])\s+(?=[A-Z])", line)
+                         if piece.strip()]
+    sections["required_skills"] = expanded_required
+    softened = [line for line in sections["required_skills"]
+                if re.search(r"\bpreferred\b.*\bnot required\b", line, re.I)]
+    if softened:
+        sections["required_skills"] = [line for line in sections["required_skills"]
+                                       if line not in softened]
+        sections["preferred_skills"].extend(line for line in softened
+                                             if line not in sections["preferred_skills"])
     fields: dict[str, Any] = {}
     distilled: dict[str, dict[str, Any]] = {}
     unassessed: dict[str, list[str]] = {}
@@ -297,5 +316,18 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
                                       for key, value in distilled.items() if value["unrecognised"]},
         "unassessed_requirements": {key: lines for key, lines in unassessed.items() if lines},
         "requirement_lines": requirement_lines,
+        # A parser saying "success" after seeing one requirements sentence is more
+        # dangerous than a clean failure: it invites a confident judgement from a
+        # fragment. Responsibilities are the work itself and must travel with the
+        # qualification lines whenever the page supplies a short structured extract.
+        "read_status": (
+            "partial"
+            if (sections["required_skills"] or sections["preferred_skills"])
+            and not sections["responsibilities"]
+            and len([line for line in str(text or "").splitlines() if line.strip()]) <= 2
+            else "complete"
+        ),
+        "body_characters": len(str(text or "").strip()),
+        "responsibility_lines": len(sections["responsibilities"]),
     }
     return fields

@@ -208,6 +208,23 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     This is the part that touches nothing outside the user's own registries. It reads the
     page's structured fields and the user's own facts, and returns a judgement.
     """
+    extraction = card.get("extraction") or {}
+    if extraction.get("read_status") == "partial":
+        return {
+            "verdict": {"call": "partial", "because": "posting_read_incomplete",
+                        "direction": None, "covered": 0, "stated": 0},
+            "lead_with": [], "gaps": [], "classified": {name: [] for name in CLASSES},
+            "unassessed_requirements": [], "stated_requirements": [],
+            "resume_shows": len(resume_fact_ids(connection)),
+            "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
+                                                   "work_arrangement", "employment_type",
+                                                   "sponsorship", "salary")},
+            "directions": [],
+            "evidence": {"matches": [], "main_gap": None, "eligibility": None,
+                         "match": None, "action": None},
+            "notice": "the posting was only partly read and nothing was stored",
+        }
+
     directions = []
     for profile in _approved_directions(connection):
         try:
@@ -228,7 +245,8 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
             "warning_terms_required": signals.get("warning_terms_required", []),
             "warning_terms_preferred_only": signals.get("warning_terms_preferred_only", []),
         })
-    directions.sort(key=lambda item: (item.get("decision") != "match",
+    decision_order = {"match": 0, "review": 1, "fail": 2, "unavailable": 3}
+    directions.sort(key=lambda item: (decision_order.get(item.get("decision"), 4),
                                       -(item.get("ranking_score") or 0),
                                       item["direction_id"]))
     evaluation = None
