@@ -158,6 +158,14 @@ class PostingSectionTests(unittest.TestCase):
         unrecognised = card["extraction"]["unrecognised_requirements"]["required_skills"]
         self.assertTrue(any("degree" in line for line in unrecognised))
 
+    def test_every_requirement_without_an_explicit_term_stays_visible_for_review(self):
+        card = SECTIONS.extract(MGB_POSTING)
+        unassessed = card["extraction"]["unassessed_requirements"]
+        self.assertTrue(any("degree" in line for line in unassessed["required_skills"]))
+        lines = card["extraction"]["requirement_lines"]["required_skills"]
+        self.assertEqual(len(lines), len(card["required_skills_stated"]))
+        self.assertTrue(any(item["recognized_terms"] for item in lines))
+
     def test_sponsorship_refusal_is_read_but_never_invented(self):
         self.assertEqual(SECTIONS.extract("We are unable to sponsor visas.")["sponsorship"],
                          "does_not_support")
@@ -299,6 +307,18 @@ class ServerBoundaryTests(unittest.TestCase):
         self.assertEqual(body["lead_with"], [])
         self.assertIn("nothing was read", body["notice"])
 
+    def test_unassessed_required_lines_are_not_claimed_as_met(self):
+        _, body = self.post("/positioning", {**PAGE, "text": MGB_POSTING,
+                                             "required_skills": None})
+        self.assertTrue(body["unassessed_requirements"])
+        self.assertEqual(body["verdict"]["call"], "review")
+        self.assertEqual(body["verdict"]["unassessed"],
+                         len(body["unassessed_requirements"]))
+        self.assertEqual(body["verdict"]["lines_read"], len(body["stated_requirements"]))
+        self.assertTrue(any(not item["recognized_terms"]
+                            for item in body["stated_requirements"]))
+        self.assertIn("not the whole posting", body["verdict"]["because"])
+
     def test_a_direction_that_does_not_accept_it_is_not_a_reason_to_skip(self):
         # Whether the user can do the job is about their evidence. Whether it sits in a
         # registered direction is about how they budget applications. The second must not
@@ -429,8 +449,18 @@ class ExtensionBoundaryTests(unittest.TestCase):
 
     def test_the_verdict_carries_counts_a_user_can_decide_on(self):
         panel = self.sources["panel.js"]
-        for piece in ("to add", "required gap", "requirements met"):
+        for piece in ("to add", "required gap", "recognized terms supported",
+                      "requirement line"):
             self.assertIn(piece, panel)
+
+    def test_unassessed_posting_lines_stay_inside_the_optional_drawer(self):
+        panel = self.sources["panel.js"]
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        self.assertIn('id="unassessed"', html)
+        self.assertIn('id="stated-requirements"', html)
+        self.assertIn("Not automatically judged", panel)
+        self.assertIn("Requirements read from the posting", panel)
+        self.assertIn("They are not counted as met or missing", panel)
 
     def test_internal_wording_does_not_reach_the_user(self):
         panel = self.sources["panel.js"]

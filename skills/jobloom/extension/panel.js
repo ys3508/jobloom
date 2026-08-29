@@ -100,11 +100,19 @@ function evidenceLine(e) {
   return `${where} · ${figure}`;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[character]);
+}
+
 function render(result, page) {
   const [label, cls] = VERDICT_TEXT[result.verdict.call] || ["Unclear", "warn"];
   const groups = result.classified || {};
   const count = (key) => (groups[key] || []).length;
   const hardGaps = (groups.real_gap || []).filter((g) => g.obligation === "required").length;
+  const unassessed = result.unassessed_requirements || [];
+  const statedRequirements = result.stated_requirements || [];
 
   $("verdict").className = `verdict ${cls}`;
   $("verdict").innerHTML = `<strong>${label}</strong>
@@ -112,7 +120,11 @@ function render(result, page) {
     <span class="tally">
       <b class="ok">${count("hidden_strength")}</b> to add ·
       <b class="bad">${hardGaps}</b> required gap${hardGaps === 1 ? "" : "s"} ·
-      ${result.verdict.covered}/${result.verdict.stated} requirements met</span>`;
+      ${result.verdict.covered}/${result.verdict.stated} recognized terms supported${
+        statedRequirements.length ? ` · ${statedRequirements.length} JD line${
+          statedRequirements.length === 1 ? "" : "s"} read` : ""}${
+        unassessed.length ? ` · <b class="warn">${unassessed.length}</b> requirement line${
+          unassessed.length === 1 ? "" : "s"} need review` : ""}</span>`;
 
   $("job-title").textContent = result.job.title || "(title not read)";
   $("job-meta").textContent = [
@@ -143,6 +155,24 @@ function render(result, page) {
       ? `<details class="group ${tone}"><summary>${heading} · ${items.length}</summary>${body}</details>`
       : `<section class="group ${tone}"><h3>${heading}</h3>${body}</section>`;
   }).join("") || "<p class='muted'>this posting stated no requirements we could read</p>";
+
+  $("unassessed").hidden = !unassessed.length;
+  $("unassessed").innerHTML = unassessed.length ? `<h3>Not automatically judged · ${unassessed.length}</h3>
+    <p class="advice">These are requirements from the posting, but the current fact matcher
+      cannot judge them safely. They are not counted as met or missing.</p>
+    <ul>${unassessed.map((item) => `<li class="stack"><span class="name"><strong>${
+      escapeHtml(item.requirement)}</strong><span class="tag ${
+      item.obligation === "required" ? "bad" : "muted-tag"}">${
+      item.obligation === "required" ? "required" : "nice to have"}</span></span></li>`).join("")}</ul>` : "";
+
+  $("stated-requirements").hidden = !statedRequirements.length;
+  $("stated-requirements").innerHTML = statedRequirements.length
+    ? `<h3>Requirements read from the posting · ${statedRequirements.length}</h3>
+      <ul>${statedRequirements.map((item) => `<li class="stack"><span class="name"><strong>${
+        escapeHtml(item.requirement)}</strong>${item.recognized_terms.length
+          ? `<span class="reasons">terms checked: ${escapeHtml(item.recognized_terms.join(", "))}</span>`
+          : `<span class="reasons">needs a human evidence check</span>`}</span></li>`).join("")}</ul>`
+    : "";
 
   $("directions").innerHTML = result.directions.map((d) => {
     const reasons = [...(d.hard_failures || []), ...(d.review_reasons || [])].slice(0, 3).join(", ");

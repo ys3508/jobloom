@@ -212,12 +212,25 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
     sections = split_sections(text)
     fields: dict[str, Any] = {}
     distilled: dict[str, dict[str, Any]] = {}
+    unassessed: dict[str, list[str]] = {}
+    requirement_lines: dict[str, list[dict[str, Any]]] = {}
+    ontology = capability_ontology.load_ontology()
     for key in ("required_skills", "preferred_skills"):
         if not sections[key]:
             continue
-        distilled[key] = distill_terms(sections[key])
+        distilled[key] = distill_terms(sections[key], ontology=ontology)
         fields[key] = distilled[key]["terms"]
         fields[f"{key}_stated"] = sections[key]
+        # A capability match helps routing, but the capability's internal label is not
+        # the requirement the employer wrote. Keep every line that yielded no explicit
+        # term visible for human review instead of silently calling the recognised terms
+        # the complete posting.
+        line_results = [(line, distill_terms([line], ontology=ontology)) for line in sections[key]]
+        requirement_lines[key] = [
+            {"text": line, "recognized_terms": result["terms"]}
+            for line, result in line_results
+        ]
+        unassessed[key] = [line for line, result in line_results if not result["terms"]]
         if distilled[key]["capabilities"]:
             fields[f"{key}_capabilities"] = distilled[key]["capabilities"]
     for key in ("responsibilities", "compensation_structure"):
@@ -241,5 +254,7 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
         "sections_found": sorted(key for key in SECTION_HEADINGS if sections[key]),
         "unrecognised_requirements": {key: value["unrecognised"]
                                       for key, value in distilled.items() if value["unrecognised"]},
+        "unassessed_requirements": {key: lines for key, lines in unassessed.items() if lines},
+        "requirement_lines": requirement_lines,
     }
     return fields

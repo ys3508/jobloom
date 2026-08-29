@@ -247,6 +247,21 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     covered = buckets["covered"] + buckets["hidden_strength"] + buckets["evidence_gap"]
     gaps = buckets["real_gap"]
     required_gaps = [item for item in gaps if item["obligation"] == "required"]
+    unassessed_by_kind = card.get("extraction", {}).get("unassessed_requirements", {})
+    unassessed = [
+        {"requirement": line,
+         "obligation": "preferred" if kind == "preferred_skills" else "required"}
+        for kind in ("required_skills", "preferred_skills")
+        for line in unassessed_by_kind.get(kind, [])
+    ]
+    required_unassessed = [item for item in unassessed if item["obligation"] == "required"]
+    line_groups = card.get("extraction", {}).get("requirement_lines", {})
+    stated_requirements = [
+        {"requirement": item["text"], "recognized_terms": item.get("recognized_terms", []),
+         "obligation": "preferred" if kind == "preferred_skills" else "required"}
+        for kind in ("required_skills", "preferred_skills")
+        for item in line_groups.get(kind, [])
+    ]
     best = directions[0] if directions else None
     blocking = [term for direction in directions
                 for term in direction.get("warning_terms_required", [])]
@@ -276,7 +291,11 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     # Letting the second answer the first is how a genomics role they are well matched to
     # comes back as "skip" because its title was not on a list.
     outside_directions = bool(best) and best.get("decision") == "fail"
-    if not covered and not buckets["transferable"]:
+    if required_unassessed:
+        verdict, because = "review", (
+            f"{len(required_unassessed)} required lines still need a human evidence check; "
+            "the recognised terms alone are not the whole posting")
+    elif not covered and not buckets["transferable"]:
         verdict, because = "skip", "none of the stated requirements resolve to your evidence"
     elif len(required_gaps) > len(covered):
         verdict, because = "stretch", (
@@ -299,10 +318,13 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     return {
         "verdict": {"call": verdict, "because": because,
                     "direction": (best or {}).get("name"),
-                    "covered": len(covered), "stated": len(matches)},
+                    "covered": len(covered), "stated": len(matches),
+                    "unassessed": len(unassessed), "lines_read": len(stated_requirements)},
         "lead_with": covered,
         "gaps": gaps,
         "classified": {name: buckets[name] for name in CLASSES},
+        "unassessed_requirements": unassessed,
+        "stated_requirements": stated_requirements,
         "resume_shows": len(on_resume),
         "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
                                                "work_arrangement", "employment_type",
