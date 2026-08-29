@@ -24,7 +24,7 @@ ALLOCATIONS = [{"direction_id": "wide", "weight_percent": 85},
 PROFILES = {"wide": {"direction_id": "wide"}, "narrow": {"direction_id": "narrow"}}
 
 
-def card(job_id, title, *, employer="Acme", stated=0, preferred=0):
+def card(job_id, title, *, employer="Acme", stated=0, preferred=0, platform_permitted=True):
     sections = {}
     if stated:
         sections["required_skills_stated"] = [f"requirement {i}" for i in range(stated)]
@@ -34,7 +34,11 @@ def card(job_id, title, *, employer="Acme", stated=0, preferred=0):
         "job_id": job_id, "employer": employer, "title": title, "location": "Boston, MA",
         "country": "US", "work_arrangement": "remote", "employment_type": "full_time",
         "salary": None, "required_skills": [], "canonical_url": f"https://e.com/{job_id}",
-        "description_sha256": job_id, "extraction": {"ats": {"apply_url": None}, "sections": sections},
+        "description_sha256": job_id,
+        "authorization": "public_job_board_api" if platform_permitted else "self_asserted",
+        "source_tier": 0 if platform_permitted else 5,
+        "platform_permitted": platform_permitted,
+        "extraction": {"ats": {"apply_url": None}, "sections": sections},
     }
 
 
@@ -202,6 +206,53 @@ class GroupingTests(unittest.TestCase):
         text = QUEUE.render(queue)
         self.assertIn("3 independent openings", text)
         self.assertIn("same title is not the same job", text)
+
+
+class ProvenanceLabellingTests(unittest.TestCase):
+    """The harm this guards against happens in what the reader is told, so these assert the
+    words that reach a person — not that some internal field equals `self_asserted`."""
+
+    def queue(self, cards, results):
+        def route(profile, _candidate, job):
+            return results[(profile["direction_id"], job["job_id"])]
+        return QUEUE.build_queue(cards, {}, ALLOCATIONS, PROFILES, route=route)
+
+    def mixed(self):
+        cards = [card("j1", "Clean role"),
+                 card("j2", "Scraped role", platform_permitted=False)]
+        results = {("wide", "j1"): routing(score=100), ("wide", "j2"): routing(score=90)}
+        results.update({("narrow", f"j{i}"): routing(decision="fail") for i in (1, 2)})
+        return self.queue(cards, results)
+
+    def test_the_rendered_row_says_the_source_was_self_asserted(self):
+        text = QUEUE.render(self.mixed())
+        self.assertIn("self-asserted compliance", text)
+        self.assertIn("not platform-permitted", text)
+
+    def test_the_rendered_summary_counts_them_and_refuses_the_authorized_wording(self):
+        text = QUEUE.render(self.mixed())
+        self.assertIn("1 of these openings", text)
+        self.assertIn("never described as coming from an authorized source", text)
+
+    def test_a_queue_with_no_self_asserted_openings_carries_no_notice(self):
+        # The label must not become boilerplate that appears everywhere and means nothing.
+        cards = [card("j1", "Clean role")]
+        results = {("wide", "j1"): routing(), ("narrow", "j1"): routing(decision="fail")}
+        text = QUEUE.render(self.queue(cards, results))
+        self.assertNotIn("self-asserted", text)
+
+    def test_the_label_travels_per_row_not_only_in_the_summary(self):
+        # A summary line does not survive into an application archive; the row does.
+        queue = self.mixed()
+        scraped = next(row for row in queue["rows"] if row["title"] == "Scraped role")
+        self.assertFalse(scraped["platform_permitted"])
+        self.assertEqual(scraped["authorization"], "self_asserted")
+        self.assertEqual(queue["self_asserted_openings"], 1)
+
+    def test_a_clean_row_is_never_labelled(self):
+        queue = self.mixed()
+        clean = next(row for row in queue["rows"] if row["title"] == "Clean role")
+        self.assertTrue(clean["platform_permitted"])
 
 
 class CardLoadingTests(unittest.TestCase):

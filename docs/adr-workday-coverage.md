@@ -1,6 +1,6 @@
 # ADR: How to cover the Workday-hosted slice of the target market
 
-Status: **Open — awaiting a policy decision. Not an engineering task.**
+Status: **Decided 2026-08-29 — option 3, a new Tier 5. See the resolution below.**
 Recorded 2026-08-29. Audience: the product owner. Nothing here is a to-do.
 
 ---
@@ -46,3 +46,24 @@ The Workday-hosted slice is a known, intentional hole, not a bug. Do not "fix" i
 an adapter.
 
 Recorded in `skills/jobloom/references/ats-sources.md`.
+
+---
+
+## Resolution (2026-08-29)
+
+Neither of the two options as originally framed. A third was chosen: **a new Tier 5 for
+sources read on the operator's own compliance judgement.**
+
+Workday coverage is obtained, and the Tier 0 boundary does not move by a millimetre. Dirty
+data wears its own label rather than a clean one. Tier 5 is defined in
+`skills/jobloom/references/ats-sources.md`; the framework, its provenance rules, and its
+tests landed before any Workday adapter, so what gets reviewed first is the isolation
+boundary rather than a specific source.
+
+The measure that makes this hold is the one absent from the first draft of the spec: a
+`self_asserted` source may never shape a market profile, and `market_profile` refuses it by
+name rather than by omission. Market profiles decide which career directions are proposed;
+data admitted there would contaminate the user's positioning itself, with its label intact
+on a card nothing downstream reads.
+
+The Workday adapter is a separate change, registered as the first Tier 5 entry.

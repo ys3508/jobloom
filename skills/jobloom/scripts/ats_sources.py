@@ -52,7 +52,36 @@ MAX_COMPENSATION_ITEMS = 20
 MAX_COMPENSATION_CHARS = 300
 DETAIL_REQUEST_DELAY = 0.25
 BOARD_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-AUTHORIZATION_BASIS = "public_job_board_api"
+# Authorization says who carries the compliance judgement for reading a source. It is a
+# property of the source, never a claim about the data's quality, and it is never inferred:
+# each adapter declares it and a card carries the declaration through to the archive.
+#
+# Tier 5 exists so that a source we know is not platform-permitted has an honest, isolated
+# place to live instead of being quietly washed into Tier 0. Adding it does not relax
+# Tier 0: Workday belongs in Tier 5 precisely because it cannot enter Tier 0.
+PUBLIC_JOB_BOARD_API = "public_job_board_api"
+SELF_ASSERTED = "self_asserted"
+AUTHORIZATIONS: dict[str, dict[str, Any]] = {
+    PUBLIC_JOB_BOARD_API: {
+        "tier": 0,
+        "platform_permitted": True,
+        "requires_operator_justification": False,
+        "description": "the platform publishes this endpoint for public, unauthenticated reading",
+    },
+    SELF_ASSERTED: {
+        "tier": 5,
+        "platform_permitted": False,
+        "requires_operator_justification": True,
+        "description": ("read through an endpoint the platform does not document for outside "
+                        "consumption; the operator carries the compliance judgement, not the platform"),
+    },
+}
+# What may be described to a user as a clean, platform-permitted source. Everything else has
+# to be labelled as what it is wherever provenance is shown.
+PLATFORM_PERMITTED = frozenset(name for name, spec in AUTHORIZATIONS.items()
+                               if spec["platform_permitted"])
+# Kept for callers that predate the tiers.
+AUTHORIZATION_BASIS = PUBLIC_JOB_BOARD_API
 
 
 class SourceError(RuntimeError):
@@ -557,6 +586,7 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "board_url": lambda token: f"https://job-boards.greenhouse.io/{token}",
         "endpoint_template": "https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true",
         "docs": "https://developers.greenhouse.io/job-board.html",
+        "authorization": PUBLIC_JOB_BOARD_API,
     },
     "lever": {
         "fetch": _lever_fetch,
@@ -566,6 +596,7 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "board_url": lambda token: f"https://jobs.lever.co/{token}",
         "endpoint_template": "https://api.lever.co/v0/postings/{board_token}?mode=json",
         "docs": "https://github.com/lever/postings-api",
+        "authorization": PUBLIC_JOB_BOARD_API,
     },
     "ashby": {
         "fetch": _ashby_fetch,
@@ -575,6 +606,7 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "board_url": lambda token: f"https://jobs.ashbyhq.com/{token}",
         "endpoint_template": "https://api.ashbyhq.com/posting-api/job-board/{board_token}?includeCompensation=true",
         "docs": "https://developers.ashbyhq.com/docs/public-job-posting-api",
+        "authorization": PUBLIC_JOB_BOARD_API,
     },
     "smartrecruiters": {
         "fetch": _smartrecruiters_fetch,
@@ -585,6 +617,7 @@ ADAPTERS: dict[str, dict[str, Any]] = {
         "endpoint_template": ("https://api.smartrecruiters.com/v1/companies/{board_token}"
                               "/postings?limit=100&offset=0"),
         "docs": "https://developers.smartrecruiters.com/reference/postingapisearch",
+        "authorization": PUBLIC_JOB_BOARD_API,
     },
 }
 SUPPORTED_ATS = tuple(sorted(ADAPTERS))
@@ -658,6 +691,7 @@ def find_source(registry: dict[str, Any], ats: str, board_token: str) -> dict[st
 
 def add_source(registry: dict[str, Any], company: str, ats: str, board_token: str, actor: str,
                *, verification: dict[str, Any] | None = None, note: str | None = None,
+               compliance_basis: str | None = None, known_risks: str | None = None,
                at: datetime | None = None) -> dict[str, Any]:
     ats, board_token = validate_source_identity(ats, board_token)
     company = clean_text(company)
@@ -668,6 +702,23 @@ def add_source(registry: dict[str, Any], company: str, ats: str, board_token: st
     if find_source(registry, ats, board_token):
         raise ValueError(f"source already registered: {ats}/{board_token}")
     adapter = ADAPTERS[ats]
+    authorization = adapter["authorization"]
+    spec = AUTHORIZATIONS[authorization]
+    # A source whose compliance rests on the operator's own judgement has to record that
+    # judgement. It is the operator carrying the risk, so the reasoning cannot stay implicit
+    # — the same discipline the repo applies to every other deliberate exception.
+    justification: dict[str, Any] | None = None
+    if spec["requires_operator_justification"]:
+        if not clean_text(compliance_basis) or not clean_text(known_risks):
+            raise ValueError(
+                f"{authorization} sources require compliance_basis and known_risks: the "
+                "operator carries this compliance judgement, so it must be written down")
+        justification = {"compliance_basis": clean_text(compliance_basis),
+                         "known_risks": clean_text(known_risks)}
+    elif compliance_basis or known_risks:
+        raise ValueError(f"{authorization} sources take no operator justification: the "
+                         "platform's own terms are the basis, and recording a private "
+                         "rationale beside them would blur which one applies")
     timestamp = (at or now_utc()).isoformat()
     source = {
         "company": company,
@@ -679,12 +730,15 @@ def add_source(registry: dict[str, Any], company: str, ats: str, board_token: st
         "registered_at": timestamp,
         "registered_by": clean_text(actor),
         "authorization": {
-            "basis": AUTHORIZATION_BASIS,
+            "basis": authorization,
+            "tier": spec["tier"],
+            "platform_permitted": spec["platform_permitted"],
             "endpoint_template": adapter["endpoint_template"],
             "docs": adapter["docs"],
             "credentials_used": False,
             "verified_at": (verification or {}).get("verified_at"),
             "verified_posting_count": (verification or {}).get("postings"),
+            **({"operator_justification": justification} if justification else {}),
         },
     }
     registry["sources"].append(source)
@@ -824,6 +878,19 @@ def build_card(source: dict[str, Any], fields: dict[str, Any], *,
     # Identity is the ATS posting itself, not the rendered URL or title, so a re-titled or
     # re-hosted posting still resolves to the same job on the next pull.
     seed = f"{source['ats']}|{source['board_token']}|{external_id}".encode("utf-8")
+    # The basis frozen at registration, not whatever the adapter says today. Reading the
+    # adapter here would mean that editing one line of `ADAPTERS` silently relabels every
+    # card from every source already registered against it — the exact upgrade this design
+    # refuses. A source that genuinely gains platform permission is registered again under
+    # the new basis, which is a new entry, not a relabelled old one, and only that
+    # re-registration may change what a card claims.
+    #
+    # An unregistered source (a `probe`, a test) falls back to the adapter's own basis,
+    # which is the most it can honestly say about itself.
+    authorization = (((source.get("authorization") or {}).get("basis"))
+                     or ADAPTERS[source["ats"]]["authorization"])
+    if authorization not in AUTHORIZATIONS:
+        raise SourceError(f"source records an unknown authorization basis: {authorization}")
     statements, sponsorship_scan = ingest_job.sponsorship_statements(description)
     canonical_url = str(fields.get("canonical_url") or "").strip()
     if fields.get("country_basis") == "us_state_abbreviation":
@@ -862,6 +929,13 @@ def build_card(source: dict[str, Any], fields: dict[str, Any], *,
         "requirements_reviewed": False,
         "source": "ats",
         "ats": source["ats"],
+        # On the card, not looked up from the registry at submission time. The registry
+        # changes — a source can be disabled, removed, or re-registered under a different
+        # basis — and an archived card has to still say six months later how it was read.
+        # This is the same rule the resume archive follows: copy the bytes, never a pointer.
+        "authorization": authorization,
+        "source_tier": AUTHORIZATIONS[authorization]["tier"],
+        "platform_permitted": AUTHORIZATIONS[authorization]["platform_permitted"],
         "requisition_id": fields.get("requisition_id"),
         "description": description,
         "description_sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
@@ -981,7 +1055,11 @@ def pull_source(source: dict[str, Any], *, fetch: Callable[[str], Any] | None = 
     company = clean_text(source.get("company"))
     if not company:
         raise ValueError("source is missing a company name")
-    identity = {"company": company, "ats": ats, "board_token": board_token}
+    # The registry row's own authorization travels with the identity, so the card records
+    # how this source was authorized when it was registered rather than how its adapter is
+    # configured now.
+    identity = {"company": company, "ats": ats, "board_token": board_token,
+                "authorization": source.get("authorization")}
     adapter = ADAPTERS[ats]
     get = fetch or fetch_json
     pause = sleep if sleep is not None else time.sleep
@@ -1153,6 +1231,10 @@ def main() -> None:
     add_parser.add_argument("--board-token", required=True)
     add_parser.add_argument("--actor", required=True)
     add_parser.add_argument("--note")
+    add_parser.add_argument("--compliance-basis",
+                            help="self_asserted sources only: why the operator accepts reading it")
+    add_parser.add_argument("--known-risks",
+                            help="self_asserted sources only: when it stops being readable or acceptable")
     add_parser.add_argument("--skip-verify", action="store_true",
                             help="register without reading the board once first")
 
@@ -1191,7 +1273,8 @@ def main() -> None:
             checked = probe(args.ats, args.board_token)
             verification = {"verified_at": checked["checked_at"], "postings": checked["postings"]}
         result = add_source(registry, args.company, args.ats, args.board_token, args.actor,
-                            verification=verification, note=args.note)
+                            verification=verification, note=args.note,
+                            compliance_basis=args.compliance_basis, known_risks=args.known_risks)
         save_registry(path, registry)
     elif args.command == "list-sources":
         registry = load_registry(path)
