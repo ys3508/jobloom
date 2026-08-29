@@ -432,9 +432,19 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn("frames < 300", panel)
         self.assertIn("if (!reading.aligned)", panel)
         self.assertIn('found = climb(current, "current_job_with_apply")', panel)
-        self.assertIn("Boolean(alignedLink)", panel)
+        self.assertIn("alignedLink && description && bodyChanged", panel)
+        self.assertIn("bodySignature !== previousPosting.bodySignature", panel)
+        self.assertIn("args: [lastPostingSnapshot]", panel)
         self.assertIn("lastPostingKey = key", panel)
         self.assertGreater(panel.index("lastPostingKey = key"), panel.index("render(body, page)"))
+
+    def test_a_new_title_cannot_be_paired_with_the_previous_posting_body(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("currentId !== previousPosting.postingId", panel)
+        self.assertIn("body_changed", panel)
+        self.assertIn("description did not reach the current job", panel)
+        self.assertGreater(panel.index("lastPostingSnapshot = { postingId: page.postingId"),
+                           panel.index("render(body, page)"))
 
     def test_following_errors_are_visible_and_old_reads_cannot_overwrite_new_ones(self):
         panel = self.sources["panel.js"]

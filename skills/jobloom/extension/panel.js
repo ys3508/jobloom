@@ -192,7 +192,7 @@ function render(result, page) {
 // Injected into the tab only when the user presses the button. Nothing from this
 // extension runs on a job site before that press, and the injection reads the text the
 // page has already rendered — it does not fetch, follow, or expand anything.
-async function readVisiblePosting() {
+async function readVisiblePosting(previousPosting = {}) {
   // Finding the open posting by class name or by URL parameter has failed repeatedly, so
   // this looks for what the user can see instead: the Apply control belongs to the posting
   // and never to the list beside it, so the smallest block containing it and a description
@@ -313,9 +313,20 @@ async function readVisiblePosting() {
       .filter((value) => value.length > 2 && value.length < 140 && !value.endsWith("?"));
     const heading = headings.find((value) => expectedTitle &&
       (value.includes(expectedTitle) || expectedTitle.includes(value))) || headings[0] || "";
+    const descriptions = found
+      ? semanticDescriptions().filter((node) => found.pane.contains(node)) : [];
+    const description = descriptions.sort((a, b) => longerText(b).length - longerText(a).length)[0];
+    const bodyText = longerText(description);
+    const bodySignature = bodyText
+      ? `${bodyText.length}:${bodyText.slice(0, 240)}:${bodyText.slice(-240)}` : "";
+    const changedJob = Boolean(previousPosting.postingId
+      && currentId !== previousPosting.postingId);
+    const bodyChanged = !changedJob || bodySignature !== previousPosting.bodySignature;
     return { ...found, expectedTitle, heading,
       headerText: longerText(alignedHeader),
-      aligned: currentQueryId ? Boolean(alignedLink) : true };
+      description, descriptions, bodyText, bodySignature, bodyChanged,
+      aligned: currentQueryId
+        ? Boolean(alignedLink && description && bodyChanged) : true };
   };
 
   // History changes before LinkedIn finishes replacing the detail pane. Wait for paint,
@@ -329,16 +340,18 @@ async function readVisiblePosting() {
   }
   tried.push(`render_frames:${frames}`);
   tried.push(`aligned:${reading.aligned}`);
+  tried.push(`body_changed:${reading.bodyChanged}`);
   if (!reading.aligned) {
     return { stale: true, postingId: currentId || "", url: window.location.href,
-      diagnostics: { tried, chars: 0, opening: "detail pane did not reach the current job" } };
+      diagnostics: { tried, chars: 0,
+        opening: "detail header changed but its description did not reach the current job" } };
   }
 
   const { pane } = reading;
   let matched = reading.matched;
-  const descriptions = semanticDescriptions().filter((node) => pane.contains(node));
-  const description = descriptions.sort((a, b) => longerText(b).length - longerText(a).length)[0];
-  let text = longerText(description || pane);
+  const descriptions = reading.descriptions;
+  const description = reading.description;
+  let text = reading.bodyText || longerText(pane);
   if (description) matched += "+description";
 
   // The page's own name for this job comes first from the current-id link.
@@ -366,6 +379,7 @@ async function readVisiblePosting() {
   return {
     url: window.location.href, postingId: currentId || "", text: text.slice(0, 60000),
     title, employer, location: place, work_arrangement: workArrangement, container: matched,
+    bodySignature: reading.bodySignature,
     // Enough for one screenshot to say what happened, instead of a console session.
     diagnostics: { tried: [...tried, `description_candidates:${descriptions.length}`],
       chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
@@ -376,6 +390,7 @@ async function readVisiblePosting() {
 // they are not. The listener is scoped to the tab they are on, runs only while this panel
 // is open, and reads nothing until the posting they are looking at actually changes.
 let lastPostingKey = "";
+let lastPostingSnapshot = { postingId: "", bodySignature: "" };
 let readGeneration = 0;
 
 async function readPosting({ onlyIfChanged = false } = {}) {
@@ -387,7 +402,7 @@ async function readPosting({ onlyIfChanged = false } = {}) {
   const generation = ++readGeneration;
   try {
     const [injected] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id }, func: readVisiblePosting
+      target: { tabId: tab.id }, func: readVisiblePosting, args: [lastPostingSnapshot]
     });
     const page = injected?.result;
     if (page?.stale) throw new Error("the new posting is still rendering; choose it again");
@@ -408,6 +423,7 @@ async function readPosting({ onlyIfChanged = false } = {}) {
     $("status").textContent = `read from ${page.container}`;
     render(body, page);
     lastPostingKey = key;
+    lastPostingSnapshot = { postingId: page.postingId, bodySignature: page.bodySignature };
   } catch (error) {
     if (generation === readGeneration) $("status").textContent = String(error.message || error);
   }
