@@ -17,8 +17,13 @@ boards, routed against the approved v4 portfolio and the real candidate profile 
 
 | | n | mean `ranking_score` |
 | --- | ---: | ---: |
-| openings with requirements the candidate's facts cover | 51 | 121.2 |
-| openings with no extracted requirements at all | 42 | **125.8** |
+| openings with a requirement the candidate's facts cover directly | 35 | 119.9 |
+| openings with no directly covered requirement | 58 | **125.3** |
+
+The effect is not an artefact of which key splits the set. Under the weaker split — whether
+any requirement was extracted at all — it is 121.2 (n=51) against 125.8 (n=42), and the
+eight highest-scoring openings carry no evidence under either key. The direct-evidence
+split is the one reported because it is the key the queue actually sorts on.
 
 The top eight by score carried no requirements. Ranks 1–3 were a Clinical Study Design
 Manager and two Site/Field Operations roles; the Biostatistician and the SQL Health Data
