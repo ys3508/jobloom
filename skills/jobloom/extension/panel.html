@@ -5,44 +5,55 @@
 <main>
   <header>
     <h1>Jobloom</h1>
-    <p id="scope">Reads only the posting you have open. It does not browse, apply, or submit.</p>
+    <p id="scope">只读取你当前打开的岗位，不浏览、不申请、不提交。</p>
   </header>
 
   <details id="setup">
-    <summary>Connection</summary>
-    <label>Bridge <input id="endpoint" type="url" value="http://127.0.0.1:8787" spellcheck="false"></label>
-    <label>Token <input id="token" type="password" placeholder="printed when the bridge starts" spellcheck="false"></label>
-    <button id="save">Save</button>
+    <summary>连接设置</summary>
+    <label>本地服务 <input id="endpoint" type="url" value="http://127.0.0.1:8787" spellcheck="false"></label>
+    <label>访问令牌 <input id="token" type="password" placeholder="启动本地服务时显示" spellcheck="false"></label>
+    <button id="save">保存</button>
   </details>
   <p id="health" class="muted"></p>
 
   <section id="access">
-    <button id="grant">Grant access to job pages</button>
+    <button id="grant">允许读取岗位页面</button>
     <p id="access-state" class="muted"></p>
   </section>
 
   <p id="status" class="muted"></p>
 
   <section id="result" hidden>
+    <header id="job-heading">
+      <h2 id="job-title"></h2>
+      <p id="job-meta" class="muted"></p>
+    </header>
+
     <div id="verdict"></div>
-    <h2 id="job-title"></h2>
-    <p id="job-meta" class="muted"></p>
+    <p id="why"></p>
+    <p id="best-direction" class="muted" hidden></p>
 
-    <details id="page-diagnostics">
-      <summary>Page reading detail</summary>
-      <p id="diagnostics" class="muted"></p>
-    </details>
-
-    <details id="detail">
-      <summary>Routing detail</summary>
-      <ul id="directions"></ul>
-    </details>
+    <div id="actions" role="group" aria-label="投递选择">
+      <button data-choice="precision"><strong>精投</strong><span>改简历再投</span></button>
+      <button data-choice="broad"><strong>广投</strong><span>直接投</span></button>
+      <button data-choice="skip"><strong>不投</strong><span>跳过</span></button>
+    </div>
 
     <details id="classes-drawer">
       <summary>逐条看：你有什么、缺什么</summary>
       <section id="stated-requirements" class="group" hidden></section>
       <section id="unassessed" class="group warn" hidden></section>
       <div id="classes"></div>
+
+      <details id="detail">
+        <summary>其他考虑过的方向</summary>
+        <ul id="directions"></ul>
+      </details>
+
+      <details id="page-diagnostics" hidden>
+        <summary>页面读取详情</summary>
+        <p id="diagnostics" class="muted"></p>
+      </details>
     </details>
 
     <p class="notice" id="notice"></p>

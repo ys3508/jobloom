@@ -44,7 +44,8 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
 }
 # Headings that end a section without starting one we keep.
 CLOSING_HEADINGS = (
-    "about us", "about the team", "eeo", "equal opportunity", "physical requirements",
+    "about us", "about the company", "about the team", "people you can reach out to",
+    "meet the hiring team", "eeo", "equal opportunity", "physical requirements",
     "additional job details", "why work here", "follow us", "how to apply", "our values",
     "diversity", "accommodation", "legal", "notice",
 )
@@ -73,6 +74,12 @@ SPONSORSHIP_POSITIVE = ("visa sponsorship", "will sponsor", "sponsorship availab
                         "we sponsor", "h-1b sponsorship")
 MAX_ITEMS = 40
 MAX_ITEM_CHARS = 300
+REQUIREMENT_CUE = re.compile(
+    r"\b(?:require(?:d|s|ments?)?|qualifications?|experience|skills?|degree|"
+    r"proficien(?:t|cy)|knowledge|ability|years?|must|preferred|familiar(?:ity)?|"
+    r"expertise|background|communication|writing)\b", re.I)
+FALLBACK_EXCLUSION = re.compile(
+    r"\b(?:equal opportunity|accommodation|benefits?|compensation|salary|pay range)\b", re.I)
 
 
 def _heading_key(line: str) -> str | None:
@@ -110,6 +117,33 @@ def split_sections(text: str) -> dict[str, list[str]]:
         if len(sections[current]) < MAX_ITEMS:
             sections[current].append(item)
     return sections
+
+
+def fallback_requirement_lines(text: str) -> dict[str, list[str]]:
+    """Read requirement-like sentences when a page exposes prose without section markup.
+
+    This is deliberately a fallback, not a new evaluator. It only restores sentences the
+    employer actually wrote so the existing controlled term distillation and evidence
+    logic can receive them.
+    """
+    required: list[str] = []
+    preferred: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = BULLET.sub("", raw).strip(" ;")
+        if not line:
+            continue
+        pieces = re.split(r"(?<=[.!?;])\s+", line) if len(line) > MAX_ITEM_CHARS else [line]
+        for piece in pieces:
+            sentence = piece.strip(" ;")
+            if not 12 <= len(sentence) <= MAX_ITEM_CHARS:
+                continue
+            if FALLBACK_EXCLUSION.search(sentence) or not REQUIREMENT_CUE.search(sentence):
+                continue
+            target = preferred if re.search(r"\b(?:preferred|nice to have|a plus|desired)\b",
+                                             sentence, re.I) else required
+            if sentence not in target and len(target) < MAX_ITEMS:
+                target.append(sentence)
+    return {"required_skills": required, "preferred_skills": preferred}
 
 
 def _salary(text: str) -> dict[str, Any] | None:
@@ -210,6 +244,13 @@ def distill_terms(lines: list[str], *, ontology: dict[str, Any] | None = None) -
 def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
     """Return the JobCard fields a posting states outright. Absent fields stay absent."""
     sections = split_sections(text)
+    extraction_strategy = "posting_sections"
+    if not sections["required_skills"] and not sections["preferred_skills"]:
+        fallback = fallback_requirement_lines(text)
+        if fallback["required_skills"] or fallback["preferred_skills"]:
+            sections["required_skills"] = fallback["required_skills"]
+            sections["preferred_skills"] = fallback["preferred_skills"]
+            extraction_strategy = "job_description_fallback"
     fields: dict[str, Any] = {}
     distilled: dict[str, dict[str, Any]] = {}
     unassessed: dict[str, list[str]] = {}
@@ -249,7 +290,7 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
         fields["employment_type"] = employment
     fields["sponsorship"] = _sponsorship(text)
     fields["extraction"] = {
-        "strategy": "posting_sections",
+        "strategy": extraction_strategy,
         "needs_user_review": True,
         "sections_found": sorted(key for key in SECTION_HEADINGS if sections[key]),
         "unrecognised_requirements": {key: value["unrecognised"]

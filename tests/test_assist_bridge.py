@@ -158,6 +158,20 @@ class PostingSectionTests(unittest.TestCase):
         unrecognised = card["extraction"]["unrecognised_requirements"]["required_skills"]
         self.assertTrue(any("degree" in line for line in unrecognised))
 
+    def test_unheaded_job_description_prose_is_a_reading_fallback(self):
+        text = ("Research Associate, Framingham Heart Study\n"
+                "The role supports longitudinal cardiovascular research.\n"
+                "This position requires a bachelor's degree and two years of experience.\n"
+                "Strong programming skills in R and excellent communication skills are required.\n")
+        card = SECTIONS.extract(text)
+        self.assertEqual(card["extraction"]["strategy"], "job_description_fallback")
+        self.assertEqual(len(card["required_skills_stated"]), 2)
+        self.assertIn("R", card["required_skills"])
+
+    def test_navigation_chrome_is_not_mistaken_for_fallback_requirements(self):
+        card = SECTIONS.extract("Jobs\nBoston, MA\n99+ results\n" * 30)
+        self.assertNotIn("required_skills_stated", card)
+
     def test_every_requirement_without_an_explicit_term_stays_visible_for_review(self):
         card = SECTIONS.extract(MGB_POSTING)
         unassessed = card["extraction"]["unassessed_requirements"]
@@ -307,6 +321,15 @@ class ServerBoundaryTests(unittest.TestCase):
         self.assertEqual(body["lead_with"], [])
         self.assertIn("nothing was read", body["notice"])
 
+    def test_unheaded_job_description_body_does_not_become_a_read_failure(self):
+        prose = ("Research Associate, Framingham Heart Study\n"
+                 "This position requires two years of research experience.\n"
+                 "Strong programming skills in R and excellent communication skills are required.\n")
+        _, body = self.post("/positioning", {**PAGE, "text": prose,
+                                             "required_skills": None})
+        self.assertNotEqual(body["verdict"]["call"], "unreadable")
+        self.assertTrue(body["stated_requirements"])
+
     def test_unassessed_required_lines_are_not_claimed_as_met(self):
         _, body = self.post("/positioning", {**PAGE, "text": MGB_POSTING,
                                              "required_skills": None})
@@ -413,7 +436,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
 
     def test_nothing_to_act_on_does_not_get_a_screen(self):
         panel = self.sources["panel.js"]
-        self.assertIn('["covered", "Already covered and shown", "ok", "nothing to do", true]',
+        self.assertIn('["covered", "已经覆盖", "ok", "简历已有对应证据", true]',
                       panel)
 
     def test_all_requirement_detail_is_one_optional_drawer(self):
@@ -425,6 +448,8 @@ class ExtensionBoundaryTests(unittest.TestCase):
         panel = self.sources["panel.js"]
         self.assertIn("current.textContent", panel)
         self.assertIn("complete.length > visible.length", panel)
+        self.assertIn("usedFullBodyFallback", panel)
+        self.assertIn('matched += "+full_body"', panel)
 
     def test_a_new_posting_waits_for_the_detail_pane_to_match_its_id(self):
         panel = self.sources["panel.js"]
@@ -449,7 +474,7 @@ class ExtensionBoundaryTests(unittest.TestCase):
     def test_following_errors_are_visible_and_old_reads_cannot_overwrite_new_ones(self):
         panel = self.sources["panel.js"]
         self.assertIn("generation !== readGeneration", panel)
-        self.assertIn("waiting for the selected posting", panel)
+        self.assertIn("正在等待新岗位正文", panel)
         self.assertNotIn('if (!onlyIfChanged) $("status").textContent', panel)
 
     def test_page_diagnostics_are_visible_without_a_console(self):
@@ -457,26 +482,48 @@ class ExtensionBoundaryTests(unittest.TestCase):
         self.assertIn('id="page-diagnostics"', html)
         self.assertIn('id="diagnostics"', html)
 
-    def test_the_verdict_carries_counts_a_user_can_decide_on(self):
+    def test_the_main_verdict_does_not_dump_internal_counts(self):
         panel = self.sources["panel.js"]
-        for piece in ("to add", "required gap", "recognized terms supported",
-                      "requirement line"):
-            self.assertIn(piece, panel)
+        for piece in ("recognized terms supported", "required gaps", "requirements met",
+                      "JD line read", "0/0"):
+            self.assertNotIn(piece, panel)
+        self.assertIn('$("why").textContent', panel)
+        self.assertNotIn("result.verdict.because", panel)
 
     def test_unassessed_posting_lines_stay_inside_the_optional_drawer(self):
         panel = self.sources["panel.js"]
         html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
         self.assertIn('id="unassessed"', html)
         self.assertIn('id="stated-requirements"', html)
-        self.assertIn("Not automatically judged", panel)
-        self.assertIn("Requirements read from the posting", panel)
-        self.assertIn("They are not counted as met or missing", panel)
+        self.assertIn("需要你确认", panel)
+        self.assertIn("岗位原文要求", panel)
+        self.assertIn("不计为满足或缺失", panel)
 
     def test_internal_wording_does_not_reach_the_user(self):
         panel = self.sources["panel.js"]
-        self.assertIn("no figure or outcome", panel)
+        self.assertIn("还没写具体成果/数字", panel)
+        self.assertIn("对照了这些技能", panel)
+        self.assertNotIn("Worth a look", panel)
+        self.assertNotIn("Routing detail", panel)
+        self.assertNotIn("direction.decision", panel)
+        self.assertNotIn("direction.direction_id", panel)
+        self.assertIn("REASON_TEXT[reason]", panel)
         self.assertIn("HUMAN_ARRANGEMENT", panel)
         self.assertIn('value !== "unknown"', panel, "unset fields are not shown as unknown")
+
+    def test_main_view_is_job_verdict_reason_actions_then_one_drawer(self):
+        html = (EXTENSION / "panel.html").read_text(encoding="utf-8")
+        ordered = ['id="job-heading"', 'id="verdict"', 'id="why"', 'id="actions"',
+                   'id="classes-drawer"']
+        positions = [html.index(token) for token in ordered]
+        self.assertEqual(positions, sorted(positions))
+        for label in ("精投", "广投", "不投", "逐条看：你有什么、缺什么"):
+            self.assertIn(label, html)
+
+    def test_unreadable_state_is_one_human_sentence_without_zero_counts(self):
+        panel = self.sources["panel.js"]
+        self.assertIn("这个岗位页面的格式我暂时读不了，换成打开岗位详情页再试。", panel)
+        self.assertIn('$("actions").hidden = unreadable', panel)
 
     def test_the_panel_answers_rather_than_dumps(self):
         panel = self.sources["panel.js"]
