@@ -79,6 +79,14 @@ def initialize(connection: sqlite3.Connection) -> None:
             deadline TEXT,
             decision TEXT NOT NULL,
             applied_at TEXT,
+            verdict TEXT,
+            verdict_reason TEXT,
+            direction TEXT,
+            covered INTEGER,
+            stated INTEGER,
+            hidden_strength INTEGER,
+            evidence_gap INTEGER,
+            suggested_choice TEXT,
             outcome TEXT,
             outcome_at TEXT,
             reason TEXT,
@@ -107,8 +115,37 @@ def _posting_dates(card: dict[str, Any]) -> tuple[str | None, str | None]:
     return (_text(ats.get("posted_at")) or None, _text(ats.get("deadline")) or None)
 
 
+JUDGEMENT_KEYS = ("verdict", "verdict_reason", "direction", "covered", "stated",
+                  "hidden_strength", "evidence_gap", "suggested_choice")
+
+
+def _judgement(value: Any) -> dict[str, Any]:
+    """The judgement as it was shown, kept verbatim rather than recomputed later.
+
+    Direction profiles are revised, the ontology is recalibrated, and the evidence library
+    grows. Re-deriving a verdict months later would answer "what would we say now", and the
+    question the funnel needs answered is "was what we said then borne out" — so this is a
+    copy, in the same spirit as an archive holding the bytes of a resume rather than a
+    pointer to a version that will have moved.
+
+    The vocabulary lives at the bridge, which owns the verdict. It is deliberately not
+    re-declared here: a second copy is a second thing to drift. A value that was never a
+    verdict shows up as its own group in any analysis, which is visible rather than silent.
+    """
+    found = value if isinstance(value, dict) else {}
+    kept: dict[str, Any] = {}
+    for key in JUDGEMENT_KEYS:
+        item = found.get(key)
+        if key in {"covered", "stated", "hidden_strength", "evidence_gap"}:
+            kept[key] = int(item) if isinstance(item, (int, float)) else None
+        else:
+            kept[key] = _text(item) or None
+    return kept
+
+
 def save(connection: sqlite3.Connection, card: dict[str, Any], *, actor: str,
          decision: str = "later", reason: str | None = None,
+         judgement: dict[str, Any] | None = None,
          at: datetime | None = None) -> dict[str, Any]:
     """Record a job to come back to. Never creates an application and never needs a review.
 
@@ -126,6 +163,7 @@ def save(connection: sqlite3.Connection, card: dict[str, Any], *, actor: str,
     if not title or not employer:
         raise ValueError("a saved job needs a title and an employer")
     posted_at, deadline = _posting_dates(card)
+    judged = _judgement(judgement)
     ats = (card.get("extraction") or {}).get("ats") or {}
     timestamp = (at or now_utc()).isoformat()
     existing = connection.execute(
@@ -140,20 +178,33 @@ def save(connection: sqlite3.Connection, card: dict[str, Any], *, actor: str,
     connection.execute("""
         INSERT INTO saved_jobs (job_url, title, employer, location, country, work_arrangement,
             employment_type, source, ats, apply_url, posted_at, deadline, decision, applied_at,
-            reason, decided_by, decided_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            verdict, verdict_reason, direction, covered, stated, hidden_strength, evidence_gap,
+            suggested_choice, reason, decided_by, decided_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_url) DO UPDATE SET
             title=excluded.title, employer=excluded.employer, location=excluded.location,
             country=excluded.country, work_arrangement=excluded.work_arrangement,
             employment_type=excluded.employment_type, source=excluded.source, ats=excluded.ats,
             apply_url=excluded.apply_url, posted_at=excluded.posted_at, deadline=excluded.deadline,
             decision=excluded.decision, applied_at=excluded.applied_at,
+            -- The judgement shown at the first decision is what the funnel tests. A later
+            -- press records the later decision without rewriting the judgement it was
+            -- first weighed against, unless there was none to begin with.
+            verdict=COALESCE(saved_jobs.verdict, excluded.verdict),
+            verdict_reason=COALESCE(saved_jobs.verdict_reason, excluded.verdict_reason),
+            direction=COALESCE(saved_jobs.direction, excluded.direction),
+            covered=COALESCE(saved_jobs.covered, excluded.covered),
+            stated=COALESCE(saved_jobs.stated, excluded.stated),
+            hidden_strength=COALESCE(saved_jobs.hidden_strength, excluded.hidden_strength),
+            evidence_gap=COALESCE(saved_jobs.evidence_gap, excluded.evidence_gap),
+            suggested_choice=COALESCE(saved_jobs.suggested_choice, excluded.suggested_choice),
             reason=excluded.reason, updated_at=excluded.updated_at
     """, (url, title, employer, _text(card.get("location")), _text(card.get("country")),
           _text(card.get("work_arrangement")), _text(card.get("employment_type")),
           _text(card.get("source")), _text(card.get("ats")), _text(ats.get("apply_url")),
-          posted_at, deadline, decision, applied_at, _text(reason, MAX_REASON), _text(actor),
-          decided_at, timestamp))
+          posted_at, deadline, decision, applied_at,
+          *(judged[key] for key in JUDGEMENT_KEYS),
+          _text(reason, MAX_REASON), _text(actor), decided_at, timestamp))
     connection.commit()
     return {"job_url": url, "decision": decision, "decided_at": decided_at,
             "applied_at": applied_at, "updated": bool(existing)}
@@ -243,6 +294,16 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
             "applied_at": row["applied_at"],
             "outcome": row["outcome"],
             "outcome_at": row["outcome_at"],
+            # What the panel said at the time, so a reply can be weighed against the call
+            # that preceded it rather than against one recomputed after the fact.
+            "verdict": row["verdict"],
+            "direction": row["direction"],
+            "covered": row["covered"],
+            "stated": row["stated"],
+            "suggested_choice": row["suggested_choice"],
+            "followed_suggestion": (None if not row["suggested_choice"]
+                                    else row["suggested_choice"] == ("later"
+                                         if row["decision"] == LATER else "broad")),
             "reason": row["reason"],
         })
     return rows
@@ -262,6 +323,19 @@ def status(connection: sqlite3.Connection, *, today: date | None = None) -> dict
         # from here, so they are not merged into a rate.
         "with_recorded_outcome": len(replies),
         "outcomes": {name: replies.count(name) for name in sorted(set(replies))},
+        # The question the funnel exists to answer: did the call precede the reply. Reported
+        # per verdict rather than as one rate, because a rate over mixed verdicts says
+        # nothing about whether the verdict was worth anything.
+        "by_verdict": {
+            name: {
+                "saved": sum(1 for row in rows if row["verdict"] == name),
+                "applied": sum(1 for row in rows
+                               if row["verdict"] == name and row["current_status"] == "Applied"),
+                "with_outcome": sum(1 for row in rows if row["verdict"] == name and row["outcome"]),
+            }
+            for name in sorted({row["verdict"] for row in rows if row["verdict"]})
+        },
+        "without_recorded_verdict": sum(1 for row in rows if not row["verdict"]),
         "with_stated_deadline": sum(1 for row in rows if row["deadline"]),
         "median_days_open": sorted(ages)[len(ages) // 2] if ages else None,
     }

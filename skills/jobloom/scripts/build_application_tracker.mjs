@@ -67,7 +67,8 @@ const rows = source.applications.map((item) => [
 const savedHeaders = [
   "Saved Time", "Employer", "Role", "Location", "Work Arrangement", "Source", "ATS",
   "Job URL", "Posted", "Days Open", "Deadline", "Current Status", "Applied", "Evidence",
-  "Outcome", "Outcome Recorded", "Reason",
+  "Outcome", "Outcome Recorded", "Verdict", "Direction", "Covered", "Stated",
+  "Suggested", "Followed", "Reason",
 ];
 const savedRows = (source.saved_jobs ?? []).map((item) => [
   item.saved_time ? new Date(item.saved_time) : null,
@@ -85,6 +86,13 @@ const savedRows = (source.saved_jobs ?? []).map((item) => [
   item.applied_evidence ?? "",
   item.outcome ?? "",
   item.outcome_at ? new Date(item.outcome_at) : null,
+  // The call as it was shown, never recomputed: a reply has to be weighable against what
+  // was said before it, and by then the directions and the ontology will have moved.
+  item.verdict ?? "", item.direction ?? "",
+  item.covered == null ? null : Number(item.covered),
+  item.stated == null ? null : Number(item.stated),
+  item.suggested_choice ?? "",
+  item.followed_suggestion == null ? "" : (item.followed_suggestion ? "yes" : "no"),
   item.reason ?? "",
 ]);
 
@@ -178,8 +186,10 @@ buildSheet({
     + "full row on the Applications sheet, so the two never count it twice. Skipping a job "
     + "leaves no record, so this counts jobs kept, never jobs seen.",
   headers: savedHeaders, rows: savedRows, tableName: "SavedJobsTable",
-  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 14, 16, 20, 18, 20, 20, 40],
-  dateTimeColumns: ["A", "M", "P"], dateColumns: ["I", "K"], numberColumns: ["J"],
+  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 14, 16, 20, 18, 20, 20,
+           12, 26, 10, 10, 12, 10, 40],
+  dateTimeColumns: ["A", "M", "P"], dateColumns: ["I", "K"],
+  numberColumns: ["J", "S", "T"],
 });
 
 const { last: appLast, height: appHeight } = applications;

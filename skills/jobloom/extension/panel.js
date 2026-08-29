@@ -253,6 +253,7 @@ function render(result, page) {
   // support, and moving on needs no button.
   const suggestedChoice = call === "skip" ? ""
     : call === "apply" && !count("hidden_strength") && !count("evidence_gap") ? "broad" : "precision";
+  lastSuggestedChoice = suggestedChoice;
   document.querySelectorAll("#actions button").forEach((button) => {
     button.classList.toggle("selected", button.dataset.choice === suggestedChoice);
     button.setAttribute("aria-pressed", String(button.dataset.choice === suggestedChoice));
@@ -337,15 +338,30 @@ let lastReading = null;
 // job means moving to the next one, so a button meaning "do not apply" would be pressed by
 // nobody. The other two record an intention the user then carries out on the job site
 // themselves, and nothing here applies on their behalf.
+let lastSuggestedChoice = "";
+
 async function recordDecision(decision) {
   if (!lastReading?.job || !lastReading?.page?.url) return;
   const job = lastReading.job;
+  const seen = lastReading.body || {};
+  const bucket = (name) => (seen.classified?.[name] || []).length;
+  const judgement = {
+    verdict: seen.verdict?.call || "",
+    verdict_reason: seen.verdict?.because || "",
+    direction: seen.verdict?.direction || "",
+    covered: seen.verdict?.covered ?? null,
+    stated: seen.verdict?.stated ?? null,
+    hidden_strength: bucket("hidden_strength"),
+    evidence_gap: bucket("evidence_gap"),
+    suggested_choice: lastSuggestedChoice,
+  };
   const response = await fetch(`${state.endpoint}/save`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
     body: JSON.stringify({
       actor: "user",
       decision,
+      judgement,
       job_card: {
         canonical_url: lastReading.page.url, title: job.title, employer: job.employer,
         location: job.location, country: job.country,
@@ -661,9 +677,12 @@ async function readPosting({ onlyIfChanged = false } = {}) {
     if (generation !== readGeneration) return;
     $("status").textContent = "";
     render(body, page);
-    // The card the panel is currently showing. "Save for later" files this one, so it can
-    // never file a job other than the one on screen.
-    lastReading = { job: body.job, page };
+    // The card the panel is currently showing, and the judgement shown with it. A decision
+    // files this one, so it can never file a job — or a verdict — other than the one on
+    // screen. The judgement travels because a reply months later has to be weighable
+    // against the call that preceded it, and by then the directions and the ontology will
+    // have moved; recomputing would answer a different question.
+    lastReading = { job: body.job, page, body };
     lastPostingKey = key;
     lastPostingSnapshot = { postingId: page.postingId, bodySignature: page.bodySignature };
   } catch (error) {
