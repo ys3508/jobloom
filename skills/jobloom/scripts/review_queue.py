@@ -35,6 +35,13 @@ import application_core  # noqa: E402
 import direction_core  # noqa: E402
 
 SCHEMA_VERSION = "0.1.0"
+# Wherever a source's trustworthiness is described to a person, a posting read on the
+# operator's own compliance judgement has to say so in words. An internal field is not
+# enough: the harm this guards against happens in what the reader is told, so the label has
+# to survive into the rendered text and not only into the JSON.
+SELF_ASSERTED_NOTICE = ("read under self-asserted compliance — the platform does not publish "
+                        "this source for public reading, so its provenance is not "
+                        "platform-permitted")
 # Evidence the candidate can actually stand behind. `mention_only` is deliberately worth
 # less than `direct` and more than nothing, and never adds up to `direct`: a transferable
 # or mentioned requirement is not a met one.
@@ -189,6 +196,9 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
             "also_matches": [item["direction_id"] for item in found[1:]],
             "employer": card["employer"],
             "title": card["title"],
+            # Carried from the card, never looked up from a registry that can change.
+            "authorization": card.get("authorization"),
+            "platform_permitted": card.get("platform_permitted", True),
             "location": card["location"],
             "country": card["country"],
             "work_arrangement": card["work_arrangement"],
@@ -206,6 +216,7 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
     annotate_groups(rows)
     grouped = sum(1 for row in rows if row.get("group"))
     evidenced = sum(1 for row in rows if row["evidence"]["direct"])
+    self_asserted = sum(1 for row in rows if not row.get("platform_permitted", True))
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -217,6 +228,10 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
         "with_direct_evidence": evidenced,
         # Openings sharing an employer and title with another. Reported, never collapsed.
         "in_title_groups": grouped,
+        # Openings whose source is not platform-permitted. Counted here and labelled again on
+        # every row, because a per-row label is what survives into an application archive
+        # while a summary line does not.
+        "self_asserted_openings": self_asserted,
         # Not "no requirements" — these state plenty. Nothing computed here distinguishes a
         # posting the distiller could not recognise from one that wants a different job, so
         # the tail is reported as one unordered group rather than given a false ordering.
@@ -229,7 +244,11 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
     labels = labels or {}
     def label(direction_id: str) -> str:
         return labels.get(direction_id, direction_id)
-    lines = ["# Review queue", "",
+    provenance_notice = ([
+        f"**{queue['self_asserted_openings']} of these openings were {SELF_ASSERTED_NOTICE}.** "
+        "They are marked individually below and are never described as coming from an "
+        "authorized source.", ""] if queue.get("self_asserted_openings") else [])
+    lines = ["# Review queue", ""] + provenance_notice + [
              f"{queue['openings_in_queue']} openings out of {queue['openings_routed']} routed. "
              f"{queue['with_direct_evidence']} carry at least one requirement your confirmed "
              f"facts cover directly and are ordered by how many. The remaining "
@@ -253,6 +272,8 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
         terms = ", ".join(evidence["direct_requirements"][:6]) or "—"
         title = (f"[{row['title']}]({row['canonical_url']})"
                  if str(row["canonical_url"]).startswith("http") else row["title"])
+        provenance = ("" if row.get("platform_permitted", True)
+                      else f" <br>**Source: {SELF_ASSERTED_NOTICE}.**")
         group = row.get("group")
         mark = (f" <br>**{group['independent_openings']} independent openings** share this "
                 f"employer and title — same title is not the same job, and each has its own "
@@ -261,7 +282,8 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
                 if group else "")
         lines.append(f"| {row['rank']} | {evidence['direct']} | {evidence['covered']}"
                      f"/{evidence['recognized_requirements']} | {evidence['stated_requirements']} "
-                     f"| {row['employer']} | {title}{mark} | {row['location']} | {terms} |")
+                     f"| {row['employer']} | {title}{provenance}{mark} | {row['location']} "
+                     f"| {terms} |")
     return "\n".join(lines) + "\n"
 
 

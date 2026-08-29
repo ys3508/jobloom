@@ -38,6 +38,73 @@ by adding an adapter.
 verified against a live board, and an unverified endpoint in a shipped adapter is worse
 than no adapter.
 
+## Tier 5 — sources read on the operator's own compliance judgement
+
+Recorded 2026-08-29, resolving `docs/adr-workday-coverage.md`.
+
+**Tier 5 — self-asserted.** Postings read through an endpoint the platform does not
+document for outside consumption, such as a Workday tenant feed. The platform does not
+permit public reading; inclusion in this tier is the operator accepting the compliance
+judgement themselves, not the platform granting anything.
+
+The difference from Tiers 0–4 is not data quality. It is who carries the compliance
+judgement: for Tiers 0–4 that is the platform or a vendor, for Tier 5 it is the operator.
+Tier 5 data is never described as a clean or platform-permitted source. Its authorization
+is permanently `self_asserted` and must be stated wherever source trustworthiness is
+described to a person.
+
+### This does not relax Tier 0
+
+Tier 0's definition is unchanged and still admits only sources the platform explicitly
+publishes for public reading. **Workday does not become admissible to Tier 0 because Tier 5
+now exists — it belongs in Tier 5 precisely because it cannot enter Tier 0.** Tier 5 is not
+a loosening; it is an honest, isolated place for a source we know is not clean and choose to
+read anyway. Any future source arguing "Workday got in, why not me" gets the same answer: it
+goes in Tier 5 too, not Tier 0.
+
+### `self_asserted` never becomes platform-permitted
+
+Authorization is derived from the adapter, never from caller input, and travels **on the
+card** — not looked up from the registry at submission time. The registry changes: a source
+can be disabled, removed, or registered again under a different basis, while an archived
+card still has to say six months later how it was read. This is the rule the resume archive
+already follows — copy the bytes, never a pointer.
+
+There is no path that raises a card's authorization. A source that genuinely gains platform
+permission is registered again under the new basis, which is a new registry entry, not a
+relabelled old one.
+
+### Tier 5 may never shape a market profile
+
+This is the deepest of the contamination paths and the least visible. `market_profile`
+aggregates JobCards into profiles that feed `career_direction_core`, which proposes career
+directions and scores their market and accessibility axes. A `self_asserted` posting that
+reached a profile would shape *where the user looks for work* — its label sitting untouched
+on a card nothing downstream reads. **Silent promotion is not only relabelling; it is also
+being consumed by something that never checks the label.**
+
+So `market_profile` refuses `self_asserted` **by name**, in `REFUSED_AUTHORIZATION_BASES`,
+rather than merely omitting it from the accepted set. Defence by omission is not defence:
+the next person who wants scraped postings to be more useful adds one word to
+`AUTHORIZATION_BASES` and cannot tell a deliberate exclusion from an oversight. A named
+refusal makes that edit fail a test that says which gate is being removed.
+
+### What a Tier 5 registry row records beyond the others
+
+`compliance_basis` — why the operator accepts reading this source — and `known_risks` —
+when it stops being readable or acceptable. Registration is refused without both. The
+compliance responsibility sits with the operator here, so the reasoning has to be written
+down and traceable rather than implicit. Conversely a platform-permitted source refuses a
+private rationale: the platform's own terms are the basis, and recording another beside them
+would blur which one applies.
+
+### Adding Tier 5 did not unify the authorization vocabularies
+
+Two exist and still diverge. `ats_sources` records `public_job_board_api`, which is not a
+member of `market_profile.AUTHORIZATION_BASES` (`user_supplied`, `official_api`,
+`licensed_dataset`, `employer_feed`). Reconciling them is a separate contract change with
+its own stored records, and is deliberately not attempted here.
+
 ## Registration comes before pulling
 
 A board is pulled only after `add-source` records it in `<private-root>/ats-sources.json`

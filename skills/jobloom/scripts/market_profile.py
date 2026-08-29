@@ -1,5 +1,8 @@
 """Aggregate authorized structured JobCards into fail-closed market profiles.
 
+Note that this module aggregates only *platform-permitted* sources. `self_asserted` sources
+are refused by name, not merely left off the list — see `REFUSED_AUTHORIZATION_BASES`.
+
 This module aggregates; it does not collect. Query templates describe search intent and
 are not an authorization to scrape any site, so a JobCard reaches a profile only when the
 source it came from is listed in `assets/market-sources.json` with a recorded
@@ -46,6 +49,22 @@ SINGLE_EMPLOYER_RISK = 0.30
 DEFAULT_WINDOW_DAYS = 90
 SPONSORSHIP_STATES = ("supports", "historical_support", "does_not_support", "unknown")
 AUTHORIZATION_BASES = {"user_supplied", "official_api", "licensed_dataset", "employer_feed"}
+# Bases that are recognised elsewhere in the system and are refused *here* specifically.
+#
+# This set is not decoration for what is already absent. A market profile is not a place a
+# posting is displayed — it shapes which career directions get proposed and how their market
+# and accessibility axes score, through `career_direction_core.profiles_for_functions`. Data
+# read on the operator's own compliance judgement rather than the platform's permission must
+# not reach that: a posting carrying a `self_asserted` label can still contaminate everything
+# downstream of a profile it was allowed to shape, with its label sitting untouched on a card
+# nobody downstream reads. Silent promotion is not only relabelling; it is also being
+# consumed by something that never checks the label.
+#
+# Leaving `self_asserted` merely unlisted would be defence by omission: the next person
+# wanting scraped postings to be more useful adds one word to AUTHORIZATION_BASES and cannot
+# tell a deliberate exclusion from an oversight. Refusing it by name makes that edit fail a
+# test that says which gate is being removed.
+REFUSED_AUTHORIZATION_BASES = {"self_asserted"}
 SOURCE_KEYS = {"source_id", "name", "authorization_basis", "terms_url", "recorded_at", "notes"}
 
 
@@ -61,6 +80,12 @@ def load_sources(path: Path | None = None) -> dict[str, dict[str, Any]]:
     for item in sources:
         if not isinstance(item, dict) or set(item) - SOURCE_KEYS or "source_id" not in item:
             raise ValueError("market source entry has missing or unknown fields")
+        if item.get("authorization_basis") in REFUSED_AUTHORIZATION_BASES:
+            raise ValueError(
+                f"market source {item['source_id']} declares "
+                f"{item['authorization_basis']}, which may never shape a market profile: "
+                "profiles decide which directions are proposed, and a source read on the "
+                "operator's own compliance judgement must not define where to look for work")
         if item.get("authorization_basis") not in AUTHORIZATION_BASES:
             raise ValueError("market source requires a recorded authorization basis")
         if item["source_id"] in by_id:

@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import os
@@ -552,6 +553,86 @@ class StructuringTests(unittest.TestCase):
         card = pull(GREENHOUSE_SOURCE, {"boards-api.greenhouse.io": payload})["cards"][0]
         self.assertEqual(card["country"], "US")
         self.assertIn("country_inferred_from_state_abbreviation", card["extraction"]["notes"])
+
+
+SELF_ASSERTED_ADAPTER = {
+    "fetch": lambda token, get: ([], []),
+    "summary": lambda posting: {},
+    "detail_url": None,
+    "card": lambda source, posting, detail: {},
+    "board_url": lambda token: f"https://{token}.example/careers",
+    "endpoint_template": "https://{board_token}.example/undocumented",
+    "docs": None,
+    "authorization": "self_asserted",
+}
+
+
+class AuthorizationTierTests(unittest.TestCase):
+    """Tier 5 exists so a source known not to be platform-permitted has an honest, isolated
+    place instead of being quietly washed into Tier 0."""
+
+    def setUp(self):
+        self.adapters = copy.copy(ATS.ADAPTERS)
+        ATS.ADAPTERS["demo_scraped"] = SELF_ASSERTED_ADAPTER
+        self.addCleanup(lambda: (ATS.ADAPTERS.clear(), ATS.ADAPTERS.update(self.adapters)))
+        self.registry = ATS.empty_registry()
+
+    def test_every_shipped_adapter_declares_its_authorization(self):
+        # A new adapter must state which tier it is in; inheriting Tier 0 by omission is how
+        # a scraper ends up described as platform-permitted.
+        for name, adapter in self.adapters.items():
+            self.assertIn(adapter.get("authorization"), ATS.AUTHORIZATIONS, name)
+
+    def test_the_shipped_adapters_are_all_platform_permitted(self):
+        for name, adapter in self.adapters.items():
+            self.assertIn(adapter["authorization"], ATS.PLATFORM_PERMITTED, name)
+
+    def test_a_self_asserted_source_must_record_the_operator_s_reasoning(self):
+        # The operator carries this compliance judgement, so it cannot stay implicit.
+        with self.assertRaises(ValueError) as caught:
+            ATS.add_source(self.registry, "Acme", "demo_scraped", "acme", "sissi", at=AT)
+        self.assertIn("compliance_basis", str(caught.exception))
+        with self.assertRaises(ValueError):
+            ATS.add_source(self.registry, "Acme", "demo_scraped", "acme", "sissi",
+                           compliance_basis="reviewed with counsel", at=AT)
+
+    def test_a_registered_self_asserted_source_carries_tier_and_reasoning(self):
+        source = ATS.add_source(self.registry, "Acme", "demo_scraped", "acme", "sissi",
+                                compliance_basis="reviewed with counsel 2026-08",
+                                known_risks="breaks if the tenant endpoint changes", at=AT)
+        authorization = source["authorization"]
+        self.assertEqual(authorization["basis"], ATS.SELF_ASSERTED)
+        self.assertEqual(authorization["tier"], 5)
+        self.assertFalse(authorization["platform_permitted"])
+        self.assertEqual(authorization["operator_justification"]["known_risks"],
+                         "breaks if the tenant endpoint changes")
+
+    def test_a_platform_permitted_source_takes_no_private_rationale(self):
+        # The platform's own terms are the basis; recording a private one beside them would
+        # blur which of the two actually applies.
+        with self.assertRaises(ValueError):
+            ATS.add_source(self.registry, "Acme Bio", "greenhouse", "acme", "sissi",
+                           compliance_basis="we think it is fine", at=AT)
+
+    def test_a_card_carries_its_authorization_rather_than_a_registry_lookup(self):
+        # The registry changes — a source can be disabled, removed, or re-registered under a
+        # different basis — and an archived card still has to say how it was read.
+        card = pull(GREENHOUSE_SOURCE, {"boards-api.greenhouse.io": GREENHOUSE_PAYLOAD})["cards"][0]
+        self.assertEqual(card["authorization"], ATS.PUBLIC_JOB_BOARD_API)
+        self.assertEqual(card["source_tier"], 0)
+        self.assertTrue(card["platform_permitted"])
+
+    def test_authorization_comes_from_the_adapter_not_from_caller_input(self):
+        # There is no path that raises a card's authorization. A source that genuinely gains
+        # platform permission is registered again under the new basis.
+        fields = {"external_id": "1", "title": "Analyst", "description": "text",
+                  "canonical_url": "https://e/1", "authorization": ATS.PUBLIC_JOB_BOARD_API,
+                  "platform_permitted": True, "source_tier": 0}
+        card = ATS.build_card({"company": "Acme", "ats": "demo_scraped", "board_token": "acme"},
+                              fields, endpoint="https://e", at=AT, extract=lambda *a, **k: {})
+        self.assertEqual(card["authorization"], ATS.SELF_ASSERTED)
+        self.assertEqual(card["source_tier"], 5)
+        self.assertFalse(card["platform_permitted"])
 
 
 class RegistryTests(unittest.TestCase):
