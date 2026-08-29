@@ -34,6 +34,18 @@ STRENGTH_FACTORS = {
     "none": 0.0,
 }
 
+# A declared grade cannot promote the surface that mentioned a capability into a kind of
+# evidence that surface does not contain. A skill row can confirm that Python was listed
+# and a course can establish exposure; neither establishes demonstrated Python work.
+FACT_TYPE_STRENGTH_CAPS = {
+    "professional_summary": "mention_only",
+    "resume_claim": "mention_only",
+    "skill": "mention_only",
+    "education": "transferable",
+    "certification": "strongly_related",
+    "experience_header": "strongly_related",
+}
+
 # Deliberately small and curated. Add domain aliases here with regression tests; do not
 # use fuzzy matching for evidence decisions.
 TOKEN_ALIASES = {
@@ -135,6 +147,14 @@ def _match_quality(requirement: str, fact: dict[str, Any]) -> int:
     return 2 if any(str(surface).strip().casefold() == wanted for surface in surfaces) else 1
 
 
+def effective_strength(fact: dict[str, Any]) -> str:
+    """Return declared strength capped by what the fact's source kind can prove."""
+    declared = fact["evidence_strength"]
+    cap = FACT_TYPE_STRENGTH_CAPS.get(
+        str(fact.get("type") or "experience_claim"), "direct")
+    return min((declared, cap), key=lambda strength: EVIDENCE_ORDER[strength])
+
+
 def related_facts(requirement: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [fact for fact in facts if fact_supports(requirement, fact)]
 
@@ -149,10 +169,10 @@ def match_requirement(requirement: str, facts: list[dict[str, Any]]) -> dict[str
     ]
     if not matches:
         return {"requirement": requirement, "strength": "none", "fact_ids": []}
-    best_strength = max((fact["evidence_strength"] for fact in matches),
+    effective = [(fact, effective_strength(fact)) for fact in matches]
+    best_strength = max((strength for _, strength in effective),
                         key=lambda strength: EVIDENCE_ORDER[strength])
-    strongest = [fact for fact in matches
-                 if fact["evidence_strength"] == best_strength]
+    strongest = [fact for fact, strength in effective if strength == best_strength]
     best_quality = max(_match_quality(requirement, fact) for fact in strongest)
     fact_ids = sorted(
         fact["id"] for fact in strongest if _match_quality(requirement, fact) == best_quality
@@ -196,19 +216,19 @@ def match_requirement_prose(requirement: str, facts: list[dict[str, Any]]) -> di
                 "strength": "none", "fact_ids": sorted({fact["id"] for group in hits.values()
                                                           for fact in group}),
                 "concepts": concepts}
-    best_per_concept = [max(group, key=lambda fact: EVIDENCE_ORDER[fact["evidence_strength"]])
+    best_per_concept = [max(group, key=lambda fact: EVIDENCE_ORDER[effective_strength(fact)])
                         for group in hits.values()]
     strongest_hits = [fact for group in hits.values()
                       for fact in group
-                      if fact["evidence_strength"] == max(
-                          (item["evidence_strength"] for item in group),
+                      if effective_strength(fact) == max(
+                          (effective_strength(item) for item in group),
                           key=lambda value: EVIDENCE_ORDER[value])]
     # All named concepts have evidence at this point. A skill-list fact may carry only a
     # mention grade while another concept in the same employer bullet is backed by a
     # direct accomplishment (for example, Microsoft Office plus building three databases).
     # Preserve the strongest actual accomplishment; the UI still shows every supporting
     # fact and therefore does not turn a mention into invented work.
-    strength = max((fact["evidence_strength"] for fact in best_per_concept),
+    strength = max((effective_strength(fact) for fact in best_per_concept),
                    key=lambda value: EVIDENCE_ORDER[value])
     return {"requirement": requirement, "recognized": True, "strength": strength,
             "fact_ids": sorted({fact["id"] for fact in strongest_hits}),
