@@ -41,6 +41,60 @@ TOKEN_ALIASES = {
     "statistics": "statistic",
 }
 
+# Requirement prose names capabilities, not always products. The ordinary matcher stays
+# deliberately strict for explicit terms (R means R); this controlled layer lets a whole
+# sentence such as "research, writing, and analysis skills" consult the fact store by the
+# capabilities it actually asks for. Every surface is curated and every hit still comes
+# from one confirmed fact -- no fuzzy or model-authored evidence.
+REQUIREMENT_CONCEPTS = {
+    "degree": {
+        "requirement": r"\b(?:bachelor'?s?|master'?s?|degree)\b",
+        "evidence": ("bachelor", "master", "mph", "degree"),
+    },
+    "research": {
+        "requirement": r"\bresearch\b",
+        "evidence": ("research", "literature review", "clinical trial"),
+    },
+    "writing": {
+        "requirement": r"\b(?:writ(?:e|ing|ten)|written deliverables?|manuscripts?)\b",
+        "evidence": ("writing", "drafted", "manuscript", "publication", "published", "report"),
+    },
+    "analysis": {
+        "requirement": r"\b(?:analys(?:is|es)|analy(?:tic|tical|ze|zed|zing))\b",
+        "evidence": ("analysis", "analytic", "analyzed", "statistical"),
+    },
+    "database_creation": {
+        "requirement": r"\b(?:database (?:creation|management)|create databases?)\b",
+        "evidence": ("built a database", "building comprehensive databases", "database management",
+                     "clinical trial database"),
+    },
+    "office": {
+        "requirement": r"\bmicrosoft office\b",
+        "evidence": ("microsoft office", "advanced excel"),
+    },
+    "presentation": {
+        "requirement": r"\b(?:present(?:ation|ations|ed)?|communicat(?:e|ion))\b",
+        "evidence": ("presentation", "presentations", "communicating analysis results",
+                     "communicated results"),
+    },
+    "synthesis": {
+        "requirement": r"\b(?:summari[sz]e|synthesi[sz]e)\b",
+        "evidence": ("synthesized", "reports", "literature review"),
+    },
+    "interpersonal": {
+        "requirement": r"\binterpersonal\b",
+        "evidence": ("stakeholders", "focus groups", "communicated", "collaborat"),
+    },
+    "organization": {
+        "requirement": r"\borganizational\b",
+        "evidence": ("project management", "coordinat", "organized", "management"),
+    },
+    "neuroimaging": {
+        "requirement": r"\b(?:neuroimaging|multimodal mri|mri)\b",
+        "evidence": ("neuroimaging", "mri", "magnetic resonance imaging"),
+    },
+}
+
 
 def expired_or_invalid(value: str | None, *, today: date | None = None) -> bool:
     """Treat malformed expiry data as unusable evidence instead of crashing routing."""
@@ -104,3 +158,60 @@ def match_requirement(requirement: str, facts: list[dict[str, Any]]) -> dict[str
         fact["id"] for fact in strongest if _match_quality(requirement, fact) == best_quality
     )
     return {"requirement": requirement, "strength": best_strength, "fact_ids": fact_ids}
+
+
+def match_requirement_prose(requirement: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve a prose requirement through controlled capability surfaces.
+
+    `recognized` distinguishes "the user lacks this" from "the adapter has no safe rule
+    for this sentence". Only the second belongs in manual review.
+    """
+    concepts = [name for name, rule in REQUIREMENT_CONCEPTS.items()
+                if re.search(rule["requirement"], requirement, re.I)]
+    if re.search(r"\b\d+\s*(?:\+\s*)?years?\b.*\bexperience\b", requirement, re.I):
+        concepts.append("dated_experience")
+    if not concepts:
+        return {"requirement": requirement, "recognized": False,
+                "strength": "none", "fact_ids": [], "concepts": []}
+
+    usable = [fact for fact in facts
+              if fact.get("status") in {"confirmed", "locked"}
+              and fact.get("evidence_strength") in EVIDENCE_ORDER
+              and fact.get("evidence_strength") != "none"
+              and not expired_or_invalid(fact.get("expires_at"))]
+    hits: dict[str, list[dict[str, Any]]] = {}
+    for concept in concepts:
+        if concept == "dated_experience":
+            hits[concept] = [fact for fact in usable
+                             if fact.get("type") == "experience_header"
+                             and re.search(r"\b(?:research|data|database|analyst|clinical)\b",
+                                           str(fact.get("value", "")), re.I)]
+            continue
+        aliases = REQUIREMENT_CONCEPTS[concept]["evidence"]
+        hits[concept] = [fact for fact in usable
+                         if any(all(token in fact_tokens(fact) for token in tokens(alias))
+                                for alias in aliases)]
+    if any(not hits[concept] for concept in concepts):
+        return {"requirement": requirement, "recognized": True,
+                "strength": "none", "fact_ids": sorted({fact["id"] for group in hits.values()
+                                                          for fact in group}),
+                "concepts": concepts}
+    best_per_concept = [max(group, key=lambda fact: EVIDENCE_ORDER[fact["evidence_strength"]])
+                        for group in hits.values()]
+    strongest_hits = [fact for group in hits.values()
+                      for fact in group
+                      if fact["evidence_strength"] == max(
+                          (item["evidence_strength"] for item in group),
+                          key=lambda value: EVIDENCE_ORDER[value])]
+    # All named concepts have evidence at this point. A skill-list fact may carry only a
+    # mention grade while another concept in the same employer bullet is backed by a
+    # direct accomplishment (for example, Microsoft Office plus building three databases).
+    # Preserve the strongest actual accomplishment; the UI still shows every supporting
+    # fact and therefore does not turn a mention into invented work.
+    strength = max((fact["evidence_strength"] for fact in best_per_concept),
+                   key=lambda value: EVIDENCE_ORDER[value])
+    return {"requirement": requirement, "recognized": True, "strength": strength,
+            "fact_ids": sorted({fact["id"] for fact in strongest_hits}),
+            "concepts": concepts,
+            "quantification_expected": not set(concepts).issubset(
+                {"degree", "dated_experience", "office", "interpersonal", "organization"})}

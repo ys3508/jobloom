@@ -43,7 +43,7 @@ import ingest_job  # noqa: E402
 import posting_sections  # noqa: E402
 import quantity_extractor  # noqa: E402
 import resume_core  # noqa: E402
-from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER, match_requirement_prose  # noqa: E402
 
 LOOPBACK = "127.0.0.1"
 MAX_PAGE_TEXT = 60_000
@@ -184,8 +184,9 @@ def classify_requirement(match: dict[str, Any], facts: dict[str, Any],
         kind = "transferable"
     elif not any(fact["id"] in on_resume for fact in supporting):
         kind = "hidden_strength"
-    elif not any(quantity_extractor.is_quantified(str(fact.get("value", "")))
-                 for fact in supporting):
+    elif match.get("quantification_expected", True) and not any(
+            quantity_extractor.is_quantified(str(fact.get("value", "")))
+            for fact in supporting):
         kind = "evidence_gap"
     else:
         kind = "covered"
@@ -209,6 +210,21 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     page's structured fields and the user's own facts, and returns a judgement.
     """
     extraction = card.get("extraction") or {}
+    usable_facts = [fact for fact in candidate.get("facts") or []
+                    if fact.get("status") in {"confirmed", "locked"}]
+    if not usable_facts:
+        return {
+            "verdict": {"call": "evidence_unavailable", "because": "candidate_fact_store_empty",
+                        "direction": None, "covered": 0, "stated": 0},
+            "lead_with": [], "gaps": [], "classified": {name: [] for name in CLASSES},
+            "unassessed_requirements": [], "stated_requirements": [], "resume_shows": 0,
+            "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
+                                                   "work_arrangement", "employment_type",
+                                                   "sponsorship", "salary")},
+            "directions": [], "evidence": {"matches": [], "main_gap": None,
+                                             "eligibility": None, "match": None, "action": None},
+            "notice": "candidate fact store is empty and nothing was stored",
+        }
     if extraction.get("read_status") == "partial":
         return {
             "verdict": {"call": "partial", "because": "posting_read_incomplete",
@@ -261,28 +277,38 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     classified = [classify_requirement(match, facts, on_resume,
                                        preferred=match["requirement"] in preferred_terms)
                   for match in matches]
-    buckets = {name: [item for item in classified if item["class"] == name] for name in CLASSES}
-    covered = buckets["covered"] + buckets["hidden_strength"] + buckets["evidence_gap"]
-    gaps = buckets["real_gap"]
-    required_gaps = [item for item in gaps if item["obligation"] == "required"]
     unassessed_by_kind = card.get("extraction", {}).get("unassessed_requirements", {})
-    unassessed = [
-        {"requirement": line,
+    prose_matches = [
+        {**match_requirement_prose(line, usable_facts),
          "obligation": "preferred" if kind == "preferred_skills" else "required"}
         for kind in ("required_skills", "preferred_skills")
         for line in unassessed_by_kind.get(kind, [])
     ]
+    classified.extend(classify_requirement(match, facts, on_resume,
+                                            preferred=match["obligation"] == "preferred")
+                      for match in prose_matches if match["recognized"])
+    buckets = {name: [item for item in classified if item["class"] == name] for name in CLASSES}
+    covered = buckets["covered"] + buckets["hidden_strength"] + buckets["evidence_gap"]
+    gaps = buckets["real_gap"]
+    required_gaps = [item for item in gaps if item["obligation"] == "required"]
+    unassessed = [{"requirement": item["requirement"], "obligation": item["obligation"]}
+                  for item in prose_matches if not item["recognized"]]
+    resolved_prose = [item for item in prose_matches if item["recognized"]]
     required_unassessed = [item for item in unassessed if item["obligation"] == "required"]
     line_groups = card.get("extraction", {}).get("requirement_lines", {})
+    prose_by_text = {item["requirement"]: item for item in prose_matches}
     stated_requirements = [
         {"requirement": item["text"], "recognized_terms": item.get("recognized_terms", []),
+         "evidence_status": (
+             "matched" if prose_by_text.get(item["text"], {}).get("strength") not in {None, "none"}
+             else "missing" if prose_by_text.get(item["text"], {}).get("recognized")
+             else "manual"
+         ),
          "obligation": "preferred" if kind == "preferred_skills" else "required"}
         for kind in ("required_skills", "preferred_skills")
         for item in line_groups.get(kind, [])
     ]
     best = directions[0] if directions else None
-    blocking = [term for direction in directions
-                for term in direction.get("warning_terms_required", [])]
     # A posting nobody could read is not a posting nobody should apply to. Saying "skip"
     # here passes off a parsing failure as a judgement about the user.
     stated = ((card.get("required_skills_stated") or [])
@@ -308,7 +334,6 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     # inside a registered direction is a question about how they are budgeting applications.
     # Letting the second answer the first is how a genomics role they are well matched to
     # comes back as "skip" because its title was not on a list.
-    outside_directions = bool(best) and best.get("decision") == "fail"
     if required_unassessed:
         verdict, because = "review", (
             f"{len(required_unassessed)} required lines still need a human evidence check; "
@@ -319,14 +344,6 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
         verdict, because = "stretch", (
             f"{len(required_gaps)} required things you have no evidence for, "
             f"against {len(covered)} you do")
-    elif outside_directions:
-        verdict, because = "review", (
-            "your evidence fits, but this sits outside the directions you registered — "
-            "worth a look, and worth asking whether the direction should widen")
-    elif blocking:
-        verdict, because = "review", (
-            "required terms you have no evidence for: "
-            + ", ".join(sorted(set(blocking))[:3]))
     elif buckets["hidden_strength"]:
         verdict, because = "apply", (
             f"{len(buckets['hidden_strength'])} of these you have done but this resume "
@@ -335,8 +352,9 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
         verdict, because = "apply", "your evidence covers most of what this posting states"
     return {
         "verdict": {"call": verdict, "because": because,
-                    "direction": (best or {}).get("name"),
-                    "covered": len(covered), "stated": len(matches),
+                    "direction": ((best or {}).get("name")
+                                  if (best or {}).get("decision") in {"match", "review"} else None),
+                    "covered": len(covered), "stated": len(matches) + len(resolved_prose),
                     "unassessed": len(unassessed), "lines_read": len(stated_requirements)},
         "lead_with": covered,
         "gaps": gaps,
@@ -349,7 +367,7 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
                                                "sponsorship", "salary")},
         "directions": directions,
         "evidence": {
-            "matches": matches,
+            "matches": matches + resolved_prose,
             "main_gap": (evaluation or {}).get("main_gap"),
             "eligibility": (evaluation or {}).get("eligibility"),
             "match": (evaluation or {}).get("match"),
@@ -384,7 +402,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
+            try:
+                candidate = _load_candidate(self.candidate_path)
+                fact_count = sum(fact.get("status") in {"confirmed", "locked"}
+                                 for fact in candidate.get("facts") or [])
+            except (OSError, ValueError, KeyError):
+                fact_count = 0
             self._send(200, {"status": "ok", "store_enabled": self.allow_store,
+                             "fact_store_ready": fact_count > 0, "fact_count": fact_count,
                              "source_fingerprint": source_fingerprint()})
             return
         self._send(404, {"error": "unknown_endpoint"})
@@ -418,7 +443,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _positioning(self, payload: dict[str, Any]) -> dict[str, Any]:
         card = build_card(payload)
-        candidate = _load_candidate(self.candidate_path)
+        try:
+            candidate = _load_candidate(self.candidate_path)
+        except (OSError, ValueError, KeyError):
+            candidate = {"facts": []}
         connection = self._connection()
         try:
             return {**positioning(card, candidate, connection), "job_card": card}

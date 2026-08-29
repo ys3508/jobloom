@@ -34,6 +34,7 @@ def load(name):
 BRIDGE = load("assist_bridge")
 SECTIONS = load("posting_sections")
 RESUMES = load("resume_core")
+EVIDENCE = load("evidence_matcher")
 EXTENSION = ROOT / "skills" / "jobloom" / "extension"
 
 PAGE = {
@@ -108,6 +109,21 @@ Required Skills
 Strong programming and analytic skills in R and Python or Perl, strong scientific writing skills, and three years relevant work or graduate education experience.
 Biological/Statistical knowledge preferred but not required.
 Equal Opportunity Employer"""
+
+UMASS_POSTING = """About the job
+Major Responsibilities
+Present research findings to various constituencies.
+Create databases to sort, evaluate, and present information.
+Required Qualifications
+Bachelors degree in Business Administration, quantitative science, a related degree, or equivalent experience
+1 year of experience in a related field
+Strong research, writing, and analysis skills
+Demonstrated experience in computer-based skills, including database creation, search engines and Microsoft Office applications
+Ability to conduct research, summarize and present key information
+Demonstrated organizational, analytical, and interpersonal skills.
+Our lab uses multimodal MRI and neuromodulation approaches to understand risk factors.
+Applicants with experience processing and analyzing neuroimaging data are preferred.
+The University is an equal opportunity employer."""
 
 
 class PostingSectionTests(unittest.TestCase):
@@ -194,6 +210,26 @@ class PostingSectionTests(unittest.TestCase):
         card = SECTIONS.extract(
             "Required Skills\nStrong programming and analytic skills in R and Python or Perl.")
         self.assertEqual(card["extraction"]["read_status"], "partial")
+
+    def test_umass_prose_is_not_all_misread_as_required(self):
+        card = SECTIONS.extract(UMASS_POSTING)
+        self.assertEqual(len(card["required_skills_stated"]), 6)
+        self.assertEqual(len(card["preferred_skills_stated"]), 1)
+        self.assertNotIn("risk factors", " ".join(card["required_skills_stated"]))
+        self.assertTrue(card["responsibilities"])
+
+    def test_requirement_prose_queries_confirmed_facts(self):
+        facts = [
+            {"id": "research", "type": "experience_claim", "status": "confirmed",
+             "evidence_strength": "direct", "value": "Conducted research and statistical analysis"},
+            {"id": "writing", "type": "experience_claim", "status": "confirmed",
+             "evidence_strength": "direct", "value": "Drafted a manuscript and published reports"},
+        ]
+        match = EVIDENCE.match_requirement_prose(
+            "Strong research, writing, and analysis skills", facts)
+        self.assertTrue(match["recognized"])
+        self.assertEqual(match["strength"], "direct")
+        self.assertEqual(match["fact_ids"], ["research", "writing"])
 
     def test_navigation_chrome_is_not_mistaken_for_fallback_requirements(self):
         card = SECTIONS.extract("Jobs\nBoston, MA\n99+ results\n" * 30)
@@ -358,7 +394,13 @@ class ServerBoundaryTests(unittest.TestCase):
         self.assertTrue(body["stated_requirements"])
 
     def test_unassessed_required_lines_are_not_claimed_as_met(self):
-        _, body = self.post("/positioning", {**PAGE, "text": MGB_POSTING,
+        unknown = """Research Analyst
+Responsibilities
+- Support the research team with project work
+Required
+- Must demonstrate exceptional judgment in ambiguous settings
+"""
+        _, body = self.post("/positioning", {**PAGE, "text": unknown,
                                              "required_skills": None})
         self.assertTrue(body["unassessed_requirements"])
         self.assertEqual(body["verdict"]["call"], "review")
@@ -378,13 +420,19 @@ class ServerBoundaryTests(unittest.TestCase):
         _, body = self.post("/positioning", page)
         directions = body["directions"]
         if directions and all(d["decision"] == "fail" for d in directions):
-            self.assertNotEqual(body["verdict"]["call"], "skip")
-            self.assertIn("outside the directions", body["verdict"]["because"])
+            self.assertNotEqual(body["verdict"]["call"], "review")
+            self.assertIsNone(body["verdict"]["direction"])
         else:
-            # No approved portfolio in this fixture, so the case cannot arise here; the
-            # rule is still asserted where it lives.
-            self.assertIn("outside the directions",
-                          (SCRIPTS / "assist_bridge.py").read_text(encoding="utf-8"))
+            self.assertNotIn("outside the directions", body["verdict"]["because"])
+
+    def test_empty_fact_store_is_explicit_not_worth_a_look(self):
+        candidate = json.loads(self.candidate_path.read_text(encoding="utf-8"))
+        candidate["facts"] = []
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        self.candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        _, body = self.post("/positioning", PAGE)
+        self.assertEqual(body["verdict"]["call"], "evidence_unavailable")
+        self.assertNotEqual(body["verdict"]["call"], "review")
 
     def test_the_reading_answers_the_three_questions_a_user_has(self):
         _, body = self.post("/positioning", PAGE)

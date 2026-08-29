@@ -37,7 +37,7 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
         "bonus points", "desired qualifications", "preferred skills", "a plus",
     ),
     "responsibilities": (
-        "responsibilities", "key responsibilities", "what you'll do", "what you will do",
+        "responsibilities", "key responsibilities", "major responsibilities", "what you'll do", "what you will do",
         "the role", "duties", "essential functions", "job summary", "position overview",
         "the successful applicant will",
         "in a highly collaborative environment, the successful applicant will",
@@ -262,9 +262,10 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
     expanded_required = [piece.strip() for line in sections["required_skills"]
                          for piece in re.split(r"(?<=[.!?])\s+(?=[A-Z])", line)
                          if piece.strip()]
-    sections["required_skills"] = expanded_required
+    sections["required_skills"] = [line for line in expanded_required
+                                   if REQUIREMENT_CUE.search(line)]
     softened = [line for line in sections["required_skills"]
-                if re.search(r"\bpreferred\b.*\bnot required\b", line, re.I)]
+                if re.search(r"\bpreferred\b", line, re.I)]
     if softened:
         sections["required_skills"] = [line for line in sections["required_skills"]
                                        if line not in softened]

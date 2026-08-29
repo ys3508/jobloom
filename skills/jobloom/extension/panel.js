@@ -10,11 +10,12 @@ const I18N = {
     connectionSettings: "Connection settings", localService: "Local service", accessToken: "Access token",
     save: "Save", grant: "Allow access to job pages", connectedReadOnly: "Local service connected · read only",
     connectedStore: "Local service connected · storing enabled", disconnected: "Local service is not connected",
+    factStoreEmpty: "Experience library is empty — import your resume or experience before judging jobs",
     accessGranted: "Job-page access granted — revoke any time in chrome://extensions",
     accessMissing: "Page access is required to read the open job", accessFailed: "Permission was not granted. Try again.",
     reading: "Reading the open job…", waiting: "Waiting for the new job description…",
     apply: "Worth applying", review: "Worth a look", stretch: "Worth a look", skipVerdict: "Not a fit",
-    unreadable: "Can't read this yet", partial: "Read incomplete", unknownVerdict: "Needs review",
+    unreadable: "Can't read this yet", partial: "Read incomplete", evidenceUnavailable: "Can't judge yet", unknownVerdict: "Needs review",
     noTitle: "Job title not found", openingApply: "Your background fits this job well. ",
     openingSkip: "This job is a weak match for your current evidence. ",
     openingStretch: "Some parts fit, but this role is a stretch. ",
@@ -23,6 +24,7 @@ const I18N = {
     hardGap: "{n} required items are not in your evidence", thinMove: "{n} items need a concrete result or number",
     noPriorityGap: "No priority gaps found.", unreadableMessage: "I can't read this page format yet. Open the full job details and try again.",
     partialMessage: "I only received part of this job description, so I did not judge it. Open the full job details and try again.",
+    evidenceUnavailableMessage: "Your experience library is empty or unavailable, so I did not judge this job. Import your resume or experience and try again.",
     bestDirection: "Best-matching direction: {name}", tailorApply: "Tailor & apply", tailorApplySub: "Edit resume first",
     applyAsIs: "Apply as-is", applyAsIsSub: "Apply directly", skip: "Skip", skipSub: "Do not apply",
     drawer: "See details: what you have and what is missing", otherDirections: "Other directions considered",
@@ -36,6 +38,7 @@ const I18N = {
     unquantified: "no concrete result or number yet", viewEvidence: "View your evidence", emptyDetails: "No itemized gaps.",
     confirmTitle: "Needs your review · {n}", confirmAdvice: "These are original job requirements the fact library cannot safely judge; they are not counted as met or missing.",
     statedTitle: "Original job requirements · {n}", comparedSkills: "Compared these skills: {skills}", manualCompare: "Needs a manual evidence check",
+    experienceMatched: "Matched to your experience", experienceMissing: "No supporting experience found",
     notice: "Draft based only on the current page; nothing was stored.", unreadableNotice: "Only the current page was read; nothing was stored.",
     charsRead: "Read {n} characters: {opening}", noBody: "No usable job description was found.", noDiagnostics: "No page-reading diagnostics.",
     reasonOutside: "The title is outside this direction", reasonContext: "The title is related, but the job description lacks enough direction evidence",
@@ -50,13 +53,14 @@ const I18N = {
     language: "语言", scope: "只读取你当前打开的岗位，不浏览、不申请、不提交。", connectionSettings: "连接设置",
     localService: "本地服务", accessToken: "访问令牌", save: "保存", grant: "允许读取岗位页面",
     connectedReadOnly: "本地服务已连接 · 只读", connectedStore: "本地服务已连接 · 已允许保存", disconnected: "本地服务未连接",
+    factStoreEmpty: "经历库为空，请先导入简历或经历，再判断岗位",
     accessGranted: "已允许读取岗位页面，可随时在 chrome://extensions 撤销", accessMissing: "需要授权后才能读取当前岗位", accessFailed: "授权没有完成，请重试。",
     reading: "正在读取当前岗位…", waiting: "正在等待新岗位正文…", apply: "值得投", review: "可以看看", stretch: "可以看看",
-    skipVerdict: "不建议投", unreadable: "暂时读不了", partial: "读取不完整", unknownVerdict: "需要确认", noTitle: "岗位名称未读到",
+    skipVerdict: "不建议投", unreadable: "暂时读不了", partial: "读取不完整", evidenceUnavailable: "暂时判不了", unknownVerdict: "需要确认", noTitle: "岗位名称未读到",
     openingApply: "你的经历跟这个岗位很搭。", openingSkip: "这个岗位与你目前的证据匹配较弱。", openingStretch: "这个岗位有一些匹配，但整体偏挑战。",
     openingReview: "这个岗位有匹配点，但还有信息值得确认。", hiddenMove: "有 {n} 项你做过、简历没写——补上更强", hardGap: "{n} 项硬要求目前没有证据",
     thinMove: "{n} 项还没写具体成果/数字", noPriorityGap: "没有需要优先处理的硬伤。", unreadableMessage: "这个岗位页面的格式我暂时读不了，换成打开岗位详情页再试。",
-    partialMessage: "我只读到了这个岗位的一部分，所以没有作出判断。请打开完整岗位详情页再试。", bestDirection: "最匹配方向：{name}",
+    partialMessage: "我只读到了这个岗位的一部分，所以没有作出判断。请打开完整岗位详情页再试。", evidenceUnavailableMessage: "经历库为空或暂时不可用，所以没有判断这个岗位。请先导入简历或经历再试。", bestDirection: "最匹配方向：{name}",
     tailorApply: "精投", tailorApplySub: "改简历再投", applyAsIs: "广投", applyAsIsSub: "直接投", skip: "不投", skipSub: "跳过",
     drawer: "逐条看：你有什么、缺什么", otherDirections: "其他考虑过的方向", readingDetails: "页面读取详情",
     hiddenTitle: "你做过、但简历没写", hiddenAdvice: "补进简历，这是你已确认做过的事", gapTitle: "你还没做过", gapAdvice: "不要硬写；如实当作岗位挑战",
@@ -64,7 +68,7 @@ const I18N = {
     coveredTitle: "已经覆盖", coveredAdvice: "简历已有对应证据", required: "硬要求", preferred: "加分项", resumeShows: "简历已写", resumeMissing: "这份简历没写",
     quantified: "已有具体成果/数字", unquantified: "还没写具体成果/数字", viewEvidence: "查看你的证据", emptyDetails: "没有需要逐条展开的差距。",
     confirmTitle: "需要你确认 · {n}", confirmAdvice: "这些是岗位原文要求，当前事实库还不能安全判断，不计为满足或缺失。", statedTitle: "岗位原文要求 · {n}",
-    comparedSkills: "对照了这些技能：{skills}", manualCompare: "需要人工对照经历", notice: "仅基于当前页面生成草稿判断；未保存任何内容。",
+    comparedSkills: "对照了这些技能：{skills}", manualCompare: "需要人工对照经历", experienceMatched: "已在经历库找到对应证据", experienceMissing: "经历库未找到对应证据", notice: "仅基于当前页面生成草稿判断；未保存任何内容。",
     unreadableNotice: "只读取当前页面；未保存任何内容。", charsRead: "读取到 {n} 个字符：{opening}", noBody: "没有找到可用的岗位正文。", noDiagnostics: "没有页面读取信息。",
     reasonOutside: "岗位名称不在这个方向的范围内", reasonContext: "岗位名称相关，但正文里的方向证据不足", reasonSponsorCheck: "雇主的签证支持情况需要进一步确认",
     reasonSponsorConflict: "雇主签证信息有冲突，需要你确认", reasonSponsorNo: "岗位明确不支持所需签证", reasonSponsorSense: "页面里的支持说明可能不是签证含义",
@@ -102,7 +106,7 @@ async function checkHealth() {
   try {
     const response = await fetch(`${state.endpoint}/health`);
     const body = await response.json();
-    $("health").textContent = body.store_enabled
+    $("health").textContent = !body.fact_store_ready ? t("factStoreEmpty") : body.store_enabled
       ? t("connectedStore") : t("connectedReadOnly");
   } catch {
     $("health").textContent = t("disconnected");
@@ -156,7 +160,8 @@ $("grant").addEventListener("click", async () => {
 
 const VERDICT_TEXT = {
   apply: ["apply", "ok"], review: ["review", "warn"], stretch: ["stretch", "warn"],
-  skip: ["skipVerdict", "bad"], unreadable: ["unreadable", "warn"], partial: ["partial", "warn"]
+  skip: ["skipVerdict", "bad"], unreadable: ["unreadable", "warn"], partial: ["partial", "warn"],
+  evidence_unavailable: ["evidenceUnavailable", "warn"]
 };
 
 // Four ways a requirement can stand, each asking for a different move. A keyword counter
@@ -209,7 +214,8 @@ function render(result, page) {
   const statedRequirements = result.stated_requirements || [];
   const unreadable = call === "unreadable";
   const partial = call === "partial";
-  const unavailable = unreadable || partial;
+  const evidenceUnavailable = call === "evidence_unavailable";
+  const unavailable = unreadable || partial || evidenceUnavailable;
 
   $("verdict").className = `verdict ${cls}`;
   $("verdict").innerHTML = `<strong>${label}</strong>`;
@@ -227,6 +233,7 @@ function render(result, page) {
   if (hardGaps) moves.push(t("hardGap", { n: hardGaps }));
   if (count("evidence_gap")) moves.push(t("thinMove", { n: count("evidence_gap") }));
   $("why").textContent = unreadable ? t("unreadableMessage") : partial ? t("partialMessage")
+    : evidenceUnavailable ? t("evidenceUnavailableMessage")
     : `${opening}${moves.length ? moves.join(state.language === "zh" ? "；" : "; ") + (state.language === "zh" ? "。" : ".") : t("noPriorityGap")}`;
 
   $("best-direction").hidden = unavailable || !result.verdict.direction;
@@ -278,7 +285,8 @@ function render(result, page) {
       <ul>${statedRequirements.map((item) => `<li class="stack"><span class="name"><strong>${
         escapeHtml(item.requirement)}</strong>${item.recognized_terms.length
           ? `<span class="reasons">${t("comparedSkills", { skills: escapeHtml(item.recognized_terms.join(state.language === "zh" ? "、" : ", ")) })}</span>`
-          : `<span class="reasons">${t("manualCompare")}</span>`}</span></li>`).join("")}</ul>`
+          : `<span class="reasons">${t(item.evidence_status === "matched" ? "experienceMatched"
+            : item.evidence_status === "missing" ? "experienceMissing" : "manualCompare")}</span>`}</span></li>`).join("")}</ul>`
     : "";
 
   const otherDirections = (result.directions || []).filter((direction) =>
