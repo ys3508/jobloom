@@ -878,10 +878,19 @@ def build_card(source: dict[str, Any], fields: dict[str, Any], *,
     # Identity is the ATS posting itself, not the rendered URL or title, so a re-titled or
     # re-hosted posting still resolves to the same job on the next pull.
     seed = f"{source['ats']}|{source['board_token']}|{external_id}".encode("utf-8")
-    # Derived from the adapter, never from caller input. There is no path that raises a
-    # card's authorization: a source that genuinely gains platform permission is registered
-    # again under the new basis, which is a new registry entry, not a relabelled old one.
-    authorization = ADAPTERS[source["ats"]]["authorization"]
+    # The basis frozen at registration, not whatever the adapter says today. Reading the
+    # adapter here would mean that editing one line of `ADAPTERS` silently relabels every
+    # card from every source already registered against it — the exact upgrade this design
+    # refuses. A source that genuinely gains platform permission is registered again under
+    # the new basis, which is a new entry, not a relabelled old one, and only that
+    # re-registration may change what a card claims.
+    #
+    # An unregistered source (a `probe`, a test) falls back to the adapter's own basis,
+    # which is the most it can honestly say about itself.
+    authorization = (((source.get("authorization") or {}).get("basis"))
+                     or ADAPTERS[source["ats"]]["authorization"])
+    if authorization not in AUTHORIZATIONS:
+        raise SourceError(f"source records an unknown authorization basis: {authorization}")
     statements, sponsorship_scan = ingest_job.sponsorship_statements(description)
     canonical_url = str(fields.get("canonical_url") or "").strip()
     if fields.get("country_basis") == "us_state_abbreviation":
@@ -1046,7 +1055,11 @@ def pull_source(source: dict[str, Any], *, fetch: Callable[[str], Any] | None = 
     company = clean_text(source.get("company"))
     if not company:
         raise ValueError("source is missing a company name")
-    identity = {"company": company, "ats": ats, "board_token": board_token}
+    # The registry row's own authorization travels with the identity, so the card records
+    # how this source was authorized when it was registered rather than how its adapter is
+    # configured now.
+    identity = {"company": company, "ats": ats, "board_token": board_token,
+                "authorization": source.get("authorization")}
     adapter = ADAPTERS[ats]
     get = fetch or fetch_json
     pause = sleep if sleep is not None else time.sleep

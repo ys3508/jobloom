@@ -622,6 +622,44 @@ class AuthorizationTierTests(unittest.TestCase):
         self.assertEqual(card["source_tier"], 0)
         self.assertTrue(card["platform_permitted"])
 
+    def test_a_registered_source_keeps_the_basis_it_was_registered_under(self):
+        # The invariant this tier exists for. Editing one line of ADAPTERS must not relabel
+        # cards from sources already registered against it: that is a silent upgrade of
+        # exactly the kind re-registration exists to prevent. Reading the adapter at card
+        # time made the invariant a comment rather than a behaviour.
+        source = ATS.add_source(self.registry, "Acme", "demo_scraped", "acme", "sissi",
+                                compliance_basis="reviewed with counsel",
+                                known_risks="tenant endpoint may change", at=AT)
+        ATS.ADAPTERS["demo_scraped"] = {**SELF_ASSERTED_ADAPTER,
+                                        "authorization": ATS.PUBLIC_JOB_BOARD_API}
+        card = ATS.build_card(source, {"external_id": "1", "title": "Analyst",
+                                       "description": "text", "canonical_url": "https://e/1"},
+                              endpoint="https://e", at=AT, extract=lambda *a, **k: {})
+        self.assertEqual(card["authorization"], ATS.SELF_ASSERTED)
+        self.assertEqual(card["source_tier"], 5)
+        self.assertFalse(card["platform_permitted"])
+
+    def test_a_pull_carries_the_registered_basis_onto_every_card(self):
+        # The identity handed to `build_card` used to drop the registry row's authorization,
+        # so the card had nothing to read but the adapter.
+        ATS.add_source(self.registry, "Acme Bio", "greenhouse", "acme", "sissi", at=AT)
+        source = ATS.find_source(self.registry, "greenhouse", "acme")
+        cards = ATS.pull_source(source, fetch=recorded_fetch(
+            {"boards-api.greenhouse.io": GREENHOUSE_PAYLOAD}), at=AT, sleep=lambda _: None)["cards"]
+        self.assertTrue(cards)
+        for card in cards:
+            self.assertEqual(card["authorization"],
+                             source["authorization"]["basis"])
+
+    def test_an_unregistered_source_may_only_claim_what_its_adapter_claims(self):
+        # A probe or a test has no registry row; the adapter's own basis is the most it can
+        # honestly say, and it can never be more than that.
+        card = ATS.build_card({"company": "Acme", "ats": "demo_scraped", "board_token": "acme"},
+                              {"external_id": "1", "title": "Analyst", "description": "text",
+                               "canonical_url": "https://e/1"},
+                              endpoint="https://e", at=AT, extract=lambda *a, **k: {})
+        self.assertEqual(card["authorization"], ATS.SELF_ASSERTED)
+
     def test_authorization_comes_from_the_adapter_not_from_caller_input(self):
         # There is no path that raises a card's authorization. A source that genuinely gains
         # platform permission is registered again under the new basis.
