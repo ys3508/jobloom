@@ -70,7 +70,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(card["country"], "US")
         self.assertEqual(result["eligibility"], "pass")
         self.assertEqual(result["match"], "strong")
-        self.assertEqual(result["evidence_matches"][0]["fact_ids"], ["fact-0001"])
+        # The experience claim outranks the skills-row mention; confirming a skills row
+        # cannot turn it into demonstrated work.
+        self.assertEqual(result["evidence_matches"][0]["fact_ids"], ["fact-0002"])
 
 
 if __name__ == "__main__":

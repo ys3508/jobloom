@@ -748,6 +748,49 @@ def _phrase_hits(phrases: tuple[str, ...], tokens_by_field: dict[str, list[str]]
     return hits
 
 
+def calibrate_direction_keywords(profile: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Report direction terms that do not fire on a measured posting corpus.
+
+    This diagnostic neither edits nor registers a direction. It uses the router's exact
+    token-sequence and field-boundary rules, preventing a term from looking alive here while
+    remaining dead in routing.
+    """
+    if not jobs:
+        raise ValueError("direction keyword calibration requires at least one job")
+    normalized = validate_profile(profile)
+    counts = {group: {term: 0 for term in normalized.get(group, [])}
+              for group in GROUP_FIELDS}
+    jobs_with_hits = {group: 0 for group in GROUP_FIELDS}
+    for job in jobs:
+        _validate_job_shape(job)
+        tokens_by_field = _field_tokens(job)
+        for group, allowed_fields in GROUP_FIELDS.items():
+            fired = []
+            for term in normalized.get(group, []):
+                if _phrase_hits((term,), tokens_by_field, allowed_fields):
+                    counts[group][term] += 1
+                    fired.append(term)
+            jobs_with_hits[group] += bool(fired)
+
+    groups = {}
+    for group in GROUP_FIELDS:
+        term_counts = counts[group]
+        ordered = sorted(term_counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+        any_hits = jobs_with_hits[group]
+        dominant = ordered[0] if ordered and ordered[0][1] else None
+        groups[group] = {
+            "terms": len(term_counts),
+            "jobs_with_any_hit": any_hits,
+            "never_fired_terms": sorted(term for term, count in term_counts.items() if count == 0),
+            "term_job_counts": {term: count for term, count in ordered},
+            "dominant_term": dominant[0] if dominant else None,
+            "dominant_term_jobs": dominant[1] if dominant else 0,
+            "sole_carrier_term": dominant[0] if dominant and dominant[1] == any_hits else None,
+        }
+    return {"direction_id": normalized["direction_id"], "corpus_jobs": len(jobs),
+            "groups": groups}
+
+
 def _validate_job_shape(job: dict[str, Any]) -> None:
     """Reject a wrong-typed routing field; never coerce it into match text."""
     for field, (kind, max_len, max_items) in JOB_FIELD_SHAPES.items():

@@ -294,7 +294,7 @@ class ServerBoundaryTests(unittest.TestCase):
                                    "sponsorship_now": False, "sponsorship_future": False,
                                    "employer_action_required": False, "confirmed": True},
             "search": {}, "facts": [
-                {"id": "f-r", "type": "skill", "value": "R", "status": "confirmed",
+                {"id": "f-r", "type": "experience_claim", "value": "Programmed analyses in R and SAS", "status": "confirmed",
                  "locked": False, "evidence_strength": "direct", "keywords": ["R", "SAS"]}],
         }
         candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
@@ -375,6 +375,19 @@ class ServerBoundaryTests(unittest.TestCase):
         match = {"requirement": "SQL", "strength": "transferable", "fact_ids": ["f-near"]}
         result = BRIDGE.classify_requirement(match, {"f-near": facts[0]}, set(), preferred=False)
         self.assertEqual(result["class"], "transferable")
+
+    def test_course_and_skill_list_do_not_become_confirmed_work(self):
+        facts = [
+            {"id": "course", "type": "education", "value": "Python Data Structure",
+             "status": "confirmed", "evidence_strength": "direct", "keywords": ["Python"]},
+            {"id": "skills", "type": "skill", "value": "Programming: R, SAS, Python",
+             "status": "confirmed", "evidence_strength": "direct", "keywords": ["Python"]},
+        ]
+        match = BRIDGE.evaluate_job.match_requirement("Python", facts)
+        result = BRIDGE.classify_requirement(
+            match, {fact["id"]: fact for fact in facts}, set(), preferred=False)
+        self.assertEqual(result["class"], "transferable")
+        self.assertNotEqual(result["class"], "hidden_strength")
 
     def test_a_page_that_gave_up_no_requirements_is_not_a_verdict(self):
         # Saying "skip" here would pass off a parsing failure as a judgement about the user.
