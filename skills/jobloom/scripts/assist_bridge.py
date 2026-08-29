@@ -449,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/positioning":
                 self._send(200, self._positioning(payload))
+            elif self.path == "/save":
+                body = self._save(payload)
             elif self.path == "/store":
                 self._send(200, self._store(payload))
             else:
@@ -472,6 +474,33 @@ class Handler(BaseHTTPRequestHandler):
         connection = self._connection()
         try:
             return {**positioning(card, candidate, connection), "job_card": card}
+        finally:
+            connection.close()
+
+    def _save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep a note of a job to come back to.
+
+        Deliberately not routed through `/store`. That path refuses an unreviewed card
+        because the pre-submission review gate stands between a card and being *sent*, and
+        relaxing it so a note could be filed would weaken a submission safeguard for a
+        bookkeeping errand. Keeping a note sends nothing and creates no application, so it
+        needs no review and gets its own door.
+        """
+        if not self.allow_store:
+            raise BridgeError("storing_disabled", 403)
+        card = payload.get("job_card")
+        if not isinstance(card, dict):
+            raise BridgeError("job_card_required")
+        import saved_jobs  # local: keeps the read-only path free of write imports
+
+        connection = self._connection()
+        try:
+            saved_jobs.initialize(connection)
+            return saved_jobs.save(connection, card,
+                                   actor=str(payload.get("actor") or "user"),
+                                   reason=payload.get("reason"))
+        except ValueError as error:
+            raise BridgeError(str(error)) from error
         finally:
             connection.close()
 

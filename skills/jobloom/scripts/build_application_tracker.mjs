@@ -34,79 +34,153 @@ const source = JSON.parse(await fs.readFile(args.input, "utf8"));
 if (!Array.isArray(source.applications) || source.row_count !== source.applications.length) {
   throw new Error("tracker source row_count does not match applications");
 }
+const savedSource = source.saved_jobs ?? [];
+if (!Array.isArray(savedSource)
+    || (source.saved_row_count ?? savedSource.length) !== savedSource.length) {
+  throw new Error("tracker source saved_row_count does not match saved_jobs");
+}
 
+// "Application URL" was always the posting's own address, which is the link you want when
+// you go back to read the description — so it is named for what it is.
 const headers = [
   "Submission Time", "Employer", "Role", "Location", "Work Arrangement", "Source", "ATS",
-  "Application URL", "Resume Version", "Cover Letter Version", "Category", "Current Status",
-  "Confirmation ID", "Follow-up Date", "Model Usage", "Archive ID", "Archive Path",
+  "Job URL", "Posted", "Days Open", "Resume Version", "Cover Letter Version", "Category",
+  "Current Status", "Confirmation ID", "Follow-up Date", "Model Usage", "Archive ID",
+  "Archive Path",
 ];
 const rows = source.applications.map((item) => [
   item.submission_time ? new Date(item.submission_time) : null,
   item.employer ?? "", item.role ?? "", item.location ?? "", item.work_arrangement ?? "",
-  item.source ?? "", item.ats ?? "", item.application_url ?? "", item.resume_version ?? "",
+  item.source ?? "", item.ats ?? "", item.job_url ?? "",
+  item.posted_at ? new Date(item.posted_at) : null,
+  item.days_open == null ? null : Number(item.days_open),
+  item.resume_version ?? "",
   item.cover_letter_version ?? "", item.category ?? "", item.current_status ?? "",
   item.confirmation_id ?? "", item.follow_up_date ? new Date(item.follow_up_date) : null,
   item.model_usage == null ? null : Number(item.model_usage), item.archive_id ?? "", item.archive_path ?? "",
 ]);
 
+// Jobs kept for later. A separate sheet because every column above describes what happened
+// after something was sent, and a kept job has no after. A job that has since been applied
+// to says so here and keeps its full row on the Applications sheet, so the two add up
+// without counting it twice.
+const savedHeaders = [
+  "Saved Time", "Employer", "Role", "Location", "Work Arrangement", "Source", "ATS",
+  "Job URL", "Posted", "Days Open", "Deadline", "Current Status", "Reason",
+];
+const savedRows = (source.saved_jobs ?? []).map((item) => [
+  item.saved_time ? new Date(item.saved_time) : null,
+  item.employer ?? "", item.role ?? "", item.location ?? "", item.work_arrangement ?? "",
+  item.source ?? "", item.ats ?? "", item.job_url ?? "",
+  item.posted_at ? new Date(item.posted_at) : null,
+  item.days_open == null ? null : Number(item.days_open),
+  // Blank means the employer stated no deadline, never that there is none.
+  item.deadline ? new Date(item.deadline) : null,
+  item.current_status ?? "", item.reason ?? "",
+]);
+
+// Column letters are derived from the header list rather than written in. Every range in
+// this file used to end at Q, so adding a column silently truncated the sheet.
+const columnLetter = (index) => {
+  let letter = "";
+  for (let value = index; value > 0; value = Math.floor((value - 1) / 26)) {
+    letter = String.fromCharCode(65 + ((value - 1) % 26)) + letter;
+  }
+  return letter;
+};
+
 const workbook = Workbook.create();
-const sheet = workbook.worksheets.add("Applications");
-sheet.showGridLines = false;
-sheet.getRange("A1:Q1").merge();
-sheet.getRange("A1").values = [["Jobloom Application Archive"]];
-sheet.getRange("A1:Q1").format = {
-  fill: "#12372A",
-  font: { bold: true, color: "#FFFFFF", size: 16 },
-  verticalAlignment: "center",
-};
-sheet.getRange("A1:Q1").format.rowHeight = 30;
-sheet.getRange("A2:Q2").merge();
-const stateTime = source.generated_from_state_at ?? "No archived submissions yet";
-sheet.getRange("A2").values = [[`Generated from local backend state: ${stateTime}`]];
-sheet.getRange("A2:Q2").format = {
-  fill: "#E8F1EC",
-  font: { color: "#355E4B", italic: true },
-  verticalAlignment: "center",
-};
-sheet.getRange("A3:Q3").values = [headers];
-sheet.getRange("A3:Q3").format = {
-  fill: "#2F6B50",
-  font: { bold: true, color: "#FFFFFF" },
-  wrapText: true,
-  verticalAlignment: "center",
-  borders: { bottom: { style: "medium", color: "#12372A" } },
-};
-sheet.getRange("A3:Q3").format.rowHeight = 34;
 
-if (rows.length > 0) {
-  const endRow = 3 + rows.length;
-  sheet.getRange(`A4:Q${endRow}`).values = rows;
-  sheet.getRange(`A4:Q${endRow}`).format = {
-    verticalAlignment: "top",
-    borders: { insideHorizontal: { style: "thin", color: "#D9E4DD" } },
+function buildSheet({ name, title, subtitle, headers: heads, rows: body, widths,
+                      dateColumns = [], dateTimeColumns = [], numberColumns = [], tableName }) {
+  const last = columnLetter(heads.length);
+  const sheet = workbook.worksheets.add(name);
+  sheet.showGridLines = false;
+  sheet.getRange(`A1:${last}1`).merge();
+  sheet.getRange("A1").values = [[title]];
+  sheet.getRange(`A1:${last}1`).format = {
+    fill: "#12372A",
+    font: { bold: true, color: "#FFFFFF", size: 16 },
+    verticalAlignment: "center",
   };
-  sheet.getRange(`A4:A${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
-  sheet.getRange(`N4:N${endRow}`).format.numberFormat = "yyyy-mm-dd";
-  sheet.getRange(`O4:O${endRow}`).format.numberFormat = "#,##0";
-  const table = sheet.tables.add(`A3:Q${endRow}`, true, "ApplicationsTable");
-  table.style = "TableStyleMedium4";
-  table.showBandedRows = true;
-  table.showFilterButton = true;
+  sheet.getRange(`A1:${last}1`).format.rowHeight = 30;
+  sheet.getRange(`A2:${last}2`).merge();
+  sheet.getRange("A2").values = [[subtitle]];
+  sheet.getRange(`A2:${last}2`).format = {
+    fill: "#E8F1EC",
+    font: { color: "#355E4B", italic: true },
+    verticalAlignment: "center",
+  };
+  sheet.getRange(`A3:${last}3`).values = [heads];
+  sheet.getRange(`A3:${last}3`).format = {
+    fill: "#2F6B50",
+    font: { bold: true, color: "#FFFFFF" },
+    wrapText: true,
+    verticalAlignment: "center",
+    borders: { bottom: { style: "medium", color: "#12372A" } },
+  };
+  sheet.getRange(`A3:${last}3`).format.rowHeight = 34;
+
+  if (body.length > 0) {
+    const endRow = 3 + body.length;
+    sheet.getRange(`A4:${last}${endRow}`).values = body;
+    sheet.getRange(`A4:${last}${endRow}`).format = {
+      verticalAlignment: "top",
+      borders: { insideHorizontal: { style: "thin", color: "#D9E4DD" } },
+    };
+    for (const column of dateTimeColumns) {
+      sheet.getRange(`${column}4:${column}${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
+    }
+    for (const column of dateColumns) {
+      sheet.getRange(`${column}4:${column}${endRow}`).format.numberFormat = "yyyy-mm-dd";
+    }
+    for (const column of numberColumns) {
+      sheet.getRange(`${column}4:${column}${endRow}`).format.numberFormat = "#,##0";
+    }
+    const table = sheet.tables.add(`A3:${last}${endRow}`, true, tableName);
+    table.style = "TableStyleMedium4";
+    table.showBandedRows = true;
+    table.showFilterButton = true;
+  }
+
+  const height = Math.max(4, body.length + 3);
+  for (let column = 0; column < widths.length; column += 1) {
+    sheet.getRangeByIndexes(0, column, height, 1).format.columnWidth = widths[column];
+  }
+  sheet.getRange(`B4:${last}${height}`).format.wrapText = true;
+  sheet.freezePanes.freezeRows(3);
+  return { sheet, last, height };
 }
 
-const widths = [20, 20, 25, 20, 17, 15, 15, 34, 23, 23, 12, 18, 20, 16, 12, 24, 40];
-for (let column = 0; column < widths.length; column += 1) {
-  sheet.getRangeByIndexes(0, column, Math.max(4, rows.length + 3), 1).format.columnWidth = widths[column];
-}
-sheet.getRange(`B4:Q${Math.max(4, rows.length + 3)}`).format.wrapText = true;
-sheet.freezePanes.freezeRows(3);
+const stateTime = source.generated_from_state_at ?? "No archived submissions yet";
+const applications = buildSheet({
+  name: "Applications",
+  title: "Jobloom Application Archive",
+  subtitle: `Generated from local backend state: ${stateTime}`,
+  headers, rows, tableName: "ApplicationsTable",
+  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 23, 23, 12, 18, 20, 16, 12, 24, 40],
+  dateTimeColumns: ["A"], dateColumns: ["I", "P"], numberColumns: ["J", "Q"],
+});
+
+buildSheet({
+  name: "Saved Jobs",
+  title: "Jobloom Saved Jobs",
+  subtitle: "Jobs kept to come back to. A job applied to since is marked here and keeps its "
+    + "full row on the Applications sheet, so the two never count it twice. Skipping a job "
+    + "leaves no record, so this counts jobs kept, never jobs seen.",
+  headers: savedHeaders, rows: savedRows, tableName: "SavedJobsTable",
+  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 14, 16, 40],
+  dateTimeColumns: ["A"], dateColumns: ["I", "K"], numberColumns: ["J"],
+});
+
+const { last: appLast, height: appHeight } = applications;
 
 const tableCheck = await workbook.inspect({
   kind: "table",
-  range: `Applications!A1:Q${Math.max(4, rows.length + 3)}`,
+  range: `Applications!A1:${appLast}${appHeight}`,
   include: "values,formulas",
   tableMaxRows: 8,
-  tableMaxCols: 17,
+  tableMaxCols: headers.length,
 });
 const errorCheck = await workbook.inspect({
   kind: "match",
@@ -116,7 +190,7 @@ const errorCheck = await workbook.inspect({
 });
 const preview = await workbook.render({
   sheetName: "Applications",
-  range: `A1:Q${Math.max(4, Math.min(rows.length + 3, 12))}`,
+  range: `A1:${appLast}${Math.max(4, Math.min(rows.length + 3, 12))}`,
   scale: 1,
   format: "png",
 });
@@ -137,6 +211,7 @@ console.log(JSON.stringify({
   output: args.output,
   preview: args.preview ?? null,
   row_count: rows.length,
+  saved_row_count: savedRows.length,
   inspect: tableCheck.ndjson,
   errors: errorCheck.ndjson,
 }));

@@ -21,6 +21,7 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 from _common import require_table  # noqa: E402
+import saved_jobs  # noqa: E402
 
 
 ARCHIVABLE_STATES = {
@@ -416,7 +417,7 @@ def create_archive(
             "archived_at": timestamp,
             "submission": {
                 "submitted_at": row["submitted_at"],
-                "application_url": row["canonical_url"],
+                "job_url": row["canonical_url"],
                 "employer": row["employer"],
                 "role": row["title"],
                 "resume_version_id": row["resume_version_id"],
@@ -529,8 +530,13 @@ def tracker_source(connection: sqlite3.Connection) -> dict[str, Any]:
     output = []
     for row in rows:
         card = json.loads(row["job_card_json"])
+        posted_at = ((card.get("extraction") or {}).get("ats") or {}).get("posted_at")
         output.append({
             "submission_time": row["submitted_at"],
+            # When the employer opened the posting, and how long it had been open. Both are
+            # facts from the board; nothing here derives a "should have applied by" date.
+            "posted_at": posted_at,
+            "days_open": saved_jobs.days_open(posted_at),
             "employer": row["employer"],
             "role": row["title"],
             "location": row["location"],
@@ -549,8 +555,16 @@ def tracker_source(connection: sqlite3.Connection) -> dict[str, Any]:
             "archive_path": row["archive_path"],
         })
     generated_from = max((row["archived_at"] for row in rows), default=None)
+    # Jobs kept for later travel in the same file and land on their own sheet. They are not
+    # applications — a kept job has no "after" — so they are never merged into the rows
+    # above, and a job that has since been applied to is marked there rather than counted
+    # in both places.
+    saved = (saved_jobs.tracker_rows(connection)
+             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                   "AND name='saved_jobs'").fetchone() else [])
     return {"schema_version": "0.1.0", "generated_from_state_at": generated_from,
-            "row_count": len(output), "applications": output}
+            "row_count": len(output), "applications": output,
+            "saved_row_count": len(saved), "saved_jobs": saved}
 
 
 def write_tracker_source(connection: sqlite3.Connection, output: Path) -> dict[str, Any]:

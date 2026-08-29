@@ -26,7 +26,10 @@ const I18N = {
     partialMessage: "I only received part of this job description, so I did not judge it. Open the full job details and try again.",
     evidenceUnavailableMessage: "Your experience library is empty or unavailable, so I did not judge this job. Import your resume or experience and try again.",
     bestDirection: "Best-matching direction: {name}", tailorApply: "Tailor & apply", tailorApplySub: "Edit resume first",
-    applyAsIs: "Apply as-is", applyAsIsSub: "Apply directly", skip: "Skip", skipSub: "Do not apply",
+    applyAsIs: "Apply as-is", applyAsIsSub: "Apply directly",
+    saveLater: "Save for later", saveLaterSub: "Not now — keep it",
+    saved: "Saved to your tracker", saveFailed: "Could not save — is storing enabled?",
+    storedNotice: "Kept in your local tracker. Nothing else was stored.",
     drawer: "See details: what you have and what is missing", otherDirections: "Other directions considered",
     readingDetails: "Page reading details", hiddenTitle: "You've done this — not on your resume",
     hiddenAdvice: "Add it to your resume; this is your confirmed work", gapTitle: "Not in your background",
@@ -61,7 +64,10 @@ const I18N = {
     openingReview: "这个岗位有匹配点，但还有信息值得确认。", hiddenMove: "有 {n} 项你做过、简历没写——补上更强", hardGap: "{n} 项硬要求目前没有证据",
     thinMove: "{n} 项还没写具体成果/数字", noPriorityGap: "没有需要优先处理的硬伤。", unreadableMessage: "这个岗位页面的格式我暂时读不了，换成打开岗位详情页再试。",
     partialMessage: "我只读到了这个岗位的一部分，所以没有作出判断。请打开完整岗位详情页再试。", evidenceUnavailableMessage: "经历库为空或暂时不可用，所以没有判断这个岗位。请先导入简历或经历再试。", bestDirection: "最匹配方向：{name}",
-    tailorApply: "精投", tailorApplySub: "改简历再投", applyAsIs: "广投", applyAsIsSub: "直接投", skip: "不投", skipSub: "跳过",
+    tailorApply: "精投", tailorApplySub: "改简历再投", applyAsIs: "广投", applyAsIsSub: "直接投",
+    saveLater: "先存着", saveLaterSub: "现在不投，留着",
+    saved: "已存入你的记录表", saveFailed: "没能存上——本地服务开了写入吗？",
+    storedNotice: "已存入本地记录表。除此之外没有保存任何内容。",
     drawer: "逐条看：你有什么、缺什么", otherDirections: "其他考虑过的方向", readingDetails: "页面读取详情",
     hiddenTitle: "你做过、但简历没写", hiddenAdvice: "补进简历，这是你已确认做过的事", gapTitle: "你还没做过", gapAdvice: "不要硬写；如实当作岗位挑战",
     thinTitle: "简历写了，但证据偏薄", thinAdvice: "还没写具体成果/数字，值得补强", transferTitle: "你有相邻经验", transferAdvice: "按相邻经验表达，不说成直接做过",
@@ -240,7 +246,10 @@ function render(result, page) {
   $("best-direction").textContent = result.verdict.direction
     ? t("bestDirection", { name: result.verdict.direction }) : "";
   $("actions").hidden = unavailable;
-  const suggestedChoice = call === "skip" ? "skip"
+  // A posting judged not a fit gets no suggestion at all. Recommending "save for later" for
+  // something the evidence says to walk away from would be a nudge the judgement does not
+  // support, and moving on needs no button.
+  const suggestedChoice = call === "skip" ? ""
     : call === "apply" && !count("hidden_strength") && !count("evidence_gap") ? "broad" : "precision";
   document.querySelectorAll("#actions button").forEach((button) => {
     button.classList.toggle("selected", button.dataset.choice === suggestedChoice);
@@ -316,13 +325,51 @@ function render(result, page) {
   state.lastPage = page;
 }
 
+let lastReading = null;
+
+// "Save for later" is the only button that does anything, and that is the point: skipping a
+// job means moving to the next one, so a button meaning "do not apply" would be pressed by
+// nobody. The other two record an intention the user then carries out on the job site
+// themselves, and nothing here applies on their behalf.
+async function saveForLater() {
+  if (!lastReading?.job || !lastReading?.page?.url) return;
+  const job = lastReading.job;
+  const response = await fetch(`${state.endpoint}/save`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
+    body: JSON.stringify({
+      actor: "user",
+      job_card: {
+        canonical_url: lastReading.page.url, title: job.title, employer: job.employer,
+        location: job.location, country: job.country,
+        work_arrangement: job.work_arrangement, employment_type: job.employment_type,
+        source: "panel", ats: job.ats || "",
+        extraction: { ats: { posted_at: job.posted_at || null, deadline: job.deadline || null,
+                             apply_url: job.apply_url || null } },
+      },
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `bridge returned ${response.status}`);
+  return body;
+}
+
 document.querySelectorAll("#actions button").forEach((button) => {
-  button.addEventListener("click", () => {
+  button.addEventListener("click", async () => {
     document.querySelectorAll("#actions button").forEach((candidate) => {
       const selected = candidate === button;
       candidate.classList.toggle("selected", selected);
       candidate.setAttribute("aria-pressed", String(selected));
     });
+    if (button.dataset.choice !== "later") return;
+    try {
+      await saveForLater();
+      $("status").textContent = t("saved");
+      // The panel promises nothing is stored. Once something is, it has to say so.
+      $("notice").textContent = t("storedNotice");
+    } catch (error) {
+      $("status").textContent = t("saveFailed");
+    }
   });
 });
 
@@ -593,6 +640,9 @@ async function readPosting({ onlyIfChanged = false } = {}) {
     if (generation !== readGeneration) return;
     $("status").textContent = "";
     render(body, page);
+    // The card the panel is currently showing. "Save for later" files this one, so it can
+    // never file a job other than the one on screen.
+    lastReading = { job: body.job, page };
     lastPostingKey = key;
     lastPostingSnapshot = { postingId: page.postingId, bodySignature: page.bodySignature };
   } catch (error) {

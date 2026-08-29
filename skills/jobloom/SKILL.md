@@ -25,6 +25,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 - For form inventory, mandatory pauses, pre-submission summaries, or final user approval, read `references/pre-submission-review.md`, `references/application-state.md`, `references/answers-and-authorization.md`, `references/resume-versions.md`, and `references/schemas.md`.
 - For submission archiving, redaction, archive verification, or the application tracker, read `references/submission-archive.md`, `references/application-state.md`, `references/resume-versions.md`, `references/answers-and-authorization.md`, and `references/schemas.md`.
 - For recruiter outcomes, usage accounting, funnel metrics, or strategy evidence, read `references/outcomes-and-usage.md`, `references/application-state.md`, and `references/schemas.md`.
+- For jobs the user kept to come back to, run `scripts/saved_jobs.py`; it records a decision, never an application, and the funnel it feeds counts jobs kept rather than jobs seen.
 - For form filling or submission preparation, read all thirteen references. Default to Fill-Only and stop before the final submission action.
 
 ## Core workflow

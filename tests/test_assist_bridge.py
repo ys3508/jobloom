@@ -617,8 +617,11 @@ class ExtensionBoundaryTests(unittest.TestCase):
                    'id="classes-drawer"']
         positions = [html.index(token) for token in ordered]
         self.assertEqual(positions, sorted(positions))
-        for key in ("tailorApply", "applyAsIs", "skip", "drawer"):
+        # The third action is "save for later", not "skip": skipping a job means moving to
+        # the next one, so a button meaning "do not apply" would be pressed by nobody.
+        for key in ("tailorApply", "applyAsIs", "saveLater", "drawer"):
             self.assertIn(f'data-i18n="{key}"', html)
+        self.assertNotIn('data-i18n="skip"', html)
 
     def test_unreadable_state_is_one_human_sentence_without_zero_counts(self):
         panel = self.sources["panel.js"]
