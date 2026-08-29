@@ -356,7 +356,22 @@ async function readVisiblePosting(previousPosting = {}) {
     const complete = contentText(node);
     return complete.length > visible.length ? complete : visible;
   };
-  const bigEnough = (node) => node && longerText(node).length > 500;
+  // The detail pane holds one posting. The results rail holds one `/jobs/view/` link per
+  // listed job and is comfortably longer than 500 characters, so a length test alone will
+  // happily return the rail — which is how a Tempus posting came back carrying the text of
+  // a Boston University one that had been open earlier. A pane linking to postings other
+  // than the open one is the list, whatever its size.
+  const otherPostingLinks = (node) => {
+    if (!node || !node.querySelectorAll) return 0;
+    return [...node.querySelectorAll('a[href*="/jobs/view/"]')].filter((link) => {
+      const href = link.getAttribute("href") || "";
+      return !currentId || !href.includes(`/jobs/view/${currentId}`);
+    }).length;
+  };
+  // One stray link — a "similar jobs" cross-reference — is not a list. Several are.
+  const holdsTheJobList = (node) => otherPostingLinks(node) > 1;
+  const bigEnough = (node) =>
+    node && longerText(node).length > 500 && !holdsTheJobList(node);
 
   const climb = (node, label) => {
     let current = node;
@@ -371,6 +386,7 @@ async function readVisiblePosting(previousPosting = {}) {
   const currentId = currentQueryId
     || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
   tried.push(`current_id:${currentId || "none"}`);
+  tried.push(`other_postings_in_body:${otherPostingLinks(document.body)}`);
   const currentLinks = () => currentId
     ? [...document.querySelectorAll(`a[href*="/jobs/view/${currentId}"]`)] : [];
   const linkTitle = (link) => clean(
@@ -442,7 +458,13 @@ async function readVisiblePosting(previousPosting = {}) {
         if (bigEnough(node)) { found = { pane: node, matched: selector }; break; }
       }
     }
-    if (!found) found = { pane: document.body, matched: "fallback_body" };
+    if (!found) {
+      // Last resort. On a search page the body contains the rail, so this pane is usable
+      // only when it is not the whole layout. Saying "I could not read this" is correct;
+      // sending the list would attribute one posting's text to another.
+      found = { pane: document.body, matched: "fallback_body" };
+      if (holdsTheJobList(document.body)) found.matched = "fallback_body_rejected_job_list";
+    }
 
     const expectedTitle = linkTitle(alignedLink || links[0]);
     const headings = [...found.pane.querySelectorAll("h1, h2")]
@@ -496,7 +518,10 @@ async function readVisiblePosting(previousPosting = {}) {
   let matched = reading.matched;
   const descriptions = reading.descriptions;
   const description = reading.description;
-  let text = reading.bodyText || longerText(pane);
+  // A rejected fallback contributes no text: an empty read reports itself honestly, while
+  // the rail's text would be read as this posting's description.
+  let text = reading.matched === "fallback_body_rejected_job_list"
+    ? "" : (reading.bodyText || longerText(pane));
   if (reading.usedFullBodyFallback) matched += "+full_body";
   else if (description) matched += "+description";
 
