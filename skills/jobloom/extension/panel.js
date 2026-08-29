@@ -310,9 +310,13 @@ function render(result, page) {
   $("notice").textContent = unavailable ? t("unreadableNotice") : t("notice");
   const diagnostics = page?.diagnostics;
   $("page-diagnostics").hidden = !unavailable;
+  // The trail was collected and then never shown, so a failed read could only report how
+  // much text it got — not which strategy produced it. One screenshot should say what ran.
   $("diagnostics").textContent = diagnostics
-    ? (diagnostics.chars ? t("charsRead", { n: diagnostics.chars, opening: diagnostics.opening })
-      : t("noBody")) : t("noDiagnostics");
+    ? [(diagnostics.chars ? t("charsRead", { n: diagnostics.chars, opening: diagnostics.opening })
+        : t("noBody")),
+       (diagnostics.tried || []).join(" · ")].filter(Boolean).join("\n")
+    : t("noDiagnostics");
   $("classes-drawer").hidden = false;
   $("classes-drawer").querySelector(":scope > summary").textContent = unavailable
     ? t("readingDetails") : t("drawer");
@@ -403,20 +407,29 @@ async function readVisiblePosting(previousPosting = {}) {
     const complete = contentText(node);
     return complete.length > visible.length ? complete : visible;
   };
-  // The detail pane holds one posting. The results rail holds one `/jobs/view/` link per
-  // listed job and is comfortably longer than 500 characters, so a length test alone will
-  // happily return the rail — which is how a Tempus posting came back carrying the text of
-  // a Boston University one that had been open earlier. A pane linking to postings other
-  // than the open one is the list, whatever its size.
-  const otherPostingLinks = (node) => {
-    if (!node || !node.querySelectorAll) return 0;
-    return [...node.querySelectorAll('a[href*="/jobs/view/"]')].filter((link) => {
+  // The detail pane holds one posting. The results rail holds many, and it is comfortably
+  // longer than 500 characters, so a length test alone will happily return the rail — which
+  // is how a Tempus posting came back carrying the text of a Boston University one that had
+  // been open earlier. Counting `/jobs/view/` links alone was not enough: the rail does not
+  // always link that way. Posting identity is collected from every attribute LinkedIn uses
+  // for it, so the count survives whichever one a given layout happens to render.
+  const postingIds = (node) => {
+    const ids = new Set();
+    if (!node || !node.querySelectorAll) return ids;
+    for (const marked of node.querySelectorAll("[data-occludable-job-id], [data-job-id]")) {
+      const id = marked.getAttribute("data-occludable-job-id") || marked.getAttribute("data-job-id");
+      if (id) ids.add(id);
+    }
+    for (const link of node.querySelectorAll('a[href*="/jobs/view/"], a[href*="currentJobId="]')) {
       const href = link.getAttribute("href") || "";
-      return !currentId || !href.includes(`/jobs/view/${currentId}`);
-    }).length;
+      const match = href.match(/\/jobs\/view\/(\d+)/) || href.match(/currentJobId=(\d+)/);
+      if (match) ids.add(match[1]);
+    }
+    return ids;
   };
-  // One stray link — a "similar jobs" cross-reference — is not a list. Several are.
-  const holdsTheJobList = (node) => otherPostingLinks(node) > 1;
+  const otherPostingIds = (node) => [...postingIds(node)].filter((id) => id !== currentId);
+  // One stray reference — a "similar jobs" cross-link — is not a list. Several are.
+  const holdsTheJobList = (node) => otherPostingIds(node).length > 1;
   const bigEnough = (node) =>
     node && longerText(node).length > 500 && !holdsTheJobList(node);
 
@@ -433,7 +446,7 @@ async function readVisiblePosting(previousPosting = {}) {
   const currentId = currentQueryId
     || (location.pathname.match(/\/jobs\/view\/(\d+)/) || [])[1];
   tried.push(`current_id:${currentId || "none"}`);
-  tried.push(`other_postings_in_body:${otherPostingLinks(document.body)}`);
+  tried.push(`other_postings_in_body:${otherPostingIds(document.body).length}`);
   const currentLinks = () => currentId
     ? [...document.querySelectorAll(`a[href*="/jobs/view/${currentId}"]`)] : [];
   const linkTitle = (link) => clean(
@@ -599,7 +612,9 @@ async function readVisiblePosting(previousPosting = {}) {
     title, employer, location: place, work_arrangement: workArrangement, container: matched,
     bodySignature: reading.bodySignature,
     // Enough for one screenshot to say what happened, instead of a console session.
-    diagnostics: { tried: [...tried, `description_candidates:${descriptions.length}`],
+    diagnostics: { tried: [...tried, `matched:${matched}`,
+                          `description_candidates:${descriptions.length}`,
+                          `other_postings_in_pane:${otherPostingIds(pane).length}`],
       chars: text.length, opening: text.slice(0, 70).replace(/\n/g, " ") }
   };
 }
