@@ -201,5 +201,49 @@ class VerdictReachabilityTests(unittest.TestCase):
                         or any(line["recognized_terms"] for line in lines))
 
 
+class SectionHeadingCoverageTests(unittest.TestCase):
+    """A posting whose headings are not recognised yields no sections, and the panel then
+    says it cannot read the page — the same "can't read this yet" a genuinely unreadable
+    page gets. These lock the headings that were counted in postings which yielded nothing."""
+
+    def read(self, text):
+        return SECTIONS.split_sections(text)
+
+    def test_duties_phrased_as_a_promise_to_the_reader(self):
+        # Employers write the duties heading as a promise as often as a noun.
+        for heading in ("We'll trust you to", "What you'll be doing", "What success looks like",
+                        "Purpose of Job"):
+            sections = self.read(f"{heading}\n- Build and validate study databases\n")
+            self.assertEqual(sections["responsibilities"],
+                             ["Build and validate study databases"], heading)
+
+    def test_requirements_phrased_as_what_you_bring(self):
+        for heading in ("You'll need to have", "What you'll bring", "Who you are",
+                        "What we're looking for"):
+            sections = self.read(f"{heading}\n- Three years of experience with SAS\n")
+            self.assertEqual(sections["required_skills"],
+                             ["Three years of experience with SAS"], heading)
+
+    def test_a_heading_is_matched_through_its_tail(self):
+        # "What you bring to Komodo Health (required)" — an exact list cannot hold every
+        # company's suffix, so a heading matches by prefix the way closings always have.
+        sections = self.read("What you bring to Komodo Health (required)\n"
+                             "- Five years of analytics experience\n")
+        self.assertEqual(sections["required_skills"], ["Five years of analytics experience"])
+
+    def test_a_sentence_opening_with_a_heading_word_does_not_start_a_section(self):
+        # The guard that makes prefix matching safe: without it, prose would open a section
+        # and swallow the rest of the page.
+        sections = self.read("Requirements are listed in the attached document.\n"
+                             "We are a fast growing team.\n")
+        self.assertEqual(sections["required_skills"], [])
+
+    def test_a_long_line_starting_with_a_heading_word_is_not_a_heading(self):
+        line = "Qualifications for this position have been developed over many years by "
+        line += "our clinical operations leadership in collaboration with research staff"
+        self.assertGreater(len(line), 80)
+        self.assertEqual(self.read(line + "\n- Something\n")["required_skills"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

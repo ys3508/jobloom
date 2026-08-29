@@ -31,6 +31,8 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
         "required", "requirements", "required qualifications", "minimum qualifications",
         "basic qualifications", "qualifications", "what you'll need", "what you need",
         "must have", "required skills",
+        "you'll need to have", "you will need to have", "what you'll bring",
+        "what you will bring", "what you bring", "what we're looking for", "who you are",
     ),
     "preferred_skills": (
         "preferred", "preferred qualifications", "nice to have", "nice-to-have",
@@ -41,12 +43,20 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
         "the role", "duties", "essential functions", "job summary", "position overview",
         "the successful applicant will",
         "in a highly collaborative environment, the successful applicant will",
+        # Employers phrase the duties heading as a promise to the reader as often as a noun.
+        # Each of these was counted in postings that yielded no section at all.
+        "we'll trust you to", "we will trust you to", "what you'll be doing",
+        "what you will be doing", "purpose of job", "what success looks like",
     ),
-    "compensation_structure": ("compensation", "salary", "pay", "pay range", "benefits"),
+    "compensation_structure": ("compensation", "salary", "pay", "pay range", "benefits",
+                               "compensation and benefits", "total rewards"),
 }
 # Headings that end a section without starting one we keep.
 CLOSING_HEADINGS = (
     "about us", "about the company", "about the team", "people you can reach out to",
+    "where you'll work", "where you will work", "equal opportunity statement",
+    "health & wellness", "work-life balance", "financial wellness", "culture & values",
+    "growth & giving back",
     "meet the hiring team", "eeo", "equal opportunity", "physical requirements",
     "additional job details", "why work here", "follow us", "how to apply", "our values",
     "diversity", "accommodation", "legal", "notice",
@@ -128,6 +138,14 @@ def _heading_key(line: str) -> str | None:
     for key, headings in SECTION_HEADINGS.items():
         if text in headings:
             return key
+    # A heading often carries a tail the exact list cannot hold — "What you bring to Komodo
+    # Health (required)". Closings have always matched by prefix; sections now do too, but
+    # only for a line shaped like a heading. A sentence that merely opens with a heading word
+    # ("Requirements are listed below.") would otherwise start a section and swallow the page.
+    if not text.endswith((".", "!", "?")) and len(text) <= 80:
+        for key, headings in SECTION_HEADINGS.items():
+            if any(text.startswith(heading) for heading in headings if len(heading) >= 9):
+                return key
     if any(text.startswith(closing) for closing in CLOSING_HEADINGS):
         return "__close__"
     return None
