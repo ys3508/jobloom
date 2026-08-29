@@ -75,7 +75,24 @@ SPONSORSHIP_NEGATIVE = ("not able to sponsor", "unable to sponsor", "no sponsors
 SPONSORSHIP_POSITIVE = ("visa sponsorship", "will sponsor", "sponsorship available",
                         "we sponsor", "h-1b sponsorship")
 MAX_ITEMS = 40
+# How long a line may be and still be *read*. A line over this is dropped by
+# `split_sections`, so this cap must stay generous: dropping a requirement is a worse
+# failure than carrying a long one.
 MAX_ITEM_CHARS = 1_000
+# What `direction_core.JOB_FIELD_SHAPES` accepts in a *routed* card, per field — the caps
+# differ, and one global pair silently violates the tightest of them. Every card built here
+# is routed (`assist_bridge` routes it directly), and an over-long item does not make a
+# richer card, it makes one that raises `malformed job card field` on the way to a decision.
+# Reading stays generous and the difference is closed on the way out, by splitting on
+# sentence boundaries and truncating only what a single sentence still will not fit.
+# `tests/test_posting_sections.py` fails if these drift from the routing engine.
+ROUTING_SHAPES: dict[str, tuple[int, int]] = {
+    "required_skills": (500, 200),
+    "preferred_skills": (500, 200),
+    "responsibilities": (500, 50),
+    "compensation_structure": (300, 20),
+}
+ROUTING_TITLE_CHARS = 300
 REQUIREMENT_CUE = re.compile(
     r"\b(?:require(?:d|s|ments?)?|qualifications?|experience|skills?|degree|"
     r"proficien(?:t|cy)|knowledge|ability|years?|must|preferred|familiar(?:ity)?|"
@@ -246,6 +263,24 @@ def distill_terms(lines: list[str], *, ontology: dict[str, Any] | None = None) -
             "unrecognised": unrecognised}
 
 
+def fit_routing_shape(items: list[str], field: str) -> list[str]:
+    """Fit read lines to one routed field's shape without losing any of them."""
+    max_chars, max_items = ROUTING_SHAPES[field]
+    fitted: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        if len(text) <= max_chars:
+            fitted.append(text)
+            continue
+        for piece in re.split(r"(?<=[.!?;])\s+", text):
+            piece = piece.strip()
+            if piece:
+                fitted.append(piece[:max_chars])
+    return fitted[:max_items]
+
+
 def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
     """Return the JobCard fields a posting states outright. Absent fields stay absent."""
     sections = split_sections(text)
@@ -280,7 +315,7 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
         if not sections[key]:
             continue
         distilled[key] = distill_terms(sections[key], ontology=ontology)
-        fields[key] = distilled[key]["terms"]
+        fields[key] = fit_routing_shape(distilled[key]["terms"], key)
         fields[f"{key}_stated"] = sections[key]
         # A capability match helps routing, but the capability's internal label is not
         # the requirement the employer wrote. Keep every line that yielded no explicit
@@ -296,9 +331,9 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
             fields[f"{key}_capabilities"] = distilled[key]["capabilities"]
     for key in ("responsibilities", "compensation_structure"):
         if sections[key]:
-            fields[key] = sections[key]
+            fields[key] = fit_routing_shape(sections[key], key)
     if title and title.strip():
-        fields["title"] = title.strip()
+        fields["title"] = title.strip()[:ROUTING_TITLE_CHARS]
     salary = _salary(text)
     if salary:
         fields["salary"] = salary
