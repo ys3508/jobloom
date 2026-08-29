@@ -229,8 +229,13 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
         return {
             "verdict": {"call": "partial", "because": "posting_read_incomplete",
                         "direction": None, "covered": 0, "stated": 0},
+            # No judgement, but the reading itself still travels. The user has to see how
+            # little arrived to know the panel is asking them to open the full posting
+            # rather than failing for reasons of its own.
             "lead_with": [], "gaps": [], "classified": {name: [] for name in CLASSES},
-            "unassessed_requirements": [], "stated_requirements": [],
+            "unassessed_requirements": [],
+            "stated_requirements": [{"text": line, "recognized_terms": []}
+                                    for line in (card.get("required_skills_stated") or [])],
             "resume_shows": len(resume_fact_ids(connection)),
             "job": {key: card.get(key) for key in ("title", "employer", "location", "country",
                                                    "work_arrangement", "employment_type",
@@ -334,22 +339,39 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     # inside a registered direction is a question about how they are budgeting applications.
     # Letting the second answer the first is how a genomics role they are well matched to
     # comes back as "skip" because its title was not on a list.
-    if required_unassessed:
+    # Refusing to judge until *every* required line resolves to a controlled term sounds
+    # careful and is a constant: measured over 1,199 live postings, 100% left at least one
+    # required line unrecognised, median seven, so "apply" was unreachable and every posting
+    # came back "worth a look" however well it matched.
+    #
+    # The line that actually separates a judgement from a guess is whether anything was
+    # assessed at all. Across the postings where the user has direct evidence, every one had
+    # at least one required line recognised; across all 1,199, 71% had none. So nothing
+    # recognised means there is genuinely nothing to compare and the verdict stays "review";
+    # anything recognised is judged on what was assessed, with the unassessed count carried
+    # into every reason so no verdict claims to have read more than it did.
+    assessed = [item for item in stated_requirements
+                if item["obligation"] == "required" and item["recognized_terms"]]
+    caveat = (f" {len(required_unassessed)} other required lines name nothing this can check "
+              "and were not assessed" if required_unassessed else "")
+    if not assessed:
         verdict, because = "review", (
-            f"{len(required_unassessed)} required lines still need a human evidence check; "
-            "the recognised terms alone are not the whole posting")
+            f"none of the {len(required_unassessed)} required lines name anything that can be "
+            "checked against your evidence, so this needs your own read")
     elif not covered and not buckets["transferable"]:
-        verdict, because = "skip", "none of the stated requirements resolve to your evidence"
+        verdict, because = "skip", (
+            "none of the stated requirements resolve to your evidence." + caveat)
     elif len(required_gaps) > len(covered):
         verdict, because = "stretch", (
             f"{len(required_gaps)} required things you have no evidence for, "
-            f"against {len(covered)} you do")
+            f"against {len(covered)} you do." + caveat)
     elif buckets["hidden_strength"]:
         verdict, because = "apply", (
             f"{len(buckets['hidden_strength'])} of these you have done but this resume "
-            "does not show — add them before applying")
+            "does not show — add them before applying." + caveat)
     else:
-        verdict, because = "apply", "your evidence covers most of what this posting states"
+        verdict, because = "apply", (
+            "your evidence covers what this posting states and can be checked." + caveat)
     return {
         "verdict": {"call": verdict, "because": because,
                     "direction": ((best or {}).get("name")
@@ -427,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/positioning":
                 self._send(200, self._positioning(payload))
+            elif self.path == "/save":
+                self._send(200, self._save(payload))
             elif self.path == "/store":
                 self._send(200, self._store(payload))
             else:
@@ -450,6 +474,33 @@ class Handler(BaseHTTPRequestHandler):
         connection = self._connection()
         try:
             return {**positioning(card, candidate, connection), "job_card": card}
+        finally:
+            connection.close()
+
+    def _save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep a note of a job to come back to.
+
+        Deliberately not routed through `/store`. That path refuses an unreviewed card
+        because the pre-submission review gate stands between a card and being *sent*, and
+        relaxing it so a note could be filed would weaken a submission safeguard for a
+        bookkeeping errand. Keeping a note sends nothing and creates no application, so it
+        needs no review and gets its own door.
+        """
+        if not self.allow_store:
+            raise BridgeError("storing_disabled", 403)
+        card = payload.get("job_card")
+        if not isinstance(card, dict):
+            raise BridgeError("job_card_required")
+        import saved_jobs  # local: keeps the read-only path free of write imports
+
+        connection = self._connection()
+        try:
+            saved_jobs.initialize(connection)
+            return saved_jobs.save(connection, card,
+                                   actor=str(payload.get("actor") or "user"),
+                                   reason=payload.get("reason"))
+        except ValueError as error:
+            raise BridgeError(str(error)) from error
         finally:
             connection.close()
 

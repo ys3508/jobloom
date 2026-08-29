@@ -48,3 +48,25 @@ When fewer than thirty applications have been submitted, label the sample `insuf
 ## Private storage
 
 Keep outcome reports under `.jobloom/`. Reports contain application metadata but no answer values or model content. Never commit private reports by default.
+
+## Jobs kept for later, and what the funnel can honestly count
+
+`saved_jobs.py` records the one decision a person would press a button for: *not now, keep
+it*. Skipping a job means moving to the next one, so a control meaning "do not apply" would
+be pressed by nobody and is not offered.
+
+It follows that the funnel's denominator is jobs **kept**, never jobs **seen**. Reporting a
+view rate would require logging every posting the panel opens, which is a different promise
+from the one it makes, and nothing infers one from what is recorded here.
+
+A kept job is not an application: an application row describes what happened after something
+was sent, and a kept job has no after. They live in separate tables and separate sheets,
+joined on the posting's URL when the tracker is built, so a job later applied to is reported
+from each side once rather than counted twice.
+
+Two dates travel with a kept job, both stated by the employer: when the posting opened, and
+its deadline where one was given. Days open is computed when the sheet is written rather
+than stored, because it changes daily. **No "apply by" date is derived.** Employers state a
+deadline on a small minority of postings, and the interval that would make one up for the
+rest — apply within N days — is not a number this system has measured. It becomes available
+when the user's own reply data can calibrate it, and not before.

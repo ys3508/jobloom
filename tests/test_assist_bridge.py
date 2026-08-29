@@ -44,9 +44,31 @@ PAGE = {
     "location": "Boston, MA",
     "country": "US",
     "required_skills": ["R", "SAS", "Epic"],
-    "text": ("Clinical Research Data Analyst at Example Health System.\n\n"
-             "Required\n- Manage clinical trial data using R and SAS\n"
-             "- Experience with Epic reporting\n"),
+    "text": (
+        # A whole posting, not a corner of one. The previous fixture was 150 characters
+        # holding a single requirements block — the exact shape the read-completeness check
+        # now refuses to judge, so asserting a confident verdict on it locked in the bug.
+        "Clinical Research Data Analyst at Example Health System.\n\n"
+        "About the job\n"
+        "The Clinical Research Informatics group supports investigator-initiated trials "
+        "across the health system. We build and maintain the data infrastructure that "
+        "study teams rely on, and we work directly with principal investigators from "
+        "protocol design through publication.\n\n"
+        "Responsibilities\n"
+        "- Build and maintain study databases for investigator-initiated clinical trials\n"
+        "- Perform data quality control, validation, and reconciliation across study visits\n"
+        "- Produce analysis datasets and summary tables for study teams\n"
+        "- Extract and reconcile clinical data from Epic reporting environments\n"
+        "- Support statistical analysis plans and contribute to manuscript preparation\n"
+        "- Present data summaries to investigators and coordinate with study coordinators\n\n"
+        "Required\n"
+        "- Manage clinical trial data using R and SAS\n"
+        "- Experience with Epic reporting\n"
+        "- Bachelor's degree in a quantitative field and two years of related experience\n"
+        "- Strong written and verbal communication skills\n\n"
+        "Preferred\n"
+        "- Experience with REDCap or a comparable electronic data capture system\n"
+    ),
 }
 
 
@@ -322,6 +344,22 @@ class ServerBoundaryTests(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, json.load(error)
 
+    def test_save_answers_the_request(self):
+        # It did not. `/save` produced its result and never sent it, so the browser waited
+        # on a response that never came — and the tests missed it because they exercised
+        # `saved_jobs.save` directly and never the endpoint. Storing is off in this fixture,
+        # so the refusal is what comes back; what matters is that something does.
+        status, body = self.post("/save", {"job_card": {
+            "canonical_url": "https://jobs.example.com/1", "title": "Analyst",
+            "employer": "Acme"}})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "storing_disabled")
+
+    def test_save_refuses_a_payload_without_a_job_card(self):
+        status, body = self.post("/save", {"actor": "user"})
+        self.assertIn(status, {400, 403})
+        self.assertTrue(body["error"])
+
     def test_health_lets_a_second_start_tell_stale_from_current(self):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}/health")
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -409,7 +447,10 @@ Required
         self.assertEqual(body["verdict"]["lines_read"], len(body["stated_requirements"]))
         self.assertTrue(any(not item["recognized_terms"]
                             for item in body["stated_requirements"]))
-        self.assertIn("not the whole posting", body["verdict"]["because"])
+        # The wording changed when the verdict stopped refusing to judge on any unassessed
+        # line at all; what must not change is that the reason says these were not assessed
+        # rather than passing them off as met.
+        self.assertIn("checked against your evidence", body["verdict"]["because"])
 
     def test_a_direction_that_does_not_accept_it_is_not_a_reason_to_skip(self):
         # Whether the user can do the job is about their evidence. Whether it sits in a
@@ -592,8 +633,11 @@ class ExtensionBoundaryTests(unittest.TestCase):
                    'id="classes-drawer"']
         positions = [html.index(token) for token in ordered]
         self.assertEqual(positions, sorted(positions))
-        for key in ("tailorApply", "applyAsIs", "skip", "drawer"):
+        # The third action is "save for later", not "skip": skipping a job means moving to
+        # the next one, so a button meaning "do not apply" would be pressed by nobody.
+        for key in ("tailorApply", "applyAsIs", "saveLater", "drawer"):
             self.assertIn(f'data-i18n="{key}"', html)
+        self.assertNotIn('data-i18n="skip"', html)
 
     def test_unreadable_state_is_one_human_sentence_without_zero_counts(self):
         panel = self.sources["panel.js"]

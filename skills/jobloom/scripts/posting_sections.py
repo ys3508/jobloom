@@ -31,6 +31,8 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
         "required", "requirements", "required qualifications", "minimum qualifications",
         "basic qualifications", "qualifications", "what you'll need", "what you need",
         "must have", "required skills",
+        "you'll need to have", "you will need to have", "what you'll bring",
+        "what you will bring", "what you bring", "what we're looking for", "who you are",
     ),
     "preferred_skills": (
         "preferred", "preferred qualifications", "nice to have", "nice-to-have",
@@ -41,12 +43,20 @@ SECTION_HEADINGS: dict[str, tuple[str, ...]] = {
         "the role", "duties", "essential functions", "job summary", "position overview",
         "the successful applicant will",
         "in a highly collaborative environment, the successful applicant will",
+        # Employers phrase the duties heading as a promise to the reader as often as a noun.
+        # Each of these was counted in postings that yielded no section at all.
+        "we'll trust you to", "we will trust you to", "what you'll be doing",
+        "what you will be doing", "purpose of job", "what success looks like",
     ),
-    "compensation_structure": ("compensation", "salary", "pay", "pay range", "benefits"),
+    "compensation_structure": ("compensation", "salary", "pay", "pay range", "benefits",
+                               "compensation and benefits", "total rewards"),
 }
 # Headings that end a section without starting one we keep.
 CLOSING_HEADINGS = (
     "about us", "about the company", "about the team", "people you can reach out to",
+    "where you'll work", "where you will work", "equal opportunity statement",
+    "health & wellness", "work-life balance", "financial wellness", "culture & values",
+    "growth & giving back",
     "meet the hiring team", "eeo", "equal opportunity", "physical requirements",
     "additional job details", "why work here", "follow us", "how to apply", "our values",
     "diversity", "accommodation", "legal", "notice",
@@ -93,12 +103,43 @@ ROUTING_SHAPES: dict[str, tuple[int, int]] = {
     "compensation_structure": (300, 20),
 }
 ROUTING_TITLE_CHARS = 300
+# Smaller than any job description a real posting has ever carried here, so text under it
+# is a fragment of a page rather than a posting. Calibrated against 1,199 live postings from
+# 17 ATS boards: the shortest was 1,060 characters over 6 lines, and nothing fell below
+# 1,000. 800 keeps a margin under that floor and flagged none of them.
+#
+# Size is the whole rule on purpose. "Requirements found but no responsibilities" looks like
+# a good completeness signal and is not: 4.1% of those 1,199 complete postings state
+# requirements under a heading and never state duties under one, so treating that shape as
+# incomplete would refuse to judge one real posting in twenty-five. The dangerous case is
+# not a posting missing a section, it is a page we only received a corner of.
+MIN_JOB_DESCRIPTION_CHARS = 800
+# A requirement line has to announce itself, because a section runs until the next heading
+# and absorbs whatever prose trails it. The additions below are not guesses: each was taken
+# from a line this filter measurably dropped across 1,199 live postings while naming a real
+# tool — "Programming in R and Python or Perl", "Fluency in SQL", "Basic understanding of
+# Python", "Experiences with eTMF or CTMS systems". `experience` was singular, so the plural
+# never matched. `understanding` is deliberately not `understand`: the bare verb appears in
+# lab-description prose ("approaches to understand risk factors") that must stay out.
 REQUIREMENT_CUE = re.compile(
-    r"\b(?:require(?:d|s|ments?)?|qualifications?|experience|skills?|degree|"
-    r"proficien(?:t|cy)|knowledge|ability|years?|must|preferred|familiar(?:ity)?|"
-    r"expertise|background|communication|writing)\b", re.I)
+    r"\b(?:require(?:d|s|ments?)?|qualifications?|experiences?|skills?|degree"
+    r"|proficien(?:t|cy)|knowledge|ability|years?|must|preferred|familiar(?:ity)?"
+    r"|expert(?:ise)?|background|communication|writing|fluen(?:t|cy)|understanding"
+    r"|programming|power user|command of|comfort(?:able)?|hands[- ]on)\b", re.I)
+
 FALLBACK_EXCLUSION = re.compile(
     r"\b(?:equal opportunity|accommodation|benefits?|compensation|salary|pay range)\b", re.I)
+
+
+# How much of the line a matched heading must account for before the line is read as one.
+# Measured against 1,953 live postings: real headings sit well above it, and the sentences
+# that merely open with a heading word sit well below.
+HEADING_COVERAGE = 0.6
+
+
+def _heading_shaped(line: str, heading: str, text: str) -> bool:
+    """A heading is nearly the whole line, or it ends in the colon that introduces a list."""
+    return line.rstrip().endswith(":") or len(heading) / max(len(text), 1) >= HEADING_COVERAGE
 
 
 def _heading_key(line: str) -> str | None:
@@ -108,8 +149,28 @@ def _heading_key(line: str) -> str | None:
     for key, headings in SECTION_HEADINGS.items():
         if text in headings:
             return key
-    if any(text.startswith(closing) for closing in CLOSING_HEADINGS):
-        return "__close__"
+    # A heading often carries a tail the exact list cannot hold — "What you bring to Komodo
+    # Health (required)". Closings have always matched by prefix; sections do too, but only
+    # for a line shaped like a heading.
+    #
+    # Excluding sentence punctuation was not enough. Plenty of prose carries none, and the
+    # heading words most likely to open a sentence are the ones in the list: "Must have
+    # office space with ability to see clients" and "Requirements include strong Python
+    # skills" both opened a section and swallowed the lines that followed. Over 1,953 live
+    # postings, what separates the two is how much of the line the heading accounts for:
+    # a real heading is nearly the whole line ("Equal Opportunity Employer", "Nice-to-Have
+    # Skills"), while a sentence that happens to start with one is mostly its own content.
+    # A trailing colon is the other heading shape and is accepted whatever the ratio, since
+    # that is how a lead-in introduces the list beneath it.
+    if not text.endswith((".", "!", "?")) and len(text) <= 80:
+        for key, headings in SECTION_HEADINGS.items():
+            for heading in headings:
+                if len(heading) >= 9 and text.startswith(heading) and _heading_shaped(line, heading, text):
+                    return key
+    for closing in CLOSING_HEADINGS:
+        if text.startswith(closing) and (text == closing
+                                         or _heading_shaped(line, closing, text)):
+            return "__close__"
     return None
 
 
@@ -353,16 +414,22 @@ def extract(text: str, *, title: str | None = None) -> dict[str, Any]:
         "unassessed_requirements": {key: lines for key, lines in unassessed.items() if lines},
         "requirement_lines": requirement_lines,
         # A parser saying "success" after seeing one requirements sentence is more
-        # dangerous than a clean failure: it invites a confident judgement from a
-        # fragment. Responsibilities are the work itself and must travel with the
-        # qualification lines whenever the page supplies a short structured extract.
-        "read_status": (
-            "partial"
-            if (sections["required_skills"] or sections["preferred_skills"])
-            and not sections["responsibilities"]
-            and len([line for line in str(text or "").splitlines() if line.strip()]) <= 2
-            else "complete"
-        ),
+        # dangerous than a clean failure: it invites a confident judgement from a fragment.
+        # A half read is worse than no read, because it is the one that answers with
+        # confidence.
+        #
+        # The previous rule required the whole received text to be two lines or fewer, which
+        # no real half read ever is — a page yielding only its "Required Skills" line still
+        # arrives with dozens of lines of navigation around it, so the check reported
+        # "complete" for exactly the readings it existed to catch.
+        # Short *and* structurally impoverished. A terse posting that still carries both a
+        # requirements section and a duties section is a whole posting; a short text
+        # carrying at most one of them is a corner of a page.
+        "read_status": ("partial"
+                        if len(str(text or "").strip()) < MIN_JOB_DESCRIPTION_CHARS
+                        and not ((sections["required_skills"] or sections["preferred_skills"])
+                                 and sections["responsibilities"])
+                        else "complete"),
         "body_characters": len(str(text or "").strip()),
         "responsibility_lines": len(sections["responsibilities"]),
     }
