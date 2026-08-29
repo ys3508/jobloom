@@ -44,9 +44,31 @@ PAGE = {
     "location": "Boston, MA",
     "country": "US",
     "required_skills": ["R", "SAS", "Epic"],
-    "text": ("Clinical Research Data Analyst at Example Health System.\n\n"
-             "Required\n- Manage clinical trial data using R and SAS\n"
-             "- Experience with Epic reporting\n"),
+    "text": (
+        # A whole posting, not a corner of one. The previous fixture was 150 characters
+        # holding a single requirements block — the exact shape the read-completeness check
+        # now refuses to judge, so asserting a confident verdict on it locked in the bug.
+        "Clinical Research Data Analyst at Example Health System.\n\n"
+        "About the job\n"
+        "The Clinical Research Informatics group supports investigator-initiated trials "
+        "across the health system. We build and maintain the data infrastructure that "
+        "study teams rely on, and we work directly with principal investigators from "
+        "protocol design through publication.\n\n"
+        "Responsibilities\n"
+        "- Build and maintain study databases for investigator-initiated clinical trials\n"
+        "- Perform data quality control, validation, and reconciliation across study visits\n"
+        "- Produce analysis datasets and summary tables for study teams\n"
+        "- Extract and reconcile clinical data from Epic reporting environments\n"
+        "- Support statistical analysis plans and contribute to manuscript preparation\n"
+        "- Present data summaries to investigators and coordinate with study coordinators\n\n"
+        "Required\n"
+        "- Manage clinical trial data using R and SAS\n"
+        "- Experience with Epic reporting\n"
+        "- Bachelor's degree in a quantitative field and two years of related experience\n"
+        "- Strong written and verbal communication skills\n\n"
+        "Preferred\n"
+        "- Experience with REDCap or a comparable electronic data capture system\n"
+    ),
 }
 
 
@@ -409,7 +431,10 @@ Required
         self.assertEqual(body["verdict"]["lines_read"], len(body["stated_requirements"]))
         self.assertTrue(any(not item["recognized_terms"]
                             for item in body["stated_requirements"]))
-        self.assertIn("not the whole posting", body["verdict"]["because"])
+        # The wording changed when the verdict stopped refusing to judge on any unassessed
+        # line at all; what must not change is that the reason says these were not assessed
+        # rather than passing them off as met.
+        self.assertIn("checked against your evidence", body["verdict"]["because"])
 
     def test_a_direction_that_does_not_accept_it_is_not_a_reason_to_skip(self):
         # Whether the user can do the job is about their evidence. Whether it sits in a
