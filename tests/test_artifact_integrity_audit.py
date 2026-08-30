@@ -305,47 +305,91 @@ class ReviewPacket(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Path(self.tmp.name) / "resumes"
-        (self.store / "v1").mkdir(parents=True)
-        (self.store / "v1" / "resume.pdf").write_bytes(synthetic_pdf(["Led 2 focus groups"]))
-        (self.store / "v1" / "claims-manifest.json").write_text(json.dumps(
-            {"schema_version": "1", "claims": [{"claim_id": "c-1", "claim_text": "Led 2 focus groups",
-                                                "fact_ids": ["f-1"], "evidence_strength": "direct"}]}))
+        self.make("v1", "resume.pdf")
 
-    def test_scan_keeps_only_hashes_and_is_not_admissible_for_approval(self):
-        packet = MODULE.run(self.store, None, include_spans=False, preserve=False)
-        self.assertEqual(packet["execution"]["observation_storage"], "hash_only")
-        self.assertFalse(packet["execution"]["admissible_for_approval"])
+    def make(self, name, filename, claim="Led 2 focus groups", manifest_suffix=""):
+        (self.store / name).mkdir(parents=True)
+        (self.store / name / filename).write_bytes(synthetic_pdf(["Led 2 focus groups"]))
+        (self.store / name / "claims-manifest.json").write_text(json.dumps(
+            {"schema_version": "1" + manifest_suffix,
+             "claims": [{"claim_id": "c-1", "claim_text": claim,
+                         "fact_ids": ["f-1"], "evidence_strength": "direct"}]}))
 
-    def test_prepare_review_preserves_the_exact_views_at_0600(self):
-        packet = MODULE.run(self.store, None, include_spans=False, preserve=True)
+    def build(self, preserve=True):
+        packet = MODULE.run(self.store, None, include_spans=False, preserve=preserve)
         out = Path(self.tmp.name) / "packet"
-        MODULE.write_review_packet(out, packet, packet["artifacts"])
+        if preserve:
+            MODULE.write_review_packet(out, packet)
+        return packet, out
 
-        self.assertEqual(packet["execution"]["observation_storage"], "observation_preserved")
-        self.assertTrue(packet["execution"]["admissible_for_approval"])
-        self.assertEqual(oct(out.stat().st_mode)[-3:], "700")
+    def test_scan_keeps_only_hashes_and_no_artifact_is_admissible(self):
+        packet, _ = self.build(preserve=False)
+        self.assertEqual(packet["execution"]["observation_storage"], "hash_only")
+        self.assertFalse(packet["execution"]["all_artifacts_admissible"])
+        self.assertFalse(packet["artifacts"][0]["admissible_for_approval"])
 
-        folder = out / packet["artifacts"][0]["artifact_sha256"][:12]
-        raw = folder / "raw-machine-view.txt"
-        canonical = folder / "canonical-machine-view.txt"
-        for path in (raw, canonical, folder / "diagnostics.txt", out / "audit-packet.json"):
-            self.assertTrue(path.is_file(), path)
-            self.assertEqual(oct(path.stat().st_mode)[-3:], "600", path)
+    def test_a_failed_artifact_is_inadmissible_while_its_neighbour_is_not_dragged_down(self):
+        self.make("broken", "resume.pdf")
+        (self.store / "broken" / "resume.pdf").write_bytes(b"not a pdf")
+        packet, _ = self.build()
+        by_status = {a["extraction_status"]: a["admissible_for_approval"]
+                     for a in packet["artifacts"]}
+        self.assertEqual(by_status, {"ok": True, "failed": False})
+        self.assertFalse(packet["execution"]["all_artifacts_admissible"],
+                         "a packet-level green light must not cover a failed artifact")
 
-        # the preserved view is the observation the hash was taken over
-        stored = json.loads((out / "audit-packet.json").read_text())["artifacts"][0]
-        self.assertEqual(MODULE.sha256_text(raw.read_text()),
-                         stored["machine_view"]["raw_sha256"])
-        self.assertEqual(MODULE.sha256_text(canonical.read_text()),
-                         stored["machine_view"]["canonical_sha256"])
+    def test_views_are_addressed_by_full_pdf_hash_and_policy(self):
+        packet, out = self.build()
+        artifact = packet["artifacts"][0]
+        expected = (Path("views") / artifact["artifact_sha256"]
+                    / packet["execution"]["extractor_policy_id"] / "raw-machine-view.txt")
+        self.assertEqual(artifact["observation_files"]["raw"]["path"], str(expected))
+        self.assertTrue((out / expected).is_file())
+
+    def test_the_same_pdf_under_two_manifests_shares_views_and_splits_reports(self):
+        self.make("v2", "resume.pdf", manifest_suffix="-alt")
+        packet, out = self.build()
+        self.assertEqual(len(packet["artifacts"]), 2)
+        self.assertEqual(len({a["artifact_sha256"] for a in packet["artifacts"]}), 1)
+        self.assertEqual(len(list((out / "views").iterdir())), 1, "one shared MachineView")
+        self.assertEqual(len(list((out / "reports").iterdir())), 2, "two distinct reports")
+
+    def test_observation_files_carry_their_own_hash_and_size(self):
+        packet, out = self.build()
+        artifact = packet["artifacts"][0]
+        for name, key in (("raw", "raw_sha256"), ("canonical", "canonical_sha256")):
+            entry = artifact["observation_files"][name]
+            body = (out / entry["path"]).read_text()
+            self.assertEqual(MODULE.sha256_text(body), entry["sha256"])
+            self.assertEqual(MODULE.sha256_text(body), artifact["machine_view"][key])
+            self.assertEqual(len(body.encode()), entry["size"])
+
+    def test_a_shared_observation_whose_bytes_differ_is_an_error_not_a_merge(self):
+        path = Path(self.tmp.name) / "view.txt"
+        MODULE.write_shared_observation(path, "abc")
+        MODULE.write_shared_observation(path, "abc")
+        with self.assertRaises(ValueError):
+            MODULE.write_shared_observation(path, "different")
+
+    def test_the_index_names_every_report_and_its_admissibility(self):
+        _, out = self.build()
+        index = json.loads((out / "audit-packet.json").read_text())
+        self.assertNotIn("artifacts", index)
+        reference, = index["reports"]
+        self.assertTrue((out / reference["report_path"]).is_file())
+        self.assertTrue(reference["admissible_for_approval"])
+
+    def test_permissions_are_private_throughout(self):
+        _, out = self.build()
+        for path in out.rglob("*"):
+            self.assertEqual(oct(path.stat().st_mode)[-3:],
+                             "700" if path.is_dir() else "600", path)
 
     def test_a_review_packet_is_never_overwritten(self):
-        packet = MODULE.run(self.store, None, include_spans=False, preserve=True)
-        out = Path(self.tmp.name) / "packet"
-        MODULE.write_review_packet(out, packet, packet["artifacts"])
+        _, out = self.build()
         again = MODULE.run(self.store, None, include_spans=False, preserve=True)
         with self.assertRaises(FileExistsError):
-            MODULE.write_review_packet(out, again, again["artifacts"])
+            MODULE.write_review_packet(out, again)
 
     def test_write_private_refuses_an_existing_file(self):
         path = Path(self.tmp.name) / "x.txt"
@@ -353,11 +397,10 @@ class ReviewPacket(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             MODULE.write_private(path, "b")
 
-    def test_the_packet_json_carries_no_view_text_unless_spans_were_asked_for(self):
-        packet = MODULE.run(self.store, None, include_spans=False, preserve=True)
-        out = Path(self.tmp.name) / "packet"
-        MODULE.write_review_packet(out, packet, packet["artifacts"])
-        stored = json.loads((out / "audit-packet.json").read_text())["artifacts"][0]
+    def test_no_view_text_is_duplicated_into_the_report_json(self):
+        _, out = self.build()
+        index = json.loads((out / "audit-packet.json").read_text())
+        stored = json.loads((out / index["reports"][0]["report_path"]).read_text())
         self.assertNotIn("_views", stored)
         self.assertNotIn("text", stored["block_inventory"][0])
 
@@ -399,7 +442,8 @@ class AssumptionCanary(unittest.TestCase):
         end = source.index("\ndef ", start)
         return source[start:end]
 
-    def test_bind_and_lock_still_have_no_artifact_format_check(self):
+    def test_bind_and_lock_have_no_inline_artifact_format_check(self):
+        """A drift reminder, not proof: a gate added via a helper would pass this."""
         for name in ("bind_version", "lock_materials"):
             body = self.body_of(name)
             self.assertNotRegex(

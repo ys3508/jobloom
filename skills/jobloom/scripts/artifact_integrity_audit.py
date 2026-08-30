@@ -557,8 +557,11 @@ AUDIT_ASSUMPTIONS = {
     "format_gate_absent_in_bind_and_lock":
         "resume_core.bind_version and resume_core.lock_materials check approval, "
         "authorization and file hash, but not artifact format; fill_core uploads the "
-        "locked snapshot_path as registered. Verified against resume_core at "
-        f"{AUDIT_VERSION}; see tests/test_artifact_integrity_audit.py canary.",
+        "locked snapshot_path as registered. Read from resume_core by hand at "
+        f"{AUDIT_VERSION}. A test watches those two bodies for an inline format check, "
+        "but it is a drift reminder, not proof: a gate added through a helper such as "
+        "_require_submission_artifact would pass it. Settling this needs an integration "
+        "fixture that binds a DOCX version, which belongs with the gate itself.",
 }
 
 
@@ -571,24 +574,78 @@ def write_private(path: Path, content: str) -> None:
         handle.write(content)
 
 
-def write_review_packet(output_dir: Path, packet: dict, artifacts: list[dict]) -> None:
+def write_shared_observation(path: Path, content: str) -> dict:
+    """Write a machine view, or accept an identical one already there.
+
+    A MachineView is addressed by PDF hash and extractor policy, so two reports over the
+    same PDF with different manifests legitimately share it. Re-writing is refused; an
+    existing file whose bytes differ under an address that claims they cannot is a real
+    error and is raised rather than reconciled.
+    """
+    if path.exists():
+        if sha256_text(path.read_text(encoding="utf-8")) != sha256_text(content):
+            raise ValueError(f"content-addressed observation differs from stored bytes: {path}")
+    else:
+        write_private(path, content)
+    return {"sha256": sha256_text(content), "size": len(content.encode("utf-8"))}
+
+
+VIEW_FILENAMES = {"raw": "raw-machine-view.txt", "canonical": "canonical-machine-view.txt",
+                  "diagnostics": "diagnostics.txt"}
+
+
+def write_review_packet(output_dir: Path, packet: dict) -> None:
+    """Lay the packet out by content address, never by directory convention.
+
+    views/<pdf-sha>/<policy>/      shared: one observation per PDF per extractor policy
+    reports/<pdf-sha>_<manifest-sha>/  not shared: one result per artifact and manifest
+    """
+    policy = packet["execution"]["extractor_policy_id"]
     output_dir.mkdir(mode=0o700, parents=True)
-    for artifact in artifacts:
-        views = artifact.pop("_views", None)
-        if views is None:
-            continue
-        folder = output_dir / artifact["artifact_sha256"][:12]
-        folder.mkdir(mode=0o700)
-        write_private(folder / "raw-machine-view.txt", views["raw"])
-        write_private(folder / "canonical-machine-view.txt", views["canonical"])
-        write_private(folder / "diagnostics.txt", "\n".join(views["diagnostics"]))
+    (output_dir / "views").mkdir(mode=0o700)
+    (output_dir / "reports").mkdir(mode=0o700)
+
+    references = []
+    for artifact in packet["artifacts"]:
+        views = artifact.pop("_views", {"raw": "", "canonical": "", "diagnostics": []})
+        # Each level explicitly: mkdir(parents=True) applies its mode to the leaf only,
+        # which left the intermediate <pdf-sha> directory world-readable.
+        view_dir = output_dir / "views"
+        for part in (artifact["artifact_sha256"], policy):
+            view_dir = view_dir / part
+            view_dir.mkdir(mode=0o700, exist_ok=True)
+        files = {}
+        for name, content in (("raw", views["raw"]), ("canonical", views["canonical"]),
+                              ("diagnostics", "\n".join(views["diagnostics"]))):
+            path = view_dir / VIEW_FILENAMES[name]
+            files[name] = {"path": str(path.relative_to(output_dir)),
+                           **write_shared_observation(path, content)}
+        artifact["observation_files"] = files
+
+        report_dir = (output_dir / "reports"
+                      / f"{artifact['artifact_sha256']}_{artifact['claims_manifest_sha256']}")
+        report_dir.mkdir(mode=0o700)
+        write_private(report_dir / "audit-result.json",
+                      json.dumps(artifact, indent=2, ensure_ascii=False))
+        references.append({
+            "artifact_sha256": artifact["artifact_sha256"],
+            "claims_manifest_sha256": artifact["claims_manifest_sha256"],
+            "report_path": str((report_dir / "audit-result.json").relative_to(output_dir)),
+            "extraction_status": artifact["extraction_status"],
+            "admissible_for_approval": artifact["admissible_for_approval"],
+        })
+
+    index = {k: v for k, v in packet.items() if k != "artifacts"}
+    index["reports"] = references
     write_private(output_dir / "audit-packet.json",
-                  json.dumps(packet, indent=2, ensure_ascii=False))
+                  json.dumps(index, indent=2, ensure_ascii=False))
 
 
 # --------------------------------------------------------------------------- driver
 
 def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) -> dict:
+    # `preserve` decides admissibility because a binding confirmed against a hash
+    # nobody kept points at an observation nobody can read back.
     registry = scan_registry(store, db_path)
     facts = active_candidate_facts(db_path)
     artifacts: dict[str, dict] = {}
@@ -610,13 +667,17 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                       "_views": {"raw": "", "canonical": "",
                                  "diagnostics": [f"{type(error).__name__}: {error}"]}}
         result.update({"artifact_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
-                       "aliases": [directory.name]})
+                       "aliases": [directory.name],
+                       # Approval attaches to one artifact. A packet-level verdict would let
+                       # a failed extraction inherit a green light from its neighbours.
+                       "admissible_for_approval": preserve and result["extraction_status"] == "ok"})
         artifacts[key] = result
 
     listed = list(artifacts.values())
     packet = {"execution": {**execution_record(),
                             "observation_storage": "observation_preserved" if preserve else "hash_only",
-                            "admissible_for_approval": preserve},
+                            "all_artifacts_admissible":
+                                bool(listed) and all(a["admissible_for_approval"] for a in listed)},
               "scope": SCOPE, "audit_assumptions": AUDIT_ASSUMPTIONS,
               "registry": registry, "artifacts": listed}
     return packet
@@ -628,7 +689,7 @@ def report(packet: dict) -> None:
     print(f"canonicalizer   : {execution['canonicalizer_version']}")
     print(f"reproducibility : {execution['byte_reproducibility']}")
     print(f"observation     : {execution['observation_storage']}   "
-          f"admissible_for_approval={execution['admissible_for_approval']}")
+          f"all_artifacts_admissible={execution['all_artifacts_admissible']}")
     print(f"versions scanned: {len(registry['versions'])}   "
           f"{dict(collections.Counter(r['integrity_status'] for r in registry['versions']))}")
     print(f"formats         : {dict(collections.Counter(r['artifact_format'] for r in registry['versions']))}")
@@ -639,7 +700,8 @@ def report(packet: dict) -> None:
     for artifact in packet["artifacts"]:
         print(f"\nartifact {artifact['artifact_sha256'][:12]} / manifest "
               f"{artifact['claims_manifest_sha256'][:12]}   aliases={len(artifact['aliases'])}"
-              f"   {artifact['extraction_status']}")
+              f"   {artifact['extraction_status']}"
+              f"   admissible={artifact['admissible_for_approval']}")
         if artifact["extraction_status"] != "ok":
             print(f"  failure_code {artifact['failure_code']}")
             continue
@@ -666,7 +728,10 @@ def main() -> None:
     sub.add_parser("scan", help="counts and hashes only; not admissible for approval")
     prepare = sub.add_parser("prepare-review",
                              help="preserve the exact machine views in a new private directory")
-    prepare.add_argument("--output-dir", required=True, type=Path)
+    prepare.add_argument("--output-dir", required=True, type=Path,
+                         help="a new private directory, named so it identifies this run "
+                              "rather than just its date, e.g. "
+                              ".jobloom/review-packets/artifact-integrity-<utc-stamp>-<id>")
     prepare.add_argument("--include-spans", action="store_true",
                          help="also embed span and block text in the packet JSON")
     args = parser.parse_args()
@@ -674,7 +739,7 @@ def main() -> None:
     preserve = args.mode == "prepare-review"
     packet = run(args.store, args.db, include_spans=preserve and args.include_spans, preserve=preserve)
     if preserve:
-        write_review_packet(args.output_dir, packet, packet["artifacts"])
+        write_review_packet(args.output_dir, packet)
         print(f"review packet   : {args.output_dir} (0700, files 0600, exclusive create)")
     else:
         for artifact in packet["artifacts"]:
