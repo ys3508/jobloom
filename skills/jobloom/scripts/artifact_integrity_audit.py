@@ -241,11 +241,103 @@ def execution_record() -> dict:
 
 # --------------------------------------------------------------------------- audit
 
+GARBAGE = ((re.compile(r"\(cid:\d+\)"), "cid_marker"),
+           (re.compile("\ufffd"), "replacement_character"))
+
+# Absence of a locked value can mean the artifact dropped it, or that the fact is
+# written in a different surface form than the page renders. Only the two categories a
+# parser must reach to contact the candidate at all are treated as a failure; the rest
+# are sent to review rather than guessed at.
+MUST_BE_LITERAL = {"identity", "contact"}
+USABLE_FACT_STATUS = {"locked", "confirmed"}
+REVIEW_IF_ABSENT = {"education", "certification", "experience_header"}
+
+
+def active_candidate_facts(db_path: Path | None) -> list[dict]:
+    """Locked and contact facts from the active registered snapshot. Read-only."""
+    if not db_path or not db_path.is_file():
+        return []
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT snapshot_path FROM candidate_snapshots WHERE status='active' "
+            "AND registered_by='user'").fetchone()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    if not row or not Path(row["snapshot_path"]).is_file():
+        return []
+    return json.loads(Path(row["snapshot_path"]).read_text(encoding="utf-8")).get("facts", [])
+
+
+def strip_separators(value: str) -> str:
+    """Everything that is not a letter or digit, removed. For telling a render difference
+    from an absence - never for deciding that a claim is present."""
+    return re.sub(r"[^0-9A-Za-z]", "", value).casefold()
+
+
+def readability_checks(canonical: str, pages: list[str], facts: list[dict]) -> list[dict]:
+    """Per-check verdicts on what a parser can reach. Never aggregated into a score.
+
+    A resume can pass every claim binding and still be unreachable: the stock failure is
+    a contact line carried by an icon font, which renders perfectly and extracts as glyph
+    names. That is why identity and contact are the only categories whose absence is a
+    failure rather than a review item.
+    """
+    checks = [
+        {"check": "text_layer", "status": "pass" if canonical.strip() else "fail",
+         "detail": {"canonical_chars": len(canonical)}},
+        {"check": "page_count", "status": "pass" if pages else "fail",
+         "detail": {"pages": len(pages), "pages_with_text": sum(1 for p in pages if p.strip())}},
+    ]
+    hits = {name: len(pattern.findall(canonical)) for pattern, name in GARBAGE}
+    checks.append({"check": "garbage_glyphs",
+                   "status": "fail" if any(hits.values()) else "pass", "detail": hits})
+
+    stripped = strip_separators(canonical)
+    for category, absent_status in (*((c, "fail") for c in sorted(MUST_BE_LITERAL)),
+                                    *((c, "review") for c in sorted(REVIEW_IF_ABSENT))):
+        relevant = [f for f in facts
+                    if f.get("type") == category
+                    and (f.get("locked") or category in MUST_BE_LITERAL)
+                    and f.get("status") in USABLE_FACT_STATUS]
+        if not relevant:
+            continue
+        # A value missing literally but present once separators are ignored is a render
+        # difference, not something a parser cannot reach. Collapsing the two would make
+        # every punctuation choice look like an unreadable contact line, and then the one
+        # genuinely unreachable value would be indistinguishable from the noise.
+        absent, rendered = [], []
+        for fact in relevant:
+            value = str(fact.get("value", ""))
+            if canonicalize(value)[0] in canonical:
+                continue
+            (rendered if strip_separators(value) in stripped else absent).append(fact["id"])
+        status = absent_status if absent else "review" if rendered else "pass"
+        checks.append({
+            "check": f"{category}_survives_extraction",
+            "status": status,
+            "detail": {"checked": len(relevant), "absent": len(absent),
+                       "render_difference": len(rendered), "absent_fact_ids": absent,
+                       "render_difference_fact_ids": rendered,
+                       "locked": all(f.get("locked") for f in relevant)},
+        })
+
+    # Reading order needs a human looking at the rendered page beside the machine view.
+    # A tool that guessed here would be the single-green-light this whole audit exists
+    # to avoid, so it stays a review item no matter how clean the extraction looks.
+    checks.append({"check": "reading_order", "status": "user_review", "detail": {}})
+    return checks
+
+
 def tokens(value: str) -> set[str]:
     return set(re.findall(r"\w+", value.casefold()))
 
 
-def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = False) -> dict:
+def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = False,
+                   facts: list[dict] | None = None) -> dict:
     pages, diagnostic_lines = extract_pages(pdf_path)
     raw, blocks = raw_blocks(pages)
     canonical, canonical_to_raw = canonicalize(raw)
@@ -314,6 +406,7 @@ def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = Fal
     codes = collections.Counter(diagnostic_code(line) for line in diagnostic_lines)
     return {
         "extraction_status": "ok",
+        "readability": readability_checks(canonical, pages, facts or []),
         "machine_view": {
             "raw_sha256": sha256_text(raw),
             "canonical_sha256": sha256_text(canonical),
@@ -453,6 +546,7 @@ SCOPE = {
                      "user-selected CandidateFact is the semantically correct source",
     "claim_to_span": "proposed; no binding here is user-confirmed",
     "block_classification": "unconfirmed; no block is classified by this tool",
+    "readability_checks": "reported per check and never aggregated; reading order is always a user review item",
     "byte_reproducibility": "observation_only",
     "general_ats_compatibility": "not_tested",
 }
@@ -496,6 +590,7 @@ def write_review_packet(output_dir: Path, packet: dict, artifacts: list[dict]) -
 
 def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) -> dict:
     registry = scan_registry(store, db_path)
+    facts = active_candidate_facts(db_path)
     artifacts: dict[str, dict] = {}
     for directory in sorted(p for p in store.iterdir() if p.is_dir()):
         pdf, manifest = directory / "resume.pdf", directory / "claims-manifest.json"
@@ -509,7 +604,7 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
             continue
         try:
             claims = json.loads(manifest.read_text(encoding="utf-8"))["claims"]
-            result = audit_artifact(pdf, claims, include_spans=include_spans)
+            result = audit_artifact(pdf, claims, include_spans=include_spans, facts=facts)
         except Exception as error:  # noqa: BLE001 - one bad artifact must not hide the rest
             result = {"extraction_status": "failed", "failure_code": failure_code(error),
                       "_views": {"raw": "", "canonical": "",
@@ -548,6 +643,9 @@ def report(packet: dict) -> None:
         if artifact["extraction_status"] != "ok":
             print(f"  failure_code {artifact['failure_code']}")
             continue
+        for check in artifact["readability"]:
+            detail = {k: v for k, v in check["detail"].items() if not k.endswith("_fact_ids")}
+            print(f"  readability.{check['check']:32} {check['status']:12} {detail}")
         for section in ("machine_view", "claims", "blocks"):
             for key, value in artifact[section].items():
                 print(f"  {section}.{key:38} {value}")

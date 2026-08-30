@@ -408,3 +408,60 @@ class AssumptionCanary(unittest.TestCase):
                 "AUDIT_ASSUMPTIONS['format_gate_absent_in_bind_and_lock'] and the "
                 "format_exposure_candidate semantics before relaxing this canary")
         self.assertIn("format_gate_absent_in_bind_and_lock", MODULE.AUDIT_ASSUMPTIONS)
+
+
+class ReadabilityChecks(unittest.TestCase):
+    def fact(self, fact_id, kind, value, locked=True, status="locked"):
+        return {"id": fact_id, "type": kind, "value": value, "locked": locked, "status": status}
+
+    def run_checks(self, text, facts=()):
+        return {c["check"]: c for c in MODULE.readability_checks(text, [text], list(facts))}
+
+    def test_an_empty_text_layer_fails(self):
+        self.assertEqual(self.run_checks("")["text_layer"]["status"], "fail")
+
+    def test_garbage_glyphs_are_detected(self):
+        checks = self.run_checks("Name (cid:42) \ufffd here")
+        self.assertEqual(checks["garbage_glyphs"]["status"], "fail")
+        self.assertEqual(checks["garbage_glyphs"]["detail"],
+                         {"cid_marker": 1, "replacement_character": 1})
+
+    def test_an_unreachable_contact_value_is_a_failure(self):
+        """The icon-font case: the page shows an address the text layer never carries."""
+        facts = [self.fact("f-1", "contact", "jane@example.com", locked=False, status="confirmed")]
+        check = self.run_checks("Jane Doe  Experience", facts)["contact_survives_extraction"]
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(check["detail"]["absent"], 1)
+        self.assertEqual(check["detail"]["render_difference"], 0)
+
+    def test_a_separator_difference_is_review_not_failure(self):
+        facts = [self.fact("f-1", "contact", "+1 (555) 123-4567", locked=False, status="confirmed")]
+        check = self.run_checks("Jane Doe 15551234567", facts)["contact_survives_extraction"]
+        self.assertEqual(check["status"], "review")
+        self.assertEqual(check["detail"]["absent"], 0)
+        self.assertEqual(check["detail"]["render_difference"], 1)
+
+    def test_a_literal_match_passes_without_a_review_item(self):
+        facts = [self.fact("f-1", "contact", "jane@example.com", locked=False, status="confirmed")]
+        check = self.run_checks("Jane Doe jane@example.com", facts)["contact_survives_extraction"]
+        self.assertEqual(check["status"], "pass")
+
+    def test_an_absent_education_value_is_review_never_failure(self):
+        facts = [self.fact("f-1", "education", "MPH, Somewhere University, 2021")]
+        check = self.run_checks("unrelated text", facts)["education_survives_extraction"]
+        self.assertEqual(check["status"], "review")
+
+    def test_unusable_fact_statuses_are_ignored(self):
+        facts = [self.fact("f-1", "education", "absent value", status="revoked")]
+        self.assertNotIn("education_survives_extraction", self.run_checks("text", facts))
+
+    def test_reading_order_is_never_auto_passed(self):
+        for text in ("", "a perfectly clean single column resume"):
+            self.assertEqual(self.run_checks(text)["reading_order"]["status"], "user_review")
+
+    def test_checks_are_never_aggregated_into_a_score(self):
+        checks = MODULE.readability_checks("text", ["text"], [])
+        self.assertIsInstance(checks, list)
+        for check in checks:
+            self.assertIn(check["status"], {"pass", "fail", "review", "user_review"})
+            self.assertNotIn("score", check)
