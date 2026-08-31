@@ -246,6 +246,9 @@ GARBAGE = ((re.compile(r"\(cid:\d+\)"), "cid_marker"),
 
 ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2060\ufeff\s]")
 USABLE_FACT_STATUS = {"locked", "confirmed"}
+# The categories an employer needs to reach the candidate at all. Everything else a
+# resume shows is a claim, governed by the claims manifest rather than by identity.
+IDENTITY_TYPES = {"identity", "contact"}
 CONTRACT_FILENAME = "identity-contract.json"
 
 
@@ -779,6 +782,41 @@ def write_review_packet(output_dir: Path, packet: dict) -> None:
 
 # --------------------------------------------------------------------------- driver
 
+def propose_contracts(store: Path, db_path: Path | None) -> list[dict]:
+    """Draft one contract per PDF version, always `proposed`, never confirmed.
+
+    The draft lists every identity and contact fact in the snapshot the version was
+    approved against, because the tool cannot know which of them this artifact was meant
+    to show. Removing the ones it does not carry is the user's half of the work, and is
+    exactly the judgement the contract exists to record.
+    """
+    versions = registry_roles(db_path)
+    drafts = []
+    for directory in sorted(p for p in store.iterdir() if p.is_dir()):
+        pdf = directory / "resume.pdf"
+        if not pdf.exists():
+            continue
+        profile_sha = versions.get(directory.name, {}).get("candidate_profile_sha256")
+        snapshot = resolve_snapshot(db_path, profile_sha)
+        by_type = collections.defaultdict(list)
+        for fact in snapshot["facts"]:
+            if fact.get("type") in IDENTITY_TYPES and fact.get("status") in USABLE_FACT_STATUS:
+                by_type[fact["type"]].append(fact["id"])
+        drafts.append({
+            "version_dir": directory.name,
+            "snapshot_status": snapshot["status"],
+            "contract": {
+                "schema_version": "1",
+                "artifact_sha256": sha256_bytes(pdf.read_bytes()),
+                "candidate_profile_sha256": profile_sha,
+                "expected_identity_fact_ids": by_type["identity"],
+                "expected_contact_fact_ids": by_type["contact"],
+                "confirmation_basis": "proposed",
+            },
+        })
+    return drafts
+
+
 def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) -> dict:
     # `preserve` decides admissibility because a binding confirmed against a hash
     # nobody kept points at an observation nobody can read back.
@@ -874,6 +912,9 @@ def main() -> None:
                         help="read-only; supplies each version's kind, source_mode and status")
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("scan", help="counts and hashes only; not admissible for approval")
+    sub.add_parser("propose-contract",
+                   help="draft an ArtifactIdentityContract per PDF version, for the user to "
+                        "trim and confirm; prints to stdout and writes nothing")
     prepare = sub.add_parser("prepare-review",
                              help="preserve the exact machine views in a new private directory")
     prepare.add_argument("--output-dir", required=True, type=Path,
@@ -883,6 +924,15 @@ def main() -> None:
     prepare.add_argument("--include-spans", action="store_true",
                          help="also embed span and block text in the packet JSON")
     args = parser.parse_args()
+
+    if args.mode == "propose-contract":
+        for draft in propose_contracts(args.store, args.db):
+            print(f"\n# {draft['version_dir']}   snapshot={draft['snapshot_status']}")
+            print(f"# review the fact IDs, drop the ones this resume does not show, set")
+            print(f"# confirmation_basis to human_confirmed, then save as")
+            print(f"#   {args.store / draft['version_dir'] / CONTRACT_FILENAME}")
+            print(json.dumps(draft["contract"], indent=2))
+        return
 
     preserve = args.mode == "prepare-review"
     packet = run(args.store, args.db, include_spans=preserve and args.include_spans, preserve=preserve)

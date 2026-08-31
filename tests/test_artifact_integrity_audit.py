@@ -623,6 +623,69 @@ class IdentityContract(unittest.TestCase):
             "contract_unreadable")
 
 
+class ProposedContracts(unittest.TestCase):
+    def build(self, profile_sha="snap-1"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        store = root / "resumes"
+        (store / "v1").mkdir(parents=True)
+        (store / "v1" / "resume.pdf").write_bytes(synthetic_pdf(["x"]))
+        snapshot = root / "candidate.json"
+        snapshot.write_text(json.dumps({"facts": [
+            {"id": "f-name", "type": "identity", "value": "Jane Doe", "status": "locked"},
+            {"id": "f-email", "type": "contact", "value": "jane@example.com", "status": "confirmed"},
+            {"id": "f-old", "type": "contact", "value": "old@example.com", "status": "revoked"},
+            {"id": "f-degree", "type": "education", "value": "MPH", "status": "locked"},
+        ]}))
+        db = root / "jobloom.db"
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE resume_versions (version_id TEXT, kind TEXT, "
+                           "source_mode TEXT, status TEXT, candidate_profile_sha256 TEXT)")
+        connection.execute("INSERT INTO resume_versions VALUES (?,?,?,?,?)",
+                           ("v1", "direction", "user_provided", "approved", profile_sha))
+        connection.execute("CREATE TABLE candidate_snapshots (content_sha256 TEXT, "
+                           "snapshot_path TEXT, file_sha256 TEXT, status TEXT)")
+        connection.execute("INSERT INTO candidate_snapshots VALUES (?,?,?,?)",
+                           ("snap-1", str(snapshot),
+                            MODULE.sha256_bytes(snapshot.read_bytes()), "active"))
+        connection.commit()
+        connection.close()
+        return store, db
+
+    def test_a_draft_lists_only_identity_and_contact_facts(self):
+        store, db = self.build()
+        draft, = MODULE.propose_contracts(store, db)
+        self.assertEqual(draft["contract"]["expected_identity_fact_ids"], ["f-name"])
+        self.assertEqual(draft["contract"]["expected_contact_fact_ids"], ["f-email"],
+                         "a revoked fact is not proposed, and education is not identity")
+
+    def test_a_draft_is_never_confirmed_by_the_tool(self):
+        store, db = self.build()
+        draft, = MODULE.propose_contracts(store, db)
+        self.assertEqual(draft["contract"]["confirmation_basis"], "proposed")
+
+    def test_a_draft_binds_the_exact_artifact_and_snapshot(self):
+        store, db = self.build()
+        draft, = MODULE.propose_contracts(store, db)
+        contract = draft["contract"]
+        self.assertEqual(contract["artifact_sha256"],
+                         MODULE.sha256_bytes((store / "v1" / "resume.pdf").read_bytes()))
+        self.assertEqual(contract["candidate_profile_sha256"], "snap-1")
+        self.assertEqual(MODULE.load_identity_contract.__name__, "load_identity_contract")
+
+    def test_a_draft_a_version_cannot_resolve_carries_no_fact_ids(self):
+        store, db = self.build(profile_sha="unregistered")
+        draft, = MODULE.propose_contracts(store, db)
+        self.assertEqual(draft["snapshot_status"], "snapshot_not_registered")
+        self.assertEqual(draft["contract"]["expected_contact_fact_ids"], [])
+
+    def test_writing_nothing_is_part_of_the_contract(self):
+        store, db = self.build()
+        MODULE.propose_contracts(store, db)
+        self.assertFalse((store / "v1" / MODULE.CONTRACT_FILENAME).exists())
+
+
 class IntegrityDecision(unittest.TestCase):
     def result(self, **overrides):
         base = {"extraction_status": "ok",
