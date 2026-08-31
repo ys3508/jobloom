@@ -244,48 +244,111 @@ def execution_record() -> dict:
 GARBAGE = ((re.compile(r"\(cid:\d+\)"), "cid_marker"),
            (re.compile("\ufffd"), "replacement_character"))
 
-# Absence of a locked value can mean the artifact dropped it, or that the fact is
-# written in a different surface form than the page renders. Only the two categories a
-# parser must reach to contact the candidate at all are treated as a failure; the rest
-# are sent to review rather than guessed at.
-MUST_BE_LITERAL = {"identity", "contact"}
+ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2060\ufeff\s]")
 USABLE_FACT_STATUS = {"locked", "confirmed"}
-REVIEW_IF_ABSENT = {"education", "certification", "experience_header"}
+CONTRACT_FILENAME = "identity-contract.json"
 
 
-def active_candidate_facts(db_path: Path | None) -> list[dict]:
-    """Locked and contact facts from the active registered snapshot. Read-only."""
+def resolve_snapshot(db_path: Path | None, profile_sha: str | None) -> dict:
+    """Load the snapshot a version was approved against, not whichever is active now.
+
+    Judging a 2026 artifact by today's contact details is derived-semantics drift under a
+    stable key: the report address would not change while its verdict did. There is
+    already a superseded snapshot in this registry and an approved version bound to it.
+    """
+    if not profile_sha:
+        return {"status": "no_candidate_binding", "facts": []}
     if not db_path or not db_path.is_file():
-        return []
+        return {"status": "registry_unavailable", "facts": []}
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
-            "SELECT snapshot_path FROM candidate_snapshots WHERE status='active' "
-            "AND registered_by='user'").fetchone()
+            "SELECT * FROM candidate_snapshots WHERE content_sha256=?", (profile_sha,)).fetchone()
     except sqlite3.Error:
-        return []
+        return {"status": "registry_unavailable", "facts": []}
     finally:
         connection.close()
-    if not row or not Path(row["snapshot_path"]).is_file():
-        return []
-    return json.loads(Path(row["snapshot_path"]).read_text(encoding="utf-8")).get("facts", [])
+    if not row:
+        return {"status": "snapshot_not_registered", "facts": []}
+    path = Path(row["snapshot_path"])
+    if not path.is_file():
+        return {"status": "snapshot_file_missing", "facts": []}
+    if sha256_bytes(path.read_bytes()) != row["file_sha256"]:
+        return {"status": "snapshot_hash_mismatch", "facts": []}
+    return {"status": "ok", "snapshot_status": row["status"],
+            "facts": json.loads(path.read_text(encoding="utf-8")).get("facts", [])}
+
+
+def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: str | None) -> dict:
+    """The declaration of which identity and contact values this artifact must carry.
+
+    Without it the audit has no way to know a resume legitimately omits an address, a
+    former employer or a second phone number, and would report ordinary selection as a
+    defect. So its absence disables the check rather than widening it to every fact.
+    """
+    path = version_dir / CONTRACT_FILENAME
+    if not path.is_file():
+        return {"status": "no_contract", "expected": []}
+    try:
+        contract = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"status": "contract_unreadable", "expected": []}
+    if contract.get("artifact_sha256") != artifact_sha:
+        return {"status": "contract_artifact_mismatch", "expected": []}
+    if contract.get("candidate_profile_sha256") != profile_sha:
+        return {"status": "contract_profile_mismatch", "expected": []}
+    if contract.get("confirmation_basis") != "human_confirmed":
+        return {"status": "contract_unconfirmed", "expected": []}
+    return {
+        "status": "ok",
+        "sha256": sha256_bytes(path.read_bytes()),
+        "expected": list(contract.get("expected_identity_fact_ids", []))
+                    + list(contract.get("expected_contact_fact_ids", [])),
+    }
+
+
+def value_kind(value: str) -> str:
+    if "@" in value:
+        return "email"
+    if len(re.sub(r"\D", "", value)) >= 7:
+        return "phone"
+    return "text"
+
+
+def compare_value(value: str, canonical: str) -> str:
+    """present | render_difference | absent, by value kind.
+
+    Deliberately not one normalizer. Deleting every separator would make
+    `john.smith@example.com` and `johnsmith@example.com` - two different mailboxes -
+    look like the same address rendered differently, so an email keeps its punctuation
+    and only loses whitespace and zero-width characters.
+    """
+    kind = value_kind(value)
+    if canonicalize(value)[0] in canonical:
+        return "present"
+    if kind == "email":
+        squeeze = lambda text: ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", text)).casefold()
+        return "render_difference" if squeeze(value) in squeeze(canonical) else "absent"
+    if kind == "phone":
+        digits = lambda text: re.sub(r"\D", "", text)
+        wanted = digits(value)
+        haystack = digits(canonical)
+        if wanted in haystack or (len(wanted) > 10 and wanted[-10:] in haystack):
+            return "render_difference"
+        return "absent"
+    return "render_difference" if strip_separators(value) in strip_separators(canonical) else "absent"
 
 
 def strip_separators(value: str) -> str:
-    """Everything that is not a letter or digit, removed. For telling a render difference
-    from an absence - never for deciding that a claim is present."""
-    return re.sub(r"[^0-9A-Za-z]", "", value).casefold()
+    """Everything that is not a letter or digit, removed. Only for names and free text,
+    where punctuation carries no identity; never for an address."""
+    return re.sub(r"[^0-9A-Za-z]", "", unicodedata.normalize("NFKC", value)).casefold()
 
 
-def readability_checks(canonical: str, pages: list[str], facts: list[dict]) -> list[dict]:
-    """Per-check verdicts on what a parser can reach. Never aggregated into a score.
-
-    A resume can pass every claim binding and still be unreachable: the stock failure is
-    a contact line carried by an icon font, which renders perfectly and extracts as glyph
-    names. That is why identity and contact are the only categories whose absence is a
-    failure rather than a review item.
-    """
+def readability_checks(canonical: str, pages: list[str], facts: list[dict],
+                       snapshot: dict, contract: dict) -> list[dict]:
+    """Per-check verdicts on what a parser can reach. Never aggregated into a score."""
     checks = [
         {"check": "text_layer", "status": "pass" if canonical.strip() else "fail",
          "detail": {"canonical_chars": len(canonical)}},
@@ -296,38 +359,43 @@ def readability_checks(canonical: str, pages: list[str], facts: list[dict]) -> l
     checks.append({"check": "garbage_glyphs",
                    "status": "fail" if any(hits.values()) else "pass", "detail": hits})
 
-    stripped = strip_separators(canonical)
-    for category, absent_status in (*((c, "fail") for c in sorted(MUST_BE_LITERAL)),
-                                    *((c, "review") for c in sorted(REVIEW_IF_ABSENT))):
-        relevant = [f for f in facts
-                    if f.get("type") == category
-                    and (f.get("locked") or category in MUST_BE_LITERAL)
-                    and f.get("status") in USABLE_FACT_STATUS]
-        if not relevant:
+    if snapshot["status"] != "ok":
+        checks.append({"check": "declared_values_survive_extraction", "status": "review",
+                       "detail": {"reason": snapshot["status"]}})
+        checks.append({"check": "reading_order", "status": "user_review", "detail": {}})
+        return checks
+    if contract["status"] != "ok":
+        checks.append({"check": "declared_values_survive_extraction", "status": "review",
+                       "detail": {"reason": contract["status"],
+                                  "note": "no declaration of which values this artifact must carry"}})
+        checks.append({"check": "reading_order", "status": "user_review", "detail": {}})
+        return checks
+
+    by_id = {f["id"]: f for f in facts if f.get("status") in USABLE_FACT_STATUS}
+    verdicts = collections.Counter()
+    absent, rendered, unknown = [], [], []
+    for fact_id in contract["expected"]:
+        fact = by_id.get(fact_id)
+        if fact is None:
+            unknown.append(fact_id)
             continue
-        # A value missing literally but present once separators are ignored is a render
-        # difference, not something a parser cannot reach. Collapsing the two would make
-        # every punctuation choice look like an unreadable contact line, and then the one
-        # genuinely unreachable value would be indistinguishable from the noise.
-        absent, rendered = [], []
-        for fact in relevant:
-            value = str(fact.get("value", ""))
-            if canonicalize(value)[0] in canonical:
-                continue
-            (rendered if strip_separators(value) in stripped else absent).append(fact["id"])
-        status = absent_status if absent else "review" if rendered else "pass"
-        checks.append({
-            "check": f"{category}_survives_extraction",
-            "status": status,
-            "detail": {"checked": len(relevant), "absent": len(absent),
-                       "render_difference": len(rendered), "absent_fact_ids": absent,
-                       "render_difference_fact_ids": rendered,
-                       "locked": all(f.get("locked") for f in relevant)},
-        })
+        verdict = compare_value(str(fact.get("value", "")), canonical)
+        verdicts[verdict] += 1
+        if verdict == "absent":
+            absent.append(fact_id)
+        elif verdict == "render_difference":
+            rendered.append(fact_id)
+    checks.append({
+        "check": "declared_values_survive_extraction",
+        "status": "fail" if absent else "review" if (rendered or unknown) else "pass",
+        "detail": {"declared": len(contract["expected"]), "present": verdicts["present"],
+                   "render_difference": len(rendered), "absent": len(absent),
+                   "not_in_snapshot": len(unknown), "absent_fact_ids": absent,
+                   "render_difference_fact_ids": rendered, "unknown_fact_ids": unknown},
+    })
 
     # Reading order needs a human looking at the rendered page beside the machine view.
-    # A tool that guessed here would be the single-green-light this whole audit exists
-    # to avoid, so it stays a review item no matter how clean the extraction looks.
+    # A tool that guessed here would be the single green light this audit exists to avoid.
     checks.append({"check": "reading_order", "status": "user_review", "detail": {}})
     return checks
 
@@ -337,7 +405,9 @@ def tokens(value: str) -> set[str]:
 
 
 def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = False,
-                   facts: list[dict] | None = None) -> dict:
+                   snapshot: dict | None = None, contract: dict | None = None) -> dict:
+    snapshot = snapshot or {"status": "no_candidate_binding", "facts": []}
+    contract = contract or {"status": "no_contract", "expected": []}
     pages, diagnostic_lines = extract_pages(pdf_path)
     raw, blocks = raw_blocks(pages)
     canonical, canonical_to_raw = canonicalize(raw)
@@ -406,7 +476,10 @@ def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = Fal
     codes = collections.Counter(diagnostic_code(line) for line in diagnostic_lines)
     return {
         "extraction_status": "ok",
-        "readability": readability_checks(canonical, pages, facts or []),
+        "readability": readability_checks(canonical, pages, snapshot["facts"],
+                                          snapshot, contract),
+        "candidate_snapshot": {k: v for k, v in snapshot.items() if k != "facts"},
+        "identity_contract": {k: v for k, v in contract.items() if k != "expected"},
         "machine_view": {
             "raw_sha256": sha256_text(raw),
             "canonical_sha256": sha256_text(canonical),
@@ -442,6 +515,19 @@ def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = Fal
     }
 
 
+def integrity_decision(result: dict) -> str:
+    """`pending` or `blocked` - never `approved`. Approval is a user act, not a verdict a
+    tool reaches on its own. `review_packet_complete` only says the packet can be read,
+    and must never be mistaken for the material having passed."""
+    if result["extraction_status"] != "ok":
+        return "blocked"
+    if any(check["status"] == "fail" for check in result["readability"]):
+        return "blocked"
+    if result["claims"]["unresolved"] or result["claims"]["span_collision_overlap"]:
+        return "blocked"
+    return "pending"
+
+
 FAILURE_CODES = {
     "FileNotDecryptedError": "encrypted_pdf",
     "EmptyFileError": "empty_file",
@@ -467,9 +553,11 @@ def registry_roles(db_path: Path | None) -> dict[str, dict]:
     try:
         return {
             row["version_id"]: {"kind": row["kind"], "source_mode": row["source_mode"],
-                                "status": row["status"]}
+                                "status": row["status"],
+                                "candidate_profile_sha256": row["candidate_profile_sha256"]}
             for row in connection.execute(
-                "SELECT version_id, kind, source_mode, status FROM resume_versions")
+                "SELECT version_id, kind, source_mode, status, candidate_profile_sha256 "
+                "FROM resume_versions")
         }
     except sqlite3.Error:
         return {}
@@ -546,6 +634,9 @@ SCOPE = {
                      "user-selected CandidateFact is the semantically correct source",
     "claim_to_span": "proposed; no binding here is user-confirmed",
     "block_classification": "unconfirmed; no block is classified by this tool",
+    "identity_values": "checked only against a human-confirmed ArtifactIdentityContract and "
+                       "the snapshot the version was approved against; absent either one, "
+                       "not checked, and reported as not checked",
     "readability_checks": "reported per check and never aggregated; reading order is always a user review item",
     "byte_reproducibility": "observation_only",
     "general_ats_compatibility": "not_tested",
@@ -632,7 +723,8 @@ def write_review_packet(output_dir: Path, packet: dict) -> None:
             "claims_manifest_sha256": artifact["claims_manifest_sha256"],
             "report_path": str((report_dir / "audit-result.json").relative_to(output_dir)),
             "extraction_status": artifact["extraction_status"],
-            "admissible_for_approval": artifact["admissible_for_approval"],
+            "review_packet_complete": artifact["review_packet_complete"],
+            "integrity_decision": artifact["integrity_decision"],
         })
 
     index = {k: v for k, v in packet.items() if k != "artifacts"}
@@ -647,7 +739,7 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
     # `preserve` decides admissibility because a binding confirmed against a hash
     # nobody kept points at an observation nobody can read back.
     registry = scan_registry(store, db_path)
-    facts = active_candidate_facts(db_path)
+    versions = registry_roles(db_path)
     artifacts: dict[str, dict] = {}
     for directory in sorted(p for p in store.iterdir() if p.is_dir()):
         pdf, manifest = directory / "resume.pdf", directory / "claims-manifest.json"
@@ -655,29 +747,40 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
             continue
         artifact_sha = sha256_bytes(pdf.read_bytes())
         manifest_sha = sha256_bytes(manifest.read_bytes())
-        key = f"{artifact_sha}/{manifest_sha}"
+        role = versions.get(directory.name, {})
+        profile_sha = role.get("candidate_profile_sha256")
+        snapshot = resolve_snapshot(db_path, profile_sha)
+        contract = load_identity_contract(directory, artifact_sha, profile_sha)
+        # The identity verdict derives from the snapshot and the contract, so both belong
+        # in the address. Keyed on PDF and manifest alone, the same report id would carry
+        # a different answer once the active snapshot moved on.
+        key = f"{artifact_sha}/{manifest_sha}/{profile_sha}/{contract.get('sha256')}"
         if key in artifacts:
             artifacts[key]["aliases"].append(directory.name)
             continue
         try:
             claims = json.loads(manifest.read_text(encoding="utf-8"))["claims"]
-            result = audit_artifact(pdf, claims, include_spans=include_spans, facts=facts)
+            result = audit_artifact(pdf, claims, include_spans=include_spans,
+                                    snapshot=snapshot, contract=contract)
         except Exception as error:  # noqa: BLE001 - one bad artifact must not hide the rest
             result = {"extraction_status": "failed", "failure_code": failure_code(error),
                       "_views": {"raw": "", "canonical": "",
                                  "diagnostics": [f"{type(error).__name__}: {error}"]}}
         result.update({"artifact_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
                        "aliases": [directory.name],
+                       "candidate_profile_sha256": profile_sha,
+                       "identity_contract_sha256": contract.get("sha256"),
                        # Approval attaches to one artifact. A packet-level verdict would let
                        # a failed extraction inherit a green light from its neighbours.
-                       "admissible_for_approval": preserve and result["extraction_status"] == "ok"})
+                       "review_packet_complete": preserve and result["extraction_status"] == "ok",
+                       "integrity_decision": integrity_decision(result)})
         artifacts[key] = result
 
     listed = list(artifacts.values())
     packet = {"execution": {**execution_record(),
                             "observation_storage": "observation_preserved" if preserve else "hash_only",
-                            "all_artifacts_admissible":
-                                bool(listed) and all(a["admissible_for_approval"] for a in listed)},
+                            "all_review_packets_complete":
+                                bool(listed) and all(a["review_packet_complete"] for a in listed)},
               "scope": SCOPE, "audit_assumptions": AUDIT_ASSUMPTIONS,
               "registry": registry, "artifacts": listed}
     return packet
@@ -689,7 +792,7 @@ def report(packet: dict) -> None:
     print(f"canonicalizer   : {execution['canonicalizer_version']}")
     print(f"reproducibility : {execution['byte_reproducibility']}")
     print(f"observation     : {execution['observation_storage']}   "
-          f"all_artifacts_admissible={execution['all_artifacts_admissible']}")
+          f"all_review_packets_complete={execution['all_review_packets_complete']}")
     print(f"versions scanned: {len(registry['versions'])}   "
           f"{dict(collections.Counter(r['integrity_status'] for r in registry['versions']))}")
     print(f"formats         : {dict(collections.Counter(r['artifact_format'] for r in registry['versions']))}")
@@ -701,7 +804,8 @@ def report(packet: dict) -> None:
         print(f"\nartifact {artifact['artifact_sha256'][:12]} / manifest "
               f"{artifact['claims_manifest_sha256'][:12]}   aliases={len(artifact['aliases'])}"
               f"   {artifact['extraction_status']}"
-              f"   admissible={artifact['admissible_for_approval']}")
+              f"   packet_complete={artifact['review_packet_complete']}"
+              f"   decision={artifact['integrity_decision']}")
         if artifact["extraction_status"] != "ok":
             print(f"  failure_code {artifact['failure_code']}")
             continue

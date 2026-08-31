@@ -201,8 +201,8 @@ class RegistryScan(unittest.TestCase):
         if rows:
             connection = sqlite3.connect(db)
             connection.execute("CREATE TABLE resume_versions (version_id TEXT, kind TEXT, "
-                               "source_mode TEXT, status TEXT)")
-            connection.executemany("INSERT INTO resume_versions VALUES (?,?,?,?)", rows)
+                               "source_mode TEXT, status TEXT, candidate_profile_sha256 TEXT)")
+            connection.executemany("INSERT INTO resume_versions VALUES (?,?,?,?,NULL)", rows)
             connection.commit()
             connection.close()
         return store, (db if rows else None)
@@ -322,20 +322,20 @@ class ReviewPacket(unittest.TestCase):
             MODULE.write_review_packet(out, packet)
         return packet, out
 
-    def test_scan_keeps_only_hashes_and_no_artifact_is_admissible(self):
+    def test_scan_keeps_only_hashes_and_no_packet_is_complete(self):
         packet, _ = self.build(preserve=False)
         self.assertEqual(packet["execution"]["observation_storage"], "hash_only")
-        self.assertFalse(packet["execution"]["all_artifacts_admissible"])
-        self.assertFalse(packet["artifacts"][0]["admissible_for_approval"])
+        self.assertFalse(packet["execution"]["all_review_packets_complete"])
+        self.assertFalse(packet["artifacts"][0]["review_packet_complete"])
 
-    def test_a_failed_artifact_is_inadmissible_while_its_neighbour_is_not_dragged_down(self):
+    def test_a_failed_artifact_is_incomplete_while_its_neighbour_is_not_dragged_down(self):
         self.make("broken", "resume.pdf")
         (self.store / "broken" / "resume.pdf").write_bytes(b"not a pdf")
         packet, _ = self.build()
-        by_status = {a["extraction_status"]: a["admissible_for_approval"]
+        by_status = {a["extraction_status"]: a["review_packet_complete"]
                      for a in packet["artifacts"]}
         self.assertEqual(by_status, {"ok": True, "failed": False})
-        self.assertFalse(packet["execution"]["all_artifacts_admissible"],
+        self.assertFalse(packet["execution"]["all_review_packets_complete"],
                          "a packet-level green light must not cover a failed artifact")
 
     def test_views_are_addressed_by_full_pdf_hash_and_policy(self):
@@ -371,13 +371,13 @@ class ReviewPacket(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.write_shared_observation(path, "different")
 
-    def test_the_index_names_every_report_and_its_admissibility(self):
+    def test_the_index_names_every_report_and_its_decision(self):
         _, out = self.build()
         index = json.loads((out / "audit-packet.json").read_text())
         self.assertNotIn("artifacts", index)
         reference, = index["reports"]
         self.assertTrue((out / reference["report_path"]).is_file())
-        self.assertTrue(reference["admissible_for_approval"])
+        self.assertTrue(reference["review_packet_complete"])
 
     def test_permissions_are_private_throughout(self):
         _, out = self.build()
@@ -454,58 +454,237 @@ class AssumptionCanary(unittest.TestCase):
         self.assertIn("format_gate_absent_in_bind_and_lock", MODULE.AUDIT_ASSUMPTIONS)
 
 
-class ReadabilityChecks(unittest.TestCase):
-    def fact(self, fact_id, kind, value, locked=True, status="locked"):
-        return {"id": fact_id, "type": kind, "value": value, "locked": locked, "status": status}
+class ValueComparison(unittest.TestCase):
+    def test_two_different_mailboxes_are_not_a_render_difference(self):
+        """Deleting every separator would merge john.smith@ and johnsmith@ into one address."""
+        self.assertEqual(MODULE.compare_value("john.smith@example.com",
+                                              "contact johnsmith@example.com here"), "absent")
 
-    def run_checks(self, text, facts=()):
-        return {c["check"]: c for c in MODULE.readability_checks(text, [text], list(facts))}
+    def test_an_email_present_verbatim_is_present(self):
+        self.assertEqual(MODULE.compare_value("jane@example.com", "jane@example.com"), "present")
+
+    def test_an_email_broken_only_by_a_zero_width_character_is_a_render_difference(self):
+        self.assertEqual(MODULE.compare_value("jane@example.com", "jane@exam\u200bple.com"),
+                         "render_difference")
+
+    def test_a_phone_keeps_its_digits_across_formatting(self):
+        self.assertEqual(MODULE.compare_value("+1 (555) 123-4567", "call 15551234567"),
+                         "render_difference")
+
+    def test_a_different_phone_number_is_absent(self):
+        self.assertEqual(MODULE.compare_value("+1 (555) 123-4567", "call 15559999999"), "absent")
+
+    def test_a_name_tolerates_punctuation(self):
+        self.assertEqual(MODULE.compare_value("Jane Q. Doe", "Jane Q Doe"), "render_difference")
+
+    def test_value_kind_is_decided_by_shape(self):
+        self.assertEqual(MODULE.value_kind("a@b.com"), "email")
+        self.assertEqual(MODULE.value_kind("(555) 123-4567"), "phone")
+        self.assertEqual(MODULE.value_kind("Jane Doe"), "text")
+
+
+class SnapshotResolution(unittest.TestCase):
+    def build(self, *, profile_sha="sha-1", registered=True, file_present=True, tamper=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        snapshot = root / "candidate.json"
+        body = json.dumps({"facts": [{"id": "f-1", "type": "contact",
+                                      "value": "jane@example.com", "status": "confirmed"}]})
+        if file_present:
+            snapshot.write_text(body)
+        stored = MODULE.sha256_bytes((b"tampered" if tamper else body.encode()))
+        db = root / "jobloom.db"
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE candidate_snapshots (content_sha256 TEXT, "
+                           "snapshot_path TEXT, file_sha256 TEXT, status TEXT)")
+        if registered:
+            connection.execute("INSERT INTO candidate_snapshots VALUES (?,?,?,?)",
+                               (profile_sha, str(snapshot), stored, "superseded"))
+        connection.commit()
+        connection.close()
+        return db
+
+    def test_a_version_with_no_candidate_binding_is_not_judged(self):
+        self.assertEqual(MODULE.resolve_snapshot(self.build(), None)["status"],
+                         "no_candidate_binding")
+
+    def test_the_snapshot_a_version_was_approved_against_is_used_not_the_active_one(self):
+        """A superseded snapshot still resolves: the artifact was approved against it."""
+        result = MODULE.resolve_snapshot(self.build(), "sha-1")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["snapshot_status"], "superseded")
+        self.assertEqual(len(result["facts"]), 1)
+
+    def test_an_unregistered_snapshot_is_reported_not_ignored(self):
+        self.assertEqual(MODULE.resolve_snapshot(self.build(), "sha-other")["status"],
+                         "snapshot_not_registered")
+
+    def test_a_missing_snapshot_file_fails_closed(self):
+        self.assertEqual(MODULE.resolve_snapshot(self.build(file_present=False), "sha-1")["status"],
+                         "snapshot_file_missing")
+
+    def test_a_tampered_snapshot_fails_closed(self):
+        self.assertEqual(MODULE.resolve_snapshot(self.build(tamper=True), "sha-1")["status"],
+                         "snapshot_hash_mismatch")
+
+    def test_an_absent_registry_never_yields_facts(self):
+        self.assertEqual(MODULE.resolve_snapshot(None, "sha-1"),
+                         {"status": "registry_unavailable", "facts": []})
+
+
+class IdentityContract(unittest.TestCase):
+    def build(self, contract=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        version = Path(tmp.name)
+        if contract is not None:
+            (version / MODULE.CONTRACT_FILENAME).write_text(json.dumps(contract))
+        return version
+
+    def valid(self):
+        return {"artifact_sha256": "pdf-1", "candidate_profile_sha256": "snap-1",
+                "expected_identity_fact_ids": ["f-name"],
+                "expected_contact_fact_ids": ["f-email"],
+                "confirmation_basis": "human_confirmed"}
+
+    def test_a_valid_contract_declares_what_must_appear(self):
+        result = MODULE.load_identity_contract(self.build(self.valid()), "pdf-1", "snap-1")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expected"], ["f-name", "f-email"])
+        self.assertEqual(len(result["sha256"]), 64)
+
+    def test_no_contract_disables_the_check_rather_than_widening_it(self):
+        result = MODULE.load_identity_contract(self.build(), "pdf-1", "snap-1")
+        self.assertEqual(result["status"], "no_contract")
+        self.assertEqual(result["expected"], [])
+
+    def test_a_contract_for_a_different_artifact_is_refused(self):
+        self.assertEqual(
+            MODULE.load_identity_contract(self.build(self.valid()), "pdf-2", "snap-1")["status"],
+            "contract_artifact_mismatch")
+
+    def test_a_contract_for_a_different_snapshot_is_refused(self):
+        self.assertEqual(
+            MODULE.load_identity_contract(self.build(self.valid()), "pdf-1", "snap-2")["status"],
+            "contract_profile_mismatch")
+
+    def test_an_unconfirmed_contract_is_refused(self):
+        contract = {**self.valid(), "confirmation_basis": "proposed"}
+        self.assertEqual(
+            MODULE.load_identity_contract(self.build(contract), "pdf-1", "snap-1")["status"],
+            "contract_unconfirmed")
+
+    def test_an_unreadable_contract_is_refused(self):
+        version = self.build()
+        (version / MODULE.CONTRACT_FILENAME).write_text("{not json")
+        self.assertEqual(
+            MODULE.load_identity_contract(version, "pdf-1", "snap-1")["status"],
+            "contract_unreadable")
+
+
+class IntegrityDecision(unittest.TestCase):
+    def result(self, **overrides):
+        base = {"extraction_status": "ok",
+                "readability": [{"check": "text_layer", "status": "pass", "detail": {}}],
+                "claims": {"unresolved": 0, "span_collision_overlap": 0}}
+        return {**base, **overrides}
+
+    def test_a_clean_artifact_is_pending_never_approved(self):
+        self.assertEqual(MODULE.integrity_decision(self.result()), "pending")
+
+    def test_a_readability_failure_blocks(self):
+        blocked = self.result(readability=[{"check": "declared_values_survive_extraction",
+                                            "status": "fail", "detail": {}}])
+        self.assertEqual(MODULE.integrity_decision(blocked), "blocked")
+
+    def test_a_review_item_alone_does_not_block(self):
+        pending = self.result(readability=[{"check": "reading_order", "status": "user_review",
+                                            "detail": {}}])
+        self.assertEqual(MODULE.integrity_decision(pending), "pending")
+
+    def test_unresolved_claims_block(self):
+        self.assertEqual(
+            MODULE.integrity_decision(self.result(claims={"unresolved": 14,
+                                                          "span_collision_overlap": 0})), "blocked")
+
+    def test_a_span_collision_blocks(self):
+        self.assertEqual(
+            MODULE.integrity_decision(self.result(claims={"unresolved": 0,
+                                                          "span_collision_overlap": 1})), "blocked")
+
+    def test_a_failed_extraction_blocks(self):
+        self.assertEqual(MODULE.integrity_decision(self.result(extraction_status="failed")),
+                         "blocked")
+
+
+class ReadabilityChecks(unittest.TestCase):
+    def checks(self, text, facts=(), snapshot_status="ok", expected=("f-1",),
+               contract_status="ok"):
+        snapshot = {"status": snapshot_status, "facts": list(facts)}
+        contract = {"status": contract_status, "expected": list(expected), "sha256": "c" * 64}
+        return {c["check"]: c
+                for c in MODULE.readability_checks(text, [text], list(facts), snapshot, contract)}
+
+    def fact(self, fact_id, kind, value, status="confirmed"):
+        return {"id": fact_id, "type": kind, "value": value, "status": status}
 
     def test_an_empty_text_layer_fails(self):
-        self.assertEqual(self.run_checks("")["text_layer"]["status"], "fail")
+        self.assertEqual(self.checks("")["text_layer"]["status"], "fail")
 
     def test_garbage_glyphs_are_detected(self):
-        checks = self.run_checks("Name (cid:42) \ufffd here")
-        self.assertEqual(checks["garbage_glyphs"]["status"], "fail")
-        self.assertEqual(checks["garbage_glyphs"]["detail"],
-                         {"cid_marker": 1, "replacement_character": 1})
+        check = self.checks("Name (cid:42) \ufffd here")["garbage_glyphs"]
+        self.assertEqual(check["status"], "fail")
+        self.assertEqual(check["detail"], {"cid_marker": 1, "replacement_character": 1})
 
-    def test_an_unreachable_contact_value_is_a_failure(self):
-        """The icon-font case: the page shows an address the text layer never carries."""
-        facts = [self.fact("f-1", "contact", "jane@example.com", locked=False, status="confirmed")]
-        check = self.run_checks("Jane Doe  Experience", facts)["contact_survives_extraction"]
+    def test_without_a_contract_nothing_is_judged_and_the_reason_is_named(self):
+        check = self.checks("text", contract_status="no_contract")["declared_values_survive_extraction"]
+        self.assertEqual(check["status"], "review")
+        self.assertEqual(check["detail"]["reason"], "no_contract")
+
+    def test_without_a_usable_snapshot_nothing_is_judged(self):
+        check = self.checks("text", snapshot_status="snapshot_hash_mismatch")
+        self.assertEqual(check["declared_values_survive_extraction"]["detail"]["reason"],
+                         "snapshot_hash_mismatch")
+
+    def test_a_declared_value_that_cannot_be_reached_fails(self):
+        facts = [self.fact("f-1", "contact", "jane@example.com")]
+        check = self.checks("Jane Doe Experience", facts)["declared_values_survive_extraction"]
         self.assertEqual(check["status"], "fail")
         self.assertEqual(check["detail"]["absent"], 1)
-        self.assertEqual(check["detail"]["render_difference"], 0)
 
-    def test_a_separator_difference_is_review_not_failure(self):
-        facts = [self.fact("f-1", "contact", "+1 (555) 123-4567", locked=False, status="confirmed")]
-        check = self.run_checks("Jane Doe 15551234567", facts)["contact_survives_extraction"]
-        self.assertEqual(check["status"], "review")
-        self.assertEqual(check["detail"]["absent"], 0)
-        self.assertEqual(check["detail"]["render_difference"], 1)
-
-    def test_a_literal_match_passes_without_a_review_item(self):
-        facts = [self.fact("f-1", "contact", "jane@example.com", locked=False, status="confirmed")]
-        check = self.run_checks("Jane Doe jane@example.com", facts)["contact_survives_extraction"]
+    def test_a_declared_value_present_verbatim_passes(self):
+        facts = [self.fact("f-1", "contact", "jane@example.com")]
+        check = self.checks("Jane jane@example.com", facts)["declared_values_survive_extraction"]
         self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["detail"]["present"], 1)
 
-    def test_an_absent_education_value_is_review_never_failure(self):
-        facts = [self.fact("f-1", "education", "MPH, Somewhere University, 2021")]
-        check = self.run_checks("unrelated text", facts)["education_survives_extraction"]
+    def test_undeclared_facts_are_never_judged(self):
+        """A resume legitimately omits facts it never claimed to carry."""
+        facts = [self.fact("f-1", "contact", "jane@example.com"),
+                 self.fact("f-2", "education", "a degree the resume left out")]
+        check = self.checks("Jane jane@example.com", facts,
+                            expected=("f-1",))["declared_values_survive_extraction"]
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["detail"]["declared"], 1)
+
+    def test_a_declared_fact_absent_from_the_snapshot_is_a_review_item(self):
+        check = self.checks("text", [], expected=("f-missing",))["declared_values_survive_extraction"]
         self.assertEqual(check["status"], "review")
+        self.assertEqual(check["detail"]["not_in_snapshot"], 1)
 
     def test_unusable_fact_statuses_are_ignored(self):
-        facts = [self.fact("f-1", "education", "absent value", status="revoked")]
-        self.assertNotIn("education_survives_extraction", self.run_checks("text", facts))
+        facts = [self.fact("f-1", "contact", "jane@example.com", status="revoked")]
+        check = self.checks("text", facts)["declared_values_survive_extraction"]
+        self.assertEqual(check["detail"]["not_in_snapshot"], 1)
 
     def test_reading_order_is_never_auto_passed(self):
         for text in ("", "a perfectly clean single column resume"):
-            self.assertEqual(self.run_checks(text)["reading_order"]["status"], "user_review")
+            self.assertEqual(self.checks(text)["reading_order"]["status"], "user_review")
 
     def test_checks_are_never_aggregated_into_a_score(self):
-        checks = MODULE.readability_checks("text", ["text"], [])
-        self.assertIsInstance(checks, list)
-        for check in checks:
+        for check in MODULE.readability_checks("text", ["text"], [],
+                                               {"status": "ok", "facts": []},
+                                               {"status": "ok", "expected": []}):
             self.assertIn(check["status"], {"pass", "fail", "review", "user_review"})
             self.assertNotIn("score", check)
