@@ -128,7 +128,7 @@ class AppliedTests(unittest.TestCase):
         SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
         row = SAVED.tracker_rows(self.db, today=TODAY)[0]
         self.assertEqual(row["current_status"], "Applied")
-        self.assertEqual(row["applied_evidence"], "self-reported")
+        self.assertEqual(row["applied_evidence"], "stated at decision")
         self.assertEqual(row["applied_at"], AT.isoformat())
 
     def test_the_apply_time_is_the_first_one_and_survives_a_change_of_mind(self):

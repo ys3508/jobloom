@@ -80,7 +80,7 @@ const savedRows = (source.saved_jobs ?? []).map((item) => [
   item.deadline ? new Date(item.deadline) : null,
   item.current_status ?? "",
   item.applied_at ? new Date(item.applied_at) : null,
-  // "self-reported" or "tracked application". `application_core`'s `submitted` requires
+  // "stated at decision" or "tracked application". `application_core`'s `submitted` requires
   // positive submission evidence; saying you applied is not that, and the column says so
   // rather than letting the two claims read alike.
   item.applied_evidence ?? "",

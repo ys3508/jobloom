@@ -15,11 +15,15 @@ something was sent; a kept job has no after. They live in separate tables and ar
 the job's own URL when the tracker is built, so a job that is later applied to is reported
 once from each side rather than counted twice.
 
-`applied` here is the user saying they applied. It is **not** the `submitted` state in
-`application_core`, which requires positive submission evidence — a confirmation page, a
-confirmation id, an account record — and a material lock. Nothing here has seen any of
-that. The two must never be read as the same claim, so this one is reported as
-self-reported wherever it is shown.
+`applied` here is the user declaring they are about to apply. The panel writes it the
+moment they press, which is *before* they open the employer's form, so it records a
+decision and not a completed submission: a long Workday flow abandoned at the account
+wall leaves this row saying `applied` and nothing to correct it. It is **not** the
+`submitted` state in `application_core`, which requires positive submission evidence — a
+confirmation page, a confirmation id, an account record — and a material lock. Nothing
+here has seen any of that. A funnel that counts these rows as submissions overcounts by
+exactly the abandonment rate, which nothing measures yet, so the two must never be read
+as the same claim and this one says when it was stated wherever it is shown.
 
 Recording it at all exists because applications made by hand are otherwise invisible: the
 tracker derived "Applied" by joining the applications table, so a job applied to outside
@@ -286,11 +290,12 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
             # job applied to by hand reading "Saved" forever, which is most of them.
             "current_status": ("Applied" if row["decision"] == APPLIED
                                             or row["job_url"] in tracked else "Saved"),
-            # Whether the applying was seen or only stated. `application_core`'s `submitted`
-            # requires positive submission evidence; this does not, and must not borrow its
-            # authority.
+            # Whether the applying was seen or only stated, and when the stating happened.
+            # The press precedes the form, so "stated at decision" is the strongest claim
+            # this side can make; `application_core`'s `submitted` requires positive
+            # submission evidence, and this must not borrow its authority.
             "applied_evidence": ("tracked application" if row["job_url"] in tracked
-                                 else "self-reported" if row["decision"] == APPLIED else ""),
+                                 else "stated at decision" if row["decision"] == APPLIED else ""),
             "applied_at": row["applied_at"],
             "outcome": row["outcome"],
             "outcome_at": row["outcome_at"],

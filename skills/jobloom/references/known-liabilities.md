@@ -186,3 +186,56 @@ where the ATS expected a PDF, or a locked artifact whose text layer was never ch
 because `artifact_integrity_audit` only knows how to read PDFs. Its
 `AUDIT_ASSUMPTIONS["format_gate_absent_in_bind_and_lock"]` records this same hole from the
 other side, and its canary is watching for the gate to appear.
+
+---
+
+## The fill pipeline has no browser worker, and reads as if it does
+
+Recorded 2026-08-31. Not fixed. Not a defect in the fill engine — the missing half was
+never built, and every document describing the engine describes it as if it were.
+
+**What was measured.** `action_package` appears in exactly one place that writes it,
+`fill_core.py`'s `private_action_package_written` event, and in `mvp_core.py`'s
+`action-packages` directory name. **Nothing reads it.** The shipped extension is five
+files on every branch — `background.js`, `manifest.json`, `panel.css`, `panel.html`,
+`panel.js` — and `panel.js` makes three outbound calls in total: `/health`,
+`/positioning`, `/save`. There is no code anywhere in this repository that locates an
+ATS field, types a value, uploads a file, or returns an observed hash to `fill_core`.
+
+The backend halves that do exist and are tested: worker leases, page observation, the
+pending-action package, per-field hash verification, checkpoints, pauses, the form
+inventory, the value-free pre-submit review, submission evidence, and the archive. In
+production they have run **zero** times: `fill_sessions`, `fill_pages`, `fill_steps`,
+`fill_checkpoints`, `form_inventories`, `pre_submit_reviews`, `application_fields` and
+`submission_archives` are all empty, and the one application has sat in `ready_to_fill`
+since 2026-08-28.
+
+**Why it reads as complete.** `mvp_core readiness` returns `fill_queue: ready` with no
+blockers, because that gate asks whether an approved material-locked application is in
+the queue — which is true, and says nothing about whether anything can act on it.
+`SKILL.md`'s Fill-Only section is written in the imperative throughout ("Observe one page
+at a time", "After each browser action, compare…"), addressed to a worker that does not
+exist. README:45 is the only place that says otherwise, in one clause, in a paragraph
+about deployment: operational use "still requires … browser integration".
+
+Two readers have now concluded from the code and the readiness report that the pipeline
+was runnable end to end. That is the cost of leaving it unrecorded.
+
+**Why it is not fixed here.** Building the worker is a product decision, not a cleanup.
+The owner's standing decision (2026-08-31) is to apply by hand: the panel judges, the
+user fills the employer's form themselves, and `saved_jobs` records the decision and
+what came back. Under that mode the worker is not on the critical path, and neither is
+the contact-fact migration nor the AnswerLibrary question mappings that a worker would
+need. Building it anyway would be building ahead of the measurement.
+
+**What would settle it.** Either a minimal browser worker that consumes one action
+package, fills one page, and returns observed hashes — at which point the backend halves
+get their first real exercise and the format gate, the contact facts and the question
+mappings all become due at once — or a decision to keep applying by hand permanently,
+which would make the whole Fill-Only engine dead weight worth deleting rather than
+maintaining.
+
+**How it could bite.** It already has, twice, as a wrong answer to "what is finished".
+The operational risk is smaller than the reporting risk: nothing can submit anything, so
+nothing unsafe happens. What breaks is planning — work sequenced behind a stage that
+does not exist.
