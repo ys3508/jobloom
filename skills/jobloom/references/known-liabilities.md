@@ -141,3 +141,48 @@ entry refuses — and the Recursion pair would be the first thing it hid.
 **Number this corrects.** "Openings worth applying to" has been reported three times on
 three different keys: ≈30 (estimated), 27 (bare employer+title, now known unsafe), and
 **31** (safe handling). Only the last was computed with a key that survived measurement.
+
+---
+
+## Nothing stops a non-PDF resume from being submitted
+
+Recorded 2026-08-31. Not fixed. Blocked on a file another session is holding.
+
+**What was measured.** `resume_core.register` accepts `.pdf`, `.docx`, `.txt` and `.md`
+(`resume_core.py:390`). Neither `bind_version` nor `lock_materials` looks at the format:
+both check approval, authorization and file hash and nothing else. `fill_core._plan_upload`
+then hands the material lock's `snapshot_path` to the browser worker exactly as registered.
+The only thing refused on its way to a submission is a `master_source`, and that is refused
+by kind, not by suffix — so an approved `direction` DOCX walks the whole path.
+
+Today's registry is one approval away from exercising it:
+
+| version | kind | status | format |
+| --- | --- | --- | --- |
+| `lsc-baseline-2026-08-25-v1` | direction | **draft** | docx |
+| `resume-a-v13-pdf--*` (×3) | direction | approved | pdf |
+| `master-canonical-2026-08-25-v2` | master_source | approved | docx |
+
+Nothing is exposed at this moment, but not because a gate exists: the three approved DOCX
+direction versions happen to be revoked, and the approved DOCX left is a `master_source`
+that kind already refuses. Approving `lsc-baseline` makes a DOCX submittable that day.
+
+**Why it is not fixed here.** The fix is small — refuse at `bind_version`, again at
+`lock_materials`, and again in `fill_core._plan_upload`, on the version's kind, its suffix
+and its leading bytes, since a renamed DOCX passes the first two. It was written and it
+works. It also fails 65 tests across nine test files whose fixtures bind a `resume.txt`,
+and one of those files, `tests/test_direction_core.py`, is open in a concurrent session.
+Updating those fixtures is mechanical, but not while someone else is editing one of them,
+and shipping only the `fill_core` third of the gate would be worse than none: it would let
+a DOCX bind and lock, then refuse at upload, after the material lock recorded it.
+
+**What would settle it.** Land it when `tests/test_direction_core.py` is free. The
+production change is three call sites; the rest is fixtures moving from `resume.txt` to a
+minimal PDF. Cover letters are not covered by the written change and need the same
+treatment through `cover_letter_core`.
+
+**How it could bite.** Silently, and only once it matters: an employer receiving a DOCX
+where the ATS expected a PDF, or a locked artifact whose text layer was never checked
+because `artifact_integrity_audit` only knows how to read PDFs. Its
+`AUDIT_ASSUMPTIONS["format_gate_absent_in_bind_and_lock"]` records this same hole from the
+other side, and its canary is watching for the gate to appear.
