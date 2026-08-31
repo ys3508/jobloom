@@ -28,6 +28,9 @@ const I18N = {
     bestDirection: "Best-matching direction: {name}", tailorApply: "Tailor & apply", tailorApplySub: "Edit resume first",
     applyAsIs: "Apply as-is", applyAsIsSub: "Apply directly",
     saveLater: "Save for later", saveLaterSub: "Not now — keep it",
+    confirmSubmitted: "I submitted it", confirmSubmittedSub: "Press after the form is sent",
+    confirmedSubmitted: "Recorded as submitted — your word, not observed",
+    alreadyConfirmed: "Already recorded as submitted", confirmFailed: "Could not record it",
     saved: "Saved to your tracker", loggedApplied: "Logged as applied — yours to confirm, not observed",
     saveFailed: "Could not save — is storing enabled?",
     storedNotice: "Kept in your local tracker. Nothing else was stored.",
@@ -67,6 +70,9 @@ const I18N = {
     partialMessage: "我只读到了这个岗位的一部分，所以没有作出判断。请打开完整岗位详情页再试。", evidenceUnavailableMessage: "经历库为空或暂时不可用，所以没有判断这个岗位。请先导入简历或经历再试。", bestDirection: "最匹配方向：{name}",
     tailorApply: "精投", tailorApplySub: "改简历再投", applyAsIs: "广投", applyAsIsSub: "直接投",
     saveLater: "先存着", saveLaterSub: "现在不投，留着",
+    confirmSubmitted: "投完了", confirmSubmittedSub: "表单真的提交后再按",
+    confirmedSubmitted: "已记为投完 —— 你的声明，非系统观测",
+    alreadyConfirmed: "已经记过了", confirmFailed: "没记上",
     saved: "已存入你的记录表", loggedApplied: "已记为已投——这是你的声明，系统没有核实",
     saveFailed: "没能存上——本地服务开了写入吗？",
     storedNotice: "已存入本地记录表。除此之外没有保存任何内容。",
@@ -254,6 +260,7 @@ function render(result, page) {
   const suggestedChoice = call === "skip" ? ""
     : call === "apply" && !count("hidden_strength") && !count("evidence_gap") ? "broad" : "precision";
   lastSuggestedChoice = suggestedChoice;
+  $("confirm-row").hidden = true;
   document.querySelectorAll("#actions button").forEach((button) => {
     button.classList.toggle("selected", button.dataset.choice === suggestedChoice);
     button.setAttribute("aria-pressed", String(button.dataset.choice === suggestedChoice));
@@ -334,10 +341,11 @@ function render(result, page) {
 
 let lastReading = null;
 
-// "Save for later" is the only button that does anything, and that is the point: skipping a
-// job means moving to the next one, so a button meaning "do not apply" would be pressed by
-// nobody. The other two record an intention the user then carries out on the job site
-// themselves, and nothing here applies on their behalf.
+// All three record a decision; there is still no button meaning "do not apply", because
+// skipping a job means moving to the next one and nobody would press it. What the two apply
+// buttons record is an intention the user then carries out on the job site themselves —
+// nothing here applies on their behalf, and the press lands before the form is even open.
+// That is why finishing has its own, later button rather than being assumed from this one.
 let lastSuggestedChoice = "";
 
 async function recordDecision(decision) {
@@ -377,6 +385,25 @@ async function recordDecision(decision) {
   return body;
 }
 
+// A second, later press than the one above: that one recorded a decision made before the
+// form was open, and this one answers whether the form was finished. Folding them into one
+// button would put the answer before the question.
+$("confirm-submitted").addEventListener("click", async () => {
+  if (!lastReading?.page?.url) return;
+  try {
+    const response = await fetch(`${state.endpoint}/confirm-submitted`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
+      body: JSON.stringify({ job_url: lastReading.page.url }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `bridge returned ${response.status}`);
+    $("status").textContent = t(body.already_confirmed ? "alreadyConfirmed" : "confirmedSubmitted");
+  } catch (error) {
+    $("status").textContent = t("confirmFailed");
+  }
+});
+
 document.querySelectorAll("#actions button").forEach((button) => {
   button.addEventListener("click", async () => {
     document.querySelectorAll("#actions button").forEach((candidate) => {
@@ -393,6 +420,11 @@ document.querySelectorAll("#actions button").forEach((button) => {
       $("status").textContent = t(decision === "later" ? "saved" : "loggedApplied");
       // The panel promises nothing is stored. Once something is, it has to say so.
       $("notice").textContent = t("storedNotice");
+      // Offered only once there is a decision to confirm, and only for applying: it asks
+      // "did you finish the form", which is not a question about a job merely kept. The
+      // press above happened before the form was open, so this is a second, later act —
+      // it is deliberately not folded into the same button.
+      $("confirm-row").hidden = decision === "later";
     } catch (error) {
       $("status").textContent = t("saveFailed");
     }

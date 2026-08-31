@@ -75,6 +75,28 @@ itself out of are enforced on the bridge side:
 | The extension cannot call a job site | `host_permissions` is the bridge alone |
 | No navigation, pagination, clicking, polling | asserted absent from the shipped sources by `tests/test_assist_bridge.py` |
 | No automatic submission | the whole product; the assistant stops where filling stops |
+| Confirming a submission needs storing enabled | `_confirm_submitted` is behind `--allow-store`, like `/save` |
+| A confirmation is the user's word, never an observation | `saved_jobs` reports it as `confirmed after applying`, never as `submitted` |
+
+## What the buttons record, and when
+
+The two apply buttons are pressed *before* the employer's form is open, so what they
+record is a decision, not an application. A Workday flow abandoned at the account wall
+would otherwise sit in the record as `applied` forever with nothing to correct it, and a
+reply rate computed over those rows is deflated by exactly the abandonment rate.
+
+So finishing has its own button, offered only after a decision to apply and pressed after
+the form is actually sent:
+
+| Rung | Written when | Claim |
+|---|---|---|
+| `decision='applied'` | the apply button is pressed, before the form | the user intends to apply |
+| `submitted_confirmed_at` | the *I submitted it* button, after the form — or an outcome only the employer could have sent | the user says it was finished |
+| `application_core`'s `submitted` | never, while no browser worker exists | positive submission evidence |
+
+Anything counting real applications uses the bottom two. Using the top one counts
+intentions. The gap between the first two is reported as `stated_not_confirmed` rather
+than divided away, because nothing here measures how many decisions were abandoned.
 
 That last table row is a test, not a convention: `test_it_never_navigates_paginates_or_clicks_for_the_user`
 fails if `chrome.tabs.create`, `location.assign`, `.click()`, `setInterval` or

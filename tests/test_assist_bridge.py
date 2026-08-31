@@ -355,6 +355,19 @@ class ServerBoundaryTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body["error"], "storing_disabled")
 
+    def test_confirming_a_submission_answers_and_needs_storing_enabled(self):
+        # Confirming writes, so it lives behind the same gate as saving: browsing must not
+        # be able to accumulate a record of applications any more than of jobs.
+        status, body = self.post("/confirm-submitted",
+                                 {"job_url": "https://jobs.example.com/1"})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "storing_disabled")
+
+    def test_confirming_refuses_a_payload_without_a_job(self):
+        status, body = self.post("/confirm-submitted", {})
+        self.assertIn(status, {400, 403})
+        self.assertTrue(body["error"])
+
     def test_save_refuses_a_payload_without_a_job_card(self):
         status, body = self.post("/save", {"actor": "user"})
         self.assertIn(status, {400, 403})

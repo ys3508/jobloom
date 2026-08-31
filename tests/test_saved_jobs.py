@@ -226,10 +226,11 @@ class JudgementSnapshotTests(unittest.TestCase):
         SAVED.save(self.db, card(url="https://jobs.example.com/2"), actor="user",
                    decision=SAVED.APPLIED, judgement={**JUDGEMENT, "verdict": "review"}, at=AT)
         summary = SAVED.status(self.db, today=TODAY)
+        # The interview confirms the first one went through; the second is a decision only.
         self.assertEqual(summary["by_verdict"]["apply"],
-                         {"saved": 1, "applied": 1, "with_outcome": 1})
+                         {"saved": 1, "applied": 1, "confirmed_submitted": 1, "with_outcome": 1})
         self.assertEqual(summary["by_verdict"]["review"],
-                         {"saved": 1, "applied": 1, "with_outcome": 0})
+                         {"saved": 1, "applied": 1, "confirmed_submitted": 0, "with_outcome": 0})
 
     def test_a_malformed_judgement_is_dropped_rather_than_stored_as_text(self):
         SAVED.save(self.db, card(), actor="user",
@@ -237,6 +238,109 @@ class JudgementSnapshotTests(unittest.TestCase):
         row = SAVED.tracker_rows(self.db, today=TODAY)[0]
         self.assertEqual(row["verdict"], "apply")
         self.assertIsNone(row["covered"])
+
+
+class ConfirmedSubmissionTests(unittest.TestCase):
+    """The rung between "decided to apply" and "there is submission evidence"."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        SAVED.initialize(self.db)
+        self.addCleanup(self.db.close)
+
+    def _applied(self, url="https://jobs.example.com/1"):
+        SAVED.save(self.db, card(url=url), actor="user", decision=SAVED.APPLIED, at=AT)
+        return url
+
+    def _row(self, url):
+        return {row["job_url"]: row for row in SAVED.tracker_rows(self.db, today=TODAY)}[url]
+
+    def test_a_decision_to_apply_is_not_a_submission(self):
+        # The press happens before the form opens, so nothing about it says the form was
+        # finished. This is the whole reason the rung exists.
+        url = self._applied()
+        self.assertEqual(self._row(url)["applied_evidence"], "stated at decision")
+        self.assertIsNone(self._row(url)["submitted_confirmed_at"])
+        self.assertEqual(SAVED.status(self.db, today=TODAY)["confirmed_submitted"], 0)
+
+    def test_confirming_says_so_and_says_when(self):
+        url = self._applied()
+        result = SAVED.confirm_submitted(self.db, url, at=AT)
+        self.assertFalse(result["already_confirmed"])
+        self.assertEqual(self._row(url)["applied_evidence"], "confirmed after applying")
+        self.assertEqual(self._row(url)["submitted_confirmed_at"], AT.isoformat())
+
+    def test_confirming_twice_keeps_the_first_time(self):
+        # The question is "was it finished", and the first yes answered it. A later press
+        # would move the date to when somebody happened to press again.
+        url = self._applied()
+        SAVED.confirm_submitted(self.db, url, at=AT)
+        later = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+        result = SAVED.confirm_submitted(self.db, url, at=later)
+        self.assertTrue(result["already_confirmed"])
+        self.assertEqual(self._row(url)["submitted_confirmed_at"], AT.isoformat())
+
+    def test_a_job_only_kept_cannot_be_confirmed_as_submitted(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.LATER, at=AT)
+        with self.assertRaises(ValueError):
+            SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
+
+    def test_an_unknown_job_cannot_be_confirmed(self):
+        with self.assertRaises(ValueError):
+            SAVED.confirm_submitted(self.db, "https://jobs.example.com/nope", at=AT)
+
+    def test_an_outcome_only_the_employer_could_send_confirms_it(self):
+        # A rejection could not have arrived unless the form went through.
+        url = self._applied()
+        result = SAVED.record_outcome(self.db, url, "rejected", at=AT)
+        self.assertTrue(result["confirmed_submitted_by_outcome"])
+        self.assertEqual(self._row(url)["applied_evidence"], "confirmed after applying")
+
+    def test_silence_and_withdrawal_confirm_nothing(self):
+        # `no_response` is the absence of evidence, and a withdrawal routinely happens
+        # partway through the form. Neither says the application was ever submitted.
+        for url, outcome in (("https://jobs.example.com/1", "no_response"),
+                             ("https://jobs.example.com/2", "withdrawn")):
+            self._applied(url)
+            result = SAVED.record_outcome(self.db, url, outcome, at=AT)
+            self.assertFalse(result["confirmed_submitted_by_outcome"], outcome)
+            self.assertEqual(self._row(url)["applied_evidence"], "stated at decision")
+        self.assertEqual(SAVED.status(self.db, today=TODAY)["confirmed_submitted"], 0)
+
+    def test_an_outcome_never_overwrites_an_earlier_confirmation(self):
+        url = self._applied()
+        SAVED.confirm_submitted(self.db, url, at=AT)
+        later = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+        result = SAVED.record_outcome(self.db, url, "interview", at=later)
+        self.assertFalse(result["confirmed_submitted_by_outcome"])
+        self.assertEqual(self._row(url)["submitted_confirmed_at"], AT.isoformat())
+
+    def test_the_gap_between_deciding_and_finishing_is_reported_not_divided_away(self):
+        self._applied("https://jobs.example.com/1")
+        self._applied("https://jobs.example.com/2")
+        self._applied("https://jobs.example.com/3")
+        SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
+        summary = SAVED.status(self.db, today=TODAY)
+        self.assertEqual(summary["applied"], 3)
+        self.assertEqual(summary["confirmed_submitted"], 1)
+        self.assertEqual(summary["stated_not_confirmed"], 2)
+
+    def test_a_table_made_before_the_column_existed_gains_it_and_keeps_its_rows(self):
+        # Rows recorded before the distinction existed predate it, so they stay
+        # unconfirmed: that is what they honestly are.
+        old = sqlite3.connect(":memory:")
+        old.row_factory = sqlite3.Row
+        self.addCleanup(old.close)
+        SAVED.initialize(old)
+        old.execute("ALTER TABLE saved_jobs DROP COLUMN submitted_confirmed_at")
+        old.commit()
+        SAVED.save(old, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        SAVED.initialize(old)
+        rows = SAVED.tracker_rows(old, today=TODAY)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["submitted_confirmed_at"])
+        self.assertEqual(rows[0]["applied_evidence"], "stated at decision")
 
 
 class ApplicationJoinTests(unittest.TestCase):

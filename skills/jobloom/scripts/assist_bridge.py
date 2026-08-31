@@ -451,6 +451,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, self._positioning(payload))
             elif self.path == "/save":
                 self._send(200, self._save(payload))
+            elif self.path == "/confirm-submitted":
+                self._send(200, self._confirm_submitted(payload))
             elif self.path == "/store":
                 self._send(200, self._store(payload))
             else:
@@ -501,6 +503,30 @@ class Handler(BaseHTTPRequestHandler):
                                    decision=str(payload.get("decision") or saved_jobs.LATER),
                                    judgement=payload.get("judgement"),
                                    reason=payload.get("reason"))
+        except ValueError as error:
+            raise BridgeError(str(error)) from error
+        finally:
+            connection.close()
+
+    def _confirm_submitted(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The user saying, after the fact, that they finished the employer's form.
+
+        A separate press from the one that recorded the decision, because it answers a
+        different question: the first was pressed before the form opened. Nothing here
+        observes the submission — this is still the user's word — but the word is now
+        given about something that happened.
+        """
+        if not self.allow_store:
+            raise BridgeError("storing_disabled", 403)
+        job_url = str(payload.get("job_url") or "").strip()
+        if not job_url:
+            raise BridgeError("job_url_required")
+        import saved_jobs  # local: keeps the read-only path free of write imports
+
+        connection = self._connection()
+        try:
+            saved_jobs.initialize(connection)
+            return saved_jobs.confirm_submitted(connection, job_url)
         except ValueError as error:
             raise BridgeError(str(error)) from error
         finally:

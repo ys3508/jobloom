@@ -15,15 +15,25 @@ something was sent; a kept job has no after. They live in separate tables and ar
 the job's own URL when the tracker is built, so a job that is later applied to is reported
 once from each side rather than counted twice.
 
-`applied` here is the user declaring they are about to apply. The panel writes it the
-moment they press, which is *before* they open the employer's form, so it records a
-decision and not a completed submission: a long Workday flow abandoned at the account
-wall leaves this row saying `applied` and nothing to correct it. It is **not** the
-`submitted` state in `application_core`, which requires positive submission evidence — a
-confirmation page, a confirmation id, an account record — and a material lock. Nothing
-here has seen any of that. A funnel that counts these rows as submissions overcounts by
-exactly the abandonment rate, which nothing measures yet, so the two must never be read
-as the same claim and this one says when it was stated wherever it is shown.
+Applying is recorded on three rungs, and they are never collapsed into one number:
+
+1. `decision='applied'` — the user declaring they are about to apply. The panel writes it
+   the moment they press, *before* the employer's form is open, so it counts intentions:
+   a long Workday flow abandoned at the account wall leaves this row saying `applied`
+   with nothing to correct it.
+2. `submitted_confirmed_at` — the user saying afterwards that they finished the form, or
+   an outcome arriving that only the employer could have sent. Still their word, but now
+   given about something that happened rather than something intended.
+3. `application_core`'s `submitted` — positive submission evidence: a confirmation page,
+   a confirmation id, an account record, plus a material lock. Nothing here has seen any
+   of that, and while no browser worker exists nothing ever will.
+
+Rung 2 exists because rung 3 is unreachable in this mode and rung 1 is the wrong
+denominator. A reply rate over decisions is deflated by exactly the abandonment rate,
+which nothing measures; a reply rate over nothing at all is what using rung 3 alone
+would give. So anything counting real applications uses rungs 2 and 3, the gap between
+1 and 2 is reported rather than divided away, and none of the three borrows another's
+authority.
 
 Recording it at all exists because applications made by hand are otherwise invisible: the
 tracker derived "Applied" by joining the applications table, so a job applied to outside
@@ -49,7 +59,7 @@ if SCRIPT_DIR not in sys.path:
 import application_core  # noqa: E402
 import outcome_core  # noqa: E402
 
-SCHEMA_VERSION = "0.2.0"
+SCHEMA_VERSION = "0.3.0"
 # Two decisions worth a press. A skip still records nothing: skipping a job means moving to
 # the next one, so a control meaning "do not apply" would be pressed by nobody.
 LATER, APPLIED = "later", "applied"
@@ -83,6 +93,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             deadline TEXT,
             decision TEXT NOT NULL,
             applied_at TEXT,
+            submitted_confirmed_at TEXT,
             verdict TEXT,
             verdict_reason TEXT,
             direction TEXT,
@@ -100,6 +111,12 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS saved_jobs_decided_idx ON saved_jobs(decided_at);
     """)
+    # A table created before 0.3.0 has every column but this one, and rows in it predate the
+    # distinction, so they stay NULL: unconfirmed is what they honestly are. Adding the
+    # column rather than recreating the table keeps decisions already recorded.
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(saved_jobs)")}
+    if "submitted_confirmed_at" not in columns:
+        connection.execute("ALTER TABLE saved_jobs ADD COLUMN submitted_confirmed_at TEXT")
     connection.commit()
 
 
@@ -214,6 +231,52 @@ def save(connection: sqlite3.Connection, card: dict[str, Any], *, actor: str,
             "applied_at": applied_at, "updated": bool(existing)}
 
 
+# An outcome only the employer could have produced is itself evidence the application
+# reached them, so recording one confirms the submission if nothing else has. `no_response`
+# is the absence of evidence, not evidence, and `withdrawn` is the user's own act which
+# routinely happens partway through a form — neither confirms anything.
+EMPLOYER_ORIGINATED_OUTCOMES = {
+    "recruiter_response", "screening_call", "interview", "final_interview", "offer", "rejected",
+}
+
+
+def confirm_submitted(connection: sqlite3.Connection, job_url: str,
+                      *, at: datetime | None = None) -> dict[str, Any]:
+    """The user saying they finished the employer's form, recorded after the fact.
+
+    The middle rung of three, and the only one this mode can climb. `decision='applied'` is
+    written when the panel button is pressed, before the form is opened, so it counts
+    intentions and includes every application abandoned at an account wall. The top rung,
+    `application_core`'s `submitted`, needs a confirmation page or id and stays empty while
+    no browser worker exists. Without this rung a hand-made application has no honest
+    denominator: a reply rate over decisions is deflated by exactly the abandonment rate.
+
+    It is still the user's word, not an observation, and it is reported as such. What it
+    buys is that the word is now given after the act rather than before it.
+
+    Confirming twice keeps the first time. The confirmation answers "was it finished", and
+    the first yes already answered it; a later press would move the date to when someone
+    happened to press again, which is not a fact about the application.
+    """
+    url = application_core.canonicalize_url(_text(job_url))
+    row = connection.execute(
+        "SELECT decision, submitted_confirmed_at FROM saved_jobs WHERE job_url=?", (url,)
+    ).fetchone()
+    if row is None:
+        raise ValueError("no saved job with that URL")
+    if row["decision"] != APPLIED:
+        raise ValueError("only a job you decided to apply to can be confirmed as submitted")
+    if row["submitted_confirmed_at"]:
+        return {"job_url": url, "submitted_confirmed_at": row["submitted_confirmed_at"],
+                "already_confirmed": True}
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE saved_jobs SET submitted_confirmed_at=?, updated_at=? WHERE job_url=?",
+        (timestamp, timestamp, url))
+    connection.commit()
+    return {"job_url": url, "submitted_confirmed_at": timestamp, "already_confirmed": False}
+
+
 def record_outcome(connection: sqlite3.Connection, job_url: str, outcome: str,
                    *, at: datetime | None = None) -> dict[str, Any]:
     """What came back. The vocabulary is `outcome_core`'s, so the two halves of the funnel
@@ -235,8 +298,19 @@ def record_outcome(connection: sqlite3.Connection, job_url: str, outcome: str,
     connection.execute(
         "UPDATE saved_jobs SET outcome=?, outcome_at=?, updated_at=? WHERE job_url=?",
         (outcome, timestamp, timestamp, url))
+    # A rejection or an interview invitation could not have arrived unless the form went
+    # through, so it settles the question the confirmation exists to answer. The date used
+    # is the outcome's, because that is when the evidence appeared; nothing here knows when
+    # the form was actually finished.
+    confirmed_by_outcome = False
+    if outcome in EMPLOYER_ORIGINATED_OUTCOMES:
+        cursor = connection.execute(
+            "UPDATE saved_jobs SET submitted_confirmed_at=? "
+            "WHERE job_url=? AND submitted_confirmed_at IS NULL", (timestamp, url))
+        confirmed_by_outcome = bool(cursor.rowcount)
     connection.commit()
-    return {"job_url": url, "outcome": outcome, "outcome_at": timestamp}
+    return {"job_url": url, "outcome": outcome, "outcome_at": timestamp,
+            "confirmed_submitted_by_outcome": confirmed_by_outcome}
 
 
 def forget(connection: sqlite3.Connection, job_url: str) -> dict[str, Any]:
@@ -290,13 +364,18 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
             # job applied to by hand reading "Saved" forever, which is most of them.
             "current_status": ("Applied" if row["decision"] == APPLIED
                                             or row["job_url"] in tracked else "Saved"),
-            # Whether the applying was seen or only stated, and when the stating happened.
-            # The press precedes the form, so "stated at decision" is the strongest claim
-            # this side can make; `application_core`'s `submitted` requires positive
-            # submission evidence, and this must not borrow its authority.
+            # Three rungs, never collapsed. "stated at decision" was written when the panel
+            # button was pressed, before the form was opened, so it includes applications
+            # abandoned partway. "confirmed after applying" is the user's word given after
+            # the act — still their word, but about something that happened. "tracked
+            # application" is the only one backed by `application_core`, which requires
+            # positive submission evidence. Anything counting real applications uses the
+            # top two; using the first counts intentions.
             "applied_evidence": ("tracked application" if row["job_url"] in tracked
+                                 else "confirmed after applying" if row["submitted_confirmed_at"]
                                  else "stated at decision" if row["decision"] == APPLIED else ""),
             "applied_at": row["applied_at"],
+            "submitted_confirmed_at": row["submitted_confirmed_at"],
             "outcome": row["outcome"],
             "outcome_at": row["outcome_at"],
             # What the panel said at the time, so a reply can be weighed against the call
@@ -319,10 +398,20 @@ def status(connection: sqlite3.Connection, *, today: date | None = None) -> dict
     ages = [row["days_open"] for row in rows if row["days_open"] is not None]
     replies = [row["outcome"] for row in rows if row["outcome"]]
     applied = [row for row in rows if row["current_status"] == "Applied"]
+    # The denominator anything downstream should use. `applied` counts decisions, which is
+    # what the panel can observe; this counts the ones somebody said were finished.
+    submitted = [row for row in applied
+                 if row["applied_evidence"] in {"confirmed after applying", "tracked application"}]
     return {
         "schema_version": SCHEMA_VERSION,
         "saved": len(rows),
+        # Decisions to apply, not applications. Written at the press, before the form.
         "applied": len(applied),
+        "confirmed_submitted": len(submitted),
+        # Neither finished nor known to be abandoned. A reply rate computed over `applied`
+        # is deflated by whatever share of these were never completed, so the gap is
+        # reported rather than divided away.
+        "stated_not_confirmed": len(applied) - len(submitted),
         # Counted over applications, not over everything kept, and only over the ones whose
         # outcome is known. An unanswered application and one never followed up look alike
         # from here, so they are not merged into a rate.
@@ -336,6 +425,9 @@ def status(connection: sqlite3.Connection, *, today: date | None = None) -> dict
                 "saved": sum(1 for row in rows if row["verdict"] == name),
                 "applied": sum(1 for row in rows
                                if row["verdict"] == name and row["current_status"] == "Applied"),
+                "confirmed_submitted": sum(1 for row in rows if row["verdict"] == name
+                                            and row["applied_evidence"] in
+                                            {"confirmed after applying", "tracked application"}),
                 "with_outcome": sum(1 for row in rows if row["verdict"] == name and row["outcome"]),
             }
             for name in sorted({row["verdict"] for row in rows if row["verdict"]})
@@ -358,6 +450,8 @@ def main() -> None:
     save_parser.add_argument("--actor", required=True)
     save_parser.add_argument("--reason")
     save_parser.add_argument("--decision", default=LATER, choices=sorted(DECISIONS))
+    confirm_parser = commands.add_parser("confirm")
+    confirm_parser.add_argument("--job-url", required=True)
     outcome_parser = commands.add_parser("outcome")
     outcome_parser.add_argument("--job-url", required=True)
     outcome_parser.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
@@ -375,6 +469,8 @@ def main() -> None:
         elif args.command == "save":
             result = save(connection, json.loads(args.job_card.read_text(encoding="utf-8")),
                           actor=args.actor, reason=args.reason, decision=args.decision)
+        elif args.command == "confirm":
+            result = confirm_submitted(connection, args.job_url)
         elif args.command == "outcome":
             result = record_outcome(connection, args.job_url, args.outcome)
         elif args.command == "forget":
