@@ -174,6 +174,91 @@ class TiebreakCounting(unittest.TestCase):
         self.assertEqual(MODULE.tiebreak_reached({"rows": []})["adjacent_pairs"], 0)
 
 
+class Provenance(unittest.TestCase):
+    def paths(self, db_rows=(("r1", "j1", "d1", "review", 122),)):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        db = root / "db.sqlite"
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE routing_records (record_id TEXT, job_id TEXT, "
+                           "direction_id TEXT, decision TEXT, ranking_score INTEGER)")
+        connection.executemany("INSERT INTO routing_records VALUES (?,?,?,?,?)", db_rows)
+        connection.execute("CREATE TABLE search_portfolios (portfolio_id TEXT, "
+                           "portfolio_sha256 TEXT, status TEXT)")
+        connection.execute("CREATE TABLE search_directions (direction_id TEXT, "
+                           "profile_sha256 TEXT, status TEXT)")
+        connection.commit()
+        connection.close()
+        candidate = root / "candidate.json"
+        candidate.write_text(json.dumps({"facts": []}))
+        cards = root / "cards"
+        cards.mkdir()
+        (cards / "manifest.json").write_text(json.dumps({"cards": 1}))
+        return db, candidate, cards
+
+    def test_nothing_is_ever_called_reproducible_from_head(self):
+        """The candidate, the database and the cards are not in Git, so a commit cannot
+        reproduce a number computed from them however clean the tree is."""
+        db, candidate, cards = self.paths()
+        result = MODULE.provenance(MODULE.input_snapshot(db, candidate, cards),
+                                   MODULE.input_snapshot(db, candidate, cards),
+                                   {"dirty_files_relevant_to_these_numbers": [],
+                                    "code_state": "matches_head"}, cards)
+        self.assertEqual(result["observation_reproducibility"], "inputs_not_preserved")
+        self.assertNotIn("reproducible_from_head", json.dumps(result))
+
+    def test_clean_code_is_still_only_provisional(self):
+        db, candidate, cards = self.paths()
+        snapshot = MODULE.input_snapshot(db, candidate, cards)
+        result = MODULE.provenance(snapshot, snapshot,
+                                   {"dirty_files_relevant_to_these_numbers": [],
+                                    "code_state": "matches_head"}, cards)
+        self.assertEqual(result["status"], "provisional_clean_code")
+
+    def test_an_input_changing_midway_invalidates_the_run(self):
+        db, candidate, cards = self.paths()
+        before = MODULE.input_snapshot(db, candidate, cards)
+        candidate.write_text(json.dumps({"facts": [{"id": "f-1"}]}))
+        after = MODULE.input_snapshot(db, candidate, cards)
+        result = MODULE.provenance(before, after,
+                                   {"dirty_files_relevant_to_these_numbers": [],
+                                    "code_state": "matches_head"}, cards)
+        self.assertFalse(result["inputs_stable_across_measurement"])
+        self.assertEqual(result["status"], "input_changed_during_measurement")
+
+    def test_the_database_hash_covers_rows_rather_than_the_file(self):
+        """A file hash moves with WAL state and with tables nothing here reads."""
+        db, _, _ = self.paths()
+        before = MODULE.relevant_db_hash(db)
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE unrelated (x TEXT)")
+        connection.execute("INSERT INTO unrelated VALUES ('noise')")
+        connection.commit()
+        connection.close()
+        self.assertEqual(MODULE.relevant_db_hash(db), before,
+                         "a table the routing never reads must not invalidate a run")
+
+    def test_a_relevant_row_changing_does_move_the_hash(self):
+        db, _, _ = self.paths()
+        before = MODULE.relevant_db_hash(db)
+        connection = sqlite3.connect(db)
+        connection.execute("UPDATE routing_records SET ranking_score=999")
+        connection.commit()
+        connection.close()
+        self.assertNotEqual(MODULE.relevant_db_hash(db), before)
+
+    def test_the_reimplemented_ordering_is_declared_and_its_source_hashed(self):
+        db, candidate, cards = self.paths()
+        snapshot = MODULE.input_snapshot(db, candidate, cards)
+        result = MODULE.provenance(snapshot, snapshot,
+                                   {"dirty_files_relevant_to_these_numbers": [],
+                                    "code_state": "matches_head"}, cards)
+        self.assertEqual(result["assist_bridge_ordering"], "source_rule_reimplemented")
+        self.assertIn("skills/jobloom/scripts/assist_bridge.py",
+                      result["external_inputs"]["routing_source_sha256"])
+
+
 class Conclusions(unittest.TestCase):
     def test_the_report_never_states_a_cause(self):
         text = json.dumps(MODULE.reachability())

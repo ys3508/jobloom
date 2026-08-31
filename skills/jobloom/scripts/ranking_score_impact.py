@@ -247,16 +247,55 @@ def assist_bridge_ordering(cards, candidate, profiles) -> dict:
 
 RELEVANT_TO_THE_NUMBERS = ("skills/jobloom/scripts/direction_core.py",
                            "skills/jobloom/scripts/evidence_matcher.py",
-                           "skills/jobloom/scripts/review_queue.py")
+                           "skills/jobloom/scripts/review_queue.py",
+                           # Its ordering rule is reimplemented here rather than called, so
+                           # its bytes are part of what these numbers depend on.
+                           "skills/jobloom/scripts/assist_bridge.py")
+
+# Rows the routing actually reads. The database file's own hash moves with WAL state and
+# with tables nothing here touches, so it would report change that changed no result.
+RELEVANT_DB_QUERIES = (
+    ("routing_records", "SELECT record_id, job_id, direction_id, decision, ranking_score "
+                        "FROM routing_records ORDER BY record_id"),
+    ("search_portfolios", "SELECT portfolio_id, portfolio_sha256, status FROM search_portfolios "
+                          "WHERE status='approved' ORDER BY portfolio_id"),
+    ("search_directions", "SELECT direction_id, profile_sha256, status FROM search_directions "
+                          "WHERE status='approved' ORDER BY direction_id"),
+)
 
 
-def provenance(db: Path, candidate: Path, cards: Path) -> dict:
-    """What these numbers were computed against, so a rerun can tell whether it agrees.
+def relevant_db_hash(db: Path) -> str | None:
+    """A canonical hash of the rows the measurement reads, not of the file it lives in."""
+    if not db.is_file():
+        return None
+    connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        payload = {name: [list(row) for row in connection.execute(query)]
+                   for name, query in RELEVANT_DB_QUERIES}
+    except sqlite3.Error as error:
+        return f"unavailable:{type(error).__name__}"
+    finally:
+        connection.close()
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        .encode("utf-8")).hexdigest()
 
-    The routing they measure lives in files a concurrent session may be holding. Numbers
-    produced against an uncommitted working tree are an observation of that tree, not a
-    result the commit reproduces, and the difference has to travel with them.
-    """
+
+def input_snapshot(db: Path, candidate: Path, cards: Path) -> dict:
+    """Everything the numbers depend on, hashed at one moment."""
+    manifest = cards / "manifest.json"
+    return {
+        "routing_source_sha256": {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                  for path in RELEVANT_TO_THE_NUMBERS if Path(path).is_file()},
+        "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if candidate.is_file() else None,
+        "relevant_database_rows_sha256": relevant_db_hash(db),
+        "cards_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()
+        if manifest.is_file() else None,
+    }
+
+
+def git_state() -> dict:
     import subprocess
 
     def run(*args):
@@ -268,22 +307,32 @@ def provenance(db: Path, candidate: Path, cards: Path) -> dict:
 
     dirty = [line[2:].strip() for line in run("git", "status", "--porcelain").splitlines()
              if line.strip()]
-    relevant_dirty = sorted(set(dirty) & set(RELEVANT_TO_THE_NUMBERS))
-    file_hashes = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-                   for path in RELEVANT_TO_THE_NUMBERS if Path(path).is_file()}
-    manifest = cards / "manifest.json"
+    relevant = sorted(set(dirty) & set(RELEVANT_TO_THE_NUMBERS))
+    return {"git_head": run("git", "rev-parse", "HEAD"),
+            "working_tree_dirty_files": sorted(dirty),
+            "dirty_files_relevant_to_these_numbers": relevant,
+            # What the commit alone can account for. Never "reproducible": the candidate,
+            # the database and the cards are not in Git, so a HEAD cannot reproduce a
+            # number computed from them however clean the tree is.
+            "code_state": "dirty" if relevant else "matches_head"}
+
+
+def provenance(before: dict, after: dict, git: dict, cards: Path) -> dict:
+    stable = before == after
     return {
-        "git_head": run("git", "rev-parse", "HEAD"),
-        "working_tree_dirty_files": sorted(dirty),
-        "dirty_files_relevant_to_these_numbers": relevant_dirty,
-        "routing_source_sha256": file_hashes,
-        "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()
-        if candidate.is_file() else None,
-        "database_sha256": hashlib.sha256(db.read_bytes()).hexdigest() if db.is_file() else None,
-        "cards_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()
-        if manifest.is_file() else None,
+        **git,
+        "external_inputs_hash_recorded": True,
+        "external_inputs": before,
+        # Hashes taken before the measurement and again after it. Taking them once would
+        # let a card, a row or a source file change midway and pair an old hash with a new
+        # result, which reads as evidence and is not.
+        "inputs_stable_across_measurement": stable,
+        "observation_reproducibility": "inputs_not_preserved",
+        "assist_bridge_ordering": "source_rule_reimplemented",
         "cards_directory": str(cards),
-        "status": "provisional_dirty_input" if relevant_dirty else "reproducible_from_head",
+        "status": ("input_changed_during_measurement" if not stable
+                   else "provisional_dirty_input" if git["dirty_files_relevant_to_these_numbers"]
+                   else "provisional_clean_code"),
     }
 
 
@@ -297,8 +346,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
+    git = git_state()
+    before = input_snapshot(args.db, args.candidate, args.cards)
     report = {"schema_version": AUDIT_SCHEMA_VERSION,
-              "provenance": provenance(args.db, args.candidate, args.cards),
               "reachability": reachability(),
               "stored_data": stored_records(args.db)}
 
@@ -310,6 +360,9 @@ def main() -> None:
                         "directions": len(profiles), "allocations": len(allocations)}
     report["live_counterfactual"] = live_counterfactual(cards, candidate, allocations, profiles)
     report["assist_bridge"] = assist_bridge_ordering(cards, candidate, profiles)
+    report["provenance"] = provenance(before,
+                                      input_snapshot(args.db, args.candidate, args.cards),
+                                      git, args.cards)
     report["conclusion"] = {
         "gates_pool_entry": not report["live_counterfactual"]["pool_membership_identical"],
         "changes_allocation": not report["live_counterfactual"]["direction_hits_identical"],
@@ -318,6 +371,7 @@ def main() -> None:
             report["assist_bridge"]["changed_buckets"] > 0,
         # Named so nobody reads a count as a cause. What moved is what moved.
         "note": "counts of what would change, not evidence that changing it would improve anything",
+        "usable": report["provenance"]["status"] != "input_changed_during_measurement",
     }
     if args.output:
         args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPTS = Path(__file__).parents[1] / "skills" / "jobloom" / "scripts"
@@ -140,6 +141,65 @@ class Verdicts(unittest.TestCase):
         self.assertNotIn("Data Analyst", json.dumps(result))
 
 
+class ReadCeiling(unittest.TestCase):
+    """The ceiling has to be applied at the read, not merely declared as a constant."""
+
+    class FakeResponse:
+        def __init__(self, payload, recorder):
+            self._payload = payload
+            self._recorder = recorder
+            self.status = 200
+            self.headers = FakeHeaders()
+
+        def read(self, size=-1):
+            self._recorder.append(size)
+            return self._payload[:size] if size and size > 0 else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def get(self, payload):
+        recorder = []
+        response = self.FakeResponse(payload, recorder)
+        with unittest.mock.patch.object(MODULE.urllib.request, "urlopen",
+                                        return_value=response):
+            return MODULE.http_get("https://example.test/board"), recorder
+
+    def test_the_read_is_bounded_by_the_ceiling_plus_one(self):
+        _, recorder = self.get(b'{"jobs": []}')
+        self.assertEqual(recorder, [MODULE.MAX_RESPONSE_BYTES + 1],
+                         "one byte past the ceiling is how an over-large body is detected "
+                         "without reading it")
+
+    def test_a_body_over_the_ceiling_is_reported_as_oversized(self):
+        record, _ = self.get(b"x" * (MODULE.MAX_RESPONSE_BYTES + 1))
+        self.assertEqual(record["outcome"], "oversized")
+        self.assertEqual(record["bytes_read"], MODULE.MAX_RESPONSE_BYTES + 1)
+        self.assertEqual(record["body"], "")
+
+    def test_a_body_under_the_ceiling_is_returned_whole(self):
+        record, _ = self.get(b'{"jobs": []}')
+        self.assertEqual(record["outcome"], "response")
+        self.assertEqual(record["body"], '{"jobs": []}')
+        self.assertEqual(record["bytes_read"], 12)
+
+    def test_the_ceiling_clears_the_largest_real_board(self):
+        """The biggest registered board answers with 12MB; a cap under it refuses a
+        working source."""
+        self.assertGreater(MODULE.MAX_RESPONSE_BYTES, 12 * 1024 * 1024)
+
+
+class FakeHeaders(dict):
+    def get_content_charset(self):
+        return "utf-8"
+
+    def get(self, key, default=None):
+        return {"Content-Type": "application/json"}.get(key, default)
+
+
 class Pagination(unittest.TestCase):
     """A paged board must not have its first page counted once per page it claims."""
 
@@ -183,11 +243,6 @@ class ResponseSize(unittest.TestCase):
     def test_an_oversized_response_says_nothing_about_the_board(self):
         """A read ceiling is this run stopping, not the board being wrong."""
         self.assertNotIn(self.oversized()["verdict"], MODULE.CONCLUSIVE)
-
-    def test_the_ceiling_clears_the_largest_real_board(self):
-        """The biggest registered board answers with 12MB; a cap under it refuses a
-        working source."""
-        self.assertGreater(MODULE.MAX_RESPONSE_BYTES, 12 * 1024 * 1024)
 
 
 class BudgetAndRetry(unittest.TestCase):
