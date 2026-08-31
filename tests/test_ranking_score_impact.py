@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPTS = Path(__file__).parents[1] / "skills" / "jobloom" / "scripts"
@@ -67,23 +68,88 @@ class StoredData(unittest.TestCase):
 
 
 class Substitution(unittest.TestCase):
+    """Patched rather than assigned: a router left replaced leaks into every later test."""
+
+    def routing(self, **overrides):
+        return {"decision": "review", "ranking_score": 130, "review_reasons": ["x"],
+                "required_skill_evidence": [], **overrides}
+
     def test_only_the_score_is_replaced(self):
         """A change downstream can then only have come from the score."""
-        original = {"decision": "review", "ranking_score": 130, "review_reasons": ["x"],
-                    "required_skill_evidence": ["a", "b"]}
-        router = MODULE.route_with_score(lambda routing, card: 0)
-        MODULE.direction_core.route_job = lambda profile, candidate, card: dict(original)
-        replaced = router({}, {}, {})
+        original = self.routing(required_skill_evidence=[{"covered_by_candidate_fact": True}])
+        with mock.patch.object(MODULE.direction_core, "route_job",
+                               return_value=dict(original)):
+            replaced = MODULE.route_with_score(lambda routing, card: 0)({}, {}, {})
         self.assertEqual(replaced["ranking_score"], 0)
         self.assertEqual({k: v for k, v in replaced.items() if k != "ranking_score"},
                          {k: v for k, v in original.items() if k != "ranking_score"})
 
-    def test_the_evidence_substitution_uses_the_evidence_count(self):
-        MODULE.direction_core.route_job = lambda profile, candidate, card: {
-            "ranking_score": 130, "required_skill_evidence": ["a", "b", "c"]}
-        router = MODULE.route_with_score(
-            lambda routing, card: len(routing.get("required_skill_evidence") or []))
-        self.assertEqual(router({}, {}, {})["ranking_score"], 3)
+    def test_the_router_is_restored_after_a_substitution(self):
+        before = MODULE.direction_core.route_job
+        with mock.patch.object(MODULE.direction_core, "route_job", return_value={}):
+            pass
+        self.assertIs(MODULE.direction_core.route_job, before)
+
+
+class EvidenceSubstitution(unittest.TestCase):
+    def entries(self, covered):
+        return [{"requirement": f"r{i}", "covered_by_candidate_fact": flag}
+                for i, flag in enumerate(covered)]
+
+    def test_only_covered_requirements_are_counted(self):
+        """The length of the list is how many requirements were recognised, which a posting
+        can raise just by listing more of them."""
+        routing = {"required_skill_evidence": self.entries([True, False, False, True])}
+        self.assertEqual(MODULE.covered_requirement_count(routing, {}), 2)
+        self.assertNotEqual(MODULE.covered_requirement_count(routing, {}),
+                            len(routing["required_skill_evidence"]))
+
+    def test_no_evidence_counts_zero(self):
+        self.assertEqual(MODULE.covered_requirement_count(
+            {"required_skill_evidence": self.entries([False, False])}, {}), 0)
+
+    def test_a_missing_field_counts_zero(self):
+        self.assertEqual(MODULE.covered_requirement_count({}, {}), 0)
+
+
+class DirectionHits(unittest.TestCase):
+    """The regression for a comparison that read a key build_queue does not return."""
+
+    def test_a_missing_key_can_no_longer_pass_for_agreement(self):
+        baseline = {"direction_hits": {"d1": 7}, "rows": []}
+        neutral = {"direction_hits": {"d1": 9}, "rows": []}
+        self.assertNotEqual(baseline["direction_hits"], neutral["direction_hits"])
+        self.assertNotIn("hits_per_direction", baseline,
+                         "build_queue returns direction_hits; reading another key "
+                         "compared None with None and called it identical")
+
+    def test_the_audit_reads_the_key_the_queue_returns(self):
+        source = (Path(__file__).parents[1] / "skills" / "jobloom" / "scripts"
+                  / "ranking_score_impact.py").read_text()
+        self.assertIn('baseline["direction_hits"]', source)
+        self.assertNotIn('get("hits_per_direction")', source)
+
+
+class AssistBridgeOrdering(unittest.TestCase):
+    """Scores differing is not an order changing."""
+
+    def order(self, members):
+        with_score = [d for _, d in sorted(members, key=lambda m: (-m[0], m[1]))]
+        without_score = sorted(direction_id for _, direction_id in members)
+        return with_score, without_score
+
+    def test_different_scores_that_agree_with_alphabetical_order_change_nothing(self):
+        with_score, without = self.order([(130, "alpha"), (120, "beta")])
+        self.assertEqual(with_score, without,
+                         "a bucket counted as decided here would be an overstatement")
+
+    def test_different_scores_that_disagree_do_change_the_order(self):
+        with_score, without = self.order([(120, "alpha"), (130, "beta")])
+        self.assertNotEqual(with_score, without)
+
+    def test_equal_scores_leave_the_order_to_the_direction_id(self):
+        with_score, without = self.order([(130, "beta"), (130, "alpha")])
+        self.assertEqual(with_score, without)
 
 
 class TiebreakCounting(unittest.TestCase):

@@ -45,12 +45,17 @@ import ats_sources  # noqa: E402
 
 PROBE_SCHEMA_VERSION = "ats-source-probe-v1"
 REQUEST_TIMEOUT = 15
+# A ceiling, not a threshold. The largest real board here answers with 12MB for 886
+# postings with full descriptions, so a cap below that would refuse a working board; a cap
+# exists at all so an endpoint answering with something unbounded is stopped rather than
+# read. Exceeding it says nothing about the board's shape, only that this run stopped.
+MAX_RESPONSE_BYTES = 48 * 1024 * 1024
 MAX_CONCURRENCY = 4
 GLOBAL_REQUEST_BUDGET = 80
 RETRYABLE = {"timeout", "server_error"}
 
 VERDICTS = ("healthy", "empty_valid", "schema_drift", "forbidden", "not_found",
-            "rate_limited", "timeout", "server_error", "network_error",
+            "rate_limited", "timeout", "server_error", "network_error", "oversized_response",
             "endpoint_not_registered", "budget_exhausted", "unsupported_ats")
 
 # Every verdict that says something about the board rather than about this run. A source
@@ -95,8 +100,15 @@ def http_get(url: str, timeout: int = REQUEST_TIMEOUT) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            body = response.read().decode(charset, errors="replace")
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                return {"outcome": "oversized", "status": response.status,
+                        "content_type": response.headers.get("Content-Type", ""),
+                        "body": "", "bytes_read": len(raw),
+                        "latency_ms": round((time.monotonic() - started) * 1000)}
+            body = raw.decode(charset, errors="replace")
             return {"outcome": "response", "status": response.status,
+                    "bytes_read": len(raw),
                     "content_type": response.headers.get("Content-Type", ""),
                     "body": body, "latency_ms": round((time.monotonic() - started) * 1000)}
     except urllib.error.HTTPError as error:
@@ -135,6 +147,11 @@ def classify(record: dict, ats: str, token: str) -> dict:
     """A verdict, a stable code, and a shape fingerprint - never a response body."""
     if record["outcome"] in {"timeout", "network_error"}:
         return {"verdict": record["outcome"], "code": record.get("error_class", "unknown")}
+    if record["outcome"] == "oversized":
+        # Its own verdict, and inconclusive. Calling it schema_drift reported a run-level
+        # limit as a fault in the board - the same mistake as reading a 429 as breakage.
+        return {"verdict": "oversized_response", "code": "response_exceeded_read_ceiling",
+                "bytes_read": record.get("bytes_read")}
     status = record["status"]
     if status == 403:
         return {"verdict": "forbidden", "code": "http_403"}
@@ -154,25 +171,46 @@ def classify(record: dict, ats: str, token: str) -> dict:
         return {"verdict": "schema_drift", "code": "not_json",
                 "content_type": record["content_type"]}
 
+    # The adapter stays the authority on shape, but it must see one page. SmartRecruiters
+    # pages until `offset >= totalFound`, and a getter that returned this same payload every
+    # time would count the first page again for every page the board claims to have.
+    # `served` is the page whose postings were counted; the adapter asks once more and gets
+    # an empty page, which is how the loop is told to stop rather than a page anyone read.
+    pages = {"requested": 0, "served": 0}
+
+    def one_page(_url):
+        pages["requested"] += 1
+        if pages["requested"] == 1:
+            pages["served"] = 1
+            return payload
+        return {"content": [], "jobs": []}
+
     try:
-        postings, notes = ats_sources.ADAPTERS[ats]["fetch"](token, lambda _url: payload)
+        postings, notes = ats_sources.ADAPTERS[ats]["fetch"](token, one_page)
     except Exception as error:  # noqa: BLE001 - the adapter rejecting the shape is the finding
         return {"verdict": "schema_drift", "code": f"adapter_{type(error).__name__}"}
+    declared_total = payload.get("totalFound") if isinstance(payload, dict) else None
 
     if not postings:
         # A board with nothing open is a fact about hiring, not about the adapter.
-        return {"verdict": "empty_valid", "code": "zero_postings", "postings": 0}
+        return {"verdict": "empty_valid", "code": "zero_postings", "postings": 0,
+                "pages_read": pages["served"], "pages_requested": pages["requested"],
+                "declared_total": declared_total}
 
     try:
         summary = ats_sources.ADAPTERS[ats]["summary"](postings[0])
     except Exception as error:  # noqa: BLE001
         return {"verdict": "schema_drift", "code": f"summary_{type(error).__name__}",
-                "postings": len(postings)}
+                "postings": len(postings), "pages_read": pages["served"]}
     missing = [field for field in ("title", "location") if not summary.get(field)]
     fingerprint = sha256_text(json.dumps(sorted(postings[0].keys()), separators=(",", ":")))
     return {"verdict": "schema_drift" if missing else "healthy",
             "code": f"missing:{','.join(missing)}" if missing else "ok",
-            "postings": len(postings), "schema_fingerprint": fingerprint,
+            # First page only, and named as such: a board with more pages is not being
+            # counted here, and `declared_total` is what it says it has.
+            "postings_first_page": len(postings), "declared_total": declared_total,
+            "pages_read": pages["served"], "pages_requested": pages["requested"],
+            "schema_fingerprint": fingerprint,
             "adapter_notes": len(notes)}
 
 
@@ -198,7 +236,8 @@ def probe_source(source: dict, budget: Budget, get=http_get, timeout: int = REQU
         return {**base, "verdict": "network_error", "code": type(error).__name__,
                 "attempts": attempts}
     return {**base, **result, "attempts": attempts,
-            "latency_ms": record.get("latency_ms"), "http_status": record.get("status")}
+            "latency_ms": record.get("latency_ms"), "http_status": record.get("status"),
+            "content_type": record.get("content_type"), "bytes_read": record.get("bytes_read")}
 
 
 def probe_all(sources: list[dict], *, get=http_get, budget_total: int = GLOBAL_REQUEST_BUDGET,

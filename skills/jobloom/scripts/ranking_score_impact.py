@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import sqlite3
 import sys
@@ -145,6 +146,17 @@ def route_with_score(replacement):
     return router
 
 
+def covered_requirement_count(routing: dict, card: dict) -> int:
+    """Requirements a candidate fact actually covers.
+
+    The length of `required_skill_evidence` is how many requirements were recognised, which
+    a posting can raise just by listing more of them. Only `covered_by_candidate_fact`
+    counts evidence.
+    """
+    return sum(1 for item in (routing.get("required_skill_evidence") or [])
+               if item.get("covered_by_candidate_fact"))
+
+
 def ranks(queue: dict) -> dict:
     return {row["job_id"]: row["rank"] for row in queue["rows"]}
 
@@ -167,8 +179,7 @@ def live_counterfactual(cards, candidate, allocations, profiles) -> dict:
         route=route_with_score(lambda routing, card: NEUTRAL_SCORE))
     by_evidence = review_queue.build_queue(
         cards, candidate, allocations, profiles,
-        route=route_with_score(
-            lambda routing, card: len(routing.get("required_skill_evidence") or [])))
+        route=route_with_score(covered_requirement_count))
 
     base_ranks, neutral_ranks, evidence_ranks = ranks(baseline), ranks(neutral), ranks(by_evidence)
     moved_neutral = [job for job, rank in base_ranks.items()
@@ -184,8 +195,12 @@ def live_counterfactual(cards, candidate, allocations, profiles) -> dict:
         "tiebreak": tiebreak_reached(baseline),
         "rank_changes_when_neutralised": len(moved_neutral),
         "rank_changes_when_replaced_by_evidence": len(moved_evidence),
-        "direction_hits_identical": (baseline.get("hits_per_direction")
-                                     == neutral.get("hits_per_direction")),
+        # `build_queue` returns `direction_hits`. Reading a key it does not return compared
+        # None with None and called it "identical", which is how a claim goes unmeasured
+        # while looking measured.
+        "direction_hits": {"baseline": baseline["direction_hits"],
+                           "score_neutralised": neutral["direction_hits"]},
+        "direction_hits_identical": baseline["direction_hits"] == neutral["direction_hits"],
     }
 
 
@@ -199,8 +214,9 @@ def assist_bridge_ordering(cards, candidate, profiles) -> dict:
     bucket comes first - so within a bucket the score decides outright. Measured here
     because a liability recorded as database-only exposure would otherwise miss it.
     """
-    decided = 0
-    ties_in_bucket = 0
+    changed_buckets = 0
+    moved_directions = 0
+    buckets_examined = 0
     for card in cards:
         routed = []
         for direction_id, profile in profiles.items():
@@ -215,13 +231,60 @@ def assist_bridge_ordering(cards, candidate, profiles) -> dict:
         for members in buckets.values():
             if len(members) < 2:
                 continue
-            ties_in_bucket += 1
-            if len({score for score, _ in members}) > 1:
-                decided += 1
-    return {"jobs": len(cards), "buckets_with_two_or_more_directions": ties_in_bucket,
-            "buckets_ordered_by_ranking_score": decided,
+            buckets_examined += 1
+            # Scores differing is not an order changing. Compare the order the bridge
+            # produces against the order it would produce with the score removed.
+            with_score = [d for _, d in sorted(members, key=lambda m: (-m[0], m[1]))]
+            without_score = sorted(direction_id for _, direction_id in members)
+            if with_score != without_score:
+                changed_buckets += 1
+                moved_directions += sum(1 for a, b in zip(with_score, without_score) if a != b)
+    return {"jobs": len(cards), "buckets_with_two_or_more_directions": buckets_examined,
+            "changed_buckets": changed_buckets, "moved_directions": moved_directions,
             "sort_position": 2, "sort_key": "(decision, -ranking_score, direction_id)",
-            "source": "assist_bridge.py"}
+            "neutral_sort_key": "(decision, direction_id)", "source": "assist_bridge.py"}
+
+
+RELEVANT_TO_THE_NUMBERS = ("skills/jobloom/scripts/direction_core.py",
+                           "skills/jobloom/scripts/evidence_matcher.py",
+                           "skills/jobloom/scripts/review_queue.py")
+
+
+def provenance(db: Path, candidate: Path, cards: Path) -> dict:
+    """What these numbers were computed against, so a rerun can tell whether it agrees.
+
+    The routing they measure lives in files a concurrent session may be holding. Numbers
+    produced against an uncommitted working tree are an observation of that tree, not a
+    result the commit reproduces, and the difference has to travel with them.
+    """
+    import subprocess
+
+    def run(*args):
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=20,
+                                  check=False).stdout.strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    dirty = [line[2:].strip() for line in run("git", "status", "--porcelain").splitlines()
+             if line.strip()]
+    relevant_dirty = sorted(set(dirty) & set(RELEVANT_TO_THE_NUMBERS))
+    file_hashes = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                   for path in RELEVANT_TO_THE_NUMBERS if Path(path).is_file()}
+    manifest = cards / "manifest.json"
+    return {
+        "git_head": run("git", "rev-parse", "HEAD"),
+        "working_tree_dirty_files": sorted(dirty),
+        "dirty_files_relevant_to_these_numbers": relevant_dirty,
+        "routing_source_sha256": file_hashes,
+        "candidate_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if candidate.is_file() else None,
+        "database_sha256": hashlib.sha256(db.read_bytes()).hexdigest() if db.is_file() else None,
+        "cards_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()
+        if manifest.is_file() else None,
+        "cards_directory": str(cards),
+        "status": "provisional_dirty_input" if relevant_dirty else "reproducible_from_head",
+    }
 
 
 def main() -> None:
@@ -235,6 +298,7 @@ def main() -> None:
     args = parser.parse_args()
 
     report = {"schema_version": AUDIT_SCHEMA_VERSION,
+              "provenance": provenance(args.db, args.candidate, args.cards),
               "reachability": reachability(),
               "stored_data": stored_records(args.db)}
 
@@ -251,7 +315,7 @@ def main() -> None:
         "changes_allocation": not report["live_counterfactual"]["direction_hits_identical"],
         "changes_review_order": report["live_counterfactual"]["rank_changes_when_neutralised"] > 0,
         "orders_directions_in_assist_bridge":
-            report["assist_bridge"]["buckets_ordered_by_ranking_score"] > 0,
+            report["assist_bridge"]["changed_buckets"] > 0,
         # Named so nobody reads a count as a cause. What moved is what moved.
         "note": "counts of what would change, not evidence that changing it would improve anything",
     }

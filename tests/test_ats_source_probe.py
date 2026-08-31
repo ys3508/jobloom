@@ -83,8 +83,13 @@ class Verdicts(unittest.TestCase):
     def test_a_board_with_postings_is_healthy(self):
         result = self.probe(responding())
         self.assertEqual(result["verdict"], "healthy")
-        self.assertEqual(result["postings"], 1)
+        self.assertEqual(result["postings_first_page"], 1)
+        self.assertEqual(result["pages_read"], 1)
         self.assertEqual(len(result["schema_fingerprint"]), 64)
+
+    def test_a_successful_probe_keeps_the_content_type_and_size(self):
+        result = self.probe(responding())
+        self.assertEqual(result["content_type"], "application/json")
 
     def test_a_board_with_nothing_open_is_valid_not_broken(self):
         """Zero openings is a fact about hiring, not about the adapter."""
@@ -133,6 +138,56 @@ class Verdicts(unittest.TestCase):
         result = self.probe(responding())
         self.assertNotIn("body", result)
         self.assertNotIn("Data Analyst", json.dumps(result))
+
+
+class Pagination(unittest.TestCase):
+    """A paged board must not have its first page counted once per page it claims."""
+
+    def smartrecruiters_page(self, total):
+        content = [{"id": f"p{i}", "name": "Data Analyst", "releasedDate": "2026-08-01",
+                    "location": {"fullLocation": "New York, NY"},
+                    "company": {"identifier": "acme"}} for i in range(100)]
+        return {"content": content, "totalFound": total}
+
+    def probe(self, total):
+        get = transport(default={"outcome": "response", "status": 200,
+                                 "content_type": "application/json",
+                                 "body": json.dumps(self.smartrecruiters_page(total)),
+                                 "latency_ms": 1})
+        return MODULE.probe_source(source(ats="smartrecruiters"), MODULE.Budget(10), get)
+
+    def test_a_board_claiming_more_than_one_page_is_read_once(self):
+        result = self.probe(total=900)
+        self.assertEqual(result["pages_read"], 1)
+        self.assertEqual(result["postings_first_page"], 100,
+                         "the first page, not the first page repeated nine times")
+
+    def test_the_declared_total_is_reported_rather_than_inferred(self):
+        self.assertEqual(self.probe(total=900)["declared_total"], 900)
+
+    def test_a_single_page_board_is_unaffected(self):
+        result = self.probe(total=100)
+        self.assertEqual(result["pages_read"], 1)
+        self.assertEqual(result["postings_first_page"], 100)
+
+
+class ResponseSize(unittest.TestCase):
+    def oversized(self):
+        return MODULE.probe_source(source(), MODULE.Budget(10), transport(default={
+            "outcome": "oversized", "status": 200, "content_type": "application/json",
+            "body": "", "bytes_read": MODULE.MAX_RESPONSE_BYTES + 1, "latency_ms": 1}))
+
+    def test_an_oversized_response_is_refused_rather_than_read(self):
+        self.assertEqual(self.oversized()["verdict"], "oversized_response")
+
+    def test_an_oversized_response_says_nothing_about_the_board(self):
+        """A read ceiling is this run stopping, not the board being wrong."""
+        self.assertNotIn(self.oversized()["verdict"], MODULE.CONCLUSIVE)
+
+    def test_the_ceiling_clears_the_largest_real_board(self):
+        """The biggest registered board answers with 12MB; a cap under it refuses a
+        working source."""
+        self.assertGreater(MODULE.MAX_RESPONSE_BYTES, 12 * 1024 * 1024)
 
 
 class BudgetAndRetry(unittest.TestCase):
