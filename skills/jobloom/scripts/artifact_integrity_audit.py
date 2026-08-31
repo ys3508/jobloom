@@ -308,12 +308,55 @@ def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: st
     }
 
 
+EMAIL = re.compile(r"[^\s|ǁ,;]+@[^\s|ǁ,;]+\.[A-Za-z]{2,}")
+URL = re.compile(r"(?:https?://)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s|ǁ,;]*")
+PHONE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+
+
+def split_channels(value: str) -> list[tuple[str, str]]:
+    """Pull the separately-addressable channels out of one fact value.
+
+    A contact fact in this registry can hold an address, a phone number and a profile URL
+    joined by a separator the page renders differently. Compared whole, such a value never
+    matches and the address inside it is reported unreachable when it is plainly there.
+    Compared channel by channel, each is checkable on its own terms.
+    """
+    channels: list[tuple[str, str]] = []
+    remainder = value
+    for kind, pattern in (("email", EMAIL), ("url", URL), ("phone", PHONE)):
+        for match in pattern.findall(remainder):
+            channels.append((kind, match))
+        remainder = pattern.sub(" ", remainder)
+    return channels
+
+
 def value_kind(value: str) -> str:
     if "@" in value:
         return "email"
     if len(re.sub(r"\D", "", value)) >= 7:
         return "phone"
     return "text"
+
+
+def compare_channel(kind: str, value: str, canonical: str) -> str:
+    """present | render_difference | absent for one channel of one kind."""
+    if canonicalize(value)[0] in canonical:
+        return "present"
+    if kind == "email":
+        squeeze = lambda text: ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", text)).casefold()
+        return "render_difference" if squeeze(value) in squeeze(canonical) else "absent"
+    if kind == "phone":
+        digits = lambda text: re.sub(r"\D", "", text)
+        wanted, haystack = digits(value), digits(canonical)
+        if wanted in haystack or (len(wanted) > 10 and wanted[-10:] in haystack):
+            return "render_difference"
+        return "absent"
+    if kind == "url":
+        # A rendered profile link is routinely shortened: the scheme, the www and a
+        # trailing slash all come and go, so the path is what identifies it.
+        trimmed = re.sub(r"^https?://(?:www\.)?", "", value.strip().rstrip("/")).casefold()
+        return "render_difference" if trimmed in canonical.casefold() else "absent"
+    return "render_difference" if strip_separators(value) in strip_separators(canonical) else "absent"
 
 
 def compare_value(value: str, canonical: str) -> str:
@@ -324,20 +367,18 @@ def compare_value(value: str, canonical: str) -> str:
     look like the same address rendered differently, so an email keeps its punctuation
     and only loses whitespace and zero-width characters.
     """
-    kind = value_kind(value)
     if canonicalize(value)[0] in canonical:
         return "present"
-    if kind == "email":
-        squeeze = lambda text: ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", text)).casefold()
-        return "render_difference" if squeeze(value) in squeeze(canonical) else "absent"
-    if kind == "phone":
-        digits = lambda text: re.sub(r"\D", "", text)
-        wanted = digits(value)
-        haystack = digits(canonical)
-        if wanted in haystack or (len(wanted) > 10 and wanted[-10:] in haystack):
-            return "render_difference"
+    channels = split_channels(value)
+    if len(channels) > 1:
+        verdicts = {compare_channel(kind, channel, canonical) for kind, channel in channels}
+        # Every channel reachable, but the fact cannot be maintained one channel at a
+        # time: changing a phone number would force re-registering an address too. That
+        # is a review item about the fact's shape, never a defect in the artifact.
+        if verdicts <= {"present", "render_difference"}:
+            return "composite_value"
         return "absent"
-    return "render_difference" if strip_separators(value) in strip_separators(canonical) else "absent"
+    return compare_channel(value_kind(value), value, canonical)
 
 
 def strip_separators(value: str) -> str:
@@ -373,7 +414,7 @@ def readability_checks(canonical: str, pages: list[str], facts: list[dict],
 
     by_id = {f["id"]: f for f in facts if f.get("status") in USABLE_FACT_STATUS}
     verdicts = collections.Counter()
-    absent, rendered, unknown = [], [], []
+    absent, rendered, unknown, composite = [], [], [], []
     for fact_id in contract["expected"]:
         fact = by_id.get(fact_id)
         if fact is None:
@@ -385,13 +426,16 @@ def readability_checks(canonical: str, pages: list[str], facts: list[dict],
             absent.append(fact_id)
         elif verdict == "render_difference":
             rendered.append(fact_id)
+        elif verdict == "composite_value":
+            composite.append(fact_id)
     checks.append({
         "check": "declared_values_survive_extraction",
-        "status": "fail" if absent else "review" if (rendered or unknown) else "pass",
+        "status": "fail" if absent else "review" if (rendered or unknown or composite) else "pass",
         "detail": {"declared": len(contract["expected"]), "present": verdicts["present"],
-                   "render_difference": len(rendered), "absent": len(absent),
-                   "not_in_snapshot": len(unknown), "absent_fact_ids": absent,
-                   "render_difference_fact_ids": rendered, "unknown_fact_ids": unknown},
+                   "render_difference": len(rendered), "composite_value": len(composite),
+                   "absent": len(absent), "not_in_snapshot": len(unknown),
+                   "absent_fact_ids": absent, "render_difference_fact_ids": rendered,
+                   "composite_value_fact_ids": composite, "unknown_fact_ids": unknown},
     })
 
     # Reading order needs a human looking at the rendered page beside the machine view.

@@ -483,6 +483,46 @@ class ValueComparison(unittest.TestCase):
         self.assertEqual(MODULE.value_kind("Jane Doe"), "text")
 
 
+class CompositeContactValues(unittest.TestCase):
+    """One fact holding an address, a phone and a profile link is not an artifact defect."""
+
+    LINE = ("sissi.example0123@gmail.com \u01c1 212-380-7559 \u01c1 "
+            "LinkedIn: https://www.linkedin.com/in/example-person/")
+    PAGE = ("| 212-380-7559 | sissi.example0123@gmail.com | linkedin.com/in/example-person |")
+
+    def test_every_channel_is_pulled_out_of_one_value(self):
+        kinds = [kind for kind, _ in MODULE.split_channels(self.LINE)]
+        self.assertEqual(sorted(kinds), ["email", "phone", "url"])
+
+    def test_a_plain_value_yields_no_channels(self):
+        self.assertEqual(MODULE.split_channels("Jane Doe"), [])
+
+    def test_a_reachable_composite_is_review_not_failure(self):
+        """Compared whole it never matches; the address inside it is plainly there."""
+        self.assertEqual(MODULE.compare_value(self.LINE, self.PAGE), "composite_value")
+
+    def test_each_channel_is_judged_on_its_own_terms(self):
+        channels = dict((kind, value) for kind, value in MODULE.split_channels(self.LINE))
+        self.assertEqual(MODULE.compare_channel("email", channels["email"], self.PAGE), "present")
+        self.assertEqual(MODULE.compare_channel("phone", channels["phone"], self.PAGE), "present")
+        self.assertEqual(MODULE.compare_channel("url", channels["url"], self.PAGE),
+                         "render_difference")
+
+    def test_a_composite_with_an_unreachable_channel_is_absent(self):
+        page = "| 212-380-7559 | linkedin.com/in/example-person |"
+        self.assertEqual(MODULE.compare_value(self.LINE, page), "absent")
+
+    def test_a_shortened_profile_link_is_a_render_difference(self):
+        self.assertEqual(
+            MODULE.compare_channel("url", "https://www.linkedin.com/in/example-person/",
+                                   "linkedin.com/in/example-person"), "render_difference")
+
+    def test_a_different_profile_link_is_absent(self):
+        self.assertEqual(
+            MODULE.compare_channel("url", "https://www.linkedin.com/in/example-person/",
+                                   "linkedin.com/in/someone-else"), "absent")
+
+
 class SnapshotResolution(unittest.TestCase):
     def build(self, *, profile_sha="sha-1", registered=True, file_present=True, tamper=False):
         tmp = tempfile.TemporaryDirectory()
@@ -646,6 +686,15 @@ class ReadabilityChecks(unittest.TestCase):
         check = self.checks("text", snapshot_status="snapshot_hash_mismatch")
         self.assertEqual(check["declared_values_survive_extraction"]["detail"]["reason"],
                          "snapshot_hash_mismatch")
+
+    def test_a_composite_value_is_reported_for_review_not_as_a_failure(self):
+        facts = [self.fact("f-1", "contact",
+                           "jane@example.com \u01c1 212-380-7559")]
+        check = self.checks("| 212-380-7559 | jane@example.com |",
+                            facts)["declared_values_survive_extraction"]
+        self.assertEqual(check["status"], "review")
+        self.assertEqual(check["detail"]["composite_value"], 1)
+        self.assertEqual(check["detail"]["absent"], 0)
 
     def test_a_declared_value_that_cannot_be_reached_fails(self):
         facts = [self.fact("f-1", "contact", "jane@example.com")]
