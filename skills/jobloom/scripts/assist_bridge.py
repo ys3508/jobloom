@@ -450,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/positioning":
                 self._send(200, self._positioning(payload))
             elif self.path == "/save":
-                body = self._save(payload)
+                self._send(200, self._save(payload))
             elif self.path == "/store":
                 self._send(200, self._store(payload))
             else:
@@ -498,6 +498,8 @@ class Handler(BaseHTTPRequestHandler):
             saved_jobs.initialize(connection)
             return saved_jobs.save(connection, card,
                                    actor=str(payload.get("actor") or "user"),
+                                   decision=str(payload.get("decision") or saved_jobs.LATER),
+                                   judgement=payload.get("judgement"),
                                    reason=payload.get("reason"))
         except ValueError as error:
             raise BridgeError(str(error)) from error

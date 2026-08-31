@@ -225,11 +225,33 @@ class SectionHeadingCoverageTests(unittest.TestCase):
                              ["Three years of experience with SAS"], heading)
 
     def test_a_heading_is_matched_through_its_tail(self):
-        # "What you bring to Komodo Health (required)" — an exact list cannot hold every
+        # "What you bring to Komodo Health (required):" — an exact list cannot hold every
         # company's suffix, so a heading matches by prefix the way closings always have.
-        sections = self.read("What you bring to Komodo Health (required)\n"
+        # The colon is not incidental: it is how the corpus actually writes this line, and
+        # it is what marks a long lead-in as a heading rather than a sentence.
+        sections = self.read("What you bring to Komodo Health (required):\n"
                              "- Five years of analytics experience\n")
         self.assertEqual(sections["required_skills"], ["Five years of analytics experience"])
+
+    def test_prose_opening_with_a_heading_word_is_not_a_heading(self):
+        # Excluding sentence punctuation was not enough: plenty of prose carries none, and
+        # the heading words most likely to open a sentence are the ones in the list. Each of
+        # these opened a section and swallowed what followed.
+        for prose in ("Requirements include strong Python skills",
+                      "Qualifications we look for in every candidate",
+                      "Must have office space with ability to see clients",
+                      "Must have a valid driver's license",
+                      "Requirements Management & Business Analysis (25%)"):
+            sections = self.read(f"{prose}\n- Something that would have been swallowed\n")
+            self.assertEqual(sections["required_skills"], [], prose)
+            self.assertEqual(sections["responsibilities"], [], prose)
+
+    def test_a_heading_that_is_nearly_the_whole_line_still_matches(self):
+        # The other heading shape: no colon, but the heading accounts for the line.
+        for heading, key in (("Equal Opportunity Employer", "__close__"),
+                             ("Nice-to-Have Skills", "preferred_skills"),
+                             ("What Success Looks Like (Your KPIs)", "responsibilities")):
+            self.assertEqual(SECTIONS._heading_key(heading), key, heading)
 
     def test_a_sentence_opening_with_a_heading_word_does_not_start_a_section(self):
         # The guard that makes prefix matching safe: without it, prose would open a section

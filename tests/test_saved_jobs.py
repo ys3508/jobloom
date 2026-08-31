@@ -19,6 +19,7 @@ def load_script(name):
 
 SAVED = load_script("saved_jobs")
 APPLICATIONS = load_script("application_core")
+OUTCOMES = load_script("outcome_core")
 AT = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
 TODAY = date(2026, 8, 29)
 
@@ -110,6 +111,134 @@ class PostingDateTests(unittest.TestCase):
         self.assertIsNone(SAVED.days_open(None, TODAY))
 
 
+class AppliedTests(unittest.TestCase):
+    """Applications made by hand were invisible: the tracker derived "Applied" by joining
+    the applications table, so a job applied to outside the fill flow stayed "Saved"
+    forever and the funnel collected nothing."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        SAVED.initialize(self.db)
+        self.addCleanup(self.db.close)
+
+    def test_saying_you_applied_is_recorded_as_yours_not_as_evidence(self):
+        # `application_core`'s `submitted` requires a confirmation page or an account
+        # record. Nothing here has seen any of that, and the row says which claim it is.
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["current_status"], "Applied")
+        self.assertEqual(row["applied_evidence"], "self-reported")
+        self.assertEqual(row["applied_at"], AT.isoformat())
+
+    def test_the_apply_time_is_the_first_one_and_survives_a_change_of_mind(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        later = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.LATER, at=later)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        # An application already made is not undone by a change of mind about the next one.
+        self.assertEqual(row["applied_at"], AT.isoformat())
+
+    def test_an_outcome_belongs_to_something_you_applied_to(self):
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        with self.assertRaises(ValueError) as caught:
+            SAVED.record_outcome(self.db, "https://jobs.example.com/1", "interview", at=AT)
+        self.assertIn("mark it applied first", str(caught.exception))
+
+    def test_an_outcome_is_recorded_and_reported(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        SAVED.record_outcome(self.db, "https://jobs.example.com/1", "interview", at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["outcome"], "interview")
+        self.assertEqual(SAVED.status(self.db, today=TODAY)["outcomes"], {"interview": 1})
+
+    def test_the_outcome_vocabulary_is_the_one_the_funnel_already_uses(self):
+        # Borrowed rather than redefined, so the two halves cannot drift apart. The
+        # `outcome_records` table itself cannot be reused: it has a foreign key to an
+        # application, and an application made by hand has no row there.
+        self.assertEqual(SAVED.OUTCOMES, OUTCOMES.OUTCOME_TYPES)
+        with self.assertRaises(ValueError):
+            SAVED.record_outcome(self.db, "https://jobs.example.com/1", "ghosted", at=AT)
+
+    def test_a_skip_still_records_nothing(self):
+        with self.assertRaises(ValueError):
+            SAVED.save(self.db, card(), actor="user", decision="skipped", at=AT)
+
+
+JUDGEMENT = {"verdict": "apply", "verdict_reason": "your evidence covers what it states",
+             "direction": "Research / Clinical Research Data", "covered": 4, "stated": 4,
+             "hidden_strength": 1, "evidence_gap": 0, "suggested_choice": "precision"}
+
+
+class JudgementSnapshotTests(unittest.TestCase):
+    """Without the call that preceded a reply, no reply can test whether the call was worth
+    anything. It has to be the call as shown — directions are revised and the ontology is
+    recalibrated, so recomputing later answers a different question."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        SAVED.initialize(self.db)
+        self.addCleanup(self.db.close)
+
+    def test_the_call_is_recorded_with_the_decision(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED,
+                   judgement=JUDGEMENT, at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["verdict"], "apply")
+        self.assertEqual(row["direction"], "Research / Clinical Research Data")
+        self.assertEqual((row["covered"], row["stated"]), (4, 4))
+
+    def test_the_first_call_survives_a_later_decision(self):
+        # The judgement the decision was weighed against is not rewritten by a later press.
+        SAVED.save(self.db, card(), actor="user", judgement=JUDGEMENT, at=AT)
+        later = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED,
+                   judgement={**JUDGEMENT, "verdict": "skip", "covered": 0}, at=later)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["verdict"], "apply")
+        self.assertEqual(row["covered"], 4)
+        self.assertEqual(row["current_status"], "Applied")
+
+    def test_a_decision_without_a_call_is_recorded_and_counted_apart(self):
+        # A CLI save has no panel behind it. It is kept, and reported as unmeasurable
+        # rather than folded into the rates.
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        self.assertIsNone(SAVED.tracker_rows(self.db, today=TODAY)[0]["verdict"])
+        self.assertEqual(SAVED.status(self.db, today=TODAY)["without_recorded_verdict"], 1)
+
+    def test_whether_the_suggestion_was_followed_is_derivable(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED,
+                   judgement={**JUDGEMENT, "suggested_choice": "broad"}, at=AT)
+        SAVED.save(self.db, card(url="https://jobs.example.com/2"), actor="user",
+                   decision=SAVED.APPLIED,
+                   judgement={**JUDGEMENT, "suggested_choice": "precision"}, at=AT)
+        rows = {row["job_url"]: row for row in SAVED.tracker_rows(self.db, today=TODAY)}
+        self.assertTrue(rows["https://jobs.example.com/1"]["followed_suggestion"])
+        self.assertFalse(rows["https://jobs.example.com/2"]["followed_suggestion"])
+
+    def test_replies_are_reported_per_verdict_not_as_one_rate(self):
+        # A rate over mixed verdicts says nothing about whether the verdict was worth
+        # anything, which is the question.
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED,
+                   judgement=JUDGEMENT, at=AT)
+        SAVED.record_outcome(self.db, "https://jobs.example.com/1", "interview", at=AT)
+        SAVED.save(self.db, card(url="https://jobs.example.com/2"), actor="user",
+                   decision=SAVED.APPLIED, judgement={**JUDGEMENT, "verdict": "review"}, at=AT)
+        summary = SAVED.status(self.db, today=TODAY)
+        self.assertEqual(summary["by_verdict"]["apply"],
+                         {"saved": 1, "applied": 1, "with_outcome": 1})
+        self.assertEqual(summary["by_verdict"]["review"],
+                         {"saved": 1, "applied": 1, "with_outcome": 0})
+
+    def test_a_malformed_judgement_is_dropped_rather_than_stored_as_text(self):
+        SAVED.save(self.db, card(), actor="user",
+                   judgement={"covered": "four", "verdict": "apply"}, at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["verdict"], "apply")
+        self.assertIsNone(row["covered"])
+
+
 class ApplicationJoinTests(unittest.TestCase):
     """A kept job and an application are different records about one job. They are joined on
     the posting's URL so the two sheets add up without counting it twice."""
@@ -125,6 +254,15 @@ class ApplicationJoinTests(unittest.TestCase):
     def test_a_kept_job_reads_as_saved_until_it_has_an_application(self):
         SAVED.save(self.db, card(), actor="user", at=AT)
         self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["current_status"], "Saved")
+
+    def test_a_tracked_application_is_named_apart_from_a_self_report(self):
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        job = {"job_id": "job-2", "canonical_url": "https://jobs.example.com/1",
+               "employer": "Acme Health", "title": "Clinical Data Analyst"}
+        APPLICATIONS.ingest_job(self.db, job, at=AT)
+        APPLICATIONS.create_application(self.db, "app-2", "job-2", at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["applied_evidence"], "tracked application")
 
     def test_a_kept_job_that_was_applied_to_says_so(self):
         SAVED.save(self.db, card(), actor="user", at=AT)

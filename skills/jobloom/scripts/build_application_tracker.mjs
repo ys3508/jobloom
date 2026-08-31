@@ -66,7 +66,9 @@ const rows = source.applications.map((item) => [
 // without counting it twice.
 const savedHeaders = [
   "Saved Time", "Employer", "Role", "Location", "Work Arrangement", "Source", "ATS",
-  "Job URL", "Posted", "Days Open", "Deadline", "Current Status", "Reason",
+  "Job URL", "Posted", "Days Open", "Deadline", "Current Status", "Applied", "Evidence",
+  "Outcome", "Outcome Recorded", "Verdict", "Direction", "Covered", "Stated",
+  "Suggested", "Followed", "Reason",
 ];
 const savedRows = (source.saved_jobs ?? []).map((item) => [
   item.saved_time ? new Date(item.saved_time) : null,
@@ -76,7 +78,22 @@ const savedRows = (source.saved_jobs ?? []).map((item) => [
   item.days_open == null ? null : Number(item.days_open),
   // Blank means the employer stated no deadline, never that there is none.
   item.deadline ? new Date(item.deadline) : null,
-  item.current_status ?? "", item.reason ?? "",
+  item.current_status ?? "",
+  item.applied_at ? new Date(item.applied_at) : null,
+  // "self-reported" or "tracked application". `application_core`'s `submitted` requires
+  // positive submission evidence; saying you applied is not that, and the column says so
+  // rather than letting the two claims read alike.
+  item.applied_evidence ?? "",
+  item.outcome ?? "",
+  item.outcome_at ? new Date(item.outcome_at) : null,
+  // The call as it was shown, never recomputed: a reply has to be weighable against what
+  // was said before it, and by then the directions and the ontology will have moved.
+  item.verdict ?? "", item.direction ?? "",
+  item.covered == null ? null : Number(item.covered),
+  item.stated == null ? null : Number(item.stated),
+  item.suggested_choice ?? "",
+  item.followed_suggestion == null ? "" : (item.followed_suggestion ? "yes" : "no"),
+  item.reason ?? "",
 ]);
 
 // Column letters are derived from the header list rather than written in. Every range in
@@ -169,8 +186,10 @@ buildSheet({
     + "full row on the Applications sheet, so the two never count it twice. Skipping a job "
     + "leaves no record, so this counts jobs kept, never jobs seen.",
   headers: savedHeaders, rows: savedRows, tableName: "SavedJobsTable",
-  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 14, 16, 40],
-  dateTimeColumns: ["A"], dateColumns: ["I", "K"], numberColumns: ["J"],
+  widths: [20, 20, 25, 20, 17, 15, 15, 34, 14, 11, 14, 16, 20, 18, 20, 20,
+           12, 26, 10, 10, 12, 10, 40],
+  dateTimeColumns: ["A", "M", "P"], dateColumns: ["I", "K"],
+  numberColumns: ["J", "S", "T"],
 });
 
 const { last: appLast, height: appHeight } = applications;
