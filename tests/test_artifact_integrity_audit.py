@@ -362,6 +362,9 @@ class ReviewPacket(unittest.TestCase):
         twin = json.loads(json.dumps({k: v for k, v in artifact.items() if k != "_views"}))
         twin["_views"] = artifact["_views"]
         twin["candidate_profile_sha256"] = "a-different-snapshot"
+        twin["report_inputs"] = {**twin["report_inputs"],
+                                 "candidate_profile_sha256": "a-different-snapshot"}
+        twin["report_key"] = MODULE.report_key(twin["report_inputs"])
         packet["artifacts"].append(twin)
         out = Path(self.tmp.name) / "packet"
         MODULE.write_review_packet(out, packet)
@@ -627,6 +630,39 @@ class IdentityContract(unittest.TestCase):
     def test_no_contract_disables_the_check_rather_than_widening_it(self):
         self.assertEqual(self.load(self.build())["status"], "no_contract")
 
+    def test_a_rejected_contract_still_identifies_itself(self):
+        """Two different unconfirmed contracts must not address the same report."""
+        first = self.load(self.build(self.valid()))
+        other = {**self.valid(), "expected_contact_fact_ids": ["f-email", "f-name"]}
+        second = self.load(self.build(other))
+        self.assertEqual(first["status"], "contract_unconfirmed")
+        self.assertEqual(second["status"], "contract_unconfirmed")
+        self.assertIsNotNone(first["observed_contract_sha256"])
+        self.assertNotEqual(first["observed_contract_sha256"],
+                            second["observed_contract_sha256"])
+
+    def test_an_unreadable_contract_still_identifies_itself(self):
+        version = self.build()
+        (version / MODULE.CONTRACT_FILENAME).write_text("{not json")
+        result = self.load(version)
+        self.assertEqual(result["status"], "contract_unreadable")
+        self.assertIsNotNone(result["observed_contract_sha256"])
+
+    def test_only_an_absent_file_has_no_contract_hash(self):
+        result = self.load(self.build())
+        self.assertEqual(result["status"], "no_contract")
+        self.assertIsNone(result["observed_contract_sha256"])
+        self.assertIsNone(result["confirmation_record_sha256"])
+
+    def test_the_confirmation_record_is_hashed_too(self):
+        version = self.build(self.valid(), "auto")
+        self.assertIsNotNone(self.load(version)["confirmation_record_sha256"])
+
+    def test_the_confirmation_timestamp_is_observed_not_supplied(self):
+        version = self.build(self.valid())
+        record = MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS, "user")
+        self.assertTrue(record["confirmed_at"].endswith("+00:00"))
+
     def test_a_contract_without_a_confirmation_record_is_not_trusted(self):
         """A word in a file anyone can type is not an approval."""
         self.assertEqual(self.load(self.build(self.valid()))["status"], "contract_unconfirmed")
@@ -652,24 +688,24 @@ class IdentityContract(unittest.TestCase):
     def test_confirm_contract_writes_a_record_and_refuses_to_overwrite_it(self):
         version = self.build(self.valid())
         record = MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
-                                         "user", "2026-08-30T00:00:00Z")
+                                         "user", at="2026-08-30T00:00:00Z")
         self.assertEqual(record["actor"], "user")
         self.assertEqual(self.load(version)["status"], "ok")
         with self.assertRaises(FileExistsError):
             MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
-                                    "user", "2026-08-31T00:00:00Z")
+                                    "user", at="2026-08-31T00:00:00Z")
 
     def test_confirm_contract_refuses_a_non_user_actor(self):
         version = self.build(self.valid())
         with self.assertRaises(ValueError):
             MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
-                                    "system", "2026-08-30T00:00:00Z")
+                                    "system", at="2026-08-30T00:00:00Z")
 
     def test_confirm_contract_refuses_an_invalid_contract(self):
         version = self.build({**self.valid(), "expected_contact_fact_ids": []})
         with self.assertRaises(ValueError):
             MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
-                                    "user", "2026-08-30T00:00:00Z")
+                                    "user", at="2026-08-30T00:00:00Z")
 
 
 class ContractValidation(unittest.TestCase):
@@ -778,6 +814,30 @@ class ProposedContracts(unittest.TestCase):
         store, db = self.build()
         MODULE.propose_contracts(store, db)
         self.assertFalse((store / "v1" / MODULE.CONTRACT_FILENAME).exists())
+
+
+class ReportIdentity(unittest.TestCase):
+    def inputs(self, **overrides):
+        base = {"pdf_sha256": "a", "claims_manifest_sha256": "b",
+                "candidate_profile_sha256": "c", "observed_contract_sha256": None,
+                "confirmation_record_sha256": None}
+        return {**base, **overrides}
+
+    def test_the_key_is_a_fixed_width_digest_not_a_path(self):
+        """A corrupt registry string used as a directory name is a traversal."""
+        key = MODULE.report_key(self.inputs(candidate_profile_sha256="../../etc"))
+        self.assertEqual(len(key), 64)
+        self.assertNotIn("/", key)
+
+    def test_every_input_changes_the_key(self):
+        base = MODULE.report_key(self.inputs())
+        for field in ("pdf_sha256", "claims_manifest_sha256", "candidate_profile_sha256",
+                      "observed_contract_sha256", "confirmation_record_sha256"):
+            self.assertNotEqual(base, MODULE.report_key(self.inputs(**{field: "changed"})),
+                                f"{field} must be part of the report identity")
+
+    def test_the_same_inputs_give_the_same_key(self):
+        self.assertEqual(MODULE.report_key(self.inputs()), MODULE.report_key(self.inputs()))
 
 
 class IntegrityDecision(unittest.TestCase):

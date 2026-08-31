@@ -49,6 +49,7 @@ import re
 import sqlite3
 import sys
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 AUDIT_VERSION = "artifact-integrity-audit-v1"
@@ -329,44 +330,63 @@ def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: st
     defect. So its absence disables the check rather than widening it to every fact.
     """
     path = version_dir / CONTRACT_FILENAME
+    record_path = version_dir / CONFIRMATION_FILENAME
+    # Hash the raw bytes of whatever is there before parsing anything. A contract that is
+    # unconfirmed or invalid still identifies the report it produced; without its hash,
+    # two different rejected contracts would address the same report.
+    observed = {
+        "status": "no_contract", "expected": [],
+        "observed_contract_sha256": sha256_bytes(path.read_bytes()) if path.is_file() else None,
+        "confirmation_record_sha256":
+            sha256_bytes(record_path.read_bytes()) if record_path.is_file() else None,
+    }
     if not path.is_file():
-        return {"status": "no_contract", "expected": []}
+        return observed
+
+    def rejected(status: str) -> dict:
+        return {**observed, "status": status}
+
     try:
         contract = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-        return {"status": "contract_unreadable", "expected": []}
-    contract_sha = sha256_bytes(path.read_bytes())
+        return rejected("contract_unreadable")
 
     # Confirmation is a recorded act, not a word in a file anyone can type. The sidecar
     # names who confirmed which bytes and when, and pins the contract's hash, so editing
     # the contract afterwards invalidates the confirmation instead of inheriting it.
-    record_path = version_dir / CONFIRMATION_FILENAME
     if not record_path.is_file():
-        return {"status": "contract_unconfirmed", "expected": []}
+        return rejected("contract_unconfirmed")
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-        return {"status": "confirmation_unreadable", "expected": []}
+        return rejected("confirmation_unreadable")
     if record.get("actor") != "user":
-        return {"status": "confirmation_actor_not_user", "expected": []}
-    if record.get("contract_sha256") != contract_sha:
-        return {"status": "contract_modified_after_confirmation", "expected": []}
+        return rejected("confirmation_actor_not_user")
+    if record.get("contract_sha256") != observed["observed_contract_sha256"]:
+        return rejected("contract_modified_after_confirmation")
 
     problem = validate_contract(contract, artifact_sha, profile_sha, facts)
     if problem != "ok":
-        return {"status": problem, "expected": []}
-    return {
-        "status": "ok",
-        "sha256": contract_sha,
-        "confirmed_at": record.get("confirmed_at"),
-        "expected": list(contract["expected_identity_fact_ids"])
-                    + list(contract["expected_contact_fact_ids"]),
-    }
+        return rejected(problem)
+    return {**observed, "status": "ok", "sha256": observed["observed_contract_sha256"],
+            "confirmed_at": record.get("confirmed_at"),
+            "expected": list(contract["expected_identity_fact_ids"])
+                        + list(contract["expected_contact_fact_ids"])}
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def confirm_contract(version_dir: Path, artifact_sha: str, profile_sha: str | None,
-                     facts: list[dict], actor: str, confirmed_at: str) -> dict:
-    """Record a confirmation of the contract as it stands. Never overwrites one."""
+                     facts: list[dict], actor: str, at: str | None = None) -> dict:
+    """Record a confirmation of the contract as it stands. Never overwrites one.
+
+    The timestamp is the one this process observed, not one the caller supplied: a
+    confirmation time a caller can choose is not evidence of when anything happened.
+    `at` exists so a test can pin it, and is not reachable from the CLI.
+    """
+    confirmed_at = at or now_utc_iso()
     path = version_dir / CONTRACT_FILENAME
     if not path.is_file():
         raise ValueError(f"no {CONTRACT_FILENAME} in {version_dir}")
@@ -670,6 +690,17 @@ def decision_reasons(result: dict) -> dict:
             "blocking_reasons": blocking, "pending_review_reasons": pending}
 
 
+def report_key(inputs: dict) -> str:
+    """One digest over every input the verdict depends on.
+
+    Nesting the raw values as directory names would put registry strings on the filesystem
+    path, where a corrupt `candidate_profile_sha256` containing a slash or `..` becomes a
+    directory traversal. A digest is fixed-width and opaque; the five inputs are kept
+    inside the report, where they are data.
+    """
+    return sha256_text(json.dumps(inputs, sort_keys=True, separators=(",", ":")))
+
+
 def integrity_decision(result: dict) -> str:
     """`pending` or `blocked` - never `approved`. Approval is a user act, not a verdict a
     tool reaches on its own. `review_packet_complete` only says the packet can be read,
@@ -868,22 +899,15 @@ def write_review_packet(output_dir: Path, packet: dict) -> None:
                            **write_shared_observation(path, content)}
         artifact["observation_files"] = files
 
-        # All four inputs, nested. Keyed on PDF and manifest alone, two reports that
-        # legitimately differ - same file, same claims, a different snapshot or contract -
-        # collided on one directory.
-        report_dir = output_dir / "reports"
-        for part in (artifact["artifact_sha256"], artifact["claims_manifest_sha256"],
-                     artifact["candidate_profile_sha256"] or "no-candidate-binding",
-                     artifact["identity_contract_sha256"] or "no-contract"):
-            report_dir = report_dir / part
-            report_dir.mkdir(mode=0o700, exist_ok=True)
+        report_dir = output_dir / "reports" / artifact["report_key"]
+        report_dir.mkdir(mode=0o700)
         write_private(report_dir / "audit-result.json",
                       json.dumps(artifact, indent=2, ensure_ascii=False))
         references.append({
             "artifact_sha256": artifact["artifact_sha256"],
             "claims_manifest_sha256": artifact["claims_manifest_sha256"],
-            "candidate_profile_sha256": artifact["candidate_profile_sha256"],
-            "identity_contract_sha256": artifact["identity_contract_sha256"],
+            "report_key": artifact["report_key"],
+            "report_inputs": artifact["report_inputs"],
             "report_path": str((report_dir / "audit-result.json").relative_to(output_dir)),
             "extraction_status": artifact["extraction_status"],
             "review_packet_complete": artifact["review_packet_complete"],
@@ -951,17 +975,26 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
         # Resolving the snapshot and the contract reads files that can be corrupt or
         # unreadable, so they sit inside the same isolation boundary as the extraction.
         # Outside it, one bad sidecar would take every other artifact's result with it.
+        # Resolved separately: a corrupt contract sidecar used to be reported as an
+        # unreadable snapshot, blaming the object that was fine.
         try:
             snapshot = resolve_snapshot(db_path, profile_sha)
+        except Exception as error:  # noqa: BLE001
+            snapshot = {"status": f"snapshot_{failure_code(error)}", "facts": []}
+        try:
             contract = load_identity_contract(directory, artifact_sha, profile_sha,
                                               snapshot["facts"])
         except Exception as error:  # noqa: BLE001
-            snapshot = {"status": "snapshot_unreadable", "facts": []}
-            contract = {"status": failure_code(error), "expected": []}
+            contract = {"status": f"contract_{failure_code(error)}", "expected": [],
+                        "observed_contract_sha256": None, "confirmation_record_sha256": None}
         # The identity verdict derives from the snapshot and the contract, so both belong
         # in the address. Keyed on PDF and manifest alone, the same report id would carry
         # a different answer once the active snapshot moved on.
-        key = f"{artifact_sha}/{manifest_sha}/{profile_sha}/{contract.get('sha256')}"
+        inputs = {"pdf_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
+                  "candidate_profile_sha256": profile_sha,
+                  "observed_contract_sha256": contract.get("observed_contract_sha256"),
+                  "confirmation_record_sha256": contract.get("confirmation_record_sha256")}
+        key = report_key(inputs)
         if key in artifacts:
             artifacts[key]["aliases"].append(directory.name)
             continue
@@ -978,6 +1011,7 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                        "aliases": [directory.name],
                        "candidate_profile_sha256": profile_sha,
                        "identity_contract_sha256": contract.get("sha256"),
+                       "report_key": key, "report_inputs": inputs,
                        # Approval attaches to one artifact. A packet-level verdict would let
                        # a failed extraction inherit a green light from its neighbours.
                        "review_packet_complete": preserve and result["extraction_status"] == "ok",
@@ -1047,9 +1081,9 @@ def main() -> None:
                              help="record a user confirmation of a version's identity "
                                   "contract as it currently stands")
     confirm.add_argument("--version-dir", required=True, type=Path)
-    confirm.add_argument("--actor", default="user")
-    confirm.add_argument("--confirmed-at", required=True,
-                         help="ISO-8601 UTC timestamp of the confirmation")
+    confirm.add_argument("--actor", required=True,
+                         help="must be `user`; no default, so automation cannot confirm "
+                              "by omission")
     prepare = sub.add_parser("prepare-review",
                              help="preserve the exact machine views in a new private directory")
     prepare.add_argument("--output-dir", required=True, type=Path,
@@ -1077,7 +1111,7 @@ def main() -> None:
         profile_sha = role.get("candidate_profile_sha256")
         snapshot = resolve_snapshot(args.db, profile_sha)
         record = confirm_contract(version_dir, sha256_bytes((version_dir / "resume.pdf").read_bytes()),
-                                  profile_sha, snapshot["facts"], args.actor, args.confirmed_at)
+                                  profile_sha, snapshot["facts"], args.actor)
         print(f"confirmed {version_dir / CONTRACT_FILENAME}")
         print(json.dumps(record, indent=2))
         return
