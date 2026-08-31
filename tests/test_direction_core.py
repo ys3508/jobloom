@@ -52,11 +52,11 @@ class DirectionCoreTests(unittest.TestCase):
 
     def make_candidate(self):
         facts = [
-            {"id": "fact-python", "type": "skill", "value": "Python", "keywords": ["python"],
+            {"id": "fact-python", "type": "experience_claim", "value": "Python", "keywords": ["python"],
              "status": "locked", "locked": True, "evidence_strength": "direct"},
             {"id": "fact-aws", "type": "skill", "value": "AWS", "keywords": ["aws"],
              "status": "confirmed", "locked": False, "evidence_strength": "transferable"},
-            {"id": "fact-sql", "type": "skill", "value": "SQL", "keywords": ["sql"],
+            {"id": "fact-sql", "type": "experience_claim", "value": "SQL", "keywords": ["sql"],
              "status": "confirmed", "locked": False, "evidence_strength": "direct"},
         ]
         candidate = {
@@ -198,6 +198,25 @@ class DirectionCoreTests(unittest.TestCase):
         )
         self.assertEqual(structured["decision"], "fail")
         self.assertIn("direction_hard_exclusion", structured["hard_failures"])
+
+    def test_direction_keyword_calibration_reports_dead_nodes_and_the_carrier(self):
+        result = DIRECTIONS.calibrate_direction_keywords(self.profile(), [
+            self.job_card(title="Backend Engineer", summary="Python services"),
+            self.job_card(title="Data Engineer", summary="Python pipelines"),
+        ])
+        positive = result["groups"]["positive_keywords"]
+        self.assertEqual(positive["never_fired_terms"], ["SQL"])
+        self.assertEqual(positive["sole_carrier_term"], "Python")
+        self.assertEqual(positive["jobs_with_any_hit"], 2)
+        precision = result["groups"]["precision_keywords"]
+        self.assertEqual(precision["never_fired_terms"], ["distributed systems"])
+        self.assertIsNone(precision["dominant_term"])
+
+    def test_direction_keyword_calibration_uses_routing_field_boundaries(self):
+        profile = self.profile(positive_keywords=["Python"])
+        result = DIRECTIONS.calibrate_direction_keywords(
+            profile, [self.job_card(employer="Python Incorporated", required_skills=[])])
+        self.assertEqual(result["groups"]["positive_keywords"]["never_fired_terms"], ["Python"])
 
     def test_sponsorship_and_rolling_portfolio_are_ranking_signals(self):
         profile = self.profile()

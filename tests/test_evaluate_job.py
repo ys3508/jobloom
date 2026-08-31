@@ -90,10 +90,11 @@ class EvaluateJobTests(unittest.TestCase):
         self.assertEqual(result["action"], "review")
         self.assertEqual(result["main_gap"], "Rust")
 
-    def test_skill_inside_a_fact_list_is_supported(self):
+    def test_skill_inside_a_fact_list_is_a_mention_not_demonstrated_work(self):
         profile = candidate()
         profile["facts"] = [{
             "id": "f-programming", "value": "Programming: R, SAS, SQL, SPSS, Python",
+            "type": "skill",
             "keywords": ["Programming: R, SAS, SQL, SPSS, Python"],
             "evidence_strength": "direct", "status": "locked",
         }]
@@ -101,8 +102,8 @@ class EvaluateJobTests(unittest.TestCase):
         posting["required_skills"] = ["R", "Python"]
         result = MODULE.evaluate(profile, posting)
         self.assertEqual([item["strength"] for item in result["evidence_matches"]],
-                         ["direct", "direct"])
-        self.assertIsNone(result["main_gap"])
+                         ["mention_only", "mention_only"])
+        self.assertEqual(result["main_gap"], "R")
 
     def test_requirement_tokens_cannot_be_combined_across_facts(self):
         profile = candidate()
