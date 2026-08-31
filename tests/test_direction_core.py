@@ -218,6 +218,23 @@ class DirectionCoreTests(unittest.TestCase):
             profile, [self.job_card(employer="Python Incorporated", required_skills=[])])
         self.assertEqual(result["groups"]["positive_keywords"]["never_fired_terms"], ["Python"])
 
+    def test_alias_mining_measures_raw_subphrases_but_never_shortens_titles(self):
+        profile = self.profile(
+            target_titles=["Research Data Analyst"],
+            positive_keywords=["longitudinal analysis"],
+            precision_keywords=[], negative_keywords=[])
+        jobs = [
+            self.job_card(title="Programmer", description="Longitudinal patient records",
+                          employer="A", required_skills=[]),
+            self.job_card(title="Scientist", description="Longitudinal outcomes",
+                          employer="B", required_skills=[]),
+        ]
+        result = DIRECTIONS.mine_direction_aliases(profile, jobs)
+        observed = result["groups"]["positive_keywords"][0]["observed_subphrases"]
+        self.assertIn({"candidate": "longitudinal", "postings": 2, "employers": 2}, observed)
+        self.assertEqual(result["target_titles"]["status"], "structurally_dead_do_not_shorten")
+        self.assertNotIn("Research", str(result["groups"]))
+
     def test_sponsorship_and_rolling_portfolio_are_ranking_signals(self):
         profile = self.profile()
         candidate = json.loads(self.candidate_path.read_text())

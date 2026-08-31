@@ -791,6 +791,57 @@ def calibrate_direction_keywords(profile: dict[str, Any], jobs: list[dict[str, A
             "groups": groups}
 
 
+def mine_direction_aliases(profile: dict[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Measure corpus-written subphrases for dead multi-word skill and domain terms.
+
+    Target titles are deliberately excluded: shortening a synthetic title to common title
+    components is matcher loosening, not alias discovery. The output is evidence for a
+    proposal, never an automatic profile edit.
+    """
+    audit = calibrate_direction_keywords(profile, jobs)
+    normalized = validate_profile(profile)
+    raw = []
+    for job in jobs:
+        text = str(job.get("description") or " ".join(_field_text(job).values()))
+        raw.append((_tokens(text), str(job.get("employer") or "unknown")))
+    groups = {}
+    for group in ("positive_keywords", "precision_keywords", "discovery_keywords"):
+        terms = []
+        dead = audit["groups"][group]["never_fired_terms"]
+        for term in dead:
+            tokens = _tokens(term)
+            candidates = []
+            seen = set()
+            for length in range(len(tokens) - 1, 0, -1):
+                for start in range(len(tokens) - length + 1):
+                    candidate_tokens = tokens[start:start + length]
+                    candidate = " ".join(candidate_tokens)
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    matched = [(employer, index) for index, (haystack, employer) in enumerate(raw)
+                               if _token_run(candidate_tokens, haystack) >= 0]
+                    if matched:
+                        candidates.append({
+                            "candidate": candidate,
+                            "postings": len({index for _, index in matched}),
+                            "employers": len({employer.casefold() for employer, _ in matched}),
+                        })
+            candidates.sort(key=lambda item: (-len(_tokens(item["candidate"])),
+                                               item["postings"], item["candidate"]))
+            terms.append({"dead_term": term, "observed_subphrases": candidates})
+        groups[group] = terms
+    return {
+        "direction_id": normalized["direction_id"],
+        "corpus_jobs": len(jobs),
+        "target_titles": {
+            "status": "structurally_dead_do_not_shorten",
+            "never_fired_terms": audit["groups"]["target_titles"]["never_fired_terms"],
+        },
+        "groups": groups,
+    }
+
+
 def _validate_job_shape(job: dict[str, Any]) -> None:
     """Reject a wrong-typed routing field; never coerce it into match text."""
     for field, (kind, max_len, max_items) in JOB_FIELD_SHAPES.items():
