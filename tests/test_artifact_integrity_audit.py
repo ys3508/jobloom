@@ -364,7 +364,10 @@ class ReviewPacket(unittest.TestCase):
         twin["candidate_profile_sha256"] = "a-different-snapshot"
         twin["report_inputs"] = {**twin["report_inputs"],
                                  "candidate_profile_sha256": "a-different-snapshot"}
-        twin["report_key"] = MODULE.report_key(twin["report_inputs"])
+        twin["identity_check_key"] = MODULE.identity_check_key(
+            twin["machine_view_key"], "a-different-snapshot", None, None)
+        twin["report_key"] = MODULE.report_key(twin["binding_set_key"],
+                                               twin["identity_check_key"])
         packet["artifacts"].append(twin)
         out = Path(self.tmp.name) / "packet"
         MODULE.write_review_packet(out, packet)
@@ -397,6 +400,15 @@ class ReviewPacket(unittest.TestCase):
         reference, = index["reports"]
         self.assertTrue((out / reference["report_path"]).is_file())
         self.assertTrue(reference["review_packet_complete"])
+
+    def test_the_index_seals_the_audit_result_so_a_session_can_detect_a_change(self):
+        _, out = self.build()
+        reference, = json.loads((out / "audit-packet.json").read_text())["reports"]
+        path = out / reference["report_path"]
+        self.assertEqual(MODULE.sha256_bytes(path.read_bytes()),
+                         reference["audit_result_sha256"])
+        for key in ("machine_view_key", "binding_set_key", "identity_check_key"):
+            self.assertEqual(len(reference[key]), 64)
 
     def test_permissions_are_private_throughout(self):
         _, out = self.build()
@@ -816,28 +828,59 @@ class ProposedContracts(unittest.TestCase):
         self.assertFalse((store / "v1" / MODULE.CONTRACT_FILENAME).exists())
 
 
-class ReportIdentity(unittest.TestCase):
-    def inputs(self, **overrides):
-        base = {"pdf_sha256": "a", "claims_manifest_sha256": "b",
-                "candidate_profile_sha256": "c", "observed_contract_sha256": None,
-                "confirmation_record_sha256": None}
-        return {**base, **overrides}
+class LayeredKeys(unittest.TestCase):
+    EXEC = {"extractor_policy_id": "policy-v1", "canonicalizer_version": "canon-v1"}
 
-    def test_the_key_is_a_fixed_width_digest_not_a_path(self):
-        """A corrupt registry string used as a directory name is a traversal."""
-        key = MODULE.report_key(self.inputs(candidate_profile_sha256="../../etc"))
+    def view(self, **overrides):
+        args = {"pdf_sha": "pdf", "execution": self.EXEC, "raw_sha": "raw",
+                "canonical_sha": "canon", **overrides}
+        return MODULE.machine_view_key(args["pdf_sha"], args["execution"],
+                                       args["raw_sha"], args["canonical_sha"])
+
+    def test_a_different_extractor_is_a_different_observation(self):
+        """The drift a key over the PDF alone cannot express."""
+        other = MODULE.machine_view_key("pdf", {**self.EXEC, "extractor_policy_id": "policy-v2"},
+                                        "raw", "canon")
+        self.assertNotEqual(self.view(), other)
+
+    def test_a_different_canonicalizer_is_a_different_observation(self):
+        other = MODULE.machine_view_key("pdf", {**self.EXEC, "canonicalizer_version": "canon-v2"},
+                                        "raw", "canon")
+        self.assertNotEqual(self.view(), other)
+
+    def test_the_extracted_bytes_are_part_of_the_observation(self):
+        self.assertNotEqual(self.view(), self.view(raw_sha="other"))
+        self.assertNotEqual(self.view(), self.view(canonical_sha="other"))
+
+    def test_writing_an_identity_contract_does_not_invalidate_claim_bindings(self):
+        """The property the whole layering exists for."""
+        view = self.view()
+        before = MODULE.binding_set_key(view, "manifest")
+        identity_before = MODULE.identity_check_key(view, "snap", None, None)
+        identity_after = MODULE.identity_check_key(view, "snap", "contract", "confirmation")
+
+        self.assertNotEqual(identity_before, identity_after, "the identity check changed")
+        self.assertEqual(before, MODULE.binding_set_key(view, "manifest"),
+                         "claim bindings are addressed without the contract")
+        self.assertNotEqual(MODULE.report_key(before, identity_before),
+                            MODULE.report_key(before, identity_after),
+                            "the aggregate report still changes")
+
+    def test_a_different_manifest_is_a_different_binding_set(self):
+        view = self.view()
+        self.assertNotEqual(MODULE.binding_set_key(view, "a"), MODULE.binding_set_key(view, "b"))
+
+    def test_a_different_observation_is_a_different_binding_set(self):
+        self.assertNotEqual(MODULE.binding_set_key(self.view(), "m"),
+                            MODULE.binding_set_key(self.view(raw_sha="other"), "m"))
+
+    def test_a_key_is_a_fixed_width_digest_not_a_path(self):
+        key = MODULE.digest({"candidate_profile_sha256": "../../etc"})
         self.assertEqual(len(key), 64)
         self.assertNotIn("/", key)
 
-    def test_every_input_changes_the_key(self):
-        base = MODULE.report_key(self.inputs())
-        for field in ("pdf_sha256", "claims_manifest_sha256", "candidate_profile_sha256",
-                      "observed_contract_sha256", "confirmation_record_sha256"):
-            self.assertNotEqual(base, MODULE.report_key(self.inputs(**{field: "changed"})),
-                                f"{field} must be part of the report identity")
-
     def test_the_same_inputs_give_the_same_key(self):
-        self.assertEqual(MODULE.report_key(self.inputs()), MODULE.report_key(self.inputs()))
+        self.assertEqual(self.view(), self.view())
 
 
 class IntegrityDecision(unittest.TestCase):

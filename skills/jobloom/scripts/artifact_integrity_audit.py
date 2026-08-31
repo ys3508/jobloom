@@ -53,6 +53,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 AUDIT_VERSION = "artifact-integrity-audit-v1"
+# Bumped when the rules change what a verdict means; part of the report identity so a
+# rerun under new rules is a new report rather than a silent overwrite of an old one.
+AUDIT_RULESET_VERSION = "artifact-integrity-rules-v1"
+BINDING_SCHEMA_VERSION = "machine-claim-binding-v1"
 CANONICALIZER_VERSION = "jobloom-machine-view-v1"
 EXTRACTION_MODE = "layout"
 POLICY_PREFIX = "jobloom-pypdf"
@@ -690,15 +694,45 @@ def decision_reasons(result: dict) -> dict:
             "blocking_reasons": blocking, "pending_review_reasons": pending}
 
 
-def report_key(inputs: dict) -> str:
-    """One digest over every input the verdict depends on.
+def digest(inputs: dict) -> str:
+    """A fixed-width, opaque key over a set of inputs.
 
-    Nesting the raw values as directory names would put registry strings on the filesystem
+    Nesting raw values as directory names would put registry strings on the filesystem
     path, where a corrupt `candidate_profile_sha256` containing a slash or `..` becomes a
-    directory traversal. A digest is fixed-width and opaque; the five inputs are kept
-    inside the report, where they are data.
+    directory traversal. The inputs are kept inside the report, where they are data.
     """
     return sha256_text(json.dumps(inputs, sort_keys=True, separators=(",", ":")))
+
+
+def machine_view_key(pdf_sha: str, execution: dict, raw_sha: str, canonical_sha: str) -> str:
+    """What was read, and by what. Reading the same PDF with a different extractor or
+    canonicalizer is a different observation even though the file never changed - the
+    drift that a key over the PDF alone cannot express."""
+    return digest({"pdf_sha256": pdf_sha,
+                   "extractor_policy_id": execution["extractor_policy_id"],
+                   "canonicalizer_version": execution["canonicalizer_version"],
+                   "raw_view_sha256": raw_sha, "canonical_view_sha256": canonical_sha})
+
+
+def binding_set_key(view_key: str, manifest_sha: str) -> str:
+    """Claims against one observation. Deliberately free of the candidate snapshot, the
+    identity contract and the confirmation: writing a contract later changes what the
+    artifact's identity check says, and must not invalidate claim bindings a person
+    already confirmed against bytes that did not move."""
+    return digest({"machine_view_key": view_key, "claims_manifest_sha256": manifest_sha,
+                   "binding_schema_version": BINDING_SCHEMA_VERSION})
+
+
+def identity_check_key(view_key: str, profile_sha: str | None, contract_sha: str | None,
+                       confirmation_sha: str | None) -> str:
+    return digest({"machine_view_key": view_key, "candidate_profile_sha256": profile_sha,
+                   "observed_contract_sha256": contract_sha,
+                   "confirmation_record_sha256": confirmation_sha})
+
+
+def report_key(binding_key: str, identity_key: str) -> str:
+    return digest({"binding_set_key": binding_key, "identity_check_key": identity_key,
+                   "audit_ruleset_version": AUDIT_RULESET_VERSION})
 
 
 def integrity_decision(result: dict) -> str:
@@ -901,9 +935,16 @@ def write_review_packet(output_dir: Path, packet: dict) -> None:
 
         report_dir = output_dir / "reports" / artifact["report_key"]
         report_dir.mkdir(mode=0o700)
-        write_private(report_dir / "audit-result.json",
-                      json.dumps(artifact, indent=2, ensure_ascii=False))
+        result_path = report_dir / "audit-result.json"
+        write_private(result_path, json.dumps(artifact, indent=2, ensure_ascii=False))
         references.append({
+            # The candidate spans, offsets and block indexes live in this file, not in the
+            # observation files that carry their own hashes. Without sealing it, a review
+            # session had no way to notice the report changed under it.
+            "audit_result_sha256": sha256_bytes(result_path.read_bytes()),
+            "machine_view_key": artifact["machine_view_key"],
+            "binding_set_key": artifact["binding_set_key"],
+            "identity_check_key": artifact["identity_check_key"],
             "artifact_sha256": artifact["artifact_sha256"],
             "claims_manifest_sha256": artifact["claims_manifest_sha256"],
             "report_key": artifact["report_key"],
@@ -994,9 +1035,9 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                   "candidate_profile_sha256": profile_sha,
                   "observed_contract_sha256": contract.get("observed_contract_sha256"),
                   "confirmation_record_sha256": contract.get("confirmation_record_sha256")}
-        key = report_key(inputs)
-        if key in artifacts:
-            artifacts[key]["aliases"].append(directory.name)
+        dedupe_key = digest(inputs)
+        if dedupe_key in artifacts:
+            artifacts[dedupe_key]["aliases"].append(directory.name)
             continue
         try:
             claims = json.loads(manifest.read_text(encoding="utf-8"))["claims"]
@@ -1007,16 +1048,29 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                       "readability": [], "claims": {}, "diagnostics": {}, "blocks": {},
                       "_views": {"raw": "", "canonical": "",
                                  "diagnostics": [f"{type(error).__name__}: {error}"]}}
-        result.update({"artifact_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
+        execution = execution_record()
+        view = result.get("machine_view", {})
+        view_key = machine_view_key(artifact_sha, execution, view.get("raw_sha256"),
+                                    view.get("canonical_sha256"))
+        binding_key = binding_set_key(view_key, manifest_sha)
+        identity_key = identity_check_key(view_key, profile_sha,
+                                          contract.get("observed_contract_sha256"),
+                                          contract.get("confirmation_record_sha256"))
+        result.update({"report_key": report_key(binding_key, identity_key),
+                       "machine_view_key": view_key, "binding_set_key": binding_key,
+                       "identity_check_key": identity_key,
+                       "audit_ruleset_version": AUDIT_RULESET_VERSION,
+                       "binding_schema_version": BINDING_SCHEMA_VERSION,
+                       "artifact_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
                        "aliases": [directory.name],
                        "candidate_profile_sha256": profile_sha,
                        "identity_contract_sha256": contract.get("sha256"),
-                       "report_key": key, "report_inputs": inputs,
+                       "report_inputs": inputs,
                        # Approval attaches to one artifact. A packet-level verdict would let
                        # a failed extraction inherit a green light from its neighbours.
                        "review_packet_complete": preserve and result["extraction_status"] == "ok",
                        **decision_reasons(result)})
-        artifacts[key] = result
+        artifacts[dedupe_key] = result
 
     listed = list(artifacts.values())
     packet = {"execution": {**execution_record(),
