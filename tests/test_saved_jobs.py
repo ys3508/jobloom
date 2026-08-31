@@ -151,7 +151,7 @@ class StatusTests(unittest.TestCase):
         SAVED.save(db, card(url="https://jobs.example.com/2"), actor="user", at=AT)
         summary = SAVED.status(db, today=TODAY)
         self.assertEqual(summary["saved"], 2)
-        self.assertEqual(summary["since_applied"], 0)
+        self.assertEqual(summary["applied"], 0)
         self.assertEqual(summary["median_days_open"], 28)
 
 
