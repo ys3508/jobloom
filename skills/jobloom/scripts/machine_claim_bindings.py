@@ -35,7 +35,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SESSION_SCHEMA_VERSION = "binding-review-session-v1"
-BINDING_SET_SCHEMA_VERSION = "machine-claim-binding-set-v1"
+# The document's own shape. The binding schema the BindingSetKey commits to is the audit's
+# `binding_schema_version`, carried through `locked_inputs`; naming a second version here
+# and letting the key cover only the first is how the two quietly diverge.
+DOCUMENT_SCHEMA_VERSION = "machine-claim-binding-set-v1"
 
 DETERMINISTIC = "deterministic_exact_unique"
 CONFIRMED_ALTERNATE = "human_confirmed_alternate_render"
@@ -110,9 +113,27 @@ def load_report(packet_dir: Path, report_key: str | None = None) -> dict:
 
 # --------------------------------------------------------------------------- session
 
+def block_anchors(packet_dir: Path, result: dict) -> dict[int, dict]:
+    """Offsets and an anchor hash for every block, so an accepted candidate commits to a
+    location rather than to an index whose meaning lives in another file."""
+    raw = (packet_dir / result["observation_files"]["raw"]["path"]).read_text(encoding="utf-8")
+    return {
+        block["block_index"]: {
+            "block_index": block["block_index"], "page": block["page"],
+            "raw_start": block["raw_start"], "raw_end": block["raw_end"],
+            "anchor_sha256": sha256_text(raw[block["raw_start"]:block["raw_end"]]),
+            # An accepted candidate binds the whole block, not the claim's exact span.
+            # Naming that keeps it from being read as a precise span binding.
+            "binding_granularity": "block",
+        }
+        for block in result["block_inventory"]
+    }
+
+
 def start_session(packet_dir: Path, report_key: str | None, at: str | None = None) -> dict:
     loaded = load_report(packet_dir, report_key)
     result, reference, execution = loaded["result"], loaded["reference"], loaded["index"]["execution"]
+    anchors = block_anchors(packet_dir, result)
 
     decisions = {}
     for binding in result["bindings"]:
@@ -127,7 +148,8 @@ def start_session(packet_dir: Path, report_key: str | None, at: str | None = Non
             "binding_basis": None if repeated else DETERMINISTIC,
             "occurrences": binding["occurrences"],
             "accepted_occurrence_indexes": None if repeated else list(range(len(binding["occurrences"]))),
-            "rejected_candidate_block_indexes": [],
+            "primary_occurrence_index": None if repeated else 0,
+            "rejected_occurrence_indexes": [],
         }
     for candidate in result["unresolved_candidates"]:
         decisions[candidate["claim_id"]] = {
@@ -137,7 +159,8 @@ def start_session(packet_dir: Path, report_key: str | None, at: str | None = Non
             "state": "pending",
             "binding_basis": None,
             "candidate_block_indexes": candidate["candidate_block_indexes"],
-            "accepted_block_index": None,
+            "candidate_blocks": [anchors[i] for i in candidate["candidate_block_indexes"]],
+            "accepted_block": None,
             "rejected_candidate_block_indexes": [],
         }
 
@@ -146,6 +169,9 @@ def start_session(packet_dir: Path, report_key: str | None, at: str | None = Non
         "status": "in_progress",
         "started_at": at or now_utc_iso(),
         "packet_dir": str(packet_dir),
+        # A lookup reference only. It is not part of the BindingSetKey, so resuming from a
+        # multi-report packet stays possible without making bindings depend on the report.
+        "source_report_key": reference["report_key"],
         # The BindingSetKey, never the aggregate report key: an identity contract written
         # later changes the report and must leave these bindings standing.
         "binding_set_key": result["binding_set_key"],
@@ -165,9 +191,15 @@ def start_session(packet_dir: Path, report_key: str | None, at: str | None = Non
     }
 
 
+def require_in_progress(session: dict) -> None:
+    if session.get("status") != "in_progress":
+        raise ValueError(f"session is {session.get('status')}; only an in-progress session "
+                         "may be decided or confirmed")
+
+
 def verify_session(session: dict, packet_dir: Path) -> None:
     """Recheck the packet on every resume. A session that outlived its evidence is stale."""
-    loaded = load_report(packet_dir, None)
+    loaded = load_report(packet_dir, session.get("source_report_key"))
     if loaded["reference"]["audit_result_sha256"] != session["locked_inputs"]["audit_result_sha256"]:
         raise ValueError("packet is stale: the audit result changed since this session started")
     if loaded["result"]["binding_set_key"] != session["binding_set_key"]:
@@ -175,8 +207,9 @@ def verify_session(session: dict, packet_dir: Path) -> None:
 
 
 def decide(session: dict, claim_id: str, *, accept_block: int | None = None,
-           accept_occurrences: list[int] | None = None, reject: bool = False,
-           needs_context: bool = False) -> dict:
+           accept_occurrences: list[int] | None = None, primary_occurrence: int | None = None,
+           reject: bool = False, needs_context: bool = False) -> dict:
+    require_in_progress(session)
     decision = session["decisions"].get(claim_id)
     if decision is None:
         raise ValueError(f"no such claim in this session: {claim_id}")
@@ -190,6 +223,8 @@ def decide(session: dict, claim_id: str, *, accept_block: int | None = None,
         # artifact stays blocked until the claim is bound or the manifest changes.
         if decision["kind"] == "alternate_render":
             decision["rejected_candidate_block_indexes"] = list(decision["candidate_block_indexes"])
+        elif decision["kind"] == "multiple_occurrences":
+            decision["rejected_occurrence_indexes"] = list(range(len(decision["occurrences"])))
         decision.update(state="decided", binding_basis=UNRESOLVED)
     elif decision["kind"] == "alternate_render":
         if accept_block is None:
@@ -198,16 +233,26 @@ def decide(session: dict, claim_id: str, *, accept_block: int | None = None,
             raise ValueError(f"block {accept_block} is not a candidate for {claim_id}")
         decision["rejected_candidate_block_indexes"] = [
             b for b in decision["candidate_block_indexes"] if b != accept_block]
+        accepted, = [b for b in decision["candidate_blocks"] if b["block_index"] == accept_block]
         decision.update(state="decided", binding_basis=CONFIRMED_ALTERNATE,
-                        accepted_block_index=accept_block)
+                        accepted_block=accepted)
     else:
         if not accept_occurrences:
             raise ValueError("accepting occurrences needs at least one occurrence index")
         available = range(len(decision["occurrences"]))
         if any(index not in available for index in accept_occurrences):
             raise ValueError(f"occurrence index out of range for {claim_id}")
+        accepted = sorted(set(accept_occurrences))
+        # The audit's own `primary` marks the first occurrence in reading order. Once a
+        # person rejects that one, nothing left is primary unless they say which is.
+        if primary_occurrence is None:
+            raise ValueError("accepting occurrences needs an explicit primary occurrence")
+        if primary_occurrence not in accepted:
+            raise ValueError("the primary occurrence must be one of the accepted occurrences")
         decision.update(state="decided", binding_basis=CONFIRMED_OCCURRENCES,
-                        accepted_occurrence_indexes=sorted(set(accept_occurrences)))
+                        accepted_occurrence_indexes=accepted,
+                        primary_occurrence_index=primary_occurrence,
+                        rejected_occurrence_indexes=[i for i in available if i not in accepted])
     return decision
 
 
@@ -220,22 +265,51 @@ def progress(session: dict) -> dict:
 
 # --------------------------------------------------------------------------- finalize
 
+def decision_commitment(decision: dict) -> dict:
+    """What this claim was bound to, exactly, and with no resume text.
+
+    Counting bases alone let two different answers hash the same: accepting one candidate
+    block or another both read as one `human_confirmed_alternate_render`, so the hash a
+    user confirmed did not commit to the choice they made.
+    """
+    commitment = {"claim_id": decision["claim_id"], "kind": decision["kind"],
+                  "binding_basis": decision["binding_basis"]}
+    if decision["kind"] == "alternate_render":
+        commitment["accepted_block"] = decision.get("accepted_block")
+        commitment["rejected_candidate_block_indexes"] = \
+            decision.get("rejected_candidate_block_indexes", [])
+    else:
+        commitment["accepted_occurrences"] = [
+            {k: v for k, v in decision["occurrences"][index].items() if k != "span_text"}
+            for index in (decision.get("accepted_occurrence_indexes") or [])]
+        commitment["primary_occurrence_index"] = decision.get("primary_occurrence_index")
+        commitment["rejected_occurrence_indexes"] = decision.get("rejected_occurrence_indexes", [])
+    return commitment
+
+
 def summary(session: dict) -> dict:
     """A body-free account of every claim's outcome, and the thing the user confirms."""
+    decisions = sorted(session["decisions"].values(), key=lambda d: d["claim_id"])
     counts: dict[str, int] = {}
-    for decision in session["decisions"].values():
-        counts[decision["binding_basis"] or "pending"] = \
-            counts.get(decision["binding_basis"] or "pending", 0) + 1
+    for decision in decisions:
+        basis = decision["binding_basis"] or "pending"
+        counts[basis] = counts.get(basis, 0) + 1
+    unresolved = sorted(d["claim_id"] for d in decisions
+                        if d["binding_basis"] in {UNRESOLVED, NEEDS_CONTEXT}
+                        or d["state"] in OPEN_STATES)
     return {
-        "schema_version": BINDING_SET_SCHEMA_VERSION,
+        "document_schema_version": DOCUMENT_SCHEMA_VERSION,
         "binding_set_key": session["binding_set_key"],
         "machine_view_key": session["machine_view_key"],
         "locked_inputs": session["locked_inputs"],
-        "claims_total": len(session["decisions"]),
+        "claims_total": len(decisions),
         "by_binding_basis": dict(sorted(counts.items())),
-        "still_unresolved_claim_ids": sorted(
-            d["claim_id"] for d in session["decisions"].values()
-            if d["binding_basis"] in {UNRESOLVED, NEEDS_CONTEXT} or d["state"] in OPEN_STATES),
+        "still_unresolved_claim_ids": unresolved,
+        # A set every claim was answered for is still not a set every claim was bound in.
+        # Downstream must not read `human_confirmed` as "this artifact's blocker is gone".
+        "binding_set_status": "incomplete" if unresolved else "complete",
+        "usable_for_integrity": not unresolved,
+        "decision_commitments": [decision_commitment(d) for d in decisions],
     }
 
 
@@ -245,6 +319,7 @@ def summary_sha256(session: dict) -> str:
 
 def finalize(session: dict, actor: str, expected_summary_sha256: str,
              at: str | None = None) -> dict:
+    require_in_progress(session)
     if actor != "user":
         raise ValueError("only the user may confirm a machine claim binding set")
     if progress(session)["pending"]:
@@ -253,13 +328,12 @@ def finalize(session: dict, actor: str, expected_summary_sha256: str,
     if actual != expected_summary_sha256:
         raise ValueError(f"summary hash mismatch: confirmed {expected_summary_sha256}, "
                          f"current {actual}")
-    return {**summary(session), "actor": actor, "confirmed_at": at or now_utc_iso(),
-            "summary_sha256": actual,
+    return {**summary(session), "review_status": "human_confirmed", "actor": actor,
+            "confirmed_at": at or now_utc_iso(), "summary_sha256": actual,
             "bindings": [
                 {k: v for k, v in decision.items() if k != "state"}
                 for decision in sorted(session["decisions"].values(),
-                                       key=lambda d: d["claim_id"])],
-            }
+                                       key=lambda d: d["claim_id"])]}
 
 
 # --------------------------------------------------------------------------- cli
@@ -287,6 +361,8 @@ def main() -> None:
     group = choose.add_mutually_exclusive_group(required=True)
     group.add_argument("--accept-block", type=int)
     group.add_argument("--accept-occurrences", type=int, nargs="+")
+    choose.add_argument("--primary-occurrence", type=int,
+                        help="required with --accept-occurrences; must be one of them")
     group.add_argument("--reject", action="store_true")
     group.add_argument("--needs-context", action="store_true")
 
@@ -324,7 +400,8 @@ def main() -> None:
     if args.mode == "decide":
         verify_session(session, Path(session["packet_dir"]))
         decision = decide(session, args.claim_id, accept_block=args.accept_block,
-                          accept_occurrences=args.accept_occurrences, reject=args.reject,
+                          accept_occurrences=args.accept_occurrences,
+                          primary_occurrence=args.primary_occurrence, reject=args.reject,
                           needs_context=args.needs_context)
         replace_private(args.session, json.dumps(session, indent=2, ensure_ascii=False))
         print(f"{decision['claim_id']}: {decision['binding_basis']}")
@@ -332,6 +409,7 @@ def main() -> None:
         return
 
     if args.mode == "summary":
+        verify_session(session, Path(session["packet_dir"]))
         print(json.dumps(summary(session), indent=2, ensure_ascii=False))
         print(f"\nsummary_sha256 {summary_sha256(session)}")
         return

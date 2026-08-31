@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.pdf_fixture import synthetic_pdf
+
 SCRIPTS = Path(__file__).parents[1] / "skills" / "jobloom" / "scripts"
 
 
@@ -21,8 +23,6 @@ AUDIT = load("artifact_integrity_audit")
 
 def packet(tmp: Path, claims):
     """A minimal review packet: one PDF, one manifest, sealed exactly as the audit seals it."""
-    from test_artifact_integrity_audit import synthetic_pdf  # noqa: PLC0415
-
     store = tmp / "resumes"
     (store / "v1").mkdir(parents=True)
     (store / "v1" / "resume.pdf").write_bytes(
@@ -73,7 +73,7 @@ class SessionStart(unittest.TestCase):
     def test_a_single_candidate_is_still_not_accepted_for_the_user(self):
         decision = self.session()["decisions"]["c-alt"]
         self.assertEqual(len(decision["candidate_block_indexes"]), 1)
-        self.assertIsNone(decision["accepted_block_index"])
+        self.assertIsNone(decision["accepted_block"])
         self.assertEqual(decision["state"], "pending")
 
     def test_the_session_binds_the_binding_set_key_not_the_report_key(self):
@@ -127,7 +127,7 @@ class Decisions(unittest.TestCase):
         block = self.s["decisions"]["c-alt"]["candidate_block_indexes"][0]
         decision = MODULE.decide(self.s, "c-alt", accept_block=block)
         self.assertEqual(decision["binding_basis"], MODULE.CONFIRMED_ALTERNATE)
-        self.assertEqual(decision["accepted_block_index"], block)
+        self.assertEqual(decision["accepted_block"]["block_index"], block)
         self.assertNotIn(block, decision["rejected_candidate_block_indexes"])
 
     def test_a_block_that_was_never_a_candidate_is_refused(self):
@@ -144,13 +144,13 @@ class Decisions(unittest.TestCase):
         self.assertEqual(decision["binding_basis"], MODULE.NEEDS_CONTEXT)
 
     def test_occurrences_are_chosen_explicitly_for_a_repeated_claim(self):
-        decision = MODULE.decide(self.s, "c-repeat", accept_occurrences=[0, 1])
+        decision = MODULE.decide(self.s, "c-repeat", accept_occurrences=[0, 1], primary_occurrence=0)
         self.assertEqual(decision["binding_basis"], MODULE.CONFIRMED_OCCURRENCES)
         self.assertEqual(decision["accepted_occurrence_indexes"], [0, 1])
 
     def test_an_occurrence_out_of_range_is_refused(self):
         with self.assertRaises(ValueError):
-            MODULE.decide(self.s, "c-repeat", accept_occurrences=[99])
+            MODULE.decide(self.s, "c-repeat", accept_occurrences=[99], primary_occurrence=99)
 
     def test_an_exact_match_takes_no_decision(self):
         with self.assertRaises(ValueError):
@@ -174,7 +174,7 @@ class Finalizing(unittest.TestCase):
         self.s = MODULE.start_session(self.packet, None, at="2026-08-30T00:00:00+00:00")
 
     def decide_all(self):
-        MODULE.decide(self.s, "c-repeat", accept_occurrences=[0])
+        MODULE.decide(self.s, "c-repeat", accept_occurrences=[0], primary_occurrence=0)
         MODULE.decide(self.s, "c-alt",
                       accept_block=self.s["decisions"]["c-alt"]["candidate_block_indexes"][0])
 
@@ -220,7 +220,7 @@ class Finalizing(unittest.TestCase):
             MODULE.write_private(out, json.dumps(record))
 
     def test_a_rejected_claim_is_named_in_the_confirmed_set(self):
-        MODULE.decide(self.s, "c-repeat", accept_occurrences=[0])
+        MODULE.decide(self.s, "c-repeat", accept_occurrences=[0], primary_occurrence=0)
         MODULE.decide(self.s, "c-alt", reject=True)
         record = MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
         self.assertEqual(record["still_unresolved_claim_ids"], ["c-alt"])
@@ -229,6 +229,147 @@ class Finalizing(unittest.TestCase):
         self.decide_all()
         record = MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
         self.assertEqual(record["binding_set_key"], self.s["binding_set_key"])
+
+
+class SummaryCommitment(unittest.TestCase):
+    """The hash a user confirms must move when their answer moves."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.packet = packet(Path(self.tmp.name), [
+            claim("c-alt", "SKILLS | R | SAS"), claim("c-repeat", "R")])
+
+    def session(self):
+        return MODULE.start_session(self.packet, None, at="2026-08-30T00:00:00+00:00")
+
+    def test_choosing_a_different_block_changes_the_summary_hash(self):
+        first, second = self.session(), self.session()
+        candidates = first["decisions"]["c-alt"]["candidate_block_indexes"]
+        if len(candidates) < 2:
+            block_a = candidates[0]
+            MODULE.decide(first, "c-alt", accept_block=block_a)
+            MODULE.decide(second, "c-alt", reject=True)
+        else:
+            MODULE.decide(first, "c-alt", accept_block=candidates[0])
+            MODULE.decide(second, "c-alt", accept_block=candidates[1])
+        self.assertNotEqual(MODULE.summary_sha256(first), MODULE.summary_sha256(second))
+
+    def test_choosing_different_occurrences_changes_the_summary_hash(self):
+        first, second = self.session(), self.session()
+        MODULE.decide(first, "c-repeat", accept_occurrences=[0], primary_occurrence=0)
+        MODULE.decide(second, "c-repeat", accept_occurrences=[1], primary_occurrence=1)
+        self.assertNotEqual(MODULE.summary_sha256(first), MODULE.summary_sha256(second))
+
+    def test_choosing_a_different_primary_changes_the_summary_hash(self):
+        first, second = self.session(), self.session()
+        MODULE.decide(first, "c-repeat", accept_occurrences=[0, 1], primary_occurrence=0)
+        MODULE.decide(second, "c-repeat", accept_occurrences=[0, 1], primary_occurrence=1)
+        self.assertNotEqual(MODULE.summary_sha256(first), MODULE.summary_sha256(second))
+
+    def test_the_commitment_records_where_an_accepted_block_is(self):
+        session = self.session()
+        block = session["decisions"]["c-alt"]["candidate_block_indexes"][0]
+        MODULE.decide(session, "c-alt", accept_block=block)
+        commitment, = [c for c in MODULE.summary(session)["decision_commitments"]
+                       if c["claim_id"] == "c-alt"]
+        accepted = commitment["accepted_block"]
+        for field in ("block_index", "page", "raw_start", "raw_end", "anchor_sha256"):
+            self.assertIsNotNone(accepted[field], field)
+        self.assertEqual(accepted["binding_granularity"], "block",
+                         "a block is not the claim's exact span and must not pass for one")
+
+    def test_the_primary_must_be_one_of_the_accepted_occurrences(self):
+        session = self.session()
+        with self.assertRaises(ValueError):
+            MODULE.decide(session, "c-repeat", accept_occurrences=[0], primary_occurrence=1)
+
+    def test_accepting_occurrences_without_naming_a_primary_is_refused(self):
+        session = self.session()
+        with self.assertRaises(ValueError):
+            MODULE.decide(session, "c-repeat", accept_occurrences=[0])
+
+    def test_a_summary_carries_no_resume_text(self):
+        session = self.session()
+        MODULE.decide(session, "c-alt",
+                      accept_block=session["decisions"]["c-alt"]["candidate_block_indexes"][0])
+        body = json.dumps(MODULE.summary(session))
+        for word in ("focus", "clinical", "SKILLS", "SAS"):
+            self.assertNotIn(word, body)
+
+
+class BindingSetCompleteness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.packet = packet(Path(self.tmp.name), [claim("c-alt", "SKILLS | R | SAS")])
+        self.s = MODULE.start_session(self.packet, None, at="2026-08-30T00:00:00+00:00")
+
+    def test_an_answered_but_unbound_claim_leaves_the_set_incomplete(self):
+        """Every question answered is not every claim bound."""
+        MODULE.decide(self.s, "c-alt", reject=True)
+        record = MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
+        self.assertEqual(record["review_status"], "human_confirmed")
+        self.assertEqual(record["binding_set_status"], "incomplete")
+        self.assertFalse(record["usable_for_integrity"])
+        self.assertEqual(record["still_unresolved_claim_ids"], ["c-alt"])
+
+    def test_needing_context_also_leaves_the_set_incomplete(self):
+        MODULE.decide(self.s, "c-alt", needs_context=True)
+        record = MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
+        self.assertEqual(record["binding_set_status"], "incomplete")
+
+    def test_a_fully_bound_set_is_complete_and_usable(self):
+        MODULE.decide(self.s, "c-alt",
+                      accept_block=self.s["decisions"]["c-alt"]["candidate_block_indexes"][0])
+        record = MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
+        self.assertEqual(record["binding_set_status"], "complete")
+        self.assertTrue(record["usable_for_integrity"])
+
+
+class SessionStateGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.packet = packet(Path(self.tmp.name), [claim("c-alt", "SKILLS | R | SAS")])
+        self.s = MODULE.start_session(self.packet, None, at="2026-08-30T00:00:00+00:00")
+        MODULE.decide(self.s, "c-alt", reject=True)
+
+    def test_a_confirmed_session_cannot_be_decided_again(self):
+        MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
+        self.s["status"] = "confirmed"
+        with self.assertRaises(ValueError):
+            MODULE.decide(self.s, "c-alt", reject=True)
+
+    def test_a_confirmed_session_cannot_be_confirmed_again(self):
+        self.s["status"] = "confirmed"
+        with self.assertRaises(ValueError):
+            MODULE.finalize(self.s, "user", MODULE.summary_sha256(self.s))
+
+
+class MultiReportResume(unittest.TestCase):
+    def test_a_session_resumes_from_a_packet_holding_more_than_one_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "resumes"
+            for name, text in (("v1", "Led 2 focus groups"), ("v2", "Analyzed clinical data in R")):
+                (store / name).mkdir(parents=True)
+                (store / name / "resume.pdf").write_bytes(
+                    synthetic_pdf(["Led 2 focus groups", "Analyzed clinical data in R"]))
+                (store / name / "claims-manifest.json").write_text(json.dumps(
+                    {"schema_version": name, "claims": [claim("c-1", text)]}))
+            out = root / "packet"
+            AUDIT.write_review_packet(out, AUDIT.run(store, None, include_spans=False,
+                                                     preserve=True))
+            index = json.loads((out / "audit-packet.json").read_text())
+            self.assertEqual(len(index["reports"]), 2)
+
+            with self.assertRaises(ValueError):
+                MODULE.start_session(out, None)
+            key = index["reports"][0]["report_key"]
+            session = MODULE.start_session(out, key, at="2026-08-30T00:00:00+00:00")
+            self.assertEqual(session["source_report_key"], key)
+            MODULE.verify_session(session, out)
 
 
 class Resuming(unittest.TestCase):
