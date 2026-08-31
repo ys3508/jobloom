@@ -1,9 +1,8 @@
 {
-  "_comment": "Which identity and contact values this exact PDF must show. Copy into the ResumeVersion directory as identity-contract.json, keep only the fact IDs this artifact actually carries, then set confirmation_basis to human_confirmed. Without this file the audit reports no_contract and judges nothing: a resume legitimately omits a former employer, a second degree or an address it never claimed to show, and a check that judged every fact in the profile would call ordinary selection a defect.",
+  "_comment": "Which identity and contact values this exact PDF must show. Copy into the ResumeVersion directory as identity-contract.json, keep only the fact IDs this artifact actually carries, then record the confirmation with `artifact_integrity_audit.py confirm-contract`. Editing this file afterwards invalidates that confirmation, because the record pins this file's hash. Each list must name at least one fact: declaring that nothing has to appear would be the easiest green light and would look identical to a resume that carries everything. Without a confirmed contract the audit reports no_contract and judges no identity value, since a resume legitimately omits a former employer, a second degree or an address it never claimed to show.",
   "schema_version": "1",
   "artifact_sha256": "<sha256 of the exact resume file this contract governs>",
   "candidate_profile_sha256": "<the version's candidate_profile_sha256, not whichever snapshot is active now>",
   "expected_identity_fact_ids": [],
-  "expected_contact_fact_ids": [],
-  "confirmation_basis": "proposed"
+  "expected_contact_fact_ids": []
 }

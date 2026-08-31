@@ -283,7 +283,45 @@ def resolve_snapshot(db_path: Path | None, profile_sha: str | None) -> dict:
             "facts": json.loads(path.read_text(encoding="utf-8")).get("facts", [])}
 
 
-def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: str | None) -> dict:
+CONFIRMATION_FILENAME = "identity-contract.confirmation.json"
+
+
+def validate_contract(contract: dict, artifact_sha: str, profile_sha: str | None,
+                      facts: list[dict]) -> str:
+    """`ok`, or the code for the first way this contract fails to mean anything.
+
+    An empty contract is the danger: declaring that nothing has to appear would be the
+    easiest possible green light, and it would look identical to a resume that carries
+    everything. So each list must name at least one fact, and every named fact must exist,
+    be usable, and sit in the list matching its own type.
+    """
+    if contract.get("artifact_sha256") != artifact_sha:
+        return "contract_artifact_mismatch"
+    if contract.get("candidate_profile_sha256") != profile_sha:
+        return "contract_profile_mismatch"
+    lists = {"identity": contract.get("expected_identity_fact_ids"),
+             "contact": contract.get("expected_contact_fact_ids")}
+    for kind, declared in lists.items():
+        if not isinstance(declared, list) or not declared:
+            return f"contract_no_{kind}_fact_declared"
+        if not all(isinstance(value, str) for value in declared):
+            return "contract_fact_id_not_a_string"
+    every = [fact_id for declared in lists.values() for fact_id in declared]
+    if len(every) != len(set(every)):
+        return "contract_duplicate_fact_id"
+    by_id = {f["id"]: f for f in facts if f.get("status") in USABLE_FACT_STATUS}
+    for kind, declared in lists.items():
+        for fact_id in declared:
+            fact = by_id.get(fact_id)
+            if fact is None:
+                return "contract_fact_not_in_snapshot"
+            if fact.get("type") != kind:
+                return "contract_fact_type_mismatch"
+    return "ok"
+
+
+def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: str | None,
+                           facts: list[dict]) -> dict:
     """The declaration of which identity and contact values this artifact must carry.
 
     Without it the audit has no way to know a resume legitimately omits an address, a
@@ -295,20 +333,54 @@ def load_identity_contract(version_dir: Path, artifact_sha: str, profile_sha: st
         return {"status": "no_contract", "expected": []}
     try:
         contract = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return {"status": "contract_unreadable", "expected": []}
-    if contract.get("artifact_sha256") != artifact_sha:
-        return {"status": "contract_artifact_mismatch", "expected": []}
-    if contract.get("candidate_profile_sha256") != profile_sha:
-        return {"status": "contract_profile_mismatch", "expected": []}
-    if contract.get("confirmation_basis") != "human_confirmed":
+    contract_sha = sha256_bytes(path.read_bytes())
+
+    # Confirmation is a recorded act, not a word in a file anyone can type. The sidecar
+    # names who confirmed which bytes and when, and pins the contract's hash, so editing
+    # the contract afterwards invalidates the confirmation instead of inheriting it.
+    record_path = version_dir / CONFIRMATION_FILENAME
+    if not record_path.is_file():
         return {"status": "contract_unconfirmed", "expected": []}
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {"status": "confirmation_unreadable", "expected": []}
+    if record.get("actor") != "user":
+        return {"status": "confirmation_actor_not_user", "expected": []}
+    if record.get("contract_sha256") != contract_sha:
+        return {"status": "contract_modified_after_confirmation", "expected": []}
+
+    problem = validate_contract(contract, artifact_sha, profile_sha, facts)
+    if problem != "ok":
+        return {"status": problem, "expected": []}
     return {
         "status": "ok",
-        "sha256": sha256_bytes(path.read_bytes()),
-        "expected": list(contract.get("expected_identity_fact_ids", []))
-                    + list(contract.get("expected_contact_fact_ids", [])),
+        "sha256": contract_sha,
+        "confirmed_at": record.get("confirmed_at"),
+        "expected": list(contract["expected_identity_fact_ids"])
+                    + list(contract["expected_contact_fact_ids"]),
     }
+
+
+def confirm_contract(version_dir: Path, artifact_sha: str, profile_sha: str | None,
+                     facts: list[dict], actor: str, confirmed_at: str) -> dict:
+    """Record a confirmation of the contract as it stands. Never overwrites one."""
+    path = version_dir / CONTRACT_FILENAME
+    if not path.is_file():
+        raise ValueError(f"no {CONTRACT_FILENAME} in {version_dir}")
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    problem = validate_contract(contract, artifact_sha, profile_sha, facts)
+    if problem != "ok":
+        raise ValueError(problem)
+    if actor != "user":
+        raise ValueError("only the user may confirm an identity contract")
+    record = {"schema_version": "1", "contract_sha256": sha256_bytes(path.read_bytes()),
+              "actor": actor, "confirmed_at": confirmed_at, "audit_version": AUDIT_VERSION}
+    write_private(version_dir / CONFIRMATION_FILENAME,
+                  json.dumps(record, indent=2, ensure_ascii=False))
+    return record
 
 
 EMAIL = re.compile(r"[^\s|ǁ,;]+@[^\s|ǁ,;]+\.[A-Za-z]{2,}")
@@ -387,7 +459,7 @@ def compare_value(value: str, canonical: str) -> str:
 def strip_separators(value: str) -> str:
     """Everything that is not a letter or digit, removed. Only for names and free text,
     where punctuation carries no identity; never for an address."""
-    return re.sub(r"[^0-9A-Za-z]", "", unicodedata.normalize("NFKC", value)).casefold()
+    return "".join(c for c in unicodedata.normalize("NFKC", value) if c.isalnum()).casefold()
 
 
 def readability_checks(canonical: str, pages: list[str], facts: list[dict],
@@ -396,8 +468,16 @@ def readability_checks(canonical: str, pages: list[str], facts: list[dict],
     checks = [
         {"check": "text_layer", "status": "pass" if canonical.strip() else "fail",
          "detail": {"canonical_chars": len(canonical)}},
-        {"check": "page_count", "status": "pass" if pages else "fail",
+        {"check": "page_container_present", "status": "pass" if pages else "fail",
+         "detail": {"pages": len(pages)}},
+        # A two-page PDF whose second page carries no text used to pass on the page count
+        # alone, which is the one thing a page count cannot tell you.
+        {"check": "all_pages_have_extractable_text",
+         "status": "pass" if pages and all(p.strip() for p in pages) else "fail",
          "detail": {"pages": len(pages), "pages_with_text": sum(1 for p in pages if p.strip())}},
+        {"check": "page_count_policy", "status": "user_review",
+         "detail": {"pages": len(pages),
+                    "note": "the page budget belongs to the version's kind, not to this audit"}},
     ]
     hits = {name: len(pattern.findall(canonical)) for pattern, name in GARBAGE}
     checks.append({"check": "garbage_glyphs",
@@ -560,6 +640,34 @@ def audit_artifact(pdf_path: Path, claims: list[dict], include_spans: bool = Fal
         "block_inventory": inventory,
         "_views": {"raw": raw, "canonical": canonical, "diagnostics": diagnostic_lines},
     }
+
+
+def decision_reasons(result: dict) -> dict:
+    """What blocks, and what is merely unreviewed. Kept apart so an empty blocking list
+    is never read as "ready to submit": clearing every hard stop moves an artifact from
+    `blocked` to `pending`, which is still not approved."""
+    blocking, pending = [], []
+    if result["extraction_status"] != "ok":
+        blocking.append("extraction_failed")
+        return {"integrity_decision": "blocked", "blocking_reasons": blocking,
+                "pending_review_reasons": pending}
+    for check in result["readability"]:
+        if check["status"] == "fail":
+            blocking.append(f"readability:{check['check']}")
+        elif check["status"] in {"review", "user_review"}:
+            pending.append(f"readability:{check['check']}")
+    if result["claims"]["unresolved"]:
+        blocking.append("claims_unresolved")
+    if result["claims"]["span_collision_overlap"]:
+        blocking.append("span_collision")
+    if result["claims"]["multiple_occurrences_requiring_review"]:
+        pending.append("claim_occurrence_unreviewed")
+    if result["diagnostics"]["line_count"]:
+        pending.append("extractor_diagnostics_unreviewed")
+    if result["blocks"]["total"]:
+        pending.append("block_classification_unconfirmed")
+    return {"integrity_decision": "blocked" if blocking else "pending",
+            "blocking_reasons": blocking, "pending_review_reasons": pending}
 
 
 def integrity_decision(result: dict) -> str:
@@ -760,18 +868,28 @@ def write_review_packet(output_dir: Path, packet: dict) -> None:
                            **write_shared_observation(path, content)}
         artifact["observation_files"] = files
 
-        report_dir = (output_dir / "reports"
-                      / f"{artifact['artifact_sha256']}_{artifact['claims_manifest_sha256']}")
-        report_dir.mkdir(mode=0o700)
+        # All four inputs, nested. Keyed on PDF and manifest alone, two reports that
+        # legitimately differ - same file, same claims, a different snapshot or contract -
+        # collided on one directory.
+        report_dir = output_dir / "reports"
+        for part in (artifact["artifact_sha256"], artifact["claims_manifest_sha256"],
+                     artifact["candidate_profile_sha256"] or "no-candidate-binding",
+                     artifact["identity_contract_sha256"] or "no-contract"):
+            report_dir = report_dir / part
+            report_dir.mkdir(mode=0o700, exist_ok=True)
         write_private(report_dir / "audit-result.json",
                       json.dumps(artifact, indent=2, ensure_ascii=False))
         references.append({
             "artifact_sha256": artifact["artifact_sha256"],
             "claims_manifest_sha256": artifact["claims_manifest_sha256"],
+            "candidate_profile_sha256": artifact["candidate_profile_sha256"],
+            "identity_contract_sha256": artifact["identity_contract_sha256"],
             "report_path": str((report_dir / "audit-result.json").relative_to(output_dir)),
             "extraction_status": artifact["extraction_status"],
             "review_packet_complete": artifact["review_packet_complete"],
             "integrity_decision": artifact["integrity_decision"],
+            "blocking_reasons": artifact["blocking_reasons"],
+            "pending_review_reasons": artifact["pending_review_reasons"],
         })
 
     index = {k: v for k, v in packet.items() if k != "artifacts"}
@@ -811,7 +929,6 @@ def propose_contracts(store: Path, db_path: Path | None) -> list[dict]:
                 "candidate_profile_sha256": profile_sha,
                 "expected_identity_fact_ids": by_type["identity"],
                 "expected_contact_fact_ids": by_type["contact"],
-                "confirmation_basis": "proposed",
             },
         })
     return drafts
@@ -831,8 +948,16 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
         manifest_sha = sha256_bytes(manifest.read_bytes())
         role = versions.get(directory.name, {})
         profile_sha = role.get("candidate_profile_sha256")
-        snapshot = resolve_snapshot(db_path, profile_sha)
-        contract = load_identity_contract(directory, artifact_sha, profile_sha)
+        # Resolving the snapshot and the contract reads files that can be corrupt or
+        # unreadable, so they sit inside the same isolation boundary as the extraction.
+        # Outside it, one bad sidecar would take every other artifact's result with it.
+        try:
+            snapshot = resolve_snapshot(db_path, profile_sha)
+            contract = load_identity_contract(directory, artifact_sha, profile_sha,
+                                              snapshot["facts"])
+        except Exception as error:  # noqa: BLE001
+            snapshot = {"status": "snapshot_unreadable", "facts": []}
+            contract = {"status": failure_code(error), "expected": []}
         # The identity verdict derives from the snapshot and the contract, so both belong
         # in the address. Keyed on PDF and manifest alone, the same report id would carry
         # a different answer once the active snapshot moved on.
@@ -846,6 +971,7 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                                     snapshot=snapshot, contract=contract)
         except Exception as error:  # noqa: BLE001 - one bad artifact must not hide the rest
             result = {"extraction_status": "failed", "failure_code": failure_code(error),
+                      "readability": [], "claims": {}, "diagnostics": {}, "blocks": {},
                       "_views": {"raw": "", "canonical": "",
                                  "diagnostics": [f"{type(error).__name__}: {error}"]}}
         result.update({"artifact_sha256": artifact_sha, "claims_manifest_sha256": manifest_sha,
@@ -855,7 +981,7 @@ def run(store: Path, db_path: Path | None, include_spans: bool, preserve: bool) 
                        # Approval attaches to one artifact. A packet-level verdict would let
                        # a failed extraction inherit a green light from its neighbours.
                        "review_packet_complete": preserve and result["extraction_status"] == "ok",
-                       "integrity_decision": integrity_decision(result)})
+                       **decision_reasons(result)})
         artifacts[key] = result
 
     listed = list(artifacts.values())
@@ -888,6 +1014,8 @@ def report(packet: dict) -> None:
               f"   {artifact['extraction_status']}"
               f"   packet_complete={artifact['review_packet_complete']}"
               f"   decision={artifact['integrity_decision']}")
+        print(f"  blocking       : {artifact['blocking_reasons'] or 'none'}")
+        print(f"  pending review : {artifact['pending_review_reasons'] or 'none'}")
         if artifact["extraction_status"] != "ok":
             print(f"  failure_code {artifact['failure_code']}")
             continue
@@ -915,6 +1043,13 @@ def main() -> None:
     sub.add_parser("propose-contract",
                    help="draft an ArtifactIdentityContract per PDF version, for the user to "
                         "trim and confirm; prints to stdout and writes nothing")
+    confirm = sub.add_parser("confirm-contract",
+                             help="record a user confirmation of a version's identity "
+                                  "contract as it currently stands")
+    confirm.add_argument("--version-dir", required=True, type=Path)
+    confirm.add_argument("--actor", default="user")
+    confirm.add_argument("--confirmed-at", required=True,
+                         help="ISO-8601 UTC timestamp of the confirmation")
     prepare = sub.add_parser("prepare-review",
                              help="preserve the exact machine views in a new private directory")
     prepare.add_argument("--output-dir", required=True, type=Path,
@@ -928,10 +1063,23 @@ def main() -> None:
     if args.mode == "propose-contract":
         for draft in propose_contracts(args.store, args.db):
             print(f"\n# {draft['version_dir']}   snapshot={draft['snapshot_status']}")
-            print(f"# review the fact IDs, drop the ones this resume does not show, set")
-            print(f"# confirmation_basis to human_confirmed, then save as")
+            print(f"# drop the fact IDs this resume does not show, save as")
             print(f"#   {args.store / draft['version_dir'] / CONTRACT_FILENAME}")
+            print(f"# then record the confirmation:")
+            print(f"#   confirm-contract --version-dir {args.store / draft['version_dir']} "
+                  f"--confirmed-at <utc>")
             print(json.dumps(draft["contract"], indent=2))
+        return
+
+    if args.mode == "confirm-contract":
+        version_dir = args.version_dir
+        role = registry_roles(args.db).get(version_dir.name, {})
+        profile_sha = role.get("candidate_profile_sha256")
+        snapshot = resolve_snapshot(args.db, profile_sha)
+        record = confirm_contract(version_dir, sha256_bytes((version_dir / "resume.pdf").read_bytes()),
+                                  profile_sha, snapshot["facts"], args.actor, args.confirmed_at)
+        print(f"confirmed {version_dir / CONTRACT_FILENAME}")
+        print(json.dumps(record, indent=2))
         return
 
     preserve = args.mode == "prepare-review"

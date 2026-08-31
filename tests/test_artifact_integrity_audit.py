@@ -352,7 +352,23 @@ class ReviewPacket(unittest.TestCase):
         self.assertEqual(len(packet["artifacts"]), 2)
         self.assertEqual(len({a["artifact_sha256"] for a in packet["artifacts"]}), 1)
         self.assertEqual(len(list((out / "views").iterdir())), 1, "one shared MachineView")
-        self.assertEqual(len(list((out / "reports").iterdir())), 2, "two distinct reports")
+        self.assertEqual(len(list((out / "reports").rglob("audit-result.json"))), 2,
+                         "two distinct reports")
+
+    def test_one_pdf_and_manifest_under_two_snapshots_still_split_into_two_reports(self):
+        """The collision: identical file, identical claims, a different candidate binding."""
+        packet = MODULE.run(self.store, None, include_spans=False, preserve=True)
+        artifact = packet["artifacts"][0]
+        twin = json.loads(json.dumps({k: v for k, v in artifact.items() if k != "_views"}))
+        twin["_views"] = artifact["_views"]
+        twin["candidate_profile_sha256"] = "a-different-snapshot"
+        packet["artifacts"].append(twin)
+        out = Path(self.tmp.name) / "packet"
+        MODULE.write_review_packet(out, packet)
+        self.assertEqual(len(list((out / "views").rglob("raw-machine-view.txt"))), 1,
+                         "one PDF under one policy is one observation")
+        self.assertEqual(len(list((out / "reports").rglob("audit-result.json"))), 2,
+                         "a different snapshot is a different report, not a collision")
 
     def test_observation_files_carry_their_own_hash_and_size(self):
         packet, out = self.build()
@@ -574,53 +590,130 @@ class SnapshotResolution(unittest.TestCase):
 
 
 class IdentityContract(unittest.TestCase):
-    def build(self, contract=None):
+    FACTS = [{"id": "f-name", "type": "identity", "value": "Jane Doe", "status": "locked"},
+             {"id": "f-email", "type": "contact", "value": "jane@example.com",
+              "status": "confirmed"},
+             {"id": "f-gone", "type": "contact", "value": "old@example.com",
+              "status": "revoked"}]
+
+    def valid(self):
+        return {"schema_version": "1", "artifact_sha256": "pdf-1",
+                "candidate_profile_sha256": "snap-1",
+                "expected_identity_fact_ids": ["f-name"],
+                "expected_contact_fact_ids": ["f-email"]}
+
+    def build(self, contract=None, confirmation=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         version = Path(tmp.name)
         if contract is not None:
             (version / MODULE.CONTRACT_FILENAME).write_text(json.dumps(contract))
+        if confirmation == "auto":
+            confirmation = {"contract_sha256": MODULE.sha256_bytes(
+                (version / MODULE.CONTRACT_FILENAME).read_bytes()),
+                "actor": "user", "confirmed_at": "2026-08-30T00:00:00Z"}
+        if confirmation is not None:
+            (version / MODULE.CONFIRMATION_FILENAME).write_text(json.dumps(confirmation))
         return version
 
-    def valid(self):
-        return {"artifact_sha256": "pdf-1", "candidate_profile_sha256": "snap-1",
-                "expected_identity_fact_ids": ["f-name"],
-                "expected_contact_fact_ids": ["f-email"],
-                "confirmation_basis": "human_confirmed"}
+    def load(self, version):
+        return MODULE.load_identity_contract(version, "pdf-1", "snap-1", self.FACTS)
 
-    def test_a_valid_contract_declares_what_must_appear(self):
-        result = MODULE.load_identity_contract(self.build(self.valid()), "pdf-1", "snap-1")
+    def test_a_confirmed_contract_declares_what_must_appear(self):
+        result = self.load(self.build(self.valid(), "auto"))
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["expected"], ["f-name", "f-email"])
-        self.assertEqual(len(result["sha256"]), 64)
 
     def test_no_contract_disables_the_check_rather_than_widening_it(self):
-        result = MODULE.load_identity_contract(self.build(), "pdf-1", "snap-1")
-        self.assertEqual(result["status"], "no_contract")
-        self.assertEqual(result["expected"], [])
+        self.assertEqual(self.load(self.build())["status"], "no_contract")
 
-    def test_a_contract_for_a_different_artifact_is_refused(self):
-        self.assertEqual(
-            MODULE.load_identity_contract(self.build(self.valid()), "pdf-2", "snap-1")["status"],
-            "contract_artifact_mismatch")
+    def test_a_contract_without_a_confirmation_record_is_not_trusted(self):
+        """A word in a file anyone can type is not an approval."""
+        self.assertEqual(self.load(self.build(self.valid()))["status"], "contract_unconfirmed")
 
-    def test_a_contract_for_a_different_snapshot_is_refused(self):
-        self.assertEqual(
-            MODULE.load_identity_contract(self.build(self.valid()), "pdf-1", "snap-2")["status"],
-            "contract_profile_mismatch")
+    def test_a_self_declared_confirmation_basis_field_grants_nothing(self):
+        contract = {**self.valid(), "confirmation_basis": "human_confirmed"}
+        self.assertEqual(self.load(self.build(contract))["status"], "contract_unconfirmed")
 
-    def test_an_unconfirmed_contract_is_refused(self):
-        contract = {**self.valid(), "confirmation_basis": "proposed"}
-        self.assertEqual(
-            MODULE.load_identity_contract(self.build(contract), "pdf-1", "snap-1")["status"],
-            "contract_unconfirmed")
+    def test_editing_the_contract_after_confirmation_invalidates_it(self):
+        version = self.build(self.valid(), "auto")
+        edited = {**self.valid(), "expected_contact_fact_ids": []}
+        (version / MODULE.CONTRACT_FILENAME).write_text(json.dumps(edited))
+        self.assertEqual(self.load(version)["status"], "contract_modified_after_confirmation")
 
-    def test_an_unreadable_contract_is_refused(self):
-        version = self.build()
-        (version / MODULE.CONTRACT_FILENAME).write_text("{not json")
-        self.assertEqual(
-            MODULE.load_identity_contract(version, "pdf-1", "snap-1")["status"],
-            "contract_unreadable")
+    def test_only_the_user_may_confirm(self):
+        version = self.build(self.valid())
+        record = {"contract_sha256": MODULE.sha256_bytes(
+            (version / MODULE.CONTRACT_FILENAME).read_bytes()),
+            "actor": "system", "confirmed_at": "2026-08-30T00:00:00Z"}
+        (version / MODULE.CONFIRMATION_FILENAME).write_text(json.dumps(record))
+        self.assertEqual(self.load(version)["status"], "confirmation_actor_not_user")
+
+    def test_confirm_contract_writes_a_record_and_refuses_to_overwrite_it(self):
+        version = self.build(self.valid())
+        record = MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
+                                         "user", "2026-08-30T00:00:00Z")
+        self.assertEqual(record["actor"], "user")
+        self.assertEqual(self.load(version)["status"], "ok")
+        with self.assertRaises(FileExistsError):
+            MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
+                                    "user", "2026-08-31T00:00:00Z")
+
+    def test_confirm_contract_refuses_a_non_user_actor(self):
+        version = self.build(self.valid())
+        with self.assertRaises(ValueError):
+            MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
+                                    "system", "2026-08-30T00:00:00Z")
+
+    def test_confirm_contract_refuses_an_invalid_contract(self):
+        version = self.build({**self.valid(), "expected_contact_fact_ids": []})
+        with self.assertRaises(ValueError):
+            MODULE.confirm_contract(version, "pdf-1", "snap-1", self.FACTS,
+                                    "user", "2026-08-30T00:00:00Z")
+
+
+class ContractValidation(unittest.TestCase):
+    FACTS = IdentityContract.FACTS
+
+    def check(self, **overrides):
+        contract = {"artifact_sha256": "pdf-1", "candidate_profile_sha256": "snap-1",
+                    "expected_identity_fact_ids": ["f-name"],
+                    "expected_contact_fact_ids": ["f-email"], **overrides}
+        return MODULE.validate_contract(contract, "pdf-1", "snap-1", self.FACTS)
+
+    def test_a_well_formed_contract_validates(self):
+        self.assertEqual(self.check(), "ok")
+
+    def test_an_empty_contract_is_refused(self):
+        """Declaring that nothing must appear would be the easiest green light."""
+        self.assertEqual(self.check(expected_contact_fact_ids=[]),
+                         "contract_no_contact_fact_declared")
+        self.assertEqual(self.check(expected_identity_fact_ids=[]),
+                         "contract_no_identity_fact_declared")
+
+    def test_a_duplicated_fact_id_is_refused(self):
+        self.assertEqual(self.check(expected_contact_fact_ids=["f-email", "f-email"]),
+                         "contract_duplicate_fact_id")
+
+    def test_a_fact_in_the_wrong_list_is_refused(self):
+        self.assertEqual(self.check(expected_identity_fact_ids=["f-email"],
+                                    expected_contact_fact_ids=["f-name"]),
+                         "contract_fact_type_mismatch")
+
+    def test_an_unknown_or_revoked_fact_is_refused(self):
+        self.assertEqual(self.check(expected_contact_fact_ids=["f-missing"]),
+                         "contract_fact_not_in_snapshot")
+        self.assertEqual(self.check(expected_contact_fact_ids=["f-gone"]),
+                         "contract_fact_not_in_snapshot")
+
+    def test_a_wrong_artifact_or_snapshot_is_refused(self):
+        self.assertEqual(self.check(artifact_sha256="pdf-2"), "contract_artifact_mismatch")
+        self.assertEqual(self.check(candidate_profile_sha256="snap-2"),
+                         "contract_profile_mismatch")
+
+    def test_a_non_string_fact_id_is_refused(self):
+        self.assertEqual(self.check(expected_contact_fact_ids=[7]),
+                         "contract_fact_id_not_a_string")
 
 
 class ProposedContracts(unittest.TestCase):
@@ -660,10 +753,11 @@ class ProposedContracts(unittest.TestCase):
         self.assertEqual(draft["contract"]["expected_contact_fact_ids"], ["f-email"],
                          "a revoked fact is not proposed, and education is not identity")
 
-    def test_a_draft_is_never_confirmed_by_the_tool(self):
+    def test_a_draft_carries_no_confirmation_of_any_kind(self):
         store, db = self.build()
         draft, = MODULE.propose_contracts(store, db)
-        self.assertEqual(draft["contract"]["confirmation_basis"], "proposed")
+        self.assertNotIn("confirmation_basis", draft["contract"])
+        self.assertFalse((store / "v1" / MODULE.CONFIRMATION_FILENAME).exists())
 
     def test_a_draft_binds_the_exact_artifact_and_snapshot(self):
         store, db = self.build()
@@ -672,7 +766,7 @@ class ProposedContracts(unittest.TestCase):
         self.assertEqual(contract["artifact_sha256"],
                          MODULE.sha256_bytes((store / "v1" / "resume.pdf").read_bytes()))
         self.assertEqual(contract["candidate_profile_sha256"], "snap-1")
-        self.assertEqual(MODULE.load_identity_contract.__name__, "load_identity_contract")
+        
 
     def test_a_draft_a_version_cannot_resolve_carries_no_fact_ids(self):
         store, db = self.build(profile_sha="unregistered")
