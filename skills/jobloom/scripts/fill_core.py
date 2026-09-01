@@ -202,6 +202,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             page_id TEXT NOT NULL,
             package_sha256 TEXT NOT NULL,
             secret TEXT NOT NULL,
+            reservation TEXT,
+            reservation_expires_at TEXT,
             issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             consumed_at TEXT,
@@ -570,13 +572,17 @@ def revoke_execution_grant(connection: sqlite3.Connection, grant_id: str,
     return {"grant_id": grant_id, "revoked": True, "status": "revoked"}
 
 
-def redeem_execution_grant(connection: sqlite3.Connection, grant_id: str,
-                           package_sha256: str, at: datetime) -> dict[str, Any]:
-    """Consume a grant atomically and return the parameters a run is authorised to use.
+def reserve_execution_grant(connection: sqlite3.Connection, grant_id: str,
+                            package_sha256: str, at: datetime,
+                            reservation_seconds: int = 120) -> dict[str, Any]:
+    """Hold a grant briefly and return the parameters a run would be authorised to use.
 
-    Single-use is a property of this row, not of a marker file: copying a package and a
-    grant to new paths cannot produce a second execution, because the second redemption
-    updates zero rows.
+    Split from consumption because everything that can still refuse a run — an unreadable
+    target counter, most of all — happens after the parameters are known. Consuming first
+    burned the grant on failures that had touched nothing, leaving a user with an error that
+    looked retryable and a grant that never could be.
+
+    A reservation lapses on its own, so a worker that dies holds nothing.
     """
     require_table(connection, "execution_grants")
     row = connection.execute(
@@ -592,20 +598,25 @@ def redeem_execution_grant(connection: sqlite3.Connection, grant_id: str,
     expires = parse_time(row["expires_at"])
     if not expires or at >= expires:
         return {"authorised": False, "reason": "grant_expired"}
+    held = parse_time(row["reservation_expires_at"])
+    if held and at < held:
+        return {"authorised": False, "reason": "grant_already_reserved"}
     page = connection.execute(
         "SELECT page_url FROM fill_pages WHERE session_id=? AND page_id=?",
         (row["session_id"], row["page_id"])).fetchone()
     attestation = field_policy.surface_attestation(connection, page["page_url"], at) if page else None
     if not attestation:
         return {"authorised": False, "reason": "surface_expired"}
+    reservation = secrets.token_hex(16)
     cursor = connection.execute(
-        "UPDATE execution_grants SET consumed_at=? WHERE grant_id=? AND consumed_at IS NULL",
-        (at.isoformat(), grant_id))
+        "UPDATE execution_grants SET reservation=?, reservation_expires_at=? "
+        "WHERE grant_id=? AND consumed_at IS NULL",
+        (reservation, (at + timedelta(seconds=reservation_seconds)).isoformat(), grant_id))
     connection.commit()
     if cursor.rowcount != 1:
         return {"authorised": False, "reason": "grant_already_consumed"}
     return {
-        "authorised": True, "grant_id": grant_id,
+        "authorised": True, "grant_id": grant_id, "reservation": reservation,
         # Everything security-relevant comes from here, not from the package: the package is
         # untrusted data once its digest has been matched.
         "target": attestation["origin"] + attestation["page_path"],
@@ -615,6 +626,29 @@ def redeem_execution_grant(connection: sqlite3.Connection, grant_id: str,
         # The oracle is a capability of the attested surface, not a caller-supplied URL.
         "oracle_url": attestation["origin"] + field_policy.ORACLE_PATH,
     }
+
+
+def consume_execution_grant(connection: sqlite3.Connection, grant_id: str, reservation: str,
+                            at: datetime) -> dict[str, Any]:
+    """Spend a reserved grant, once. This is where single-use actually lives."""
+    require_table(connection, "execution_grants")
+    cursor = connection.execute(
+        "UPDATE execution_grants SET consumed_at=? WHERE grant_id=? AND consumed_at IS NULL "
+        "AND reservation=? AND revoked_at IS NULL",
+        (at.isoformat(), grant_id, reservation))
+    connection.commit()
+    if cursor.rowcount == 1:
+        return {"consumed": True, "grant_id": grant_id}
+    row = connection.execute(
+        "SELECT consumed_at, revoked_at, reservation FROM execution_grants WHERE grant_id=?",
+        (grant_id,)).fetchone()
+    if not row:
+        return {"consumed": False, "reason": "grant_unknown"}
+    if row["revoked_at"]:
+        return {"consumed": False, "reason": "grant_revoked"}
+    if row["consumed_at"]:
+        return {"consumed": False, "reason": "grant_already_consumed"}
+    return {"consumed": False, "reason": "reservation_mismatch"}
 
 
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:

@@ -228,11 +228,11 @@ class _SessionBase(unittest.TestCase):
             self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
         )
 
-    def authority(self, redeem=None):
+    def authority(self, reserve=None):
         """The real service, backed by the real redemption logic."""
         return AUTHORITY.ExecutionAuthority(
-            self.db, redeem or FILL.redeem_execution_grant,
-            clock=lambda: self.now)
+            self.db, reserve or FILL.reserve_execution_grant,
+            consume=FILL.consume_execution_grant, clock=lambda: self.now)
 
     def reacquire(self, worker_id="worker-2"):
         APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
@@ -336,6 +336,7 @@ class AuthorityTests(_SessionBase):
         super().setUp()
 
     def redeem(self, authority, grant_id, digest, token=None):
+        """One reservation attempt, which is what "is this authorised" now means."""
         request = urllib.request.Request(
             authority.url,
             data=json.dumps({"grant_id": grant_id, "package_sha256": digest}).encode(),
@@ -376,7 +377,7 @@ class AuthorityTests(_SessionBase):
                 status, answer = self.redeem(authority, grant["grant_id"], "0" * 64)
                 self.assertEqual((status, answer["reason"]), (403, "grant_package_mismatch"))
 
-    def test_redemption_is_single_use_and_survives_copying_the_files(self):
+    def test_consumption_is_single_use_and_survives_copying_the_files(self):
         # Single-use is a row in the authority's state, not a marker beside a path, so
         # copying the package elsewhere buys nothing.
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
@@ -386,13 +387,47 @@ class AuthorityTests(_SessionBase):
             digest = hashlib.sha256(package.read_bytes()).hexdigest()
             copied = self.root / "private" / "copy.json"
             copied.write_bytes(package.read_bytes())
+            status, answer = 0, {}
+            with self.authority() as authority:
+                status, answer = self.redeem(authority, grant["grant_id"], digest)
+                self.assertEqual(status, 200)
+                FILL.consume_execution_grant(
+                    self.db, grant["grant_id"], answer["reservation"], self.now)
+                self.assertEqual(
+                    self.redeem(authority, grant["grant_id"], digest)[1]["reason"],
+                    "grant_already_consumed")
+            self.assertEqual(
+                hashlib.sha256(copied.read_bytes()).hexdigest(), digest,
+                "the copy is byte-identical and still cannot run")
+
+    def test_an_unconsumed_reservation_lapses_and_the_grant_can_run_later(self):
+        # The point of splitting the phases: a run refused before it touched anything must
+        # not have burned the grant.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
             with self.authority() as authority:
                 self.assertEqual(self.redeem(authority, grant["grant_id"], digest)[0], 200)
-                status, answer = self.redeem(authority, grant["grant_id"], digest)
-                self.assertEqual((status, answer["reason"]), (403, "grant_already_consumed"))
+                # Held, so a second attempt right away is refused rather than racing.
                 self.assertEqual(
-                    hashlib.sha256(copied.read_bytes()).hexdigest(), digest,
-                    "the copy is byte-identical and still cannot run")
+                    self.redeem(authority, grant["grant_id"], digest)[1]["reason"],
+                    "grant_already_reserved")
+            later = AUTHORITY.ExecutionAuthority(
+                self.db, FILL.reserve_execution_grant, consume=FILL.consume_execution_grant,
+                clock=lambda: self.now + timedelta(minutes=5))
+            with later as authority:
+                # The reservation lapsed; the grant was never consumed, so it still works.
+                self.assertEqual(self.redeem(authority, grant["grant_id"], digest)[0], 200)
+
+    def test_consuming_needs_the_reservation_that_was_issued(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            grant = self.issue(self.export())
+            outcome = FILL.consume_execution_grant(
+                self.db, grant["grant_id"], "not-the-reservation", self.now)
+            self.assertEqual(outcome, {"consumed": False, "reason": "reservation_mismatch"})
 
     def test_a_revoked_or_expired_grant_is_refused(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
@@ -406,7 +441,7 @@ class AuthorityTests(_SessionBase):
                     self.redeem(authority, revoked["grant_id"], digest)[1]["reason"],
                     "grant_revoked")
             later = AUTHORITY.ExecutionAuthority(
-                self.db, FILL.redeem_execution_grant,
+                self.db, FILL.reserve_execution_grant,
                 clock=lambda: self.now + timedelta(hours=2))
             fresh = self.issue(package)
             with later as authority:
@@ -446,15 +481,15 @@ class AuthorityTests(_SessionBase):
             grant = self.issue(package)
             digest = hashlib.sha256(package.read_bytes()).hexdigest()
 
-            def lying_redeem(connection, grant_id, package_sha256, at):
-                answer = FILL.redeem_execution_grant(connection, grant_id, package_sha256, at)
+            def lying_reserve(connection, grant_id, package_sha256, at):
+                answer = FILL.reserve_execution_grant(connection, grant_id, package_sha256, at)
                 if answer.get("authorised"):
                     answer["oracle_url"] = "http://127.0.0.1:9/always-zero"
                 return answer
 
-            with self.authority(redeem=lying_redeem) as authority:
+            with self.authority(reserve=lying_reserve) as authority:
                 with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                    WORKER.redeem(authority.url, authority.token, grant["grant_id"], digest)
+                    WORKER.reserve(authority.url, authority.token, grant["grant_id"], digest)
                 self.assertEqual(str(caught.exception), "oracle_outside_surface")
 
 
@@ -495,10 +530,42 @@ class BrowserExecutionTests(_SessionBase):
             self.assertEqual(envelope["final_action_activations"], 0)
             self.assertEqual(self.final_actions(server), 0)
             self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
+            # The expected digest is computed here, from the package bytes, before the
+            # envelope is consulted. Using `envelope["package_sha256"]` on both sides is what
+            # hid a bug where the field carried the last action's observed hash instead —
+            # every real import would have failed on `package_hash_mismatch`.
+            expected = hashlib.sha256(
+                (self.root / "private" / "result.json.package.json").read_bytes()).hexdigest()
+            self.assertEqual(envelope["package_sha256"], expected)
+            observed = {entry.get("observed_sha256") for entry in envelope["results"]}
+            self.assertNotIn(expected, observed)
             PROTOCOL.validate_result(
                 envelope, expected_session="session-1", expected_page="page-1",
-                expected_package_sha256=envelope["package_sha256"],
+                expected_package_sha256=expected,
                 expected_action_ids=["session-1:page-1:lever-0-1"], at=self.now)
+
+    def test_the_package_digest_is_not_the_last_field_hash(self):
+        # A multi-action run, because the shadowed variable took the value of whichever
+        # action ran last: with one action the two could still have looked plausible.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server, extra_field_ids=("lever-0-2", "lever-0-3"))
+            package = self.export("multi.package.json")
+            expected = hashlib.sha256(package.read_bytes()).hexdigest()
+            issued = self.issue(package)
+            output = self.root / "multi.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            envelope = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(envelope["package_sha256"], expected)
+            self.assertEqual(len(envelope["results"]), 3)
+            for entry in envelope["results"]:
+                self.assertNotEqual(entry.get("observed_sha256"), expected)
+            PROTOCOL.validate_result(
+                envelope, expected_session="session-1", expected_page="page-1",
+                expected_package_sha256=expected,
+                expected_action_ids=[entry["action_id"] for entry in envelope["results"]],
+                at=self.now)
 
     def test_the_result_carries_no_value_nonce_or_local_path(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
@@ -620,7 +687,10 @@ class RevocationTests(_SessionBase):
                 "already_revoked")
             second = self.issue(package)
             digest = hashlib.sha256(package.read_bytes()).hexdigest()
-            FILL.redeem_execution_grant(self.db, second["grant_id"], digest, self.now)
+            reserved = FILL.reserve_execution_grant(
+                self.db, second["grant_id"], digest, self.now)
+            FILL.consume_execution_grant(
+                self.db, second["grant_id"], reserved["reservation"], self.now)
             outcome = FILL.revoke_execution_grant(self.db, second["grant_id"], self.now)
             self.assertEqual(outcome["status"], "already_consumed")
             self.assertFalse(outcome["revoked"])
@@ -738,14 +808,14 @@ class TimingBoundaryTests(_SessionBase):
             package = self.export()
             issued = self.issue(package)
 
-            def blind_redeem(connection, grant_id, package_sha256, at):
-                answer = FILL.redeem_execution_grant(connection, grant_id, package_sha256, at)
+            def blind_reserve(connection, grant_id, package_sha256, at):
+                answer = FILL.reserve_execution_grant(connection, grant_id, package_sha256, at)
                 if answer.get("authorised"):
                     # Same surface, an oracle path that is not being served.
                     answer["oracle_url"] = answer["origin"] + "/__state-missing"
                 return answer
 
-            with self.authority(redeem=blind_redeem) as service:
+            with self.authority(reserve=blind_reserve) as service:
                 with self.assertRaises(WORKER.WorkerRefusal) as caught:
                     WORKER.run(package, self.root / "blind.json", service.url, service.token,
                                issued["grant_id"], headed=False, at=self.now)
@@ -757,13 +827,29 @@ class TimingBoundaryTests(_SessionBase):
 
 
 class CapabilityTests(_SessionBase):
-    """The authority token travels in a 0600 file, never anywhere a neighbour can read."""
+    """The token stays out of `argv`. That is the claim, and it is the whole claim.
+
+    A 0600 file excludes other Unix users and keeps the value out of the process list. It
+    does not exclude a hostile process running as this same user — that one can read the
+    file — so nothing here tests for a property the mechanism does not have.
+    """
 
     def setUp(self):
         self.now = AT
         super().setUp()
 
-    def test_the_token_is_read_from_a_private_file_and_leaks_nowhere(self):
+    def test_the_documented_limit_is_the_one_the_mechanism_has(self):
+        # A same-UID reader is not excluded, and the docstrings say so rather than implying
+        # a guarantee file permissions cannot give.
+        def flat(text):
+            return " ".join(text.split())
+
+        for text in (inspect.getdoc(WORKER.read_capability),
+                     inspect.getdoc(AUTHORITY.ExecutionAuthority.write_capability)):
+            self.assertIn("same user", flat(text))
+        self.assertIn("does not exclude", flat(inspect.getdoc(WORKER.read_capability)))
+
+    def test_the_token_is_read_from_a_private_file_and_stays_out_of_argv(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.replay_session(server)
             package = self.export()

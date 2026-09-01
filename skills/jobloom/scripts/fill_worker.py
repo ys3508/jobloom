@@ -63,8 +63,11 @@ def _refuse(code: str) -> None:
 def read_capability(path: Path) -> tuple[str, str]:
     """Read the redemption endpoint and its token from a 0600 file.
 
-    Not from `argv`, where any process this user runs can read it, and not from an
-    environment variable, which children inherit.
+    Not from `argv`, which is visible in the process list to other users, and not from the
+    environment, which children inherit. The mode excludes other Unix users; it does not
+    exclude a hostile process running as this same user, which can simply read the file.
+    That limit is real and is not papered over: closing it needs a different OS identity, a
+    sandbox, or an inherited descriptor, none of which a file permission can provide.
     """
     if (os.stat(path).st_mode & 0o777) != 0o600:
         _refuse("capability_permissions")
@@ -75,8 +78,40 @@ def read_capability(path: Path) -> tuple[str, str]:
     return url, token
 
 
-def redeem(authority_url: str, token: str, grant_id: str,
-           package_sha256: str) -> dict[str, Any]:
+def _call_authority(authority_url: str, token: str, path: str,
+                    payload: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        authority_url.rsplit("/", 1)[0] + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as refusal:
+        try:
+            return json.load(refusal)
+        except Exception:  # noqa: BLE001
+            _refuse("grant_refused")
+    except Exception:  # noqa: BLE001 - an unreachable authority authorises nothing
+        _refuse("authority_unreachable")
+
+
+def consume(authority_url: str, token: str, grant_id: str, reservation: str) -> None:
+    """Spend the grant, once, after everything that could refuse the run has passed.
+
+    Split from reservation because an unreadable oracle used to burn the grant: the worker
+    consumed first and only then discovered it could not prove anything, leaving the user a
+    failure that looked retryable and never was.
+    """
+    answer = _call_authority(authority_url, token, "/consume",
+                             {"grant_id": grant_id, "reservation": reservation})
+    if not answer.get("consumed"):
+        _refuse(answer.get("reason") or "grant_refused")
+
+
+def reserve(authority_url: str, token: str, grant_id: str,
+            package_sha256: str) -> dict[str, Any]:
     """Ask the authority whether this package may run, and get back what it may use.
 
     A secret cannot verify anything while it travels beside the signature it verifies, which
@@ -87,24 +122,12 @@ def redeem(authority_url: str, token: str, grant_id: str,
     Everything security-relevant in the answer replaces the package's own account of it. The
     package is untrusted data whose digest has been matched, nothing more.
     """
-    request = urllib.request.Request(
-        authority_url,
-        data=json.dumps({"grant_id": grant_id, "package_sha256": package_sha256}).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-        method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            answer = json.load(response)
-    except urllib.error.HTTPError as refusal:
-        try:
-            answer = json.load(refusal)
-        except Exception:  # noqa: BLE001
-            _refuse("grant_refused")
-    except Exception:  # noqa: BLE001 - an unreachable authority authorises nothing
-        _refuse("authority_unreachable")
+    answer = _call_authority(authority_url, token, "/reserve",
+                             {"grant_id": grant_id, "package_sha256": package_sha256})
     if not answer.get("authorised"):
         _refuse(answer.get("reason") or "grant_refused")
-    for field in ("target", "origin", "renderer_version", "page_sha256", "oracle_url"):
+    for field in ("target", "origin", "renderer_version", "page_sha256", "oracle_url",
+                  "reservation"):
         if not isinstance(answer.get(field), str) or not answer[field]:
             _refuse("incomplete_authorisation")
     if not LOOPBACK_ORIGIN.fullmatch(answer["origin"]):
@@ -322,11 +345,14 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
     from playwright.sync_api import sync_playwright
 
     package = load_package(package_path)
-    digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
+    # Named so it cannot be shadowed. An earlier version reused `digest` for each action's
+    # observed hash, so the envelope carried the last field's value hash where the package
+    # digest belonged and every real import would have failed on `package_hash_mismatch`.
+    package_digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
     # Redemption is what makes this single-use, and it happens in the authority's own state
     # rather than beside the package: copying the package somewhere else cannot buy a second
     # run, because the second redemption updates no rows.
-    authorisation = redeem(authority_url, authority_token, grant_id, digest)
+    authorisation = reserve(authority_url, authority_token, grant_id, package_digest)
     surface = {"origin": authorisation["origin"],
                "page_sha256": authorisation["page_sha256"]}
     target = authorisation["target"]
@@ -338,7 +364,10 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
     # grant is spent.
     before = _read_oracle(oracle_url)
     if before is None:
+        # Refused while the grant is still only reserved, so the reservation lapses and the
+        # same grant can be run again once the target is readable.
         _refuse("oracle_unavailable")
+    consume(authority_url, authority_token, grant_id, authorisation["reservation"])
 
     results: list[dict[str, Any]] = []
     stopped_on: str | None = None
@@ -372,7 +401,7 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
                                         "control": action["control"],
                                         "error_code": stopped_on})
                         continue
-                    outcome, digest, error = _perform(page, action)
+                    outcome, observed_digest, error = _perform(page, action)
                     # A request an action triggers can reach the route handler after the
                     # action call returns, so let the page settle before deciding. Without
                     # this a fill that submitted the form could be reported `verified`
@@ -381,8 +410,8 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
                     entry: dict[str, Any] = {"action_id": action["step_id"],
                                              "outcome": outcome,
                                              "control": action["control"]}
-                    if digest:
-                        entry["observed_sha256"] = digest
+                    if observed_digest:
+                        entry["observed_sha256"] = observed_digest
                     if error:
                         entry["error_code"] = error
                     if guards.violations and index == len(results):
@@ -412,7 +441,7 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
     envelope = {
         "protocol_version": worker_protocol.PROTOCOL_VERSION,
         "session_id": package["session_id"], "page_id": package["page_id"],
-        "package_sha256": digest,
+        "package_sha256": package_digest,
         # A number only when the target itself was counting. Otherwise `null`: the guard
         # observing nothing is evidence about the guard, not about the target.
         "final_action_activations": (after - before if after is not None else None),

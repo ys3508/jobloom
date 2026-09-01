@@ -155,14 +155,25 @@ the attestation that is live now. An added action, an edited value, a changed ha
 swapped surface each refuse.
 
 The redemption token travels in a 0600 capability file, never in `argv`: process arguments are
-readable by other processes this user runs, which is precisely who the token excludes.
+visible in the process list to other users and to anything running `ps`. **The mode excludes
+other Unix users; it does not exclude a hostile process running as this same user**, which can
+read the file — closing that would need a different OS identity, a sandbox, or an inherited
+descriptor, and no file permission substitutes for one. The token stops an unauthenticated
+caller, and that is the whole of the claim.
 Revocation reports which of four things happened — unknown, already revoked, already consumed,
 or revoked — because returning success for a grant that never existed is an absence turned
 into a fact.
 
-Redemption is where single-use lives. It is an atomic update of that row, not a marker beside
-a file path, so copying the package and re-running buys nothing: the second redemption updates
-zero rows. The response carries the parameters the run may use — target, origin, renderer
+Redemption is two phases, because everything that can still refuse a run happens after the
+parameters are known. **Reserve** holds the grant briefly and returns them; the target's
+counter baseline is read; only then does **consume** spend it. Consuming first burned the
+grant on failures that had touched nothing — an unreadable counter left the user an error that
+looked retryable and a grant that never could be. A reservation lapses on its own, so a worker
+that dies holds nothing and the grant runs later.
+
+Consumption is where single-use lives. It is an atomic update of that row, not a marker beside
+a file path, so copying the package and re-running buys nothing: the second consumption
+updates zero rows. The response carries the parameters the run may use — target, origin, renderer
 version, page digest, and the oracle URL — and the worker uses those instead of the package's
 own account of them. **The oracle is a capability of the attested surface**, never a
 caller-supplied URL, because any service can return a constant zero.
