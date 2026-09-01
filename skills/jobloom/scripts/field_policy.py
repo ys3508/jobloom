@@ -37,6 +37,15 @@ from _common import context_matches, parse_time  # noqa: E402
 
 DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
 
+# Domains whose fields are never answered from a Jobloom source, whatever the page declares.
+ALWAYS_MANUAL_DOMAINS = {"voluntary_eeo", "compensation", "employer_conflict", "sponsorship"}
+MANUAL_REASONS = {
+    "voluntary_eeo": "voluntary_disclosure_manual",
+    "compensation": "employer_defined_compensation_manual",
+    "employer_conflict": "employer_entity_not_approved",
+    "sponsorship": "sponsorship_meaning_ambiguous",
+}
+
 LOCALE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Z]{2})?$")
 
 # Non-disclosure options are chosen from this table, never typed by a user. A free-text
@@ -96,14 +105,14 @@ def disposition(field_id: str, question: str, control: str,
     Returned as `(disposition, domain, family)` so the caller can both route the field and
     name why. Domain rules win over whatever the page declared, in that order.
     """
-    if control == "file":
-        return "material", None, None
     domain = classify(field_id, question)
     if domain:
         kind, family = domain
-        if kind in {"voluntary_eeo", "compensation", "employer_conflict"}:
+        if kind in ALWAYS_MANUAL_DOMAINS:
             return "always_manual", kind, family
         return "answer", kind, family
+    if control == "file":
+        return "material", None, None
     if source_kind == "fact":
         return "fact", None, None
     if source_kind in {None, "answer"}:
@@ -174,15 +183,20 @@ def classify(field_id: str, question: str) -> tuple[str, str] | None:
 
 
 def sponsorship_is_ambiguous(question: str) -> bool:
-    """A sponsorship question resolves only when it names exactly one point in time.
+    """Always true in v1. Page wording may not settle which canonical meaning is being asked.
 
-    The reviewed fixture's `authorization.sponsorship_status` is a single broad control, and
-    the four canonical meanings are deliberately separate. Anything that asks about both, or
-    about neither, is a question this system has not been told the meaning of.
+    This function used to resolve the question when its wording named exactly one point in
+    time — "do you require sponsorship now?" reading as `sponsorship_now`. That let page text
+    *lower* caution, which is the one direction untrusted input may never move: an employer
+    who writes "now" while meaning "now or in the future" would have had a narrower answer
+    submitted than the question asked for, and the four meanings are separate precisely
+    because that substitution is the harm.
+
+    Resolving one of the four requires a user-reviewed canonical answer scoped to this
+    application, which `answer_library` already enforces through `IMMIGRATION_CANONICAL_IDS`.
+    Until a mapping is reviewed for this application, the field is the user's.
     """
-    now = bool(SPONSORSHIP_NOW.search(question))
-    future = bool(SPONSORSHIP_FUTURE.search(question))
-    return now == future
+    return True
 
 
 def initialize(connection: sqlite3.Connection) -> None:
@@ -299,11 +313,33 @@ def policy_issue(row: sqlite3.Row, context: dict[str, Any], at: datetime) -> str
     return None
 
 
+def normalize_options(options: Any) -> list[dict[str, str]] | None:
+    """Accept `[{"label": ..., "value": ...}]` and reject anything looser.
+
+    A real control's visible label and its submitted value are different strings —
+    `<option value="3">Decline to self-identify</option>` — so matching the label proves
+    nothing about what the form would send. Both halves are required.
+    """
+    if options is None:
+        return None
+    if not isinstance(options, list):
+        raise ValueError("observed field options must be a list")
+    normalized = []
+    for option in options:
+        if not isinstance(option, dict) or set(option) != {"label", "value"}:
+            raise ValueError("each option must carry exactly a label and a value")
+        if not all(isinstance(option[key], str) and 0 < len(option[key]) <= 256
+                   for key in ("label", "value")):
+            raise ValueError("option labels and values must be bounded strings")
+        normalized.append({"label": option["label"], "value": option["value"]})
+    return normalized
+
+
 def resolve_nondisclosure(
     connection: sqlite3.Connection,
     question_family: str,
     locale: str,
-    options: list[str] | None,
+    options: list[dict[str, str]] | None,
     context: dict[str, Any],
     at: datetime,
 ) -> dict[str, Any]:
@@ -312,6 +348,12 @@ def resolve_nondisclosure(
     Selecting "decline to answer" discloses nothing, which is why it may be automated at all
     while a demographic value may not. That only holds while the match is exact: a fuzzy match
     could select a real category, so anything other than exactly one hit pauses.
+
+    The reviewed vocabulary is matched against the option's **label**, because that is what a
+    person reviewed. What gets submitted is the option's **value**, which is the page's own
+    opaque string and is carried through unread. Matching a label is therefore evidence that
+    the control offers a non-disclosure choice, not evidence about what the form sends — so a
+    label that maps to more than one value, or to none, pauses.
     """
     rows = connection.execute(
         "SELECT * FROM nondisclosure_policies WHERE question_family=? AND locale=?",
@@ -336,10 +378,13 @@ def resolve_nondisclosure(
         return {"applied": False, "reason": "nondisclosure_option_unavailable"}
     allowed = set(vocabulary_options(
         policy["locale"], json.loads(policy["option_tokens_json"]), policy["vocabulary_version"]))
-    matches = [option for option in options if option in allowed]
+    matches = [option for option in options if option["label"] in allowed]
     if len(matches) != 1:
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
-    return {"applied": True, "policy_id": policy["policy_id"], "option": matches[0]}
+    if len({option["value"] for option in matches}) != 1:
+        return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
+    return {"applied": True, "policy_id": policy["policy_id"],
+            "option_label": matches[0]["label"], "submitted_value": matches[0]["value"]}
 
 
 def conflict_derivation(

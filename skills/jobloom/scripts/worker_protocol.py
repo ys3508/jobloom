@@ -81,6 +81,10 @@ FORBIDDEN_RESULT_KEYS = {
     "file_path", "local_path", "screenshot", "page_text", "answer",
 }
 
+# What a verified chain is evidence of. Named so that a later reader of an archive cannot
+# mistake it for proof that the employer's form had no further pages.
+COVERAGE_BASIS = "self_reported_page_chain"
+
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
 
@@ -188,6 +192,16 @@ def chain_issue(pages: list[dict[str, Any]]) -> str | None:
     Every rule here exists because its absence let something be assumed. The chain must start
     at index 0, advance one index at a time with each page naming the checkpoint of the page
     before it, and end on a page that declared itself final and saw the submit control.
+
+    **What this proves, and what it does not.** Every input is self-reported by the observer:
+    the index, the predecessor hash, the final-page flag. So a passing chain establishes that
+    the observer reported a contiguous sequence it could not have fabricated cheaply — each
+    link names a checkpoint hash computed from steps that were actually verified — and that
+    nothing was skipped *within what was reported*. It does not establish that the reported
+    sequence is the employer's whole form. An observer that never saw a page cannot report
+    its absence, and no artefact available here can. Anything resting on this must therefore
+    say it rests on a self-reported chain, which is why `finalize_handling` records
+    `COVERAGE_BASIS` alongside the coverage hash rather than claiming completeness outright.
     """
     if not pages:
         return "no_pages_observed"

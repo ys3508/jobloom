@@ -13,6 +13,7 @@ import json
 import re
 import socket
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -43,13 +44,28 @@ class VendoredCorpusTests(unittest.TestCase):
     def fixture(self, name):
         return json.loads((UPSTREAM / name / "fixture.json").read_text(encoding="utf-8"))
 
-    def test_vendored_bytes_match_the_recorded_manifest_and_upstream_provenance(self):
+    def test_vendored_bytes_are_the_pinned_commits_git_objects(self):
+        # A pinned commit written in prose anchors nothing. These are the object names git
+        # itself uses — sha1(b"blob <len>\0" + bytes) — so the bytes on disk are tied to the
+        # objects in that commit's tree, checkable offline. They were confirmed against
+        # `GET /repos/.../contents/...?ref=<commit>` when vendored.
         manifest = json.loads((UPSTREAM / "SHA256SUMS.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["upstream_commit"], UPSTREAM_COMMIT)
+        for relative, digests in manifest["files"].items():
+            with self.subTest(path=relative):
+                data = (UPSTREAM / relative).read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), digests["sha256"])
+                self.assertEqual(
+                    hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(),
+                    digests["git_blob_sha1"])
+        self.assertEqual(
+            set(manifest["files"]),
+            {f"{name}/{part}.json" for name in FAMILIES
+             for part in ("fixture", "provenance", "approval")} | {"LICENSE"})
+
+    def test_vendored_bytes_match_upstream_provenance(self):
         for name in FAMILIES:
             with self.subTest(fixture=name):
-                for part in ("fixture", "provenance", "approval"):
-                    raw = (UPSTREAM / name / f"{part}.json").read_bytes()
-                    self.assertEqual(hashlib.sha256(raw).hexdigest(), manifest[name][part])
                 # Upstream's own provenance names the digest of the fixture it approved, so
                 # the copy is checked against the source's record, not only against ours.
                 provenance = json.loads((UPSTREAM / name / "provenance.json").read_text())
@@ -57,8 +73,6 @@ class VendoredCorpusTests(unittest.TestCase):
                     hashlib.sha256((UPSTREAM / name / "fixture.json").read_bytes()).hexdigest(),
                     provenance["fixtureSha256"])
                 self.assertEqual(provenance["approvedBy"], "qa-owner")
-        self.assertEqual(
-            hashlib.sha256((UPSTREAM / "LICENSE").read_bytes()).hexdigest(), manifest["LICENSE"])
 
     def test_attribution_names_the_source_licence_and_pinned_commit(self):
         notice = (UPSTREAM / "NOTICE.md").read_text(encoding="utf-8")
@@ -146,8 +160,11 @@ class GeneratedReplayTests(unittest.TestCase):
             with self.subTest(fixture=name):
                 self.assertNotIn("http://", page.replace("http://www.w3.org", ""))
                 self.assertNotIn("https://", page)
-                for forbidden in ("fetch(", "XMLHttpRequest", "import ", "src=", "action="):
+                for forbidden in ("fetch(", "XMLHttpRequest", "import ", "src=", "<script"):
                     self.assertNotIn(forbidden, page)
+                # The only action target is the loopback counting endpoint.
+                for action in re.findall(r'action="([^"]*)"', page):
+                    self.assertIn(action, ("", "/__final_action"))
                 # Synthetic wording only: no real employer name reaches the repository.
                 self.assertIn("Not a real employer form", page)
 
@@ -181,10 +198,12 @@ class GeneratedReplayTests(unittest.TestCase):
         self.assertNotIn("window.open", first)
         self.assertNotIn("setTimeout", first)
         self.assertNotIn("submit()", first + last)
-        # The final control is a stop boundary that only counts.
-        self.assertIn('type="button"', last)
-        self.assertNotIn('type="submit"', last)
-        self.assertIn("onsubmit=\"return false;\"", last)
+        # The final control really can submit; that is the point. An oracle that cannot
+        # observe an activation cannot fail, and the earlier inert button plus a `window`
+        # counter the server never read was exactly that.
+        self.assertIn('type="submit"', last)
+        self.assertIn('action="/__final_action"', last)
+        self.assertNotIn('action="/__final_action"', first)
 
 
 class ReplayServerTests(unittest.TestCase):
@@ -220,6 +239,17 @@ class ReplayServerTests(unittest.TestCase):
             urllib.request.urlopen(f"{server.origin}/lever/1", timeout=5).read()
             state = json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))
             self.assertEqual(state["final_action_activations"], 0)
+
+    def test_the_counter_actually_moves_when_the_final_action_is_activated(self):
+        # Without this the zero above proves nothing: the previous oracle was a page-side
+        # variable the server never read, so it reported zero unconditionally.
+        with ReplayServer() as server:
+            request = urllib.request.Request(f"{server.origin}/__final_action", data=b"")
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(refused.exception.code, 403)
+            state = json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))
+            self.assertEqual(state["final_action_activations"], 1)
 
 
 if __name__ == "__main__":

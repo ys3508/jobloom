@@ -71,7 +71,12 @@ reviewed Lever fixture, 2 resolve to career evidence.
 **Voluntary EEO.** Race, ethnicity, gender, disability and veteran self-identification values
 are never stored, read, hashed, archived or placed in a package. A separate
 `nondisclosure_policies` row — not an AnswerEntry — may select a reviewed non-disclosure
-option, and only on an exact match. The row stores a **token and a vocabulary version**, never
+option, and only on an exact match against the option's **label**, which is what a person
+reviewed. What gets submitted is the option's **value**, the page's own opaque string, carried
+through unread — so a label match is evidence that the control offers a non-disclosure choice,
+never evidence about what the form would send. One reviewed label mapping to more than one
+value pauses. Classification runs before every source branch including uploads, so a control
+declared `file` cannot outrun it. The row stores a **token and a vocabulary version**, never
 a page-facing string: `NONDISCLOSURE_VOCABULARY` lives in code, is versioned, and is reviewed
 per locale, because a free-text allowlist is precisely how a real demographic value would
 reach the database. The page's option strings are never persisted either, only their count.
@@ -110,9 +115,12 @@ certified complete and in date. `jobs.normalized_employer` is a deduplication an
 it may propose a candidate, never establish identity. **A registry miss is `unknown`, never
 `No`.** None of those objects exists, so every conflict field is manual today.
 
-**Sponsorship.** One broad control may not stand in for four canonical meanings. A sponsorship
-question that names both a present and a future point in time, or neither, pauses as
-`sponsorship_meaning_ambiguous` no matter which canonical answer would have matched.
+**Sponsorship.** One broad control may not stand in for four canonical meanings, and **page
+wording may not settle which meaning is being asked**. Every sponsorship question pauses as
+`sponsorship_meaning_ambiguous` regardless of which canonical answer would have matched. An
+earlier version resolved the question when its wording named one point in time, which let
+untrusted page text lower caution: an employer writing "now" while meaning "now or in the
+future" would have had a narrower answer submitted than the question asked for.
 
 **Discovery source.** How the user heard about a role is their statement. It is never inferred
 from the posting URL, the ATS host, or which collector surfaced the opening — those record how

@@ -412,6 +412,51 @@ def _require_chain_link(connection: sqlite3.Connection, session_id: str, page_in
         raise ValueError("no page follows the final page")
 
 
+def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity, locale,
+                       context, current_time, planned, eeo_handling):
+    """Apply the rule for a classified domain. Returns a pause reason, a marker, or None.
+
+    `None` means the field falls through to the ordinary source dispatch;
+    `"continue_to_source"` is never returned for a domain that must not.
+    """
+    domain_kind, family = domain
+    if domain_kind == "voluntary_eeo":
+        # Protected-characteristic questions are the user's alone. The reason code hashes the
+        # field regardless of what the page declared, so neither the question nor an answer is
+        # legible in the pause record.
+        resolved = field_policy.resolve_nondisclosure(
+            connection, family, locale or "",
+            field_policy.normalize_options(field.get("options")), context, current_time)
+        if not resolved["applied"]:
+            eeo_handling[field_id] = resolved["reason"]
+            return _field_reason(resolved["reason"], field_id, "sensitive_personal")
+        # Selecting a reviewed "prefer not to answer" option discloses nothing, which is the
+        # whole reason it may be automated while a value may not. The submitted value is the
+        # page's own opaque option value, not the reviewed label.
+        planned.append({"ordinal": ordinal, "field": field, "operation": "fill",
+                        "source_kind": "nondisclosure_policy",
+                        "source_id": resolved["policy_id"],
+                        "source_status": "active", "sensitivity": "sensitive_personal",
+                        "value": resolved["submitted_value"],
+                        "expected_sha256": canonical_hash(resolved["submitted_value"])})
+        eeo_handling[field_id] = "policy_declined"
+        return "continue_to_source"
+    if domain_kind == "compensation":
+        # Employer-defined brackets exist only in page text, and the direction criteria
+        # `salary_floor` is a search filter in another subsystem. Neither may pick a band.
+        return _field_reason("employer_defined_compensation_manual", field_id, sensitivity)
+    if domain_kind == "employer_conflict":
+        derivation = field_policy.conflict_derivation(connection, family, context, current_time)
+        if not derivation["derivable"]:
+            return _field_reason(derivation["reason"], field_id, sensitivity)
+        return None
+    if domain_kind == "sponsorship":
+        # One broad control cannot stand in for four separate canonical meanings, and page
+        # wording may not settle which one it is.
+        return _field_reason("sponsorship_meaning_ambiguous", field_id, sensitivity)
+    return None
+
+
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:
     """How the user heard about a role is their statement, never an inference.
 
@@ -534,12 +579,9 @@ def observe_page(
         seen_fields.add(field_id)
         if not isinstance(field.get("required"), bool):
             raise ValueError("observed field required must be Boolean")
-        options = field.get("options")
-        if options is not None and (
-            not isinstance(options, list) or len(options) > 100
-            or not all(isinstance(option, str) and 0 < len(option) <= 256 for option in options)
-        ):
-            raise ValueError("observed field options must be up to 100 bounded strings")
+        options = field_policy.normalize_options(field.get("options"))
+        if options is not None and len(options) > 100:
+            raise ValueError("observed field options must be at most 100 entries")
         control = field["control"]
         if control not in ALLOWED_CONTROLS:
             reasons.append(_field_reason("unsupported_form", field_id, field.get("sensitivity", "normal")))
@@ -557,6 +599,19 @@ def observe_page(
         if archive_core.SENSITIVE_FIELD_PATTERN.search(f"{field_id} {field['question']}") and sensitivity == "normal":
             reasons.append(_field_reason("sensitive_field_misclassified", field_id, "sensitive_personal"))
             continue
+        # Classification runs before every source branch, including uploads. A control
+        # declared `file` with `upload_kind: "resume"` and a question asking for an identity
+        # document would otherwise have been planned as a resume upload without ever being
+        # classified — the upload branch used to `continue` before this ran.
+        domain = field_policy.classify(field_id, field["question"])
+        if domain:
+            outcome = _apply_domain_rule(connection, domain, field, field_id, ordinal,
+                                         sensitivity, locale, context, current_time,
+                                         planned, eeo_handling)
+            if outcome:
+                if outcome != "continue_to_source":
+                    reasons.append(outcome)
+                continue
         if control == "file":
             upload_kind = field.get("upload_kind")
             upload = _plan_upload(connection, session, upload_kind)
@@ -569,46 +624,6 @@ def observe_page(
                             "source_status": "locked", "sensitivity": sensitivity,
                             "value": value, "expected_sha256": expected})
             continue
-        domain = field_policy.classify(field_id, field["question"])
-        if domain:
-            domain_kind, family = domain
-            if domain_kind == "voluntary_eeo":
-                # Protected-characteristic questions are the user's alone. The reason code
-                # hashes the field regardless of what the page declared, so neither the
-                # question nor an answer is legible in the pause record.
-                resolved = field_policy.resolve_nondisclosure(
-                    connection, family, locale or "", field.get("options"), context, current_time)
-                if not resolved["applied"]:
-                    reasons.append(_field_reason(resolved["reason"], field_id, "sensitive_personal"))
-                    eeo_handling[field_id] = resolved["reason"]
-                    continue
-                # Selecting a reviewed "prefer not to answer" option discloses nothing, which
-                # is the whole reason it may be automated while a value may not.
-                planned.append({"ordinal": ordinal, "field": field, "operation": "fill",
-                                "source_kind": "nondisclosure_policy",
-                                "source_id": resolved["policy_id"],
-                                "source_status": "active", "sensitivity": "sensitive_personal",
-                                "value": resolved["option"],
-                                "expected_sha256": canonical_hash(resolved["option"])})
-                eeo_handling[field_id] = "policy_declined"
-                continue
-            if domain_kind == "compensation":
-                # Employer-defined brackets exist only in page text, and the direction
-                # criteria `salary_floor` is a search filter in another subsystem. Neither
-                # may pick a band.
-                reasons.append(_field_reason(
-                    "employer_defined_compensation_manual", field_id, sensitivity))
-                continue
-            if domain_kind == "employer_conflict":
-                derivation = field_policy.conflict_derivation(
-                    connection, family, context, current_time)
-                if not derivation["derivable"]:
-                    reasons.append(_field_reason(derivation["reason"], field_id, sensitivity))
-                    continue
-            if domain_kind == "sponsorship" and field_policy.sponsorship_is_ambiguous(field["question"]):
-                # One broad control cannot stand in for four separate canonical meanings.
-                reasons.append(_field_reason("sponsorship_meaning_ambiguous", field_id, sensitivity))
-                continue
         source_kind = field.get("source_kind")
         if source_kind == "fact":
             fact = facts.get(field.get("source_id"))
@@ -924,7 +939,8 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
         raise ValueError("final submit control has not been observed")
     field_policy.finalize_handling(
         connection, session["application_id"], observed_eeo,
-        canonical_hash([page["observation_sha256"] for page in pages]), at or now_utc())
+        f"{worker_protocol.COVERAGE_BASIS}:"
+        f"{canonical_hash([page['observation_sha256'] for page in pages])}", at or now_utc())
     legal_items = sorted({item for page in pages for item in json.loads(page["legal_items_json"])})
     restrictions = sorted({item for page in pages for item in json.loads(page["restricted_requests_json"])})
     pre_submit_core.register_inventory(

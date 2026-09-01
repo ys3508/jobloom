@@ -40,6 +40,24 @@ class ReplayServer:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                """The only honest place to count an activation.
+
+                A page-side counter is a variable the server never reads: it reports zero
+                whether or not anything was activated. Counting here means the oracle can
+                actually fail, which is the only reason to have one.
+                """
+                if self.path != "/__final_action":
+                    self.send_error(404)
+                    return
+                server.final_activations += 1
+                body = b"final action refused"
+                self.send_response(403)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):  # noqa: N802
                 if self.path == "/__state":
                     body = json.dumps({

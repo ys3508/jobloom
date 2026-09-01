@@ -195,6 +195,19 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     RACE_VALUES = ["Hispanic or Latino", "Black or African American", "Asian"]
     DECLINE = "I do not wish to self-identify"
     OTHER_DECLINE = "Prefer not to answer"
+    # A real control's label and its submitted value are different strings.
+    DECLINE_VALUE = "opt-9"
+
+    def options(self, labels):
+        return [{"label": label, "value": f"opt-{index}"}
+                for index, label in enumerate(labels)]
+
+    def race_options(self, extra=()):
+        return ([{"label": label, "value": f"opt-{index}"}
+                 for index, label in enumerate(self.RACE_VALUES)]
+                + [{"label": self.DECLINE, "value": self.DECLINE_VALUE}]
+                + [{"label": label, "value": f"opt-x{index}"}
+                   for index, label in enumerate(extra)])
 
     def field(self, field_id, question, **updates):
         value = {"field_id": field_id, "question": question, "selector": f"#{field_id}",
@@ -262,14 +275,14 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                         "What is your expected total compensation?", "150000")
         result = self.observe([self.field(
             "comp_range", "What is your expected total compensation?",
-            options=["$100k-$150k", "$150k-$200k"], source_kind="answer")])
+            options=self.options(["$100k-$150k", "$150k-$200k"]), source_kind="answer")])
         self.assertEqual(self.pause_reasons(result), {"employer_defined_compensation_manual"})
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM fill_steps").fetchone()[0], 0)
 
     def test_employer_defined_bracket_is_always_manual(self):
         result = self.observe([self.field(
             "comp_range", "Select the salary range you expect",
-            options=["$100k-$150k", "$150k-$200k"])])
+            options=self.options(["$100k-$150k", "$150k-$200k"]))])
         self.assertEqual(self.pause_reasons(result), {"employer_defined_compensation_manual"})
 
     # ---- 6: sponsorship -------------------------------------------------
@@ -286,11 +299,60 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                     source_kind="answer")])
                 self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
 
-    def test_a_sponsorship_question_naming_one_point_in_time_is_not_ambiguous(self):
-        self.assertFalse(POLICY.sponsorship_is_ambiguous(
-            "Do you require sponsorship now, at this time?"))
-        self.assertTrue(POLICY.sponsorship_is_ambiguous(
-            "Will you require employment visa sponsorship?"))
+    def test_page_wording_cannot_lower_caution_on_a_sponsorship_question(self):
+        # This used to resolve when the wording named one point in time, which let untrusted
+        # page text move caution in the one direction it may never move. An employer who
+        # writes "now" while meaning "now or in the future" would have had a narrower answer
+        # submitted than the question asked for.
+        for wording in ("Do you require sponsorship now, at this time?",
+                        "Will you ever require sponsorship in the future?",
+                        "Will you require employment visa sponsorship?",
+                        "Sponsorship?"):
+            with self.subTest(wording=wording):
+                self.assertTrue(POLICY.sponsorship_is_ambiguous(wording))
+        self.setUp()
+        self.add_answer("answer-now", "sponsorship_now",
+                        "Do you require sponsorship now, at this time?", False)
+        result = self.observe([self.field(
+            "sponsorship", "Do you require sponsorship now, at this time?",
+            source_kind="answer")])
+        self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
+
+    def test_a_label_match_does_not_settle_what_the_form_would_submit(self):
+        self.add_decline_policy()
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", options=self.race_options())], locale="en-US")
+        self.assertNotEqual(result["status"], "paused")
+        step = self.db.execute(
+            "SELECT value_json FROM fill_steps ORDER BY ordinal").fetchall()[-1]
+        # The reviewed label chose the option; the page's own opaque value is submitted.
+        self.assertEqual(json.loads(step["value_json"]), self.DECLINE_VALUE)
+        self.assertNotIn(self.DECLINE, step["value_json"])
+
+    def test_one_reviewed_label_mapping_to_two_values_pauses(self):
+        self.add_decline_policy()
+        duplicated = self.race_options() + [{"label": self.DECLINE, "value": "opt-other"}]
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", options=duplicated)], locale="en-US")
+        self.assertEqual(self.pause_reasons(result), {"nondisclosure_option_ambiguous"})
+
+    def test_a_file_control_cannot_outrun_its_domain_classification(self):
+        # The upload branch used to `continue` before classification ran, so a control
+        # declared `file` with `upload_kind: "resume"` and an identity-document question was
+        # planned as a resume upload without ever being classified.
+        # An identity document is caught by `archive_core.SENSITIVE_FIELD_PATTERN` even
+        # under the old order, so the case that actually got through is a protected
+        # characteristic asked for as an upload.
+        result = self.observe([self.field(
+            "veteran_proof", "Upload documentation of your protected veteran status",
+            control="file", upload_kind="resume")])
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_absent"})
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM fill_steps WHERE operation='upload'").fetchone()[0], 0)
+        self.assertEqual(POLICY.disposition(
+            "veteran_proof", "Upload documentation of your protected veteran status",
+            "file", None)[0], "always_manual")
 
     # ---- 7-9: voluntary EEO --------------------------------------------
 
@@ -302,7 +364,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             with self.subTest(field_id=field_id):
                 self.setUp()
                 result = self.observe([self.field(
-                    field_id, question, options=self.RACE_VALUES + [self.DECLINE],
+                    field_id, question, options=self.race_options(),
                     source_kind="answer")], locale="en-US")
                 self.assertEqual(result["status"], "paused")
                 self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_absent"})
@@ -311,7 +373,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.add_decline_policy()
         result = self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         self.assertNotEqual(result["status"], "paused")
         step = self.db.execute(
             "SELECT source_kind, source_id FROM fill_steps ORDER BY ordinal").fetchall()[-1]
@@ -333,8 +395,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                 self.setUp()
                 register()
                 options = None if reason == "nondisclosure_option_unavailable" else (
-                    self.RACE_VALUES + [self.DECLINE]
-                    + ([self.OTHER_DECLINE] if reason == "nondisclosure_option_ambiguous" else []))
+                    self.race_options(
+                        [self.OTHER_DECLINE] if reason == "nondisclosure_option_ambiguous" else []))
                 result = self.observe([self.field(
                     "eeo_race", "Race / Ethnicity", options=options)], locale="en-US")
                 self.assertEqual(self.pause_reasons(result), {reason})
@@ -343,14 +405,14 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         POLICY.revoke_policy(self.db, "policy-eeo_race", "user_withdrew", AT)
         result = self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_revoked"})
 
     def test_no_demographic_value_reaches_any_action_result_or_store(self):
         self.add_decline_policy()
         self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
         package = output.read_text(encoding="utf-8")
@@ -371,7 +433,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.add_answer("answer-race", "race", "Race / Ethnicity", "Asian")
         result = self.observe([self.field(
             "eeo_race", "Race / Ethnicity", source_kind="answer",
-            options=self.RACE_VALUES)], locale="en-US")
+            options=self.options(self.RACE_VALUES))], locale="en-US")
         self.assertEqual(result["status"], "paused")
         # The answer exists and is confirmed; what must not exist is a step that used it.
         self.assertEqual(self.db.execute(
@@ -384,7 +446,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.add_decline_policy()
         self.observe([
             self.field("eeo_race", "Race / Ethnicity",
-                       options=self.RACE_VALUES + [self.DECLINE]),
+                       options=self.race_options()),
             self.field("next_page", "Continue to the next step", control="submit"),
         ], locale="en-US")
         output = self.root / "private" / "page-actions.json"
@@ -407,7 +469,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.add_decline_policy()
         self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
         for row in self.db.execute(
@@ -450,7 +512,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # Replanning from it would skip the policy the user just registered.
         self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         self.add_decline_policy()
         self.reacquire()
         with self.assertRaisesRegex(ValueError, "new live observation"):
@@ -459,7 +521,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                                 self.candidate_path, AT)
         fresh = self.page(fields=[
             self.field("eeo_race", "Race / Ethnicity",
-                       options=self.RACE_VALUES + [self.DECLINE]),
+                       options=self.race_options()),
             self.field("submit", "Submit application", control="submit")], locale="en-US")
         result = FILL.resume_session(
             self.db, "session-1", "worker-2", "auth-1",
@@ -475,7 +537,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # the observer, or re-rendered away. Those are not the same event.
         self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
-            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+            options=self.race_options())], locale="en-US")
         self.reacquire()
         fresh = self.page(fields=[
             self.field("other", "Are you authorized to work?", source_kind="answer"),
@@ -536,7 +598,11 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.assertEqual(row["evidence_kind"], "complete_inventory")
         observed = [r[0] for r in self.db.execute(
             "SELECT observation_sha256 FROM fill_pages ORDER BY page_index")]
-        self.assertEqual(row["evidence_ref"], FILL.canonical_hash(observed))
+        # The reference names what the claim rests on, not only the bytes it covers: a
+        # verified chain is a self-report, and an archive read later must not mistake it for
+        # proof that the employer's form had no further pages.
+        self.assertEqual(row["evidence_ref"],
+                         f"self_reported_page_chain:{FILL.canonical_hash(observed)}")
 
     def test_a_policy_that_can_never_apply_is_refused(self):
         with self.assertRaisesRegex(ValueError, "expire after it takes effect"):

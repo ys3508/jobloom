@@ -179,12 +179,14 @@ def render_page(fixture: dict[str, Any], step_index: int, *, include_variants: b
                            for name, (kind, label) in sorted(SAFETY_VARIANTS.items()))
     final_control = ""
     if final:
-        # A stop boundary, rendered so it can be observed and never activated. Its handler
-        # only counts, so a test can read the counter without touching the control.
+        # A real stop boundary, not a decorative one. The earlier version incremented a
+        # `window` variable that the server never read, so the counter reported zero whether
+        # or not anything had been activated — an oracle that could not fail. Activating this
+        # control posts to the server, which is the only party that can honestly observe it,
+        # and is also how a real form would behave.
         final_control = (
-            '<button type="button" id="final-action" data-test-id="final-action" '
-            'onclick="window.__finalActionActivations=(window.__finalActionActivations||0)+1">'
-            'Submit application</button>')
+            '<input type="submit" id="final-action" data-test-id="final-action" '
+            'value="Submit application">')
     next_link = ""
     if step_index + 1 < len(fixture["steps"]):
         next_link = (f'<a href="/{family}/{step_index + 1}" id="next-page" '
@@ -192,11 +194,10 @@ def render_page(fixture: dict[str, Any], step_index: int, *, include_variants: b
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>{_escape(family)} replay page {step_index}</title>
-<script>window.__finalActionActivations = 0;</script>
 </head><body>
 <main><h1>Synthetic {_escape(family)} application</h1>
 <p>Generated locally from a reviewed semantic fixture. Not a real employer form.</p>
-<form id="application" onsubmit="return false;">
+<form id="application" method="post" action="{'/__final_action' if final else ''}">
 {controls}{variants}{final_control}
 </form>
 {next_link}
