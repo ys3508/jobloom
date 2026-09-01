@@ -37,11 +37,31 @@ from tests.pdf_fixture import synthetic_pdf
 
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
-try:  # pragma: no cover - availability, not behaviour
-    import playwright.sync_api  # noqa: F401
-    PLAYWRIGHT = True
-except ImportError:  # pragma: no cover
-    PLAYWRIGHT = False
+def _browser_available() -> bool:
+    """Playwright importable *and* a Chromium actually installed.
+
+    Importing the package says nothing about whether a browser was downloaded, and a merge
+    gate that accepts "it imported" would let the acceptance tests skip in CI.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:  # noqa: BLE001 - absence is the answer, not an error to raise
+        return False
+
+
+PLAYWRIGHT = _browser_available()
+
+if os.environ.get("JOBLOOM_REQUIRE_BROWSER") and not PLAYWRIGHT:
+    # A merge gate sets this. Skipping is correct on a laptop and unacceptable where the
+    # eleven acceptance tests are the point of the run.
+    raise RuntimeError(
+        "JOBLOOM_REQUIRE_BROWSER is set but no Chromium is available: "
+        "run `python -m playwright install chromium`")
 
 
 class PackageAcceptanceTests(unittest.TestCase):
@@ -155,9 +175,26 @@ class BrowserExecutionTests(unittest.TestCase):
                 "control": control, "operation": operation, "value": value,
                 "expected_sha256": "0" * 64}
 
-    def execute(self, package, name="result.json"):
+    def grant_for(self, package, ttl_seconds=900, at=None):
+        """A grant the way `fill_core` issues one, without needing a whole fill session."""
+        import worker_protocol as protocol_module  # the same module the worker verifies with
+        moment = at or self.now
+        digest = hashlib.sha256(package.read_bytes()).hexdigest()
+        secret = "s" * 64
+        grant = {"grant_id": "grant-1", "session_id": "session-1", "page_id": "page-1",
+                 "package_sha256": digest, "surface_origin": "http://127.0.0.1:0",
+                 "renderer_version": "1.0.0", "issued_at": moment.isoformat(),
+                 "expires_at": (moment + timedelta(seconds=ttl_seconds)).isoformat()}
+        grant["signature"] = PROTOCOL.grant_signature(secret, digest, grant)
+        path = package.with_suffix(".grant.json")
+        path.write_text(json.dumps({"grant": grant, "secret": secret}), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def execute(self, package, name="result.json", grant=None, oracle=None, **updates):
         output = self.root / name
-        WORKER.run(package, output, headed=False)
+        WORKER.run(package, output, grant or self.grant_for(package), headed=False,
+                   oracle_url=oracle, at=self.now, **updates)
         return json.loads(output.read_text(encoding="utf-8")), output
 
     def final_actions(self, server):
@@ -173,9 +210,11 @@ class BrowserExecutionTests(unittest.TestCase):
                             POLICY.replay_option_value(
                                 "Phoenix, Arizona, United States", server.nonce)),
             ])
-            envelope, output = self.execute(package)
+            envelope, output = self.execute(
+                package, oracle=f"{server.origin}/__state")
             self.assertEqual([entry["outcome"] for entry in envelope["results"]],
                              ["verified", "verified"])
+            # A zero because the target was counting, not because the field was hardcoded.
             self.assertEqual(envelope["final_action_activations"], 0)
             # The oracle that can actually fail: the server's own counter.
             self.assertEqual(self.final_actions(server), 0)
@@ -185,7 +224,7 @@ class BrowserExecutionTests(unittest.TestCase):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             package = self.package_for(server, "/lever/0", [
                 self.action("lever-0-1", "text", "fill", "Verified Candidate")])
-            envelope, output = self.execute(package)
+            envelope, output = self.execute(package, oracle=f"{server.origin}/__state")
             raw = output.read_text(encoding="utf-8")
             for leak in ("Verified Candidate", server.nonce, str(self.root)):
                 self.assertNotIn(leak, raw)
@@ -238,8 +277,8 @@ class BrowserExecutionTests(unittest.TestCase):
                 server, "/lever/0",
                 [self.action("lever-0-1", "text", "fill", "Verified Candidate")],
                 surface=tampered)
-            envelope, _ = self.execute(package)
-            self.assertEqual(envelope["results"][0]["outcome"], "refused")
+            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
+            self.assertEqual(envelope["results"][0]["outcome"], "not_attempted")
             self.assertEqual(envelope["results"][0]["error_code"],
                              "control_changed_since_observation")
             self.assertEqual(self.final_actions(server), 0)
@@ -272,8 +311,8 @@ class BrowserExecutionTests(unittest.TestCase):
                 server, "/lever/0",
                 [self.action("lever-0-1", "text", "fill", "x")], surface=attestation)
             with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "elsewhere.json", headed=False,
-                           page_url=f"{server.origin}/lever/1")
+                WORKER.run(package, self.root / "elsewhere.json", self.grant_for(package),
+                           headed=False, page_url=f"{server.origin}/lever/1", at=self.now)
             self.assertEqual(str(caught.exception), "page_outside_attested_surface")
 
     def test_the_scoped_guard_blocks_a_submit_the_page_itself_attempts(self):
@@ -295,7 +334,8 @@ class BrowserExecutionTests(unittest.TestCase):
                     self.assertEqual(self.final_actions(server), 1)
 
                     guarded = browser.new_context().new_page()
-                    with WORKER.PageGuards(guarded, server.origin) as guards:
+                    with WORKER.PageGuards(guarded, server.origin,
+                                           f"{server.origin}/lever/1") as guards:
                         guarded.goto(f"{server.origin}/lever/1",
                                      wait_until="domcontentloaded")
                         guarded.click("#final-action")
@@ -321,13 +361,15 @@ class BrowserExecutionTests(unittest.TestCase):
                 browser = playwright.chromium.launch(headless=True)
                 try:
                     page = browser.new_context().new_page()
-                    guards = WORKER.PageGuards(page, server.origin,
-                                               allowed_upload_urls=(upload_url,))
+                    guards = WORKER.PageGuards(
+                        page, server.origin, f"{server.origin}/lever/0",
+                        allowed_upload_urls=(upload_url,))
                     seen = []
 
                     class Request:
-                        def __init__(self, url, method):
+                        def __init__(self, url, method, resource_type="xhr"):
                             self.url, self.method = url, method
+                            self.resource_type = resource_type
 
                     class Route:
                         def continue_(self):
@@ -343,13 +385,129 @@ class BrowserExecutionTests(unittest.TestCase):
                 finally:
                     browser.close()
 
+    # ---- the five review findings ---------------------------------------
+
+    def test_a_same_origin_get_submit_is_stopped_and_never_reported_as_zero(self):
+        """The hole: `same origin and GET` was allowed unconditionally.
+
+        A form with `method="GET"` submits by navigating, so filling one field reached the
+        application endpoint, the page left, and the run still reported no final action.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/hazard/get-submit", [
+                self.action("h-1", "text", "fill", "Verified Candidate")])
+            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
+            self.assertEqual(envelope["results"][0]["outcome"], "refused")
+            # Named for what the guard saw, not for what the page said it was: a GET form
+            # submit is a document navigation, and calling it a refused final action would
+            # claim knowledge of the form's intent that only the page could supply.
+            self.assertEqual(envelope["results"][0]["error_code"], "navigation_attempted")
+            # The target's own counter is the proof, and it did not move.
+            self.assertEqual(self.final_actions(server), 0)
+            self.assertEqual(envelope["final_action_activations"], 0)
+
+    def test_a_same_origin_location_change_is_stopped(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/hazard/location", [
+                self.action("h-1", "text", "fill", "Verified Candidate")])
+            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
+            self.assertEqual(envelope["results"][0]["outcome"], "refused")
+            self.assertEqual(envelope["results"][0]["error_code"], "navigation_attempted")
+            self.assertEqual(self.final_actions(server), 0)
+
+    def test_the_first_violation_stops_the_page_and_the_rest_is_not_attempted(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/hazard/get-submit", [
+                self.action("h-1", "text", "fill", "first"),
+                self.action("h-1", "text", "fill", "second"),
+                self.action("h-1", "text", "fill", "third")])
+            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
+            outcomes = [entry["outcome"] for entry in envelope["results"]]
+            self.assertEqual(outcomes, ["refused", "not_attempted", "not_attempted"])
+            # Not all three disguised as "refused": which one caused it stays legible.
+            self.assertEqual(self.final_actions(server), 0)
+
+    def test_a_forged_package_from_a_rogue_local_server_has_no_grant(self):
+        """0600 and loopback are not provenance: any local process can produce both."""
+        with ReplayServer() as rogue:
+            forged = self.root / "forged.json"
+            forged.write_text(json.dumps({
+                "schema_version": "0.1.0", "mode": "fill_only", "session_id": "session-1",
+                "application_id": "app-1", "page_id": "page-1",
+                "page_url": f"{rogue.origin}/lever/0",
+                "surface": {"origin": rogue.origin, "renderer_version": "1.0.0",
+                            "page_path": "/lever/0",
+                            "page_sha256": rogue.page_digests()["/lever/0"],
+                            "expires_at": (self.now + timedelta(hours=1)).isoformat()},
+                "actions": [self.action("lever-0-1", "text", "fill", "x")],
+                "stop_before_submit": True, "submission_action": None,
+            }), encoding="utf-8")
+            forged.chmod(0o600)
+            # Every check the previous version made still passes on this package.
+            self.assertEqual(WORKER.load_package(forged)["page_id"], "page-1")
+            # A grant issued for different bytes does not carry it.
+            other = self.root / "other.json"
+            other.write_text("{}", encoding="utf-8")
+            other.chmod(0o600)
+            with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                WORKER.run(forged, self.root / "forged-result.json",
+                           self.grant_for(other), headed=False, at=self.now)
+            self.assertEqual(str(caught.exception), "grant_package_mismatch")
+
+    def test_an_expired_grant_or_surface_refuses_before_the_browser_starts(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/lever/0", [
+                self.action("lever-0-1", "text", "fill", "x")])
+            with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                WORKER.run(package, self.root / "late.json",
+                           self.grant_for(package, ttl_seconds=60), headed=False,
+                           at=self.now + timedelta(minutes=5))
+            self.assertEqual(str(caught.exception), "grant_expired")
+            # And a surface that lapsed after export, with the same bytes still served.
+            stale = self.package_for(
+                server, "/lever/0", [self.action("lever-0-1", "text", "fill", "x")],
+                surface={**POLICY.surface_attestation(
+                    self.db, f"{server.origin}/lever/0", self.now),
+                    "expires_at": (self.now - timedelta(minutes=1)).isoformat()})
+            with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                WORKER.run(stale, self.root / "stale.json", self.grant_for(stale),
+                           headed=False, at=self.now)
+            self.assertEqual(str(caught.exception), "surface_expired")
+            self.assertEqual(self.final_actions(server), 0)
+
+    def test_a_revoked_grant_refuses_even_though_the_page_is_unchanged(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/lever/0", [
+                self.action("lever-0-1", "text", "fill", "x")])
+            grant = self.grant_for(package)
+            grant.with_suffix(grant.suffix + ".revoked").write_text("", encoding="utf-8")
+            with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                WORKER.run(package, self.root / "revoked.json", grant, headed=False,
+                           at=self.now)
+            self.assertEqual(str(caught.exception), "grant_revoked")
+
+    def test_an_unobservable_target_reports_no_count_rather_than_zero(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package = self.package_for(server, "/lever/0", [
+                self.action("lever-0-1", "text", "fill", "Verified Candidate")])
+            envelope, _ = self.execute(package)  # no oracle supplied
+            self.assertIsNone(envelope["final_action_activations"])
+            # And `fill_core` cannot import an unprovable run as a safe one.
+            with self.assertRaises(PROTOCOL.ProtocolError) as caught:
+                PROTOCOL.validate_result(
+                    envelope, expected_session="session-1", expected_page="page-1",
+                    expected_package_sha256=envelope["package_sha256"],
+                    expected_action_ids=["step-lever-0-1"], at=self.now)
+            self.assertEqual(str(caught.exception), "final_action_count_unproven")
+
     def test_a_consumed_package_cannot_be_replayed(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             package = self.package_for(server, "/lever/0", [
                 self.action("lever-0-1", "text", "fill", "Verified Candidate")])
             self.execute(package, "first.json")
             with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "second.json", headed=False)
+                WORKER.run(package, self.root / "second.json", self.grant_for(package),
+                           headed=False, at=self.now)
             self.assertEqual(str(caught.exception), "package_already_consumed")
             self.assertEqual(self.final_actions(server), 0)
 

@@ -22,6 +22,8 @@ assumption, and it is the precondition for writing `not_present`.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 import sys
@@ -46,7 +48,8 @@ ASSETS = Path(__file__).resolve().parent.parent / "assets"
 ALLOWED_OPERATIONS = {"fill", "select", "check", "uncheck", "upload"}
 FORBIDDEN_OPERATIONS = {"submit", "click", "navigate", "press", "download", "evaluate", "open"}
 
-OUTCOME_CODES = {"verified", "mismatch", "not_found", "not_actionable", "refused", "error"}
+OUTCOME_CODES = {"verified", "mismatch", "not_found", "not_actionable", "refused", "error",
+                 "not_attempted"}
 
 # "Bounded" is not "value-free": 64 characters is room for a short answer or a line of page
 # text, so a hostile or careless worker could return one in an error code. The vocabulary is
@@ -88,6 +91,51 @@ COVERAGE_BASIS = "self_reported_page_chain"
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
+
+
+GRANT_FIELDS = {"grant_id", "session_id", "page_id", "package_sha256", "surface_origin",
+                "renderer_version", "issued_at", "expires_at", "signature"}
+
+
+def grant_signature(secret: str, package_sha256: str, grant: dict[str, Any]) -> str:
+    """Bind one grant to one package's bytes.
+
+    The signed payload names the package digest, so a grant issued for one package cannot be
+    presented with another. Substituting the package is the forgery this actually prevents.
+    """
+    payload = json.dumps(
+        {key: grant[key] for key in sorted(GRANT_FIELDS - {"signature"})},
+        sort_keys=True, separators=(",", ":")) + "\0" + package_sha256
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_grant(grant: dict[str, Any], secret: str, package_bytes: bytes,
+                 at: datetime) -> None:
+    """Refuse a package that was not issued for execution, or whose window has closed.
+
+    `0600` and a loopback address prove nothing about where a package came from: any process
+    running as this user can write one file and start one server. A grant is what `fill_core`
+    issues, for one package, once, with an expiry — so a package that arrived some other way
+    has no grant that matches its bytes.
+
+    What this does not claim: under a same-user threat model a process that can read the
+    grant file can present it. What it buys is that a package must be accompanied by a grant
+    issued for exactly those bytes, that the grant expires, and that `fill_core` will refuse
+    a result whose grant it never issued or has already consumed.
+    """
+    if not isinstance(grant, dict) or set(grant) != GRANT_FIELDS:
+        raise ProtocolError("malformed_execution_grant")
+    digest = hashlib.sha256(package_bytes).hexdigest()
+    if grant["package_sha256"] != digest:
+        raise ProtocolError("grant_package_mismatch")
+    expires = parse_time(grant["expires_at"])
+    if not expires:
+        raise ProtocolError("grant_missing_expiry")
+    if at >= expires:
+        raise ProtocolError("grant_expired")
+    expected = grant_signature(secret, digest, grant)
+    if not hmac.compare_digest(expected, grant["signature"]):
+        raise ProtocolError("grant_signature_mismatch")
 
 
 class ProtocolError(ValueError):
@@ -164,7 +212,12 @@ def validate_result(result: dict[str, Any], *, expected_session: str, expected_p
     _require(result.get("session_id") == expected_session, "session_mismatch")
     _require(result.get("page_id") == expected_page, "page_mismatch")
     _require(result.get("package_sha256") == expected_package_sha256, "package_hash_mismatch")
-    _require(result.get("final_action_activations") == 0, "final_action_activated")
+    # `null` means the run could not observe the target's own counter. That is not a zero,
+    # and `fill_core` must not be able to import it as one: an unprovable run is refused
+    # here rather than recorded as safe.
+    activations = result.get("final_action_activations")
+    _require(activations is not None, "final_action_count_unproven")
+    _require(activations == 0, "final_action_activated")
     entries = result.get("results")
     _require(isinstance(entries, list), "malformed_results")
     seen: list[str] = []

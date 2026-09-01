@@ -60,6 +60,32 @@ class ReplayServer:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            HAZARDS = {
+                # Two pages a real ATS could serve, used only to prove the guard sees them.
+                # `/hazard/get-submit` submits by navigating with method="GET"; nothing about
+                # being same-origin makes that safe. `/hazard/location` leaves the page from
+                # an input handler.
+                "/hazard/get-submit": (
+                    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<title>get submit</title></head><body><form id="application" '
+                    'method="get" action="/__final_action">'
+                    '<label for="h-1">Full name</label>'
+                    '<input type="text" id="h-1" data-test-id="h-1" name="h-1">'
+                    '<input type="submit" id="final-action" data-test-id="final-action" '
+                    'value="Submit"></form>'
+                    '<script>document.getElementById("h-1").addEventListener("input",'
+                    'function(){document.getElementById("application").submit();});</script>'
+                    "</body></html>\n"),
+                "/hazard/location": (
+                    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<title>location</title></head><body>'
+                    '<label for="h-1">Full name</label>'
+                    '<input type="text" id="h-1" data-test-id="h-1">'
+                    '<script>document.getElementById("h-1").addEventListener("input",'
+                    'function(){window.location = "/lever/1";});</script>'
+                    "</body></html>\n"),
+            }
+
             def do_POST(self):  # noqa: N802
                 """The only honest place to count an activation.
 
@@ -67,7 +93,7 @@ class ReplayServer:
                 whether or not anything was activated. Counting here means the oracle can
                 actually fail, which is the only reason to have one.
                 """
-                if self.path != "/__final_action":
+                if self.path.split("?", 1)[0] != "/__final_action":
                     self.send_error(404)
                     return
                 server.final_activations += 1
@@ -85,6 +111,14 @@ class ReplayServer:
                         "pages": sorted(server.pages),
                     }).encode("utf-8")
                     content_type = "application/json"
+                elif self.path.split("?", 1)[0] == "/__final_action":
+                    # A GET form submit reaches the same place a POST would.
+                    server.final_activations += 1
+                    self.send_error(403)
+                    return
+                elif self.path in self.HAZARDS:
+                    body = self.HAZARDS[self.path].encode("utf-8")
+                    content_type = "text/html; charset=utf-8"
                 elif self.path in server.pages:
                     body = server.pages[self.path].encode("utf-8")
                     content_type = "text/html; charset=utf-8"
@@ -100,6 +134,7 @@ class ReplayServer:
             def log_message(self, *arguments):  # noqa: D102
                 return
 
+        self._handler_class = Handler
         self._httpd = HTTPServer(("127.0.0.1", 0), Handler)
         self.host, self.port = self._httpd.server_address[:2]
         self.origin = f"http://127.0.0.1:{self.port}"
@@ -120,8 +155,11 @@ class ReplayServer:
 
     def page_digests(self) -> dict[str, str]:
         """The digest of each page as served, so a worker can check the page it actually got."""
-        return {path: hashlib.sha256(body.encode("utf-8")).hexdigest()
-                for path, body in self.pages.items()}
+        digests = {path: hashlib.sha256(body.encode("utf-8")).hexdigest()
+                   for path, body in self.pages.items()}
+        digests.update({path: hashlib.sha256(body.encode("utf-8")).hexdigest()
+                        for path, body in self._handler_class.HAZARDS.items()})
+        return digests
 
     def content_sha256(self) -> str:
         """What this surface is actually serving.

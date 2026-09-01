@@ -26,6 +26,8 @@ import json
 import os
 import re
 import sys
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,30 @@ class WorkerRefusal(RuntimeError):
 
 def _refuse(code: str) -> None:
     raise WorkerRefusal(code)
+
+
+def load_grant(grant_path: Path, package_path: Path, at: datetime) -> dict[str, Any]:
+    """The proof that `fill_core` authorised this exact package to run, once, until when.
+
+    File permissions and a loopback address prove nothing about provenance: any process
+    running as this user can write a 0600 file and start a local server. That is the hole
+    this closes at the execution boundary, the same one that was closed for option mappings
+    at the planning boundary.
+    """
+    if (os.stat(grant_path).st_mode & 0o777) != 0o600:
+        _refuse("grant_permissions")
+    if grant_path.with_suffix(grant_path.suffix + ".revoked").exists():
+        # Revocation has to be legible on disk, because this worker reads no database.
+        _refuse("grant_revoked")
+    document = json.loads(grant_path.read_text(encoding="utf-8"))
+    grant, secret = document.get("grant"), document.get("secret")
+    if not isinstance(grant, dict) or not isinstance(secret, str):
+        _refuse("malformed_execution_grant")
+    try:
+        worker_protocol.verify_grant(grant, secret, package_path.read_bytes(), at)
+    except worker_protocol.ProtocolError as problem:
+        _refuse(str(problem))
+    return grant
 
 
 def load_package(path: Path) -> dict[str, Any]:
@@ -102,27 +128,55 @@ class PageGuards:
     POST, so refusing every POST would refuse uploads while calling itself submit protection.
     """
 
-    def __init__(self, page, origin: str, allowed_upload_urls: tuple[str, ...] = ()):
+    def __init__(self, page, origin: str, target: str,
+                 allowed_upload_urls: tuple[str, ...] = ()):
         self.page = page
         self.origin = origin
+        self.target = target
         self.allowed_upload_urls = allowed_upload_urls
         self.violations: list[str] = []
+        self._document_loaded = False
         self._handlers: list[tuple[str, Any]] = []
 
+    def allow_initial_navigation(self) -> None:
+        """One document load, to the exact attested URL, before any action runs."""
+        self._document_loaded = False
+
+    def seal(self) -> None:
+        """After this, no document may load for any reason."""
+        self._document_loaded = True
+
     def _route(self, route, request):
-        if request.url.startswith(self.origin) and request.method == "GET":
-            route.continue_()
-            return
-        if request.method == "POST" and request.url in self.allowed_upload_urls:
-            route.continue_()
+        is_document = request.resource_type == "document"
+        if is_document:
+            # A same-origin GET is not safe by virtue of being same-origin: a form with
+            # `method="GET"` submits by navigating, and an input handler can set
+            # `window.location`. Both would leave the attested page while every other check
+            # still reported success. Exactly one document load is allowed, to the exact URL
+            # the authority attested, before any action runs.
+            if (not self._document_loaded and request.url == self.target
+                    and request.method == "GET"):
+                self._document_loaded = True
+                route.continue_()
+                return
+            # A form submit is a document request too, so name which one happened: a POST
+            # document request is the form being sent, a GET one is the page being left.
+            self.violations.append(
+                "submit_attempted" if request.method == "POST" else "navigation_attempted")
+            route.abort()
             return
         if request.method == "POST":
+            if request.url in self.allowed_upload_urls:
+                route.continue_()
+                return
             self.violations.append("submit_attempted")
-        elif not request.url.startswith(self.origin):
+            route.abort()
+            return
+        if not request.url.startswith(self.origin):
             self.violations.append("outside_allowed_origin")
-        else:
-            self.violations.append("navigation_attempted")
-        route.abort()
+            route.abort()
+            return
+        route.continue_()
 
     def _record(self, code):
         def handler(*_arguments):
@@ -199,7 +253,9 @@ def _perform(page, action: dict[str, Any]) -> tuple[str, str | None, str | None]
             path = Path(value)
             if not path.is_file():
                 return "error", None, "upload_rejected"
-            if path.suffix.casefold() != ".pdf" or path.open("rb").read(5) != b"%PDF-":
+            with path.open("rb") as handle:
+                head = handle.read(5)
+            if path.suffix.casefold() != ".pdf" or head != b"%PDF-":
                 return "error", None, "upload_type_not_pdf"
             locator.set_input_files(str(path))
             observed = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -216,71 +272,114 @@ def _perform(page, action: dict[str, Any]) -> tuple[str, str | None, str | None]
     return "verified", digest, None
 
 
-def run(package_path: Path, output_path: Path, *, headed: bool = True,
-        page_url: str | None = None) -> dict[str, Any]:
+def _read_oracle(oracle_url: str | None) -> int | None:
+    """The target's own count of final-action activations, if the target keeps one.
+
+    Only the replay does. On any other surface this is `None`, and `None` is reported rather
+    than a zero, because a run that cannot observe the counter has not shown it did not move.
+    """
+    if not oracle_url:
+        return None
+    try:
+        with urllib.request.urlopen(oracle_url, timeout=5) as response:
+            return int(json.load(response)["final_action_activations"])
+    except Exception:  # noqa: BLE001 - an unreadable oracle is an unknown, not a zero
+        return None
+
+
+def run(package_path: Path, output_path: Path, grant_path: Path, *, headed: bool = True,
+        page_url: str | None = None, oracle_url: str | None = None,
+        at: datetime | None = None) -> dict[str, Any]:
     """Execute one package against one page and write a result envelope.
 
     Headed by default: a run the user cannot see is a run they cannot stop.
     """
     from playwright.sync_api import sync_playwright
 
+    now = at or datetime.now(timezone.utc)
+    load_grant(grant_path, package_path, now)
     package = load_package(package_path)
     surface = package["surface"]
+    expires = worker_protocol.parse_time(surface.get("expires_at"))
+    if expires and now >= expires:
+        # The surface can lapse between export and execution; the same bytes served from the
+        # same address afterwards are not a live surface.
+        _refuse("surface_expired")
     target = page_url or (surface["origin"] + surface["page_path"])
-    if not target.startswith(surface["origin"] + surface["page_path"]):
+    if target != surface["origin"] + surface["page_path"]:
         _refuse("page_outside_attested_surface")
     consume(package_path)
 
+    before = _read_oracle(oracle_url)
     results: list[dict[str, Any]] = []
-    violations: list[str] = []
+    stopped_on: str | None = None
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not headed)
         try:
             context = browser.new_context()
             page = context.new_page()
-            with PageGuards(page, surface["origin"]) as guards:
+            # Short and explicit. A page that will not settle should not hold the user's
+            # browser for the framework default, and a guard-aborted navigation makes every
+            # retry pointless anyway.
+            page.set_default_timeout(5000)
+            with PageGuards(page, surface["origin"], target) as guards:
                 response = page.goto(target, wait_until="domcontentloaded")
                 # The response body, not `page.content()`: the latter is the serialized DOM
                 # after the browser has parsed and normalised the markup, so it would never
                 # equal the bytes the attestation covers.
                 served = hashlib.sha256(response.body()).hexdigest() if response else ""
                 if served != surface["page_sha256"]:
-                    # Not the page the authority attested. Nothing is touched.
                     guards.violations.append("page_digest_mismatch")
-                else:
-                    for action in package["actions"]:
-                        outcome, digest, error = _perform(page, action)
-                        entry: dict[str, Any] = {"action_id": action["step_id"],
-                                                 "outcome": outcome,
-                                                 "control": action["control"]}
-                        if digest:
-                            entry["observed_sha256"] = digest
-                        if error:
-                            entry["error_code"] = error
-                        results.append(entry)
-                violations = list(guards.violations)
+                for index, action in enumerate(package["actions"]):
+                    if guards.violations:
+                        # Stop at the first violation. Continuing would act on a page that
+                        # has already done something it was not allowed to do, and reporting
+                        # every field as "refused" would hide which one caused it.
+                        stopped_on = stopped_on or _violation_code(guards.violations[0])
+                        results.append({"action_id": action["step_id"],
+                                        "outcome": "not_attempted",
+                                        "control": action["control"],
+                                        "error_code": stopped_on})
+                        continue
+                    outcome, digest, error = _perform(page, action)
+                    entry: dict[str, Any] = {"action_id": action["step_id"],
+                                             "outcome": outcome,
+                                             "control": action["control"]}
+                    if digest:
+                        entry["observed_sha256"] = digest
+                    if error:
+                        entry["error_code"] = error
+                    if guards.violations and index == len(results):
+                        # The action itself tripped a guard: it is a refusal, not a success.
+                        entry = {"action_id": action["step_id"], "outcome": "refused",
+                                 "control": action["control"],
+                                 "error_code": _violation_code(guards.violations[0])}
+                        stopped_on = entry["error_code"]
+                    results.append(entry)
+                guards.seal()
+                observed_violations = list(guards.violations)
         finally:
             browser.close()
 
+    after = _read_oracle(oracle_url)
     envelope = {
         "protocol_version": worker_protocol.PROTOCOL_VERSION,
         "session_id": package["session_id"], "page_id": package["page_id"],
         "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
-        "final_action_activations": 0,
+        # A number only when the target itself was counting. Otherwise `null`: the guard
+        # observing nothing is evidence about the guard, not about the target.
+        "final_action_activations": (
+            after - before if before is not None and after is not None else None),
         "results": results,
     }
-    if violations:
-        # A refusal is an outcome, not a value: the codes are the closed protocol vocabulary.
-        envelope["results"] = [{"action_id": action["step_id"], "outcome": "refused",
-                                "control": action["control"],
-                                "error_code": _violation_code(violations[0])}
-                               for action in package["actions"]]
     handle = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         json.dump(envelope, stream, indent=2, sort_keys=True)
         stream.write("\n")
     return {"output": str(output_path), "action_count": len(package["actions"]),
-            "refused": bool(violations)}
+            "guard_observations": observed_violations,
+            "final_action_evidence": "replay_oracle" if before is not None else "unobservable",
+            "stopped_on": stopped_on}
 
 
 def _violation_code(violation: str) -> str:
@@ -298,13 +397,17 @@ def _violation_code(violation: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--grant", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--oracle-url", default=None,
+                        help="a target that counts its own final-action activations")
     parser.add_argument("--headless", action="store_true",
                         help="tests only; a run the user cannot see is a run they cannot stop")
     arguments = parser.parse_args()
     # Value-free by construction: counts and a path the caller already knows.
-    print(json.dumps(run(arguments.package, arguments.output,
-                         headed=not arguments.headless), indent=2))
+    print(json.dumps(run(arguments.package, arguments.output, arguments.grant,
+                         headed=not arguments.headless,
+                         oracle_url=arguments.oracle_url), indent=2))
 
 
 if __name__ == "__main__":

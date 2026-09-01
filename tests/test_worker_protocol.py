@@ -298,6 +298,9 @@ class PageChainTests(unittest.TestCase):
             self.result(results=[{"action_id": "step-1", "outcome": "submitted"}, entries[1]])))
         self.refuses("final_action_activated",
                      lambda: self.checked_result(self.result(final_action_activations=1)))
+        # Null is what an unobservable target yields, and it must not import as a zero.
+        self.refuses("final_action_count_unproven",
+                     lambda: self.checked_result(self.result(final_action_activations=None)))
 
     def test_a_result_carrying_a_value_is_refused_at_any_depth(self):
         for key in ("value", "text", "cookie", "token", "file_path", "options", "page_text"):
@@ -332,12 +335,15 @@ class PageChainTests(unittest.TestCase):
         self.assertEqual(
             set(result_schema["properties"]["results"]["items"]["properties"]["outcome"]["enum"]),
             PROTOCOL.OUTCOME_CODES)
-        self.assertEqual(result_schema["properties"]["final_action_activations"]["const"], 0)
+        self.assertEqual(result_schema["properties"]["final_action_activations"]["type"],
+                         ["integer", "null"])
         # The two oracles must not be reported as the same evidence.
         oracle = result_schema["properties"]["final_action_activations"]["description"]
-        self.assertIn("test oracle", oracle)
+        self.assertIn("real oracle", oracle)
         self.assertIn("scoped guard", oracle)
         self.assertIn("upload", oracle.casefold())
+        # And the distinction that matters most: a null is not a zero.
+        self.assertIn("Null is not a zero", oracle)
         metadata = PROTOCOL.schema("action-package-metadata")
         self.assertEqual(metadata["properties"]["submission_action"]["type"], "null")
 

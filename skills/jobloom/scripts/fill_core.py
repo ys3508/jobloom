@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -184,6 +186,18 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS fill_step_next_idx
             ON fill_steps(session_id, page_id, status, ordinal);
+
+        CREATE TABLE IF NOT EXISTS execution_grants (
+            grant_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            secret TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT,
+            revoked_at TEXT
+        );
 
         CREATE TABLE IF NOT EXISTS fill_checkpoints (
             checkpoint_id TEXT PRIMARY KEY,
@@ -456,6 +470,69 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
         # wording may not settle which one it is.
         return _field_reason("sponsorship_meaning_ambiguous", field_id, sensitivity)
     return None
+
+
+def issue_execution_grant(connection: sqlite3.Connection, session_id: str, page_id: str,
+                          package_path: Path, grant_path: Path, at: datetime,
+                          ttl_seconds: int = 900) -> dict[str, Any]:
+    """Authorise one worker run, for one package, once.
+
+    Written here because this is the authority. The secret lives in the protected store and
+    in the grant file the worker is handed; the package itself carries no part of it, so a
+    package produced by anything other than `export_page` has no grant that matches its bytes.
+    """
+    require_table(connection, "execution_grants")
+    package_bytes = package_path.read_bytes()
+    digest = hashlib.sha256(package_bytes).hexdigest()
+    page = connection.execute(
+        "SELECT page_url FROM fill_pages WHERE session_id=? AND page_id=?",
+        (session_id, page_id)).fetchone()
+    if not page:
+        raise ValueError("page not found for execution grant")
+    attestation = field_policy.surface_attestation(connection, page["page_url"], at)
+    if not attestation:
+        raise ValueError("no attested replay surface for this page")
+    secret = secrets.token_hex(32)
+    grant = {
+        "grant_id": f"grant-{secrets.token_hex(8)}", "session_id": session_id,
+        "page_id": page_id, "package_sha256": digest,
+        "surface_origin": attestation["origin"],
+        "renderer_version": attestation["renderer_version"],
+        "issued_at": at.isoformat(),
+        "expires_at": (at + timedelta(seconds=ttl_seconds)).isoformat(),
+    }
+    grant["signature"] = worker_protocol.grant_signature(secret, digest, grant)
+    connection.execute(
+        "INSERT INTO execution_grants (grant_id, session_id, page_id, package_sha256, "
+        "secret, issued_at, expires_at, consumed_at, revoked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+        (grant["grant_id"], session_id, page_id, digest, secret,
+         grant["issued_at"], grant["expires_at"]),
+    )
+    connection.commit()
+    handle = os.open(grant_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump({"grant": grant, "secret": secret}, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    return {"grant_id": grant["grant_id"], "grant_path": str(grant_path),
+            "expires_at": grant["expires_at"]}
+
+
+def revoke_execution_grant(connection: sqlite3.Connection, grant_id: str, grant_path: Path,
+                           at: datetime) -> dict[str, Any]:
+    """Withdraw an unused grant. The marker beside the file is what the worker can see.
+
+    The worker reads no database, so revocation has to be legible on disk; the row is
+    updated too, because that is what refuses a result if one arrives anyway.
+    """
+    connection.execute(
+        "UPDATE execution_grants SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL",
+        (at.isoformat(), grant_id))
+    connection.commit()
+    marker = grant_path.with_suffix(grant_path.suffix + ".revoked")
+    if not marker.exists():
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    return {"grant_id": grant_id, "revoked": True}
 
 
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:

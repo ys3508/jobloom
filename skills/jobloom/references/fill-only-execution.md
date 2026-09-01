@@ -136,11 +136,31 @@ the page this run is expected to load. The worker hashes the **response body** �
 nothing if it differs. The nonce is deliberately not in the package; the worker has no use for
 it and a package is a file on disk.
 
+A package is not self-authorising. `fill_core` issues an **execution grant** for one package,
+once, with an expiry: an HMAC over the package's own digest, written to a 0600 file the worker
+is handed separately, with the row kept in the protected store. Mode 0600 and a loopback
+address prove nothing about where a package came from — any process running as this user can
+write one file and start one server — so a package that arrived some other way has no grant
+matching its bytes. Revocation is a marker beside the grant file, because the worker reads no
+database. The residual limit is stated rather than hidden: under a same-user threat model a
+process that can read the grant can present it; what this buys is that the package must be the
+one the grant was issued for, that the window closes, and that `fill_core` refuses a result
+whose grant it never issued.
+
 Scoped guards go in before the first action and come out before control returns, because a
-guard left installed would change how the user's own browsing behaves. They abort navigation
-away from the attested origin and record a popup, a download, or a POST. Upload traffic is
-allowed by exact URL: a file upload is a POST, so refusing every POST would refuse uploads
+guard left installed would change how the user's own browsing behaves. **Exactly one document
+load is allowed, to the exact attested URL, before any action runs.** Same-origin GET is not
+safe by virtue of being same-origin: a form with `method="GET"` submits by navigating, and an
+input handler can set `window.location`, so an earlier version filled one field, reached the
+application endpoint, left the page, and still reported no final action. Any document request
+after the first is aborted and named for what was seen — a POST document request is the form
+being sent, a GET one is the page being left. Popups and downloads are recorded. Upload traffic
+is allowed by exact URL: a file upload is a POST, so refusing every POST would refuse uploads
 while calling itself submit protection.
+
+**Execution stops at the first violation.** Continuing would act on a page that has already
+done something it was not allowed to do, and reporting every field as `refused` would hide
+which one caused it, so the remaining actions are marked `not_attempted`.
 
 The package is consumed by a marker file beside it rather than by deletion, so a replay fails
 on its second attempt instead of its second effect and the package survives for audit. Action
@@ -149,6 +169,13 @@ is a run they cannot stop — and headless only in tests.
 
 **What the local proof is worth.** The replay's final-action counter is a real oracle: a test
 clicks the control without the guard and the server's counter reaches one, which is what makes
-every other zero in that file worth reading. But it is still our own page. Nothing here is
-evidence that a live ATS can be filled, and each production adapter still needs its own
-supervised live acceptance test.
+every other zero in that file worth reading. The worker reports that count only when it could
+read it, and `null` otherwise — a run that could not observe the counter has not shown it did
+not move, and `validate_result` refuses a null so an unprovable run cannot be imported as a
+safe one.
+
+But it is still our own page. Nothing here is evidence that a live ATS can be filled, and each
+production adapter still needs its own supervised live acceptance test. The eleven browser
+acceptance tests skip themselves where Chromium is absent, which is right on a laptop and
+wrong as a merge gate, so CI runs them with `JOBLOOM_REQUIRE_BROWSER=1`, which turns a skip
+into a failure.

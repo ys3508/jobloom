@@ -30,8 +30,12 @@
       "pattern": "^[0-9a-f]{64}$"
     },
     "final_action_activations": {
-      "const": 0,
-      "description": "On the local replay this is a test oracle: we build the page, so we can count. On a supervised live page there is no counter, and the equivalent is a scoped guard installed for the run — a capture-phase submit-event block plus unexpected-navigation detection — removed before control returns to the user. Upload traffic is separately allowed and validated, because a file upload is a POST and 'block all POST' is not submission protection. The two must not be reported as the same evidence."
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "The target's own count, or null when the target keeps none and the run could not observe it. Null is not a zero: `validate_result` refuses it, so `fill_core` cannot import an unprovable run as a safe one. On the local replay this is a real oracle — a test clicks the control without the guard and it reaches one. On a supervised live page there is no counter, and the equivalent is a scoped guard installed for the run (capture-phase submit block plus unexpected-navigation detection) removed before control returns to the user. Upload traffic is separately allowed and validated, because a file upload is a POST and 'block all POST' is not submission protection. The two must not be reported as the same evidence."
     },
     "results": {
       "type": "array",
@@ -50,12 +54,13 @@
           },
           "outcome": {
             "enum": [
-              "verified",
+              "error",
               "mismatch",
-              "not_found",
               "not_actionable",
+              "not_attempted",
+              "not_found",
               "refused",
-              "error"
+              "verified"
             ]
           },
           "observed_sha256": {
@@ -89,7 +94,7 @@
           }
         }
       },
-      "description": "One entry per issued action, in the order they were issued. Missing, extra, duplicated and reordered results all fail closed."
+      "description": "One entry per issued action, in the order they were issued. Missing, extra, duplicated and reordered results all fail closed. `not_attempted` means execution stopped at an earlier violation and this action was never run — deliberately distinct from `refused`, so which action caused the stop stays legible."
     }
   },
   "$comment": "Refused anywhere at any depth: value, values, text, inner_text, html, outer_html, content, label, options, cookie, cookies, token, session_token, authorization, path, file_path, local_path, screenshot, page_text, answer. Options in particular are transient observation data only and never reach a persisted observation."

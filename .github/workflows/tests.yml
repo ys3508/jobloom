@@ -17,3 +17,20 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install -r requirements.txt
       - run: python -m unittest discover -s tests
+
+  browser:
+    # The eleven worker acceptance tests skip themselves when Chromium is absent, which is
+    # right for a laptop and wrong for a merge gate: without this job they could stay
+    # unexecuted forever while the suite reported OK. JOBLOOM_REQUIRE_BROWSER turns a skip
+    # into a failure, so "the browser tests did not run" cannot pass silently.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - env:
+          JOBLOOM_REQUIRE_BROWSER: "1"
+        run: python -m unittest discover -s tests
