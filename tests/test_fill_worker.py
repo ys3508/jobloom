@@ -83,6 +83,8 @@ if os.environ.get("JOBLOOM_REQUIRE_BROWSER") and not PLAYWRIGHT:
         "run `python -m playwright install chromium`")
 
 
+from tests.fixtures.completed_page import complete_page_as_if_imported
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -218,18 +220,12 @@ class _SessionBase(unittest.TestCase):
         ]
 
     def complete_page(self, page_id="page-1", worker_id="worker-1"):
-        rows = self.db.execute(
-            "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id='session-1' AND page_id=? "
-            "ORDER BY ordinal", (page_id,),
-        ).fetchall()
-        for row in rows:
-            FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
-        # These suites drive the per-step `complete_step` path, which predates result
-        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
+        # A test-only shortcut, in `tests/`, because production has no bypass: see
+        # `tests/fixtures/completed_page.py`. The real path runs with a browser in
+        # `tests/test_fill_worker.py`.
+        complete_page_as_if_imported(FILL, self.db, "session-1", worker_id, page_id, AT)
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
-            require_verified_import=False,
-        )
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT)
 
     def authority(self, reserve=None):
         """The real service, backed by the real redemption logic."""
@@ -884,11 +880,11 @@ class ResultImportTests(_SessionBase):
         # route would be a checkpoint with no verified result behind it.
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             _, issued, output = self.run_worker(server)
-            for row in self.db.execute(
-                "SELECT step_id, expected_sha256 FROM fill_steps ORDER BY ordinal"
-            ).fetchall():
-                FILL.complete_step(self.db, "session-1", "worker-1", row["step_id"],
-                                   row["expected_sha256"], self.now)
+            session = self.db.execute(
+                "SELECT * FROM fill_sessions WHERE session_id='session-1'").fetchone()
+            for step in self.db.execute("SELECT * FROM fill_steps").fetchall():
+                FILL._apply_step(self.db, session, "worker-1", step, self.now)
+            self.db.commit()
             with self.assertRaisesRegex(ValueError, "without a verified result import"):
                 FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1",
                                      self.now)
@@ -1041,6 +1037,176 @@ class ResultImportTests(_SessionBase):
             FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
                                issued["grant_id"], self.now)
             self.assertTrue(output.is_file())
+
+    # ---- transaction boundary ---------------------------------------------
+
+    def test_a_failure_midway_through_applying_leaves_nothing_behind(self):
+        """A Python exception does not roll SQLite back on its own.
+
+        Without an explicit savepoint the first step's writes would sit uncommitted in the
+        connection, and the next `commit()` anyone made would make a failed batch permanent.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(
+                server, extra_field_ids=("lever-0-2", "lever-0-3"))
+            before = self.counts()
+            original = FILL._apply_step
+            calls = []
+
+            def fail_on_second(connection, session, worker_id, step, at):
+                calls.append(step["step_id"])
+                if len(calls) == 2:
+                    raise RuntimeError("source vanished mid-batch")
+                return original(connection, session, worker_id, step, at)
+
+            FILL._apply_step = fail_on_second
+            self.addCleanup(setattr, FILL, "_apply_step", original)
+            with self.assertRaises(RuntimeError):
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)
+            FILL._apply_step = original
+            # Someone else's commit must not be able to make the partial batch permanent.
+            self.db.commit()
+            self.assertEqual(self.counts(), before)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_steps WHERE status='pending'").fetchone()[0], 3)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM imported_results").fetchone()[0], 0)
+
+    # ---- per-step source freshness -----------------------------------------
+
+    def test_an_answer_that_expired_or_moved_since_planning_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.add_answer("answer-company", "current_company", "Current company",
+                            "Example Corp")
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0",
+                "fields": [
+                    # A textbox: a radiogroup renders as a fieldset, which the worker
+                    # names as unsupported rather than acting on.
+                    {"field_id": "lever-0-5", "question": "Current company",
+                     "selector": "#c", "control": "text", "required": False,
+                     "sensitivity": "normal", "source_kind": "answer"},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }, self.now)
+            package = self.export("answer.package.json")
+            issued = self.issue(package)
+            output = self.root / "answer.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            arguments = {"result": output, "grant_id": issued["grant_id"]}
+
+            # `record_field` is satisfied by "active and the same value", so each of these
+            # would previously have imported cleanly.
+            for column, value, reason in (
+                ("expires_at", (self.now - timedelta(days=1)).isoformat(), "answer_expired"),
+                ("review_after", (self.now - timedelta(days=1)).isoformat(),
+                 "answer_review_due"),
+                ("confirmation_status", "provisional", "answer_not_confirmed"),
+                ("scope_json", json.dumps({"country": "DE"}), "answer_scope_mismatch"),
+                ("preconditions_json", json.dumps({"country": "DE"}),
+                 "answer_precondition_failed"),
+                ("auto_fill_allowed", 0, "automatic_fill_not_allowed"),
+                ("answer_json", json.dumps("changed"), "answer_value_changed"),
+            ):
+                with self.subTest(column=column):
+                    keep = self.db.execute(
+                        f"SELECT {column} AS value FROM answers WHERE answer_id='answer-company'"
+                    ).fetchone()["value"]
+                    self.db.execute(
+                        f"UPDATE answers SET {column}=? WHERE answer_id='answer-company'",
+                        (value,))
+                    self.refuses(reason, **arguments)
+                    self.db.execute(
+                        f"UPDATE answers SET {column}=? WHERE answer_id='answer-company'",
+                        (keep,))
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
+    def test_a_fact_that_changed_or_unlocked_since_planning_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            arguments = {"result": output, "grant_id": issued["grant_id"]}
+            self.db.execute("UPDATE candidate_facts SET locked=0 WHERE fact_id='fact-name'")
+            self.refuses("candidate_fact_not_locked", **arguments)
+            self.db.execute("UPDATE candidate_facts SET locked=1 WHERE fact_id='fact-name'")
+            self.db.execute("UPDATE candidate_facts SET value_json=? WHERE fact_id='fact-name'",
+                            (json.dumps("Someone Else"),))
+            self.refuses("candidate_fact_changed", **arguments)
+
+    def test_a_policy_that_expired_or_narrowed_since_planning_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            POLICY.register_policy(
+                self.db, policy_id="policy-eeo_gender", question_family="eeo_gender",
+                locale="en-US", option_tokens=["decline_to_answer"], confirmed_by="user",
+                confirmed_at=self.now, scope={})
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0", "locale": "en-US",
+                "fields": [
+                    {"field_id": "lever-0-23", "question": "Gender", "selector": "#g",
+                     "control": "select", "required": False, "sensitivity": "normal",
+                     "options": [{"label": label,
+                                  "value": POLICY.replay_option_value(label, server.nonce)}
+                                 for label in ("Male", "Female", "Decline to answer")]},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }, self.now)
+            package = self.export("policy.package.json")
+            issued = self.issue(package)
+            output = self.root / "policy.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            arguments = {"result": output, "grant_id": issued["grant_id"]}
+
+            # `record_handling` never re-read the policy at all.
+            POLICY.revoke_policy(self.db, "policy-eeo_gender", "user_withdrew", self.now)
+            self.refuses("nondisclosure_policy_revoked", **arguments)
+            self.db.execute("UPDATE nondisclosure_policies SET revoked_at=NULL")
+            self.db.execute("UPDATE nondisclosure_policies SET expires_at=? ",
+                            ((self.now - timedelta(days=1)).isoformat(),))
+            self.refuses("nondisclosure_policy_expired", **arguments)
+            self.db.execute("UPDATE nondisclosure_policies SET expires_at=NULL")
+            self.db.execute("UPDATE nondisclosure_policies SET scope_json=?",
+                            (json.dumps({"country": "DE"}),))
+            self.refuses("nondisclosure_policy_scope_mismatch", **arguments)
+            self.db.execute("UPDATE nondisclosure_policies SET scope_json='{}'")
+            # Narrowed to a vocabulary that no longer produces the option that was planned.
+            self.db.execute("UPDATE nondisclosure_policies SET option_tokens_json=?",
+                            (json.dumps(["prefer_not_to_answer"]),))
+            self.refuses("nondisclosure_option_no_longer_reviewed", **arguments)
+            self.db.execute("UPDATE nondisclosure_policies SET option_tokens_json=?",
+                            (json.dumps(["decline_to_answer"]),))
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
+    def test_idempotence_never_returns_success_for_the_wrong_page(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+            # Same grant, same bytes, a page the caller named wrongly.
+            with self.assertRaises(FILL.ImportRefused) as caught:
+                FILL.import_result(self.db, "session-1", "page-9", "worker-1", output,
+                                   issued["grant_id"], self.now)
+            # The recorded import is what belongs elsewhere, and idempotence does not get to
+            # skip that check: the old branch returned success with the caller's wrong ids
+            # echoed back.
+            self.assertEqual(str(caught.exception), "import_belongs_to_another_page")
 
     # ---- value isolation ---------------------------------------------------
 

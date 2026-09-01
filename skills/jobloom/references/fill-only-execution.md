@@ -264,13 +264,32 @@ version, session and page, package digest, action completeness and order, `verif
 action with an exact hash match, a proven `final_action_activations` of zero, and
 `side_effect_attribution: complete`.
 
-**Either the page's actions are all recorded or none are.** Nothing writes until every check
-has passed, and then one transaction applies them. A loop over `complete_step` would have
-committed as it went, so a mismatch on the last field would leave every earlier field
-recorded — the opposite of what verification is for. `_apply_step` exists so the batch has a
-primitive that commits nothing.
+Each step's source is re-checked against the store as it is **now**, not as it was when the
+page was planned. Authorization freshness alone was not enough: `record_field` asks only
+whether an answer is active with the same value, which an expired, review-due, out-of-scope,
+precondition-failed or no-longer-auto-fillable answer all satisfy, and `record_handling` never
+re-read the policy at all. So the import runs `answer_issue` for answers, re-reads the locked
+fact from the active snapshot for facts, and runs `policy_issue` plus the reviewed vocabulary
+for a non-disclosure policy — a policy revoked, expired, moved out of scope or narrowed after
+planning no longer writes a marker.
 
-Import is idempotent and non-replayable. The result file is kept for audit; `imported_results`
+**Either the page's actions are all recorded or none are**, and that is a real transaction
+now. Nothing writes until every check has passed; the batch then runs inside a `SAVEPOINT`
+and rolls back to it on any exception, because a Python error does not roll SQLite back on
+its own — a partial batch would otherwise sit in the connection until someone else's commit
+made it permanent. `archive_core.record_field` grew a `commit` flag for the same reason: it
+committed per field, so "all or none" had never actually been true.
+
+There is **no bypass**. `complete_step`, its CLI command, and the
+`checkpoint_page(require_verified_import=False)` switch were removed rather than left as a
+legacy option: together they let a caller finish a page with a hash read out of the database
+and seal it, which made the entire import path optional. Suites that predate the import path
+use `tests/fixtures/completed_page.py`, which lives outside the shipped code and says so.
+
+Import is idempotent and non-replayable, and idempotence does not skip identity: a repeat is
+matched against the recorded import's own session, page and package before it is allowed to
+report success, because returning `already_imported` for a page the caller named wrongly would
+hand back a fact about the wrong application. The result file is kept for audit; `imported_results`
 records its digest, the grant, the package digest and the time. The same result imports once
 and then reports `already_imported` without duplicating a field, a marker or an event; a
 different result presented for the same grant is refused as a conflict rather than overwriting

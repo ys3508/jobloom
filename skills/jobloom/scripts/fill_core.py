@@ -28,7 +28,7 @@ import field_policy  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
 import worker_protocol  # noqa: E402
-from _common import parse_time as _parse_time  # noqa: E402
+from _common import answer_issue, parse_time as _parse_time  # noqa: E402
 from _common import require_application_material_format, require_table  # noqa: E402
 
 
@@ -1039,7 +1039,7 @@ def _apply_step(connection: sqlite3.Connection, session: sqlite3.Row, worker_id:
         archive_core.record_field(
             connection, session["application_id"], step["field_id"], step["question"],
             json.loads(step["value_json"]), step["source_kind"], step["source_id"],
-            step["source_status"], step["sensitivity"], at,
+            step["source_status"], step["sensitivity"], at, commit=False,
         )
     connection.execute(
         "UPDATE fill_steps SET status='completed', completed_at=? WHERE step_id=?",
@@ -1052,24 +1052,6 @@ def _apply_step(connection: sqlite3.Connection, session: sqlite3.Row, worker_id:
         step_metadata["step_id_sha256"] = canonical_hash(step["step_id"])
     _event(connection, session, worker_id, "step_completed", "observed_value_hash_matched",
            step_metadata, at)
-
-
-def complete_step(connection: sqlite3.Connection, session_id: str, worker_id: str,
-                  step_id: str, observed_sha256: str, at: datetime | None = None) -> dict[str, Any]:
-    session = _active_session(connection, session_id, worker_id, at)
-    step = connection.execute(
-        "SELECT * FROM fill_steps WHERE step_id=? AND session_id=?", (step_id, session_id)
-    ).fetchone()
-    if not step or step["status"] != "pending":
-        raise ValueError("pending fill step not found")
-    if observed_sha256 != step["expected_sha256"]:
-        return _pause(connection, session, [_field_reason(
-            "incorrect_autofill", step["field_id"], step["sensitivity"]
-        )],
-                      worker_id, step["page_id"], at)
-    _apply_step(connection, session, worker_id, step, at)
-    connection.commit()
-    return {"session_id": session_id, "step_id": step_id, "status": "completed"}
 
 
 class ImportRefused(ValueError):
@@ -1128,6 +1110,14 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
     if previous:
         if previous["result_sha256"] != result_digest:
             raise ImportRefused("result_conflicts_with_recorded_import")
+        # Idempotence is not a reason to skip identity. Returning success for a session or
+        # page the caller named wrongly would hand back a fact about the wrong application.
+        if previous["session_id"] != session_id or previous["page_id"] != page_id:
+            raise ImportRefused("import_belongs_to_another_page")
+        if previous["package_sha256"] != _authoritative_package_hash(
+            connection, session_id, page_id, grant_id
+        ):
+            raise ImportRefused("import_package_mismatch")
         return {"session_id": session_id, "page_id": page_id, "status": "already_imported",
                 "verified_action_count": 0, "result_sha256": result_digest}
 
@@ -1175,21 +1165,99 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
         if entry.get("observed_sha256") != step["expected_sha256"]:
             raise ImportRefused("observed_hash_mismatch")
 
-    # Nothing above wrote. From here it is one transaction.
+    # Each step's source has to be current now, not when the page was planned. Authorization
+    # freshness alone left an answer that expired, fell out of scope, or lost a precondition
+    # between planning and import able to be recorded as verified.
     for step in steps:
-        _apply_step(connection, session, worker_id, step, current_time)
-    connection.execute(
-        "INSERT INTO imported_results (result_sha256, session_id, page_id, grant_id, "
-        "package_sha256, status, imported_at) VALUES (?, ?, ?, ?, ?, 'verified', ?)",
-        (result_digest, session_id, page_id, grant_id, package_sha256,
-         current_time.isoformat()))
-    _event(connection, session, worker_id, "results_imported",
-           "observed_hashes_verified",
-           {"page_id": page_id, "verified_action_count": len(steps),
-            "result_sha256": result_digest}, at)
+        _require_source_still_valid(connection, session, step, context, current_time)
+
+    # Nothing above wrote. From here it is one transaction, and a failure inside it leaves
+    # nothing behind: a Python exception does not roll SQLite back on its own, so a partial
+    # batch would otherwise sit in the connection waiting for someone else's commit to make
+    # it permanent.
+    connection.execute("SAVEPOINT import_result")
+    try:
+        for step in steps:
+            _apply_step(connection, session, worker_id, step, current_time)
+        connection.execute(
+            "INSERT INTO imported_results (result_sha256, session_id, page_id, grant_id, "
+            "package_sha256, status, imported_at) VALUES (?, ?, ?, ?, ?, 'verified', ?)",
+            (result_digest, session_id, page_id, grant_id, package_sha256,
+             current_time.isoformat()))
+        _event(connection, session, worker_id, "results_imported",
+               "observed_hashes_verified",
+               {"page_id": page_id, "verified_action_count": len(steps),
+                "result_sha256": result_digest}, at)
+    except BaseException:
+        connection.execute("ROLLBACK TO SAVEPOINT import_result")
+        connection.execute("RELEASE SAVEPOINT import_result")
+        raise
+    connection.execute("RELEASE SAVEPOINT import_result")
     connection.commit()
     return {"session_id": session_id, "page_id": page_id, "status": "verified",
             "verified_action_count": len(steps), "result_sha256": result_digest}
+
+
+def _require_source_still_valid(connection: sqlite3.Connection, session: sqlite3.Row,
+                                step: sqlite3.Row, context: dict[str, Any],
+                                at: datetime) -> None:
+    """Re-run the check that let this step be planned, against the store as it is now.
+
+    `record_field` only asks whether an answer is active and its value unchanged, which an
+    expired or out-of-scope answer satisfies. The freshness rules live in `answer_issue` and
+    `policy_issue`, so those are what run here.
+    """
+    source_kind, source_id = step["source_kind"], step["source_id"]
+    if source_kind == "answer":
+        row = connection.execute(
+            "SELECT * FROM answers WHERE answer_id=?", (source_id,)).fetchone()
+        if not row:
+            raise ImportRefused("answer_missing")
+        issue = answer_issue(row, context, at)
+        if issue:
+            raise ImportRefused(issue)
+        if not row["auto_fill_allowed"]:
+            raise ImportRefused("automatic_fill_not_allowed")
+        if row["answer_json"] != step["value_json"]:
+            raise ImportRefused("answer_value_changed")
+    elif source_kind == "fact":
+        fact = connection.execute("""
+            SELECT cf.* FROM material_locks ml
+            JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+            JOIN candidate_snapshots cs ON cs.content_sha256=rv.candidate_profile_sha256
+            JOIN candidate_facts cf ON cf.content_sha256=cs.content_sha256
+            WHERE ml.application_id=? AND ml.invalidated_at IS NULL
+              AND cs.status='active' AND cs.registered_by='user' AND cf.fact_id=?
+        """, (session["application_id"], source_id)).fetchone()
+        if not fact:
+            raise ImportRefused("candidate_fact_unknown")
+        if fact["status"] != "locked" or not fact["locked"]:
+            raise ImportRefused("candidate_fact_not_locked")
+        if fact["value_json"] != step["value_json"]:
+            raise ImportRefused("candidate_fact_changed")
+    elif source_kind == "nondisclosure_policy":
+        policy = connection.execute(
+            "SELECT * FROM nondisclosure_policies WHERE policy_id=?", (source_id,)).fetchone()
+        if not policy:
+            raise ImportRefused("nondisclosure_policy_absent")
+        issue = field_policy.policy_issue(policy, context, at)
+        if issue:
+            raise ImportRefused(issue)
+        # The value has to still be one this policy's reviewed vocabulary produces, under
+        # this locale and version — a policy narrowed after planning must not keep applying.
+        allowed = field_policy.vocabulary_options(
+            policy["locale"], json.loads(policy["option_tokens_json"]),
+            policy["vocabulary_version"])
+        surface = field_policy.active_replay_surface(
+            connection, session["form_url"], at)
+        if not surface:
+            raise ImportRefused("surface_expired")
+        expected = {field_policy.replay_option_value(label, surface["nonce"])
+                    for label in allowed}
+        if json.loads(step["value_json"]) not in expected:
+            raise ImportRefused("nondisclosure_option_no_longer_reviewed")
+    elif source_kind not in {"resume", "cover_letter"}:
+        raise ImportRefused("unsupported_source")
 
 
 def _candidate_facts_unchanged(connection: sqlite3.Connection, application_id: str) -> None:
@@ -1208,8 +1276,7 @@ def _candidate_facts_unchanged(connection: sqlite3.Connection, application_id: s
 
 
 def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: str,
-                    page_id: str, checkpoint_id: str, at: datetime | None = None,
-                    require_verified_import: bool = True) -> dict[str, Any]:
+                    page_id: str, checkpoint_id: str, at: datetime | None = None) -> dict[str, Any]:
     _require_id(checkpoint_id, "checkpoint_id")
     session = _active_session(connection, session_id, worker_id, at)
     page = connection.execute(
@@ -1227,12 +1294,17 @@ def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: 
     planned = connection.execute(
         "SELECT COUNT(*) FROM fill_steps WHERE session_id=? AND page_id=?",
         (session_id, page_id)).fetchone()[0]
-    if planned and require_verified_import:
-        # A page is checkpointed on the strength of a verified import, not on steps having
-        # been marked complete by some other route. A failed or conflicting import leaves no
-        # row here, so the page cannot be sealed as though it had succeeded.
+    if planned:
+        # A page is sealed on the strength of a verified import of the package this page
+        # actually exported — not on steps having been marked complete by some other route,
+        # and not on this page having had any verified import at some point. There is no
+        # parameter to turn this off: a boolean bypass would make the whole import path
+        # optional, which is the opposite of the point.
         imported = connection.execute(
-            "SELECT 1 FROM imported_results WHERE session_id=? AND page_id=? AND status='verified'",
+            "SELECT 1 FROM imported_results i JOIN exported_packages e "
+            "ON e.session_id=i.session_id AND e.page_id=i.page_id "
+            "AND e.package_sha256=i.package_sha256 "
+            "WHERE i.session_id=? AND i.page_id=? AND i.status='verified'",
             (session_id, page_id)).fetchone()
         if not imported:
             raise ValueError("cannot checkpoint a page without a verified result import")
@@ -1410,11 +1482,6 @@ def main() -> None:
     export.add_argument("--worker-id", required=True)
     export.add_argument("--page-id", required=True)
     export.add_argument("--output", required=True, type=Path)
-    complete = commands.add_parser("complete-step")
-    complete.add_argument("--session-id", required=True)
-    complete.add_argument("--worker-id", required=True)
-    complete.add_argument("--step-id", required=True)
-    complete.add_argument("--observed-sha256", required=True)
     # Narrow on purpose: where the result is and which grant authorised it. Everything it
     # is checked against is read from the database, because a caller that could supply its
     # own expectations could satisfy any of them.
@@ -1456,10 +1523,6 @@ def main() -> None:
     elif args.command == "import-result":
         result = import_result(connection, args.session_id, args.page_id, args.worker_id,
                                args.result, args.grant_id)
-    elif args.command == "complete-step":
-        result = complete_step(
-            connection, args.session_id, args.worker_id, args.step_id, args.observed_sha256
-        )
     elif args.command == "checkpoint":
         result = checkpoint_page(
             connection, args.session_id, args.worker_id, args.page_id, args.checkpoint_id

@@ -41,6 +41,8 @@ PRE_SUBMIT = load_script("pre_submit_core")
 POLICY = load_script("field_policy")
 from tests.pdf_fixture import synthetic_pdf
 
+from tests.fixtures.completed_page import complete_page_as_if_imported
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -175,18 +177,12 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         ]
 
     def complete_page(self, page_id="page-1", worker_id="worker-1"):
-        rows = self.db.execute(
-            "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id='session-1' AND page_id=? "
-            "ORDER BY ordinal", (page_id,),
-        ).fetchall()
-        for row in rows:
-            FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
-        # These suites drive the per-step `complete_step` path, which predates result
-        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
+        # A test-only shortcut, in `tests/`, because production has no bypass: see
+        # `tests/fixtures/completed_page.py`. The real path runs with a browser in
+        # `tests/test_fill_worker.py`.
+        complete_page_as_if_imported(FILL, self.db, "session-1", worker_id, page_id, AT)
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
-            require_verified_import=False,
-        )
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT)
 
     def reacquire(self, worker_id="worker-2"):
         APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
@@ -556,11 +552,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
-        for row in self.db.execute(
-            "SELECT step_id, expected_sha256 FROM fill_steps ORDER BY ordinal"
-        ).fetchall():
-            FILL.complete_step(self.db, "session-1", "worker-1", row["step_id"],
-                               row["expected_sha256"], AT)
+        complete_page_as_if_imported(FILL, self.db, "session-1", "worker-1", "page-1", AT)
         self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
                          {"eeo_race": "policy_declined"})
         self.assertEqual(self.db.execute(

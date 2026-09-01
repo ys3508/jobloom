@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import os
 import sqlite3
@@ -29,6 +30,8 @@ COVERS = load_script("cover_letter_core")
 ARCHIVE = load_script("archive_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 from tests.pdf_fixture import synthetic_pdf
+
+from tests.fixtures.completed_page import complete_page_as_if_imported
 
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
@@ -164,18 +167,12 @@ class FillCoreTests(unittest.TestCase):
         ]
 
     def complete_page(self, page_id="page-1", worker_id="worker-1"):
-        rows = self.db.execute(
-            "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id='session-1' AND page_id=? "
-            "ORDER BY ordinal", (page_id,),
-        ).fetchall()
-        for row in rows:
-            FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
-        # These suites drive the per-step `complete_step` path, which predates result
-        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
+        # A test-only shortcut, in `tests/`, because production has no bypass: see
+        # `tests/fixtures/completed_page.py`. The real path runs with a browser in
+        # `tests/test_fill_worker.py`.
+        complete_page_as_if_imported(FILL, self.db, "session-1", worker_id, page_id, AT)
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
-            require_verified_import=False,
-        )
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT)
 
     def reacquire(self, worker_id="worker-2"):
         APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
@@ -275,26 +272,36 @@ class FillCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported fields"):
             self.start(authorization_context={"country": "US", "password": "do-not-store"})
 
-    def test_incorrect_autofill_hash_pauses_without_recording_field(self):
+    def test_production_exposes_no_way_to_complete_a_step_without_an_import(self):
+        """There is no bypass, and no switch that turns the import path off.
+
+        `complete_step` and `checkpoint_page(require_verified_import=False)` used to exist.
+        Together they let a caller finish a whole page with a hash read out of the database
+        and seal it, which made the entire result-import path optional. The behaviour this
+        test replaced — a wrong observed hash recording nothing — is covered against a real
+        browser in `tests/test_fill_worker.py`.
+        """
+        self.assertFalse(hasattr(FILL, "complete_step"))
+        self.assertNotIn("require_verified_import",
+                         inspect.signature(FILL.checkpoint_page).parameters)
+        source = inspect.getsource(FILL.main)
+        self.assertNotIn("complete-step", source)
+        self.assertIn("import-result", source)
+
+    def test_a_page_cannot_be_checkpointed_without_a_verified_import(self):
         self.start()
         FILL.observe_page(
             self.db, "session-1", "worker-1", self.candidate_path,
             self.page(fields=[self.standard_fields()[0]]), AT,
         )
-        step = self.db.execute("SELECT step_id FROM fill_steps").fetchone()
-        result = FILL.complete_step(
-            self.db, "session-1", "worker-1", step["step_id"], "wrong", AT
-        )
-        self.assertEqual(result["state"], "waiting_for_user_takeover")
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM application_fields").fetchone()[0], 0)
-        self.reacquire()
-        resumed = FILL.resume_session(
-            self.db, "session-1", "worker-2", "auth-1", {"country": "US"}, self.candidate_path, AT
-        )
-        self.assertEqual(resumed["status"], "active")
-        self.assertEqual(self.db.execute(
-            "SELECT COUNT(*) FROM fill_steps WHERE session_id='session-1' AND status='pending'"
-        ).fetchone()[0], 1)
+        session = self.db.execute(
+            "SELECT * FROM fill_sessions WHERE session_id='session-1'").fetchone()
+        for step in self.db.execute("SELECT * FROM fill_steps").fetchall():
+            FILL._apply_step(self.db, session, "worker-1", step, AT)
+        self.db.commit()
+        # Steps complete, no import: the page still cannot be sealed.
+        with self.assertRaisesRegex(ValueError, "without a verified result import"):
+            FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1", AT)
 
     def test_unlocked_fact_and_unapproved_upload_pause(self):
         self.start()

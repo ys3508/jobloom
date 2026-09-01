@@ -148,6 +148,7 @@ def record_field(
     source_status: str,
     sensitivity: str,
     at: datetime | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     _require_safe_id(field_id, "field_id")
     if not question.strip():
@@ -207,7 +208,11 @@ def record_field(
         field_metadata["field_id_sha256"] = hashlib.sha256(field_id.encode("utf-8")).hexdigest()
     _event(connection, "field_recorded", "verified_source_mapped", application_id=application_id,
            metadata=field_metadata, at=at)
-    connection.commit()
+    if commit:
+        # A batch import applies every field inside one savepoint, and a commit here would
+        # end it — which is how "either all of the page or none of it" quietly became "each
+        # field as it goes".
+        connection.commit()
     return {"application_id": application_id, "field_id": field_id, "source_kind": source_kind,
             "sensitivity": sensitivity, "status": "recorded"}
 
