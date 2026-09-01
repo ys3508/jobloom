@@ -302,11 +302,20 @@ wrong identity, a stale lease or a source that expired all mean the import shoul
 and nothing is written. An observed hash that differs means the worker did act and the page now
 holds something other than what was planned — a disagreement about the form in front of the
 user — so after confirming that no step, field, marker or verified row was written, the import
-records a value-free rejection and moves the session to `waiting_for_user_takeover`. The record
-carries a page id, a hashed step id and a stable code: neither the expected nor the observed
-hash appears, because they are properties of the value and two of them together say a great
-deal about it. Replaying the same rejected result reports `already_rejected` and does not pause
-or record again.
+records a value-free rejection and moves the session to `waiting_for_user_takeover`.
+
+**The rejection and the handover are one transaction.** The rejected row, a `result_rejected`
+event, the paused session and page, and the application's move to takeover succeed together or
+none of them happens. Committing the row first meant a failing pause left a result marked
+rejected while the session stayed active — and because replay then answers `already_rejected`,
+the handover would never be attempted again. `application_core.transition` and `release_lease`
+take a `commit` flag so this path can own its transaction; calling a function that ends the
+transaction from inside a savepoint is how the row got committed alone.
+
+Everything persisted is value-free: the event carries a page id, a hashed step id and stable
+codes, and neither the expected nor the observed hash appears anywhere — they are properties of
+the value, and two of them together say a great deal about it. Replaying the same rejected
+result reports `already_rejected` without pausing or recording again.
 
 A page may be checkpointed only on the strength of a verified import. Steps marked complete by
 some other route do not qualify, and a failed or conflicting import leaves nothing to qualify

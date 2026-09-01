@@ -530,6 +530,7 @@ def transition(
     reason_code: str,
     metadata: dict[str, Any] | None = None,
     at: datetime | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     if to_state not in APPLICATION_STATES:
         raise ValueError(f"unknown application state: {to_state}")
@@ -653,7 +654,11 @@ def transition(
         ) if key in metadata
     }
     _event(connection, application_id, actor, current, to_state, reason_code, event_metadata, at)
-    connection.commit()
+    if commit:
+        # A caller inside a savepoint owns the transaction. Committing here would end it,
+        # which is how a rejected import could be recorded while the pause that has to
+        # accompany it was still to come.
+        connection.commit()
     return {"application_id": application_id, "from_state": current, "state": to_state}
 
 
@@ -743,12 +748,14 @@ def release_lease(
     reason_code: str,
     error_code: str | None = None,
     at: datetime | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     row = connection.execute("SELECT * FROM applications WHERE application_id=?", (application_id,)).fetchone()
     if not row or row["state"] != "filling" or row["worker_id"] != worker_id:
         raise ValueError("active lease is not owned by this worker")
     metadata = {"error_code": error_code} if error_code else {}
-    return transition(connection, application_id, to_state, worker_id, reason_code, metadata, at)
+    return transition(connection, application_id, to_state, worker_id, reason_code, metadata,
+                      at, commit=commit)
 
 
 def status(connection: sqlite3.Connection) -> dict[str, Any]:

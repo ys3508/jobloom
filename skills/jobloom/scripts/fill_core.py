@@ -310,6 +310,7 @@ def _pause(
     actor: str,
     page_id: str | None = None,
     at: datetime | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     unique = sorted(set(reasons))
     timestamp = (at or now_utc()).isoformat()
@@ -329,6 +330,7 @@ def _pause(
     application_core.release_lease(
         connection, session["application_id"], session["worker_id"], target,
         "fill_paused_for_user" if answer_pause else "fill_paused_for_takeover", at=at,
+        commit=commit,
     )
     return {"session_id": session["session_id"], "status": "paused", "state": target,
             "reasons": unique, "completed_checkpoints_preserved": True}
@@ -1217,18 +1219,36 @@ def _reject_with_takeover(connection: sqlite3.Connection, session: sqlite3.Row,
     """Record the rejection and hand the page to the user. Nothing successful is written.
 
     Reached only after every action was checked and before anything was applied, so there is
-    no successful batch to undo. The record is value-free: a page id, a hashed step id and a
-    stable code. Neither the expected nor the observed hash appears — they are properties of
-    the value, and two of them together say a great deal about it.
+    no successful batch to undo. The rejected row, the `result_rejected` event, the paused
+    session and page, and the application's move to takeover are one transaction: any of them
+    failing leaves none of them, because a rejected row without a pause would eat the handover
+    signal — replay would answer `already_rejected` and never try again.
+
+    Everything persisted is value-free: a page id, a hashed step id and stable codes. Neither
+    the expected nor the observed hash appears in any of it — they are properties of the value,
+    and two of them together say a great deal about it.
     """
-    connection.execute(
-        "INSERT OR IGNORE INTO imported_results (result_sha256, session_id, page_id, "
-        "grant_id, package_sha256, status, imported_at) "
-        "VALUES (?, ?, ?, ?, ?, 'rejected', ?)",
-        (result_digest, session["session_id"], page_id, grant_id, package_sha256,
-         current_time.isoformat()))
+    connection.execute("SAVEPOINT reject_import")
+    try:
+        connection.execute(
+            "INSERT OR IGNORE INTO imported_results (result_sha256, session_id, page_id, "
+            "grant_id, package_sha256, status, imported_at) "
+            "VALUES (?, ?, ?, ?, ?, 'rejected', ?)",
+            (result_digest, session["session_id"], page_id, grant_id, package_sha256,
+             current_time.isoformat()))
+        # The record and the handover are one fact. Committing the record first meant a
+        # failing pause left a result marked rejected while the session stayed active — and
+        # replay then answered `already_rejected`, so the takeover was never attempted again.
+        _event(connection, session, worker_id, "result_rejected", "observed_hash_mismatch",
+               {"page_id": page_id, "step_id_sha256": canonical_hash(step["step_id"])}, at)
+        paused = _pause(connection, session, ["incorrect_autofill"], worker_id, page_id, at,
+                        commit=False)
+    except BaseException:
+        connection.execute("ROLLBACK TO SAVEPOINT reject_import")
+        connection.execute("RELEASE SAVEPOINT reject_import")
+        raise
+    connection.execute("RELEASE SAVEPOINT reject_import")
     connection.commit()
-    paused = _pause(connection, session, ["incorrect_autofill"], worker_id, page_id, at)
     return {"session_id": session["session_id"], "page_id": page_id, "status": "rejected",
             "reason": "observed_hash_mismatch", "state": paused["state"],
             "verified_action_count": 0, "result_sha256": result_digest,

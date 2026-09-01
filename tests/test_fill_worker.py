@@ -1235,6 +1235,169 @@ class ResultImportTests(_SessionBase):
                 FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
                                    issued["grant_id"], self.now)["status"], "verified")
 
+    def test_a_rejection_and_its_handover_are_one_transaction(self):
+        """A rejected row without a pause would eat the handover signal permanently.
+
+        Replay answers `already_rejected`, so the takeover would never be attempted again.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            broken = self.rewrite(
+                output, lambda e: e["results"][0].update({"observed_sha256": "f" * 64}))
+            before_state = self.db.execute(
+                "SELECT state FROM applications WHERE application_id='app-1'"
+            ).fetchone()["state"]
+            before_events = self.db.execute(
+                "SELECT COUNT(*) FROM fill_events").fetchone()[0]
+
+            original = FILL.application_core.release_lease
+
+            def fail_after_the_row(*arguments, **keywords):
+                raise RuntimeError("lease race during handover")
+
+            FILL.application_core.release_lease = fail_after_the_row
+            self.addCleanup(setattr, FILL.application_core, "release_lease", original)
+            with self.assertRaises(RuntimeError):
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
+                                   issued["grant_id"], self.now)
+            FILL.application_core.release_lease = original
+            # A commit by anyone else must not make the half-written handover permanent.
+            self.db.commit()
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM imported_results").fetchone()[0], 0)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_events").fetchone()[0], before_events)
+            self.assertEqual(self.db.execute(
+                "SELECT status FROM fill_sessions WHERE session_id='session-1'"
+            ).fetchone()["status"], "active")
+            self.assertEqual(self.db.execute(
+                "SELECT status FROM fill_pages WHERE page_id='page-1'"
+            ).fetchone()["status"], "active")
+            self.assertEqual(self.db.execute(
+                "SELECT state FROM applications WHERE application_id='app-1'"
+            ).fetchone()["state"], before_state)
+
+            # With the handover working, all four land together.
+            outcome = FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
+                                         issued["grant_id"], self.now)
+            self.assertEqual(outcome["status"], "rejected")
+            self.assertEqual(self.db.execute(
+                "SELECT status FROM imported_results").fetchone()["status"], "rejected")
+            self.assertEqual(self.db.execute(
+                "SELECT status FROM fill_sessions WHERE session_id='session-1'"
+            ).fetchone()["status"], "paused")
+            self.assertEqual(self.db.execute(
+                "SELECT state FROM applications WHERE application_id='app-1'"
+            ).fetchone()["state"], "waiting_for_user_takeover")
+            reasons = [row["reason_code"] for row in self.db.execute(
+                "SELECT reason_code FROM fill_events")]
+            self.assertIn("observed_hash_mismatch", reasons)
+
+    def test_the_rejection_event_carries_a_hashed_step_id_and_no_hashes_of_values(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            expected = self.db.execute(
+                "SELECT step_id, expected_sha256 FROM fill_steps").fetchone()
+            broken = self.rewrite(
+                output, lambda e: e["results"][0].update({"observed_sha256": "f" * 64}))
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
+                               issued["grant_id"], self.now)
+            row = self.db.execute(
+                "SELECT metadata_json FROM fill_events WHERE event_type='result_rejected'"
+            ).fetchone()
+            metadata = json.loads(row["metadata_json"])
+            # Persisted, not merely returned: the docstring's claim and the record agree.
+            self.assertEqual(set(metadata), {"page_id", "step_id_sha256"})
+            self.assertNotEqual(metadata["step_id_sha256"], expected["step_id"])
+            events = " ".join(str(part) for line in self.db.execute(
+                "SELECT * FROM fill_events") for part in line)
+            self.assertNotIn(expected["expected_sha256"], events)
+            self.assertNotIn("f" * 64, events)
+            self.assertNotIn("Verified Candidate", events)
+
+    def test_an_immigration_answer_rescoped_after_planning_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            # A text value, so a correct fill hashes to the planned digest: a boolean would
+            # come back as "True" and be a hash mismatch, which is a different path.
+            self.db.execute("UPDATE answers SET answer_json=? WHERE answer_id='answer-auth'",
+                            (json.dumps("Yes"),))
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0",
+                "fields": [
+                    {"field_id": "lever-0-5", "question": "Are you authorized to work?",
+                     "selector": "#a", "control": "text", "required": True,
+                     "sensitivity": "normal", "source_kind": "answer"},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }, self.now)
+            package = self.export("immigration.package.json")
+            issued = self.issue(package)
+            output = self.root / "immigration.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            # One of the four immigration meanings, re-scoped to another application after
+            # the page was planned. `answer_issue` alone would not object.
+            self.db.execute("UPDATE answers SET scope_json=? WHERE answer_id='answer-auth'",
+                            (json.dumps({"country": "US", "application_id": "app-2"}),))
+            self.refuses("answer_scope_mismatch", result=output,
+                         grant_id=issued["grant_id"])
+            self.db.execute("UPDATE answers SET scope_json=? WHERE answer_id='answer-auth'",
+                            (json.dumps({"country": "US", "application_id": "app-1"}),))
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
+    def test_a_discovery_source_answer_that_loses_its_permission_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            ANSWERS.add_answer(self.db, {
+                "answer_id": "answer-source", "canonical_id": "discovery_source",
+                "canonical_meaning": "How did you hear about us?", "answer": "Job board",
+                "answer_type": "application_specific", "source_type": "user_confirmed",
+                "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
+                "validity_class": "per_application",
+                "scope": {"country": "US", "application_id": "app-1"},
+                "auto_fill_allowed": True, "auto_submit_allowed": False,
+            })
+            ANSWERS.add_question_form(self.db, "discovery_source",
+                                      "How did you hear about us?")
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0",
+                "fields": [
+                    {"field_id": "lever-0-5", "question": "How did you hear about us?",
+                     "selector": "#d", "control": "text", "required": False,
+                     "sensitivity": "normal", "source_kind": "answer"},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }, self.now)
+            package = self.export("discovery.package.json")
+            issued = self.issue(package)
+            output = self.root / "discovery.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            # How the user heard about a role is their statement. A source type that is no
+            # longer a user confirmation loses that standing after planning.
+            self.db.execute("UPDATE answers SET source_type='deterministic_derivation' "
+                            "WHERE answer_id='answer-source'")
+            self.refuses("discovery_source_not_user_confirmed", result=output,
+                         grant_id=issued["grant_id"])
+            self.db.execute("UPDATE answers SET source_type='user_confirmed' "
+                            "WHERE answer_id='answer-source'")
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
     def test_a_fact_that_changed_or_unlocked_since_planning_refuses_the_import(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             _, issued, output = self.run_worker(server)
