@@ -413,7 +413,7 @@ def _require_chain_link(connection: sqlite3.Connection, session_id: str, page_in
 
 
 def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity, locale,
-                       context, current_time, planned, eeo_handling):
+                       context, current_time, planned, eeo_handling, form_url):
     """Apply the rule for a classified domain. Returns a pause reason, a marker, or None.
 
     `None` means the field falls through to the ordinary source dispatch;
@@ -426,7 +426,8 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
         # legible in the pause record.
         resolved = field_policy.resolve_nondisclosure(
             connection, family, locale or "",
-            field_policy.normalize_options(field.get("options")), context, current_time)
+            field_policy.normalize_options(field.get("options")), context, current_time,
+            form_url=form_url)
         if not resolved["applied"]:
             eeo_handling[field_id] = resolved["reason"]
             return _field_reason(resolved["reason"], field_id, "sensitive_personal")
@@ -607,7 +608,7 @@ def observe_page(
         if domain:
             outcome = _apply_domain_rule(connection, domain, field, field_id, ordinal,
                                          sensitivity, locale, context, current_time,
-                                         planned, eeo_handling)
+                                         planned, eeo_handling, session["form_url"])
             if outcome:
                 if outcome != "continue_to_source":
                     reasons.append(outcome)

@@ -72,10 +72,13 @@ reviewed Lever fixture, 2 resolve to career evidence.
 are never stored, read, hashed, archived or placed in a package. A separate
 `nondisclosure_policies` row — not an AnswerEntry — may select a reviewed non-disclosure
 option, and only on an exact match against the option's **label**, which is what a person
-reviewed. What gets submitted is the option's **value**, the page's own opaque string, carried
-through unread — so a label match is evidence that the control offers a non-disclosure choice,
-never evidence about what the form would send. One reviewed label mapping to more than one
-value pauses. Classification runs before every source branch including uploads, so a control
+reviewed. A page supplies both halves of an option, so a page can lie about either:
+`<option value="Asian">Prefer not to answer</option>` offers the reviewed label and submits a
+category. Not being able to read a value is not the same as the value being safe, so the pair
+must be **checkable, not merely opaque** — v1 trusts it only where Jobloom generated both
+halves, on its own loopback replay, where the value is recomputable from the label. Any other
+surface needs an approved adapter mapping with a fixed hash and version; none exists, so the
+control is the user's. One reviewed label mapping to more than one value also pauses. Classification runs before every source branch including uploads, so a control
 declared `file` cannot outrun it. The row stores a **token and a vocabulary version**, never
 a page-facing string: `NONDISCLOSURE_VOCABULARY` lives in code, is versioned, and is reviewed
 per locale, because a free-text allowlist is precisely how a real demographic value would
@@ -93,8 +96,13 @@ ApplicationField stores what was entered and here Jobloom must not be able to sa
 Each marker carries the evidence it rests on, and **no marker may be inferred from something
 not happening**. An empty handling table is `unknown`, not `not_present`: it is equally what a
 half-observed form, a missed control, an abandoned session, or a failed write looks like.
-`not_present` is written only by `finalize_handling`, from `finish_session`, where every page
-is known to have been observed and checkpointed, and it stores a hash over those observations.
+**`not_present` is never written in v1.** A completed page chain is self-reported — index,
+predecessor hash and final-page flag all come from the observer — and an observer that never
+saw a page cannot report its absence. Naming the evidence honestly made the weak claim honest
+without making it strong, so the status stays `unknown`. "No voluntary-disclosure control
+appeared in the self-reported chain" is reportable; "this form has none" is not. The marker
+stays in the vocabulary because a surface that can enumerate a whole form could one day earn
+it.
 `user_handled` is written only by `confirm_user_handled`, which requires the user as actor: a
 control that stopped appearing in the next observation may have been completed by the user, or
 missed by the observer, or re-rendered away, and those are not the same event. The pre-submit

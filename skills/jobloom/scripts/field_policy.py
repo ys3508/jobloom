@@ -20,6 +20,7 @@ the existing answer path, which pauses on `new_question`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -31,6 +32,8 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 import sys  # noqa: E402
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+from urllib.parse import urlparse  # noqa: E402
 
 from _common import context_matches, parse_time  # noqa: E402
 
@@ -47,6 +50,7 @@ MANUAL_REASONS = {
 }
 
 LOCALE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Z]{2})?$")
+LOOPBACK_HOST = re.compile(r"^127\.0\.0\.1$")
 
 # Non-disclosure options are chosen from this table, never typed by a user. A free-text
 # allowlist is how a real demographic value would reach the database: a user who pasted
@@ -62,6 +66,10 @@ NONDISCLOSURE_VOCABULARY: dict[str, dict[str, tuple[str, ...]]] = {
             "I don't wish to answer",
             "I don't want to answer",
             "I do not want to answer",
+        ),
+        "decline_to_answer": (
+            "Decline to answer",
+            "I decline to answer",
         ),
         "decline_to_self_identify": (
             "Decline to self-identify",
@@ -342,6 +350,7 @@ def resolve_nondisclosure(
     options: list[dict[str, str]] | None,
     context: dict[str, Any],
     at: datetime,
+    form_url: str = "",
 ) -> dict[str, Any]:
     """Pick the one reviewed non-disclosure option a page offers, or say why not.
 
@@ -383,6 +392,8 @@ def resolve_nondisclosure(
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
     if len({option["value"] for option in matches}) != 1:
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
+    if not option_mapping_trusted(form_url, matches[0]):
+        return {"applied": False, "reason": "option_mapping_unverified"}
     return {"applied": True, "policy_id": policy["policy_id"],
             "option_label": matches[0]["label"], "submitted_value": matches[0]["value"]}
 
@@ -494,19 +505,49 @@ def handling_summary(connection: sqlite3.Connection, application_id: str) -> dic
             "markers": {key: value for key, value in markers.items() if key != INVENTORY_SCOPE}}
 
 
+# --- option mapping trust -------------------------------------------------
+
+# A page supplies both halves of an option, so a page can lie about either. The value below
+# is what makes a label match mean anything: Jobloom's own replay renderer derives the value
+# from the label by this rule, so an observed pair can be recomputed rather than believed.
+def replay_option_value(label: str) -> str:
+    """The value Jobloom's own renderer emits for a label. Deterministic, and checkable."""
+    return "opt-" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+
+
+def option_mapping_trusted(form_url: str, option: dict[str, str]) -> bool:
+    """Whether this label may be believed to select this value.
+
+    `<option value="Asian">Prefer not to answer</option>` is the attack: the reviewed label
+    is offered while a real category is submitted. Not understanding the value is not the
+    same as the value being safe, so v1 trusts a pair only where Jobloom generated both
+    halves — its own loopback replay, whose values are recomputable from the label. A live
+    surface needs an approved adapter mapping with a fixed hash and version, which does not
+    exist, so on any other page the control is the user's.
+    """
+    parsed = urlparse(form_url or "")
+    if parsed.scheme != "http" or not LOOPBACK_HOST.fullmatch(parsed.hostname or ""):
+        return False
+    return option.get("value") == replay_option_value(option.get("label", ""))
+
+
 def finalize_handling(connection: sqlite3.Connection, application_id: str,
                       observed_eeo_field_ids: list[str], inventory_ref: str,
                       at: datetime) -> dict[str, Any]:
-    """Settle the voluntary-disclosure record once the whole form is known.
+    """Settle what can be settled about voluntary disclosures. In v1 that is never absence.
 
-    Called only where every page has been observed and checkpointed, which is the one moment
-    "no such control exists on this form" becomes a claim evidence can support.
+    A completed page chain is self-reported: index, predecessor hash and final-page flag all
+    come from the observer, and an observer that never saw a page cannot report its absence.
+    Renaming the evidence made the weak claim honest without making it strong, so v1 does not
+    write `not_present` at all. "No voluntary-disclosure control appeared in the self-reported
+    chain" is reportable; "this form has none" is not.
+
+    `not_present` stays in `HANDLING_MARKERS` because a future surface that can enumerate a
+    whole form — a supervised live acceptance with a full-page inventory, say — could earn it.
+    Nothing today may write it.
     """
     recorded = handling_markers(connection, application_id)
     missing = sorted(set(observed_eeo_field_ids) - set(recorded))
     if missing:
         raise ValueError("voluntary disclosure controls were observed without a handling marker")
-    if not observed_eeo_field_ids:
-        record_handling(connection, application_id, INVENTORY_SCOPE, "not_present",
-                        inventory_ref, at)
     return handling_summary(connection, application_id)

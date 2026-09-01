@@ -7,6 +7,7 @@ published. What is tested is that Jobloom has an explicit disposition for every 
 real employers ship, and that the local target is inert.
 """
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -44,20 +45,63 @@ class VendoredCorpusTests(unittest.TestCase):
     def fixture(self, name):
         return json.loads((UPSTREAM / name / "fixture.json").read_text(encoding="utf-8"))
 
-    def test_vendored_bytes_are_the_pinned_commits_git_objects(self):
-        # A pinned commit written in prose anchors nothing. These are the object names git
-        # itself uses — sha1(b"blob <len>\0" + bytes) — so the bytes on disk are tied to the
-        # objects in that commit's tree, checkable offline. They were confirmed against
-        # `GET /repos/.../contents/...?ref=<commit>` when vendored.
+    def test_vendored_bytes_are_proven_to_be_in_the_pinned_commits_tree(self):
+        """Walk the real object chain: commit -> root tree -> qa -> fixtures -> path -> blob.
+
+        The previous version of this test recomputed each local file's blob id and compared
+        it to a manifest that lived beside the files, so editing a file and updating the
+        manifest kept it green. It compared the vendoring to itself. Here every stored object
+        is re-hashed, which is what makes the chain unforgeable offline: changing a blob
+        changes its id, which changes the tree that names it, which changes the tree above,
+        which changes the commit — and the commit id is the constant this test starts from.
+        """
+        anchor = json.loads((UPSTREAM / "GIT-ANCHOR.json").read_text(encoding="utf-8"))
+        self.assertEqual(anchor["commit"], UPSTREAM_COMMIT)
+
+        def payload(object_id):
+            stored = anchor["objects"][object_id]
+            data = base64.b64decode(stored["base64"])
+            header = f"{stored['type']} {len(data)}".encode() + b"\0"
+            self.assertEqual(hashlib.sha1(header + data).hexdigest(), object_id,
+                             f"stored object does not hash to its own id: {object_id}")
+            return stored["type"], data
+
+        def entries(tree_id):
+            kind, data = payload(tree_id)
+            self.assertEqual(kind, "tree")
+            found, index = {}, 0
+            while index < len(data):
+                space = data.index(b" ", index)
+                nul = data.index(b"\0", space)
+                found[data[space + 1:nul].decode()] = data[nul + 1:nul + 21].hex()
+                index = nul + 21
+            return found
+
+        kind, commit = payload(UPSTREAM_COMMIT)
+        self.assertEqual(kind, "commit")
+        root = commit.split(b"\n", 1)[0].split()[1].decode()
+        fixtures = entries(entries(entries(root)["qa"])["fixtures"])
+        resolved = {"LICENSE": entries(root)["LICENSE"]}
+        for name in FAMILIES:
+            directory = entries(fixtures[name])
+            for part in ("fixture", "provenance", "approval"):
+                resolved[f"{name}/{part}.json"] = directory[f"{part}.json"]
+
+        self.assertEqual(resolved, anchor["paths"])
+        for relative, blob_id in resolved.items():
+            with self.subTest(path=relative):
+                data = (UPSTREAM / relative).read_bytes()
+                self.assertEqual(
+                    hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), blob_id,
+                    f"{relative} is not the blob the pinned commit's tree names")
+
+    def test_the_recorded_digests_still_describe_the_vendored_files(self):
         manifest = json.loads((UPSTREAM / "SHA256SUMS.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["upstream_commit"], UPSTREAM_COMMIT)
         for relative, digests in manifest["files"].items():
             with self.subTest(path=relative):
                 data = (UPSTREAM / relative).read_bytes()
                 self.assertEqual(hashlib.sha256(data).hexdigest(), digests["sha256"])
-                self.assertEqual(
-                    hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(),
-                    digests["git_blob_sha1"])
         self.assertEqual(
             set(manifest["files"]),
             {f"{name}/{part}.json" for name in FAMILIES
@@ -93,7 +137,7 @@ class VendoredCorpusTests(unittest.TestCase):
         expected = sorted(
             [f"{name}/{part}.json" for name in FAMILIES
              for part in ("approval", "fixture", "provenance")]
-            + ["LICENSE", "NOTICE.md", "SHA256SUMS.json"])
+            + ["LICENSE", "NOTICE.md", "SHA256SUMS.json", "GIT-ANCHOR.json"])
         self.assertEqual(copied, expected)
         # No upstream executable code, markup, or recording came with them.
         for path in UPSTREAM.rglob("*.json"):
@@ -153,6 +197,19 @@ class GeneratedReplayTests(unittest.TestCase):
                     for control in fixture["steps"][index]["controls"]:
                         self.assertIn(f'data-kind="{control["kind"]}"', page)
 
+    def test_the_page_states_that_its_wording_is_recorded_not_synthetic(self):
+        # An earlier version asserted the page was synthetic on the strength of a banner
+        # reading "Not a real employer form". The labels come from upstream recordings, so
+        # that assertion was checking a sentence rather than a property.
+        fixture = json.loads((UPSTREAM / FAMILIES[0] / "fixture.json").read_text())
+        labels = [control.get("label") for step in fixture["steps"]
+                  for control in step["controls"] if control.get("label")]
+        page = REPLAY.render_page(fixture, 0)
+        rendered = [label for label in labels if label in page]
+        self.assertTrue(rendered, "labels should be rendered as recorded")
+        self.assertIn("recorded upstream wording", page)
+        self.assertIn("MIT", page)
+
     def test_the_markup_is_jobloom_owned_and_reaches_nothing_outside_the_process(self):
         for name in FAMILIES:
             fixture = json.loads((UPSTREAM / name / "fixture.json").read_text())
@@ -165,8 +222,11 @@ class GeneratedReplayTests(unittest.TestCase):
                 # The only action target is the loopback counting endpoint.
                 for action in re.findall(r'action="([^"]*)"', page):
                     self.assertIn(action, ("", "/__final_action"))
-                # Synthetic wording only: no real employer name reaches the repository.
-                self.assertIn("Not a real employer form", page)
+                # The banner is not a claim about the labels. They are upstream recorded
+                # wording, vendored under MIT and rendered as recorded, because a paraphrase
+                # would test a form no employer ships. What the banner says is that the page
+                # is local and inert; it does not make the wording synthetic.
+                self.assertIn("recorded upstream wording", page)
 
     def test_every_safety_variant_is_discoverable_on_the_first_page(self):
         fixture = json.loads((UPSTREAM / FAMILIES[0] / "fixture.json").read_text())
@@ -229,7 +289,7 @@ class ReplayServerTests(unittest.TestCase):
             for path in state["pages"]:
                 with self.subTest(path=path):
                     with urllib.request.urlopen(f"{server.origin}{path}", timeout=5) as page:
-                        self.assertIn(b"Synthetic", page.read())
+                        self.assertIn(b"Local", page.read())
 
     def test_the_final_action_counter_starts_at_zero_and_reads_without_being_touched(self):
         with ReplayServer() as server:

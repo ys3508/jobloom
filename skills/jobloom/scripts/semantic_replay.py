@@ -142,15 +142,21 @@ def render_control(control: dict[str, Any], test_id: str) -> str:
     common = f'id="{test_id}" name="{test_id}" data-test-id="{test_id}" data-kind="{_escape(kind)}"'
     if role == "radiogroup":
         options = "".join(
-            f'<label><input type="radio" name="{test_id}" value="{_escape(choice)}" '
+            f'<label><input type="radio" name="{test_id}" '
+            f'value="{_escape(field_policy.replay_option_value(choice))}" '
             f'data-test-id="{test_id}--{index}"> {_escape(choice)}</label>'
             for index, choice in enumerate(control.get("choices") or [])
         )
         return (f'<fieldset role="radiogroup" aria-label="{label}" data-kind="{_escape(kind)}" '
                 f'data-test-id="{test_id}"><legend>{label}</legend>{options}</fieldset>')
     if role == "combobox":
-        options = "".join(f'<option value="{_escape(choice)}">{_escape(choice)}</option>'
-                          for choice in control.get("choices") or [])
+        # Value derived from the label by the one rule `field_policy` can recompute, so an
+        # observed pair is checkable rather than merely readable. On a real control the two
+        # are unrelated strings, which is exactly why a label match alone proves nothing.
+        options = "".join(
+            f'<option value="{_escape(field_policy.replay_option_value(choice))}">'
+            f'{_escape(choice)}</option>'
+            for choice in control.get("choices") or [])
         return (f'<label for="{test_id}">{label}</label>'
                 f'<select {common}{required}><option value=""></option>{options}</select>')
     if role == "file":
@@ -195,8 +201,12 @@ def render_page(fixture: dict[str, Any], step_index: int, *, include_variants: b
 <html lang="en"><head><meta charset="utf-8">
 <title>{_escape(family)} replay page {step_index}</title>
 </head><body>
-<main><h1>Synthetic {_escape(family)} application</h1>
-<p>Generated locally from a reviewed semantic fixture. Not a real employer form.</p>
+<main><h1>Local {_escape(family)} replay</h1>
+<p>Generated locally and served from loopback. The control labels below are
+<strong>recorded upstream wording</strong> from a reviewed semantic fixture
+(<code>neonwatty/job-apply-plugin</code>, MIT, Jeremy Watt), rendered as recorded rather than
+paraphrased, because a paraphrase would test a form no employer ships. Recorded wording is not
+synthetic wording. Nothing here reaches an employer.</p>
 <form id="application" method="post" action="{'/__final_action' if final else ''}">
 {controls}{variants}{final_control}
 </form>

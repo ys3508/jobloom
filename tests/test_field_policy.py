@@ -139,7 +139,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def start(self, **updates):
         value = {
             "session_id": "session-1", "application_id": "app-1", "worker_id": "worker-1",
-            "form_url": "https://apply.example.com/jobs/1/apply",
+            "form_url": "http://127.0.0.1:8931/lever/0",
             "observed_employer": "Example Corp", "observed_role": "Backend Engineer",
             "known_form": True, "authorization_id": "auth-1",
             "authorization_context": {"country": "wrong", "application_id": "wrong"}, "at": AT,
@@ -150,7 +150,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def page(self, fields=None, **updates):
         value = {
             "page_id": "page-1", "page_index": 0,
-            "page_url": "https://apply.example.com/jobs/1/apply",
+            "page_url": "http://127.0.0.1:8931/lever/0",
             "fields": fields if fields is not None else self.standard_fields(),
             "legal_items": [], "restricted_requests": [], "final_page": True,
         }
@@ -196,18 +196,14 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     DECLINE = "I do not wish to self-identify"
     OTHER_DECLINE = "Prefer not to answer"
     # A real control's label and its submitted value are different strings.
-    DECLINE_VALUE = "opt-9"
+
 
     def options(self, labels):
-        return [{"label": label, "value": f"opt-{index}"}
-                for index, label in enumerate(labels)]
+        return [{"label": label, "value": POLICY.replay_option_value(label)}
+                for label in labels]
 
     def race_options(self, extra=()):
-        return ([{"label": label, "value": f"opt-{index}"}
-                 for index, label in enumerate(self.RACE_VALUES)]
-                + [{"label": self.DECLINE, "value": self.DECLINE_VALUE}]
-                + [{"label": label, "value": f"opt-x{index}"}
-                   for index, label in enumerate(extra)])
+        return self.options(list(self.RACE_VALUES) + [self.DECLINE] + list(extra))
 
     def field(self, field_id, question, **updates):
         value = {"field_id": field_id, "question": question, "selector": f"#{field_id}",
@@ -318,6 +314,29 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             source_kind="answer")])
         self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
 
+    def test_a_page_that_mislabels_its_own_option_cannot_be_trusted(self):
+        # The attack the "opaque value" story missed entirely: offer the reviewed label and
+        # submit a real category. Not understanding the value is not the value being safe.
+        self.add_decline_policy()
+        spoofed = [{"label": label, "value": POLICY.replay_option_value(label)}
+                   for label in self.RACE_VALUES]
+        spoofed.append({"label": self.DECLINE, "value": "Asian"})
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", options=spoofed)], locale="en-US")
+        self.assertEqual(self.pause_reasons(result), {"option_mapping_unverified"})
+        self.assertNotIn("Asian", self.database_dump())
+
+    def test_a_live_surface_has_no_approved_option_mapping(self):
+        # Trust comes from the surface, never from the page: the same recomputable pair is
+        # refused off the Jobloom replay because no approved adapter mapping exists.
+        self.add_decline_policy()
+        self.assertFalse(POLICY.option_mapping_trusted(
+            "https://jobs.lever.co/example/1",
+            {"label": self.DECLINE, "value": POLICY.replay_option_value(self.DECLINE)}))
+        self.assertTrue(POLICY.option_mapping_trusted(
+            "http://127.0.0.1:8931/lever/0",
+            {"label": self.DECLINE, "value": POLICY.replay_option_value(self.DECLINE)}))
+
     def test_a_label_match_does_not_settle_what_the_form_would_submit(self):
         self.add_decline_policy()
         result = self.observe([self.field(
@@ -326,12 +345,13 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         step = self.db.execute(
             "SELECT value_json FROM fill_steps ORDER BY ordinal").fetchall()[-1]
         # The reviewed label chose the option; the page's own opaque value is submitted.
-        self.assertEqual(json.loads(step["value_json"]), self.DECLINE_VALUE)
+        self.assertEqual(json.loads(step["value_json"]),
+                         POLICY.replay_option_value(self.DECLINE))
         self.assertNotIn(self.DECLINE, step["value_json"])
 
     def test_one_reviewed_label_mapping_to_two_values_pauses(self):
         self.add_decline_policy()
-        duplicated = self.race_options() + [{"label": self.DECLINE, "value": "opt-other"}]
+        duplicated = self.race_options() + [{"label": self.DECLINE, "value": "opt-other"}]  # noqa: E501
         result = self.observe([self.field(
             "eeo_race", "Race / Ethnicity", options=duplicated)], locale="en-US")
         self.assertEqual(self.pause_reasons(result), {"nondisclosure_option_ambiguous"})
@@ -571,18 +591,19 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", "", AT)
         self.assertNotIn("Asian", self.database_dump())
 
-    def test_not_present_requires_a_finalized_inventory_that_covered_every_page(self):
+    def test_finalizing_never_writes_not_present_in_v1(self):
+        # A self-reported chain cannot establish absence: an observer that never saw a page
+        # cannot report that page missing. Naming the evidence honestly did not make it
+        # stronger, so nothing writes `not_present` at all.
         summary = POLICY.finalize_handling(self.db, "app-1", [], "inventory-hash", AT)
-        self.assertEqual(summary, {"status": "not_present", "markers": {}})
-        evidence = self.db.execute(
-            "SELECT field_id, evidence_kind FROM nondisclosure_handling").fetchone()
-        self.assertEqual(evidence["field_id"], POLICY.INVENTORY_SCOPE)
-        self.assertEqual(evidence["evidence_kind"], "complete_inventory")
-        # An observed control with no marker cannot be finalized away.
+        self.assertEqual(summary, {"status": "unknown", "markers": {}})
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM nondisclosure_handling").fetchone()[0], 0)
+        # An observed control with no marker still cannot be finalized away.
         with self.assertRaisesRegex(ValueError, "without a handling marker"):
             POLICY.finalize_handling(self.db, "app-2", ["eeo_race"], "inventory-hash", AT)
 
-    def test_finishing_a_session_settles_the_record_from_every_observed_page(self):
+    def test_finishing_a_session_still_leaves_an_unseen_control_unknown(self):
         # The claim "this form had no voluntary-disclosure control" is only made here, where
         # every page is known to have been observed and checkpointed.
         self.start()
@@ -591,18 +612,11 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                          {"status": "unknown", "markers": {}})
         self.complete_page()
         FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", AT)
+        # Finishing settles nothing about a control nobody saw.
         self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
-                         {"status": "not_present", "markers": {}})
-        row = self.db.execute(
-            "SELECT evidence_kind, evidence_ref FROM nondisclosure_handling").fetchone()
-        self.assertEqual(row["evidence_kind"], "complete_inventory")
-        observed = [r[0] for r in self.db.execute(
-            "SELECT observation_sha256 FROM fill_pages ORDER BY page_index")]
-        # The reference names what the claim rests on, not only the bytes it covers: a
-        # verified chain is a self-report, and an archive read later must not mistake it for
-        # proof that the employer's form had no further pages.
-        self.assertEqual(row["evidence_ref"],
-                         f"self_reported_page_chain:{FILL.canonical_hash(observed)}")
+                         {"status": "unknown", "markers": {}})
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM nondisclosure_handling").fetchone()[0], 0)
 
     def test_a_policy_that_can_never_apply_is_refused(self):
         with self.assertRaisesRegex(ValueError, "expire after it takes effect"):
