@@ -327,10 +327,11 @@ def _pause(
            {"reason_codes": unique, "page_id": page_id}, at)
     answer_pause = all(reason.split(":", 1)[0] in USER_ANSWER_PAUSES for reason in unique)
     target = "waiting_for_user_answer" if answer_pause else "waiting_for_user_takeover"
-    application_core.release_lease(
+    release = (application_core.release_lease if commit
+               else application_core._release_lease_uncommitted)
+    release(
         connection, session["application_id"], session["worker_id"], target,
         "fill_paused_for_user" if answer_pause else "fill_paused_for_takeover", at=at,
-        commit=commit,
     )
     return {"session_id": session["session_id"], "status": "paused", "state": target,
             "reasons": unique, "completed_checkpoints_preserved": True}
@@ -1193,6 +1194,8 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
     try:
         for step in steps:
             _apply_step(connection, session, worker_id, step, current_time)
+        # Also the decision point on this side: losing the race must not record a second
+        # import or apply a batch on top of someone else's.
         connection.execute(
             "INSERT INTO imported_results (result_sha256, session_id, page_id, grant_id, "
             "package_sha256, status, imported_at) VALUES (?, ?, ?, ?, ?, 'verified', ?)",
@@ -1202,6 +1205,11 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
                "observed_hashes_verified",
                {"page_id": page_id, "verified_action_count": len(steps),
                 "result_sha256": result_digest}, at)
+    except sqlite3.IntegrityError:
+        connection.execute("ROLLBACK TO SAVEPOINT import_result")
+        connection.execute("RELEASE SAVEPOINT import_result")
+        return _answer_from_recorded_import(connection, session_id, page_id, grant_id,
+                                            result_digest)
     except BaseException:
         connection.execute("ROLLBACK TO SAVEPOINT import_result")
         connection.execute("RELEASE SAVEPOINT import_result")
@@ -1210,6 +1218,24 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
     connection.commit()
     return {"session_id": session_id, "page_id": page_id, "status": "verified",
             "verified_action_count": len(steps), "result_sha256": result_digest}
+
+
+def _answer_from_recorded_import(connection: sqlite3.Connection, session_id: str,
+                                 page_id: str, grant_id: str,
+                                 result_digest: str) -> dict[str, Any]:
+    """What to say when another connection recorded this grant's import first."""
+    row = connection.execute(
+        "SELECT * FROM imported_results WHERE grant_id=?", (grant_id,)).fetchone()
+    if not row:
+        # The conflict was real, so a row must exist; if it does not, refuse rather than
+        # invent an outcome.
+        raise ImportRefused("import_record_missing_after_conflict")
+    if row["result_sha256"] != result_digest:
+        raise ImportRefused("result_conflicts_with_recorded_import")
+    return {"session_id": session_id, "page_id": page_id,
+            "status": ("already_imported" if row["status"] == "verified"
+                       else "already_rejected"),
+            "verified_action_count": 0, "result_sha256": result_digest}
 
 
 def _reject_with_takeover(connection: sqlite3.Connection, session: sqlite3.Row,
@@ -1230,12 +1256,23 @@ def _reject_with_takeover(connection: sqlite3.Connection, session: sqlite3.Row,
     """
     connection.execute("SAVEPOINT reject_import")
     try:
+        # No `OR IGNORE`: the insert is the decision. Ignoring a conflict made a losing
+        # racer carry on and pause an application whose page another connection had already
+        # imported successfully.
         connection.execute(
-            "INSERT OR IGNORE INTO imported_results (result_sha256, session_id, page_id, "
+            "INSERT INTO imported_results (result_sha256, session_id, page_id, "
             "grant_id, package_sha256, status, imported_at) "
             "VALUES (?, ?, ?, ?, ?, 'rejected', ?)",
             (result_digest, session["session_id"], page_id, grant_id, package_sha256,
              current_time.isoformat()))
+    except sqlite3.IntegrityError:
+        # Someone else got there first. Undo, read what they wrote, and answer from it —
+        # without pausing anything or adding an event.
+        connection.execute("ROLLBACK TO SAVEPOINT reject_import")
+        connection.execute("RELEASE SAVEPOINT reject_import")
+        return _answer_from_recorded_import(connection, session["session_id"], page_id,
+                                            grant_id, result_digest)
+    try:
         # The record and the handover are one fact. Committing the record first meant a
         # failing pause left a result marked rejected while the session stayed active — and
         # replay then answered `already_rejected`, so the takeover was never attempted again.

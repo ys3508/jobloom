@@ -530,8 +530,34 @@ def transition(
     reason_code: str,
     metadata: dict[str, Any] | None = None,
     at: datetime | None = None,
-    commit: bool = True,
 ) -> dict[str, Any]:
+    """Move an application, and persist the move. Always commits.
+
+    A `commit=False` parameter used to live here so a caller inside a savepoint could own the
+    transaction. It made persistence a boolean a public caller could get wrong and still
+    receive a successful-looking return value, so the uncommitted behaviour moved to
+    `_transition_uncommitted`, where the name says what it does not do.
+    """
+    result = _transition_uncommitted(connection, application_id, to_state, actor,
+                                     reason_code, metadata, at)
+    connection.commit()
+    return result
+
+
+def _transition_uncommitted(
+    connection: sqlite3.Connection,
+    application_id: str,
+    to_state: str,
+    actor: str,
+    reason_code: str,
+    metadata: dict[str, Any] | None = None,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """The same move, without committing. Only for a caller that already holds a savepoint.
+
+    Nothing here is persisted until that caller commits, which is the point: a rejected
+    import and the handover it implies have to land together or not at all.
+    """
     if to_state not in APPLICATION_STATES:
         raise ValueError(f"unknown application state: {to_state}")
     row = connection.execute("SELECT * FROM applications WHERE application_id=?", (application_id,)).fetchone()
@@ -654,11 +680,6 @@ def transition(
         ) if key in metadata
     }
     _event(connection, application_id, actor, current, to_state, reason_code, event_metadata, at)
-    if commit:
-        # A caller inside a savepoint owns the transaction. Committing here would end it,
-        # which is how a rejected import could be recorded while the pause that has to
-        # accompany it was still to come.
-        connection.commit()
     return {"application_id": application_id, "from_state": current, "state": to_state}
 
 
@@ -748,14 +769,30 @@ def release_lease(
     reason_code: str,
     error_code: str | None = None,
     at: datetime | None = None,
-    commit: bool = True,
 ) -> dict[str, Any]:
+    """Hand a lease back, and persist it. Always commits."""
+    result = _release_lease_uncommitted(connection, application_id, worker_id, to_state,
+                                        reason_code, error_code, at)
+    connection.commit()
+    return result
+
+
+def _release_lease_uncommitted(
+    connection: sqlite3.Connection,
+    application_id: str,
+    worker_id: str,
+    to_state: str,
+    reason_code: str,
+    error_code: str | None = None,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """The same handback, without committing. Only for a caller holding a savepoint."""
     row = connection.execute("SELECT * FROM applications WHERE application_id=?", (application_id,)).fetchone()
     if not row or row["state"] != "filling" or row["worker_id"] != worker_id:
         raise ValueError("active lease is not owned by this worker")
     metadata = {"error_code": error_code} if error_code else {}
-    return transition(connection, application_id, to_state, worker_id, reason_code, metadata,
-                      at, commit=commit)
+    return _transition_uncommitted(connection, application_id, to_state, worker_id,
+                                   reason_code, metadata, at)
 
 
 def status(connection: sqlite3.Connection) -> dict[str, Any]:

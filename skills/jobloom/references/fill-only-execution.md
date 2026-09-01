@@ -308,9 +308,18 @@ records a value-free rejection and moves the session to `waiting_for_user_takeov
 event, the paused session and page, and the application's move to takeover succeed together or
 none of them happens. Committing the row first meant a failing pause left a result marked
 rejected while the session stayed active — and because replay then answers `already_rejected`,
-the handover would never be attempted again. `application_core.transition` and `release_lease`
-take a `commit` flag so this path can own its transaction; calling a function that ends the
-transaction from inside a savepoint is how the row got committed alone.
+the handover would never be attempted again.
+
+**The insert is the decision point on both paths.** An `INSERT OR IGNORE` swallowed the unique
+conflict on the grant, so a connection that lost a race carried on and paused an application
+whose page another connection had already imported cleanly. A conflict now rolls the savepoint
+back, re-reads the row that won, and answers from it — `already_imported`, `already_rejected`,
+or a conflict for different bytes — and pauses nothing.
+
+Transaction ownership is not a public boolean. `transition` and `release_lease` always commit;
+`_transition_uncommitted` and `_release_lease_uncommitted` are for a caller that already holds
+a savepoint. A `commit=False` parameter on the public functions let any caller get persistence
+wrong and still receive a successful-looking return value.
 
 Everything persisted is value-free: the event carries a page id, a hashed step id and stable
 codes, and neither the expected nor the observed hash appears anywhere — they are properties of

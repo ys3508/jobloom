@@ -1250,17 +1250,20 @@ class ResultImportTests(_SessionBase):
             before_events = self.db.execute(
                 "SELECT COUNT(*) FROM fill_events").fetchone()[0]
 
-            original = FILL.application_core.release_lease
+            # The savepoint path uses the uncommitted primitive, which is the point of
+            # having a separately named one.
+            original = FILL.application_core._release_lease_uncommitted
 
             def fail_after_the_row(*arguments, **keywords):
                 raise RuntimeError("lease race during handover")
 
-            FILL.application_core.release_lease = fail_after_the_row
-            self.addCleanup(setattr, FILL.application_core, "release_lease", original)
+            FILL.application_core._release_lease_uncommitted = fail_after_the_row
+            self.addCleanup(setattr, FILL.application_core,
+                            "_release_lease_uncommitted", original)
             with self.assertRaises(RuntimeError):
                 FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
                                    issued["grant_id"], self.now)
-            FILL.application_core.release_lease = original
+            FILL.application_core._release_lease_uncommitted = original
             # A commit by anyone else must not make the half-written handover permanent.
             self.db.commit()
             self.assertEqual(self.db.execute(
@@ -1474,6 +1477,124 @@ class ResultImportTests(_SessionBase):
             # skip that check: the old branch returned success with the caller's wrong ids
             # echoed back.
             self.assertEqual(str(caught.exception), "import_belongs_to_another_page")
+
+    # ---- two connections racing for one grant ------------------------------
+
+    def shared_database(self):
+        """The same state on disk, reachable from two independent connections."""
+        path = self.root / "race.db"
+        first = sqlite3.connect(path, check_same_thread=False)
+        first.row_factory = sqlite3.Row
+        self.addCleanup(first.close)
+        for line in self.db.iterdump():
+            try:
+                first.execute(line)
+            except sqlite3.Error:
+                pass
+        first.commit()
+        second = sqlite3.connect(path, check_same_thread=False)
+        second.row_factory = sqlite3.Row
+        self.addCleanup(second.close)
+        return first, second
+
+    def test_a_verified_import_winning_the_race_is_not_undone_by_a_mismatch(self):
+        """The bug `INSERT OR IGNORE` created: a losing racer paused a finished page.
+
+        The conflict was swallowed, so the mismatch path carried on and moved an application
+        whose page another connection had already imported cleanly.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            broken = self.rewrite(
+                output, lambda e: e["results"][0].update({"observed_sha256": "f" * 64}))
+            winner, loser = self.shared_database()
+
+            self.assertEqual(
+                FILL.import_result(winner, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+            # A different result for a grant already imported is a conflict, not a pause.
+            with self.assertRaises(FILL.ImportRefused) as caught:
+                FILL.import_result(loser, "session-1", "page-1", "worker-1", broken,
+                                   issued["grant_id"], self.now)
+            self.assertEqual(str(caught.exception),
+                             "result_conflicts_with_recorded_import")
+        rows = winner.execute("SELECT status FROM imported_results").fetchall()
+        self.assertEqual([row["status"] for row in rows], ["verified"])
+        self.assertNotEqual(
+            winner.execute("SELECT state FROM applications WHERE application_id='app-1'"
+                           ).fetchone()["state"], "waiting_for_user_takeover")
+
+    def test_a_rejection_winning_the_race_leaves_the_verified_path_writing_nothing(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            broken = self.rewrite(
+                output, lambda e: e["results"][0].update({"observed_sha256": "f" * 64}))
+            winner, loser = self.shared_database()
+
+            self.assertEqual(
+                FILL.import_result(winner, "session-1", "page-1", "worker-1", broken,
+                                   issued["grant_id"], self.now)["status"], "rejected")
+            with self.assertRaises(FILL.ImportRefused) as caught:
+                FILL.import_result(loser, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)
+            self.assertEqual(str(caught.exception),
+                             "result_conflicts_with_recorded_import")
+        rows = winner.execute("SELECT status FROM imported_results").fetchall()
+        self.assertEqual([row["status"] for row in rows], ["rejected"])
+        # The losing verified path applied nothing.
+        for table in ("application_fields", "nondisclosure_handling"):
+            self.assertEqual(
+                winner.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+        self.assertEqual(winner.execute(
+            "SELECT COUNT(*) FROM fill_steps WHERE status='completed'").fetchone()[0], 0)
+        # State and events agree with the row that won.
+        self.assertEqual(winner.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'"
+        ).fetchone()["state"], "waiting_for_user_takeover")
+        self.assertEqual(winner.execute(
+            "SELECT COUNT(*) FROM fill_events WHERE event_type='result_rejected'"
+        ).fetchone()[0], 1)
+
+    def test_the_same_result_racing_itself_is_idempotent_on_both_connections(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            winner, loser = self.shared_database()
+            self.assertEqual(
+                FILL.import_result(winner, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+            self.assertEqual(
+                FILL.import_result(loser, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"],
+                "already_imported")
+        self.assertEqual(winner.execute(
+            "SELECT COUNT(*) FROM imported_results").fetchone()[0], 1)
+
+    # ---- transaction ownership is not a public boolean ---------------------
+
+    def test_the_public_transition_api_always_persists(self):
+        self.assertNotIn("commit",
+                         inspect.signature(APPLICATIONS.transition).parameters)
+        self.assertNotIn("commit",
+                         inspect.signature(APPLICATIONS.release_lease).parameters)
+        self.assertTrue(hasattr(APPLICATIONS, "_transition_uncommitted"))
+        self.assertTrue(hasattr(APPLICATIONS, "_release_lease_uncommitted"))
+        first, second = self.shared_database()
+        # Public: visible from another connection immediately.
+        APPLICATIONS.transition(first, "app-1", "waiting_for_user_takeover", "worker-1",
+                                "fill_paused_for_takeover", at=self.now)
+        self.assertEqual(second.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'"
+        ).fetchone()["state"], "waiting_for_user_takeover")
+        # Private: nothing is durable until the caller that owns the transaction commits.
+        APPLICATIONS._transition_uncommitted(first, "app-1", "ready_to_fill", "user",
+                                             "user_resolved", at=self.now)
+        self.assertEqual(second.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'"
+        ).fetchone()["state"], "waiting_for_user_takeover")
+        first.commit()
+        self.assertEqual(second.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'"
+        ).fetchone()["state"], "ready_to_fill")
 
     # ---- value isolation ---------------------------------------------------
 
