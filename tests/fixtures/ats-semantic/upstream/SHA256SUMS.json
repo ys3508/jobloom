@@ -1,0 +1,18 @@
+{
+  "LICENSE": "0aa40dd74716b08a6a70518f048f6441b7f10aa424110313ed289f4e3d294311",
+  "ashby-application-2026-08-v1": {
+    "approval": "26f3485ba812e59220fc33d463121e4334483671af2621284b8ee107983324cb",
+    "fixture": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
+    "provenance": "3b8c7daa655f826a3f1fc2773fbae89367467b4144690426fd341e7f74c52488"
+  },
+  "greenhouse-single-page-2026-08-v1": {
+    "approval": "7a732ee453f360b7476e3fed8ddb626dd12cfbc6c25aff64b662a6cdfea94996",
+    "fixture": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+    "provenance": "21b7cea2f035b00aec116025a3135f26ce7c3cd13c5d178123b9de937635dafb"
+  },
+  "lever-application-2026-08-v1": {
+    "approval": "419f82ff56a822a21eaafc00bea868703def37b3b94b3775635251c9839cee67",
+    "fixture": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+    "provenance": "c52c7f43cbfdb68ea136fa72cfda59c95c3ade04b87dd65ee06cae111abeb8c4"
+  }
+}
