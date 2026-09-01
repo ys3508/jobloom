@@ -111,3 +111,44 @@ contract with non-disclosure policy registration. Field `options` are transient 
 data used only to match a reviewed non-disclosure option: they never enter a persisted
 observation, which keeps `options_count` alone, and a page that paused on such a control is
 therefore resumed with a fresh live observation rather than replanned from its own record.
+
+## The worker
+
+`fill_worker.py` sits outside `fill_core` because it is the part `fill_core` does not trust.
+It reads no database, no AnswerLibrary and no CandidateFact, consumes exactly one
+already-verified private package, discovers no file path — an upload path can only come from
+the package — and returns hashes and closed codes rather than claims.
+
+Most of the boundary is structural rather than promised. The operations are fill, select,
+check, uncheck and upload; there is no click, Enter, navigate, press, download or evaluate, so
+Next, Continue and the final action are not refused by a rule that could be argued with —
+they are not expressible. No JavaScript of any origin runs: control identity, visibility,
+enablement, uniqueness and type agreement are all decided with selectors, and `page.locator`
+searches the top frame only, so acting inside a frame is impossible rather than forbidden.
+Every one of those checks runs immediately before the control is touched, because a page can
+re-render, duplicate, detach or retype a control between observation and action.
+
+Trust in the surface does not come from the address. `127.0.0.1` is a network location and any
+local process can listen on one, so the package carries an attestation `fill_core` wrote from
+a `replay_surfaces` record it holds: the exact origin, the renderer version, and the digest of
+the page this run is expected to load. The worker hashes the **response body** — not
+`page.content()`, which is the browser's normalised DOM and would never match — and touches
+nothing if it differs. The nonce is deliberately not in the package; the worker has no use for
+it and a package is a file on disk.
+
+Scoped guards go in before the first action and come out before control returns, because a
+guard left installed would change how the user's own browsing behaves. They abort navigation
+away from the attested origin and record a popup, a download, or a POST. Upload traffic is
+allowed by exact URL: a file upload is a POST, so refusing every POST would refuse uploads
+while calling itself submit protection.
+
+The package is consumed by a marker file beside it rather than by deletion, so a replay fails
+on its second attempt instead of its second effect and the package survives for audit. Action
+and result files are mode 0600. The browser is headed by default — a run the user cannot see
+is a run they cannot stop — and headless only in tests.
+
+**What the local proof is worth.** The replay's final-action counter is a real oracle: a test
+clicks the control without the guard and the server's counter reaches one, which is what makes
+every other zero in that file worth reading. But it is still our own page. Nothing here is
+evidence that a live ATS can be filled, and each production adapter still needs its own
+supervised live acceptance test.

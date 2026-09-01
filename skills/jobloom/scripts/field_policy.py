@@ -244,6 +244,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             origin TEXT NOT NULL,
             nonce TEXT NOT NULL,
             fixture_sha256 TEXT NOT NULL,
+            page_digests_json TEXT NOT NULL DEFAULT '{}',
             renderer_version TEXT NOT NULL,
             issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
@@ -541,7 +542,8 @@ def replay_option_value(label: str, nonce: str) -> str:
 
 def register_replay_surface(connection: sqlite3.Connection, surface_id: str, origin: str,
                             nonce: str, fixture_sha256: str, renderer_version: str,
-                            issued_at: datetime, expires_at: datetime) -> dict[str, Any]:
+                            issued_at: datetime, expires_at: datetime,
+                            page_digests: dict[str, str] | None = None) -> dict[str, Any]:
     """Record that Jobloom started this replay server, and on which exact origin.
 
     Issued by the process that starts the renderer, so the backend holds the record. Nothing
@@ -556,8 +558,10 @@ def register_replay_surface(connection: sqlite3.Connection, surface_id: str, ori
         raise ValueError("a replay surface requires a session nonce")
     connection.execute(
         "INSERT INTO replay_surfaces (surface_id, origin, nonce, fixture_sha256, "
-        "renderer_version, issued_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-        (surface_id, origin, nonce, fixture_sha256, renderer_version,
+        "page_digests_json, renderer_version, issued_at, expires_at, revoked_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        (surface_id, origin, nonce, fixture_sha256,
+         json.dumps(page_digests or {}, sort_keys=True), renderer_version,
          issued_at.isoformat(), expires_at.isoformat()),
     )
     connection.commit()
@@ -590,6 +594,27 @@ def active_replay_surface(connection: sqlite3.Connection, form_url: str,
         # recent would be a guess presented as a fact.
         return None
     return live[0]
+
+
+def surface_attestation(connection: sqlite3.Connection, page_url: str,
+                        at: datetime) -> dict[str, Any] | None:
+    """What `fill_core` may tell a worker about the surface it is being sent to.
+
+    The worker never reads this database. It is handed the origin, renderer version and the
+    digest of the exact page it is expected to load, and checks the page it actually gets
+    against them. The nonce is deliberately absent: the worker has no use for it, and a
+    package is a file on disk.
+    """
+    surface = active_replay_surface(connection, page_url, at)
+    if not surface:
+        return None
+    parsed = urlparse(page_url)
+    digests = json.loads(surface["page_digests_json"] or "{}")
+    if parsed.path not in digests:
+        return None
+    return {"origin": surface["origin"], "renderer_version": surface["renderer_version"],
+            "page_path": parsed.path, "page_sha256": digests[parsed.path],
+            "expires_at": surface["expires_at"]}
 
 
 def option_mapping_trusted(connection: sqlite3.Connection, form_url: str,

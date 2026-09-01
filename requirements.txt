@@ -1,1 +1,7 @@
 pypdf>=6.0,<7.0
+
+# Pinned exactly, not ranged: the browser the worker drives is part of the safety argument,
+# and a range would let it change without review. Chromium only — `playwright install
+# chromium`. The browser binaries live in the Playwright cache outside this repository and
+# are never committed.
+playwright==1.62.0

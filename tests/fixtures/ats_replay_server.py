@@ -111,11 +111,17 @@ class ReplayServer:
             field_policy.register_replay_surface(
                 connection, self.surface_id, self.origin, self.nonce,
                 self.content_sha256(), semantic_replay.RENDERER_VERSION, issued,
-                issued + timedelta(hours=lifetime_hours))
+                issued + timedelta(hours=lifetime_hours),
+                page_digests=self.page_digests())
 
     def __enter__(self):
         self._thread.start()
         return self
+
+    def page_digests(self) -> dict[str, str]:
+        """The digest of each page as served, so a worker can check the page it actually got."""
+        return {path: hashlib.sha256(body.encode("utf-8")).hexdigest()
+                for path, body in self.pages.items()}
 
     def content_sha256(self) -> str:
         """What this surface is actually serving.

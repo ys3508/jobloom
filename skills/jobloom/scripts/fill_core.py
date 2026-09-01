@@ -738,9 +738,18 @@ def export_page(connection: sqlite3.Connection, session_id: str, worker_id: str,
         "control": row["control"], "operation": row["operation"],
         "value": json.loads(row["value_json"]), "expected_sha256": row["expected_sha256"],
     } for row in steps]
+    # The worker never reads this database. Everything it is allowed to check about the
+    # surface travels with the package, and the nonce deliberately does not: a package is a
+    # file on disk and the worker has no use for the secret.
+    # `None` when no surface was issued for this page. Export stays possible — a future
+    # production adapter will have a different attestation — but the worker refuses to act on
+    # a package that carries none, so the gate sits at execution rather than at planning.
+    attestation = field_policy.surface_attestation(
+        connection, page["page_url"], at or now_utc())
     package = {
         "schema_version": "0.1.0", "mode": "fill_only", "session_id": session_id,
         "application_id": session["application_id"], "page_id": page_id, "page_url": page["page_url"],
+        "surface": attestation,
         "actions": actions, "stop_before_submit": True, "submission_action": None,
     }
     if output.exists():
