@@ -310,7 +310,13 @@ def _perform(page, action: dict[str, Any]) -> tuple[str, str | None, str | None]
             getattr(locator, operation)()
             observed = str(locator.is_checked())
         elif operation == "upload":
-            path = Path(value)
+            # An upload action carries an object, not a bare path: `_plan_upload` emits the
+            # locked version id, its snapshot path and its digest together. Treating it as a
+            # path meant every real upload failed as `value_rejected_by_page`, which only a
+            # package built by hand could hide.
+            if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+                return "error", None, "upload_rejected"
+            path = Path(value["path"])
             if not path.is_file():
                 return "error", None, "upload_rejected"
             with path.open("rb") as handle:

@@ -506,6 +506,10 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
         if not derivation["derivable"]:
             return _field_reason(derivation["reason"], field_id, sensitivity)
         return None
+    if domain_kind == "referral_contact":
+        # Naming a colleague is a claim about another person, so it is theirs and the user's
+        # to make, never this system's.
+        return _field_reason("referral_contact_requires_user", field_id, sensitivity)
     if domain_kind == "sponsorship":
         # One broad control cannot stand in for four separate canonical meanings, and page
         # wording may not settle which one it is.

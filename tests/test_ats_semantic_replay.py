@@ -373,9 +373,11 @@ class ReplayServerTests(unittest.TestCase):
     def test_all_three_families_are_served_and_pages_are_reached_one_at_a_time(self):
         with ReplayServer() as server:
             state = json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))
+            # `/lever/split/*` is a Jobloom pagination of the same reviewed controls, added
+            # so a two-package flow has two pages of fields to work with.
             self.assertEqual(sorted(state["pages"]),
                              ["/ashby/0", "/ashby/1", "/greenhouse/0", "/greenhouse/1",
-                              "/lever/0", "/lever/1"])
+                              "/lever/0", "/lever/1", "/lever/split/0", "/lever/split/1"])
             for path in state["pages"]:
                 with self.subTest(path=path):
                     with urllib.request.urlopen(f"{server.origin}{path}", timeout=5) as page:

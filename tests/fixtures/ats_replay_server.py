@@ -52,6 +52,19 @@ class ReplayServer:
             if family not in families:
                 continue
             self._source_bytes.append((directory / "fixture.json").read_bytes())
+            if family == "lever":
+                # A two-page arrangement of the same reviewed controls. Upstream puts them
+                # all on one step with the final action alone on the next, so a flow with two
+                # packages needs a split; the controls are unchanged and only the pagination
+                # is Jobloom's.
+                controls = list(enumerate(fixture["steps"][0]["controls"]))
+                head = [(index, control) for index, control in controls
+                        if index in (0, 1, 5)]
+                tail = [(index, control) for index, control in controls if index == 20]
+                self.pages["/lever/split/0"] = semantic_replay.render_controls(
+                    family, 0, head, self.nonce, next_path="/lever/split/1")
+                self.pages["/lever/split/1"] = semantic_replay.render_controls(
+                    family, 1, tail, self.nonce, final=True)
             last = len(fixture["steps"]) - 1
             for index in range(len(fixture["steps"])):
                 self.pages[f"/{family}/{index}"] = semantic_replay.render_page(

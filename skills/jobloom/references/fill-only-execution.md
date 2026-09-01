@@ -233,6 +233,33 @@ on its second attempt instead of its second effect and the package survives for 
 and result files are mode 0600. The browser is headed by default — a run the user cannot see
 is a run they cannot stop — and headless only in tests.
 
+## The workflow, proven end to end
+
+`tests/test_fill_worker_end_to_end.py` carries one application from a private root that does
+not exist yet to `waiting_for_submission_approval`, through every production path and no
+shortcut: a real PDF and claims manifest, an approved ResumeVersion, a material lock, a worker
+lease, a replay served over loopback, an execution grant reserved and consumed, a real
+Chromium, a result import, a checkpoint per page, a form inventory and a pre-submit review.
+Moving between the two pages is a person following a link — the worker has no verb for it.
+
+Every expected value comes from somewhere other than the thing being checked: package digests
+from the exported bytes, the final-action count from the server's own endpoint, states from
+the database, the review digest recomputed from the summary. The two pages are a Jobloom
+pagination of the reviewed controls, because every upstream fixture puts its controls on one
+step with the final action alone on the next; the controls are unchanged.
+
+Alongside it, sixteen mandatory pauses each assert the same four things — no action ran,
+nothing was verified or checkpointed, the target's counter never moved, and the state is the
+right kind of waiting.
+
+**Two production defects this found**, both invisible to tests that built their own packages.
+The worker treated an upload action's value as a path when `_plan_upload` emits an object, so
+every real upload failed as `value_rejected_by_page`. And the conflict-question pattern did not
+match `Related to someone at this company?` — the reviewed corpus's own wording — so a
+per-employer disclosure fell through to the answer path. A test now checks every recorded label
+in all three fixtures against its declared disposition, because patterns written from
+imagination miss the forms employers actually ship.
+
 **What the local proof is worth.** The replay's final-action counter is a real oracle: a test
 clicks the control without the guard and the server's counter reaches one, which is what makes
 every other zero in that file worth reading. The worker reports that count only when it could

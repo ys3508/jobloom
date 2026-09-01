@@ -41,12 +41,14 @@ from _common import context_matches, parse_time  # noqa: E402
 DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
 
 # Domains whose fields are never answered from a Jobloom source, whatever the page declares.
-ALWAYS_MANUAL_DOMAINS = {"voluntary_eeo", "compensation", "employer_conflict", "sponsorship"}
+ALWAYS_MANUAL_DOMAINS = {"voluntary_eeo", "compensation", "employer_conflict", "sponsorship",
+                         "referral_contact"}
 MANUAL_REASONS = {
     "voluntary_eeo": "voluntary_disclosure_manual",
     "compensation": "employer_defined_compensation_manual",
     "employer_conflict": "employer_entity_not_approved",
     "sponsorship": "sponsorship_meaning_ambiguous",
+    "referral_contact": "referral_contact_requires_user",
 }
 
 LOCALE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Z]{2})?$")
@@ -146,11 +148,18 @@ COMPENSATION_BRACKET = re.compile(
 # Kept as two families on purpose: a relative at the company and a commercial relationship
 # with it are different disclosures and must never share an answer.
 EMPLOYER_CONFLICT_FAMILIES = {
+    # "Related to someone at this company?" is the reviewed corpus's own wording, and the
+    # first version of this pattern missed it — the end-to-end run against the real labels is
+    # what found that. Patterns written from imagination miss the forms employers ship.
     "conflict_related_person": re.compile(
-        r"relative|related person|family member|spouse|immediate family", re.IGNORECASE),
+        r"relative|related (?:person|to)|family member|spouse|immediate family",
+        re.IGNORECASE),
     "conflict_commercial_relationship": re.compile(
         r"customer|partner|reseller|supplier|vendor|distributor", re.IGNORECASE),
 }
+
+# Naming a colleague is the user's to do: it is a claim about another person.
+REFERRAL_CONTACT = re.compile(r"referral contact|employee referral", re.IGNORECASE)
 
 SPONSORSHIP = re.compile(r"sponsor", re.IGNORECASE)
 SPONSORSHIP_NOW = re.compile(r"\bnow\b|currently|presently|at this time|to begin", re.IGNORECASE)
@@ -185,6 +194,8 @@ def classify(field_id: str, question: str) -> tuple[str, str] | None:
     for family, pattern in EMPLOYER_CONFLICT_FAMILIES.items():
         if pattern.search(text):
             return "employer_conflict", family
+    if REFERRAL_CONTACT.search(text):
+        return "referral_contact", "referral_contact"
     if SPONSORSHIP.search(text):
         return "sponsorship", "sponsorship"
     if COMPENSATION_BRACKET.search(text):

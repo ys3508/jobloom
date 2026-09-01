@@ -167,6 +167,46 @@ def render_control(control: dict[str, Any], test_id: str, nonce: str) -> str:
             f'<input type="text" {common}{required}>')
 
 
+def render_controls(family: str, page_index: int, controls: list[dict[str, Any]],
+                    nonce: str, *, include_variants: bool = False, final: bool = False,
+                    next_path: str | None = None) -> str:
+    """Render an explicit list of reviewed controls as one local page.
+
+    The pagination is Jobloom's, not upstream's: every reviewed fixture puts its controls on
+    one step and the final action on the next, so a two-package flow needs the controls split
+    across two pages. The controls themselves are unchanged — only which page they appear on
+    is ours, and multi-page application forms are ordinary.
+    """
+    body = "".join(
+        render_control(control, f"{family}-0-{index}", nonce)
+        for index, control in controls)
+    variants = ""
+    if include_variants:
+        variants = "".join(_render_variant(name, kind, label)
+                           for name, (kind, label) in sorted(SAFETY_VARIANTS.items()))
+    final_control = (
+        '<input type="submit" id="final-action" data-test-id="final-action" '
+        'value="Submit application">' if final else "")
+    link = (f'<a href="{_escape(next_path)}" id="next-page" data-test-id="next-page">'
+            f'Continue</a>' if next_path else "")
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{_escape(family)} replay page {page_index}</title>
+</head><body>
+<main><h1>Local {_escape(family)} replay</h1>
+<p>Generated locally and served from loopback. The control labels below are
+<strong>recorded upstream wording</strong> from a reviewed semantic fixture
+(<code>neonwatty/job-apply-plugin</code>, MIT, Jeremy Watt), rendered as recorded rather than
+paraphrased, because a paraphrase would test a form no employer ships. Recorded wording is not
+synthetic wording. Nothing here reaches an employer.</p>
+<form id="application" method="post" action="{'/__final_action' if final else ''}">
+{body}{variants}{final_control}
+</form>
+{link}
+</main></body></html>
+"""
+
+
 def render_page(fixture: dict[str, Any], step_index: int, nonce: str, *,
                 include_variants: bool = False, final: bool = False) -> str:
     """One page of a semantic fixture as a standalone local document.
