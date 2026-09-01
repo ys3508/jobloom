@@ -292,6 +292,42 @@ def _locator(page, action: dict[str, Any]):
     return locator, None
 
 
+UPLOAD_VALUE_FIELDS = {"version_id", "path", "file_sha256"}
+
+
+def _verify_upload(value: Any, expected_sha256: str | None) -> tuple[str | None, str | None]:
+    """Check the file completely before the page is allowed anywhere near it.
+
+    The earlier order checked the suffix and the leading bytes, handed the file to the form,
+    and only then computed the digest for `fill_core` to compare. A resume swapped for another
+    valid PDF between export and execution was therefore already in the employer's file input
+    by the time anything noticed — no submission needed for the wrong document to have been
+    disclosed. Nothing here touches the control.
+    """
+    if not isinstance(value, dict) or set(value) != UPLOAD_VALUE_FIELDS:
+        return "upload_rejected", None
+    if not all(isinstance(value[key], str) and value[key] for key in UPLOAD_VALUE_FIELDS):
+        return "upload_rejected", None
+    if not worker_protocol.SHA256.fullmatch(value["file_sha256"]):
+        return "upload_rejected", None
+    path = Path(value["path"])
+    if not path.is_file():
+        return "upload_rejected", None
+    if path.suffix.casefold() != ".pdf":
+        return "upload_type_not_pdf", None
+    data = path.read_bytes()
+    if data[:5] != b"%PDF-":
+        return "upload_type_not_pdf", None
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != value["file_sha256"]:
+        # The bytes on disk are not the bytes the material lock approved.
+        return "upload_rejected", None
+    if expected_sha256 is not None and value["file_sha256"] != expected_sha256:
+        # The package disagrees with itself about which file this is.
+        return "upload_rejected", None
+    return None, digest
+
+
 def _perform(page, action: dict[str, Any]) -> tuple[str, str | None, str | None]:
     """Do exactly one thing and hash what the page holds afterwards."""
     locator, problem = _locator(page, action)
@@ -310,21 +346,11 @@ def _perform(page, action: dict[str, Any]) -> tuple[str, str | None, str | None]
             getattr(locator, operation)()
             observed = str(locator.is_checked())
         elif operation == "upload":
-            # An upload action carries an object, not a bare path: `_plan_upload` emits the
-            # locked version id, its snapshot path and its digest together. Treating it as a
-            # path meant every real upload failed as `value_rejected_by_page`, which only a
-            # package built by hand could hide.
-            if not isinstance(value, dict) or not isinstance(value.get("path"), str):
-                return "error", None, "upload_rejected"
-            path = Path(value["path"])
-            if not path.is_file():
-                return "error", None, "upload_rejected"
-            with path.open("rb") as handle:
-                head = handle.read(5)
-            if path.suffix.casefold() != ".pdf" or head != b"%PDF-":
-                return "error", None, "upload_type_not_pdf"
-            locator.set_input_files(str(path))
-            observed = hashlib.sha256(path.read_bytes()).hexdigest()
+            problem, digest = _verify_upload(value, action.get("expected_sha256"))
+            if problem:
+                return "error", None, problem
+            locator.set_input_files(value["path"])
+            observed = digest
         else:
             return "refused", None, "control_type_mismatch"
     except Exception:  # noqa: BLE001 - a page can fail in ways this cannot enumerate

@@ -1,0 +1,340 @@
+{
+  "reviewed_at": "2026-09-01",
+  "reviewed_by": "product owner review, recorded during Task 6",
+  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why.",
+  "entries": [
+    {
+      "kind": "contact.email",
+      "recorded_label": "Email address",
+      "role": "textbox",
+      "source_fixture": "ashby-application-2026-08-v1",
+      "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
+      "expected_disposition": "fact",
+      "expected_target": "contact.email"
+    },
+    {
+      "kind": "contact.full_name",
+      "recorded_label": "Full name",
+      "role": "textbox",
+      "source_fixture": "ashby-application-2026-08-v1",
+      "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
+      "expected_disposition": "fact",
+      "expected_target": "contact.full_name"
+    },
+    {
+      "kind": "resume.file",
+      "recorded_label": "Resume",
+      "role": "file",
+      "source_fixture": "ashby-application-2026-08-v1",
+      "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
+      "expected_disposition": "material",
+      "expected_target": "resume"
+    },
+    {
+      "kind": "authorization.sponsorship_select",
+      "recorded_label": "Will you require employment visa sponsorship?",
+      "role": "combobox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "always_manual",
+      "review_reason": "One broad control cannot stand in for four canonical meanings."
+    },
+    {
+      "kind": "contact.first_name",
+      "recorded_label": "First name",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.first_name"
+    },
+    {
+      "kind": "contact.last_name",
+      "recorded_label": "Last name",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.last_name"
+    },
+    {
+      "kind": "contact.location_city",
+      "recorded_label": "City",
+      "role": "combobox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.location_city"
+    },
+    {
+      "kind": "contact.phone",
+      "recorded_label": "Phone number",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.phone"
+    },
+    {
+      "kind": "contact.phone_country",
+      "recorded_label": "Phone country",
+      "role": "combobox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.phone_country"
+    },
+    {
+      "kind": "contact.preferred_name",
+      "recorded_label": "Preferred first name",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.preferred_name"
+    },
+    {
+      "kind": "cover_letter.file",
+      "recorded_label": "Cover letter",
+      "role": "file",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "material",
+      "expected_target": "cover_letter"
+    },
+    {
+      "kind": "employment.prior_affiliate",
+      "recorded_label": "Have you previously worked for this company or an affiliate?",
+      "role": "combobox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "answer",
+      "expected_target": "prior_employment_at_an_affiliate"
+    },
+    {
+      "kind": "profile.linkedin",
+      "recorded_label": "LinkedIn profile",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "profile.linkedin"
+    },
+    {
+      "kind": "profile.website",
+      "recorded_label": "Website",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "profile.website"
+    },
+    {
+      "kind": "referral.contact",
+      "recorded_label": "Employee referral contact",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "always_manual",
+      "review_reason": "Naming a colleague is a claim about another person."
+    },
+    {
+      "kind": "source.discovery",
+      "recorded_label": "How did you hear about this opportunity?",
+      "role": "combobox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "answer",
+      "expected_target": "discovery_source"
+    },
+    {
+      "kind": "authorization.green_card",
+      "recorded_label": "Permanent resident?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "permanent_residence_status"
+    },
+    {
+      "kind": "authorization.sponsorship_status",
+      "recorded_label": "Will you require employment visa sponsorship?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "One broad control cannot stand in for four canonical meanings."
+    },
+    {
+      "kind": "authorization.us_citizen",
+      "recorded_label": "United States citizen?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "citizenship_status"
+    },
+    {
+      "kind": "authorization.work_authorized",
+      "recorded_label": "Authorized to work in the United States?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "work_authorized_now"
+    },
+    {
+      "kind": "compensation.target_salary",
+      "recorded_label": "Target salary",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A negotiating stance, not a fact past work proves."
+    },
+    {
+      "kind": "compensation.total_range",
+      "recorded_label": "Expected total compensation",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "An employer-defined bracket; the bands exist only in page text."
+    },
+    {
+      "kind": "conflict.customer_partner_reseller",
+      "recorded_label": "Worked for a customer, partner, or reseller?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A per-employer disclosure, separate from the relative question."
+    },
+    {
+      "kind": "conflict.related_person",
+      "recorded_label": "Related to someone at this company?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A per-employer disclosure; a registry miss is unknown, never No."
+    },
+    {
+      "kind": "contact.location",
+      "recorded_label": "Current location",
+      "role": "combobox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "contact.location"
+    },
+    {
+      "kind": "eeo.disability",
+      "recorded_label": "Disability status",
+      "role": "combobox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A protected characteristic. Values never enter Jobloom."
+    },
+    {
+      "kind": "eeo.gender",
+      "recorded_label": "Gender",
+      "role": "combobox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A protected characteristic. Values never enter Jobloom."
+    },
+    {
+      "kind": "eeo.race",
+      "recorded_label": "Race or ethnicity",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A protected characteristic. Values never enter Jobloom."
+    },
+    {
+      "kind": "eeo.veteran",
+      "recorded_label": "Veteran status",
+      "role": "combobox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "always_manual",
+      "review_reason": "A protected characteristic. Values never enter Jobloom."
+    },
+    {
+      "kind": "employment.current_company",
+      "recorded_label": "Current company",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "employment.current_company"
+    },
+    {
+      "kind": "employment.prior_company",
+      "recorded_label": "Previously worked for this company?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "prior_employment_at_this_company"
+    },
+    {
+      "kind": "location.city_state",
+      "recorded_label": "City and state",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "contact.location_city"
+    },
+    {
+      "kind": "location.us_resident",
+      "recorded_label": "Live in the United States?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "current_country_of_residence"
+    },
+    {
+      "kind": "profile.github",
+      "recorded_label": "GitHub profile",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "profile.github"
+    },
+    {
+      "kind": "profile.location_url",
+      "recorded_label": "Current location profile",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "profile.location_url"
+    },
+    {
+      "kind": "profile.portfolio",
+      "recorded_label": "Portfolio",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "profile.portfolio"
+    },
+    {
+      "kind": "source.discovery_radio",
+      "recorded_label": "How did you hear about this opportunity?",
+      "role": "radiogroup",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "answer",
+      "expected_target": "discovery_source"
+    }
+  ]
+}

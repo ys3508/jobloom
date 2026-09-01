@@ -55,6 +55,7 @@ CANDIDATES = load_script("candidate_core")
 REPLAY = load_script("semantic_replay")
 
 from tests.fixtures.ats_replay_server import ReplayServer
+from tests.fixtures.replay_observer import ObservationRefused, observe as observe_replay
 from tests.pdf_fixture import synthetic_pdf
 
 
@@ -112,6 +113,8 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
             {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
              "status": "locked", "locked": True, "evidence_strength": "direct"},
             {"id": "fact-city", "type": "location", "value": "New York, NY",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-company", "type": "employment", "value": "Example Employer",
              "status": "locked", "locked": True, "evidence_strength": "direct"},
         ]
         candidate = {
@@ -208,13 +211,32 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
         value.update(extra)
         return value
 
-    def run_page(self, server, page_id, index, path, fields, final=False,
-                 predecessor=None, **extra):
+    def observe_live(self, server, page_id, index, path, final=False, predecessor=None,
+                     locale=None):
+        """The observation the page itself produces, not one written here.
+
+        Handing `fill_core` a constant proves planner → worker → import and nothing about
+        whether the description matches the form — which is the same gap that let the upload
+        bug live.
+        """
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_context().new_page()
+                page.goto(f"{server.origin}{path}", wait_until="domcontentloaded")
+                return observe_replay(page, page_id, index, f"{server.origin}{path}",
+                                      final=final, predecessor=predecessor, locale=locale)
+            finally:
+                browser.close()
+
+    def run_page(self, server, page_id, index, path, final=False, predecessor=None,
+                 locale=None):
         """observe -> export -> grant -> reserve/consume -> Chromium -> import -> checkpoint."""
+        observation = self.observe_live(server, page_id, index, path, final, predecessor,
+                                        locale)
         observed = FILL.observe_page(
-            self.db, "session-1", "worker-1", self.candidate_path,
-            self.observation(page_id, index, path, server, fields, final, predecessor,
-                             **extra), self.now)
+            self.db, "session-1", "worker-1", self.candidate_path, observation, self.now)
         self.assertNotEqual(observed.get("status"), "paused", observed.get("reasons"))
         package = self.private / f"{page_id}-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", page_id, package, self.now)
@@ -237,7 +259,7 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
                                           f"checkpoint-{page_id}", self.now)
         return {"package": package, "package_digest": package_digest, "grant": grant,
                 "result": result, "capability": capability, "checkpoint": checkpoint,
-                "imported": imported}
+                "imported": imported, "observation": observation}
 
     def start_session(self, server, path="/lever/split/0"):
         return FILL.start_session(
@@ -272,13 +294,12 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
             self.assertEqual(self.oracle(server), 0)
             self.start_session(server)
 
-            first = self.run_page(server, "page-1", 0, "/lever/split/0",
-                                  self.page_one_fields())
+            first = self.run_page(server, "page-1", 0, "/lever/split/0")
             # The page is left by a person following a link; the protocol has no way to.
             with urllib.request.urlopen(f"{server.origin}/lever/split/1", timeout=5) as page:
                 self.assertIn(b"final-action", page.read())
             second = self.run_page(
-                server, "page-2", 1, "/lever/split/1", self.page_two_fields(), final=True,
+                server, "page-2", 1, "/lever/split/1", final=True,
                 predecessor=first["checkpoint"]["checkpoint_sha256"])
 
             FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", self.now)
@@ -530,8 +551,8 @@ class MandatoryPauses(LocalFillOnlyWorkflow):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
             FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
-                              self.observation("page-1", 0, "/lever/split/0", server,
-                                               self.page_one_fields()), self.now)
+                              self.observe_live(server, "page-1", 0,
+                                                "/lever/split/0"), self.now)
             package = self.private / "blind-actions.json"
             FILL.export_page(self.db, "session-1", "worker-1", "page-1", package, self.now)
             grant = FILL.issue_execution_grant(self.db, "session-1", "page-1", package,
@@ -565,8 +586,8 @@ class MandatoryPauses(LocalFillOnlyWorkflow):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
             FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
-                              self.observation("page-1", 0, "/lever/split/0", server,
-                                               self.page_one_fields()), self.now)
+                              self.observe_live(server, "page-1", 0,
+                                                "/lever/split/0"), self.now)
             package = self.private / "stale-actions.json"
             FILL.export_page(self.db, "session-1", "worker-1", "page-1", package, self.now)
             grant = FILL.issue_execution_grant(self.db, "session-1", "page-1", package,
@@ -578,9 +599,9 @@ class MandatoryPauses(LocalFillOnlyWorkflow):
             ) as authority:
                 WORKER.run(package, result, authority.url, authority.token,
                            grant["grant_id"], headed=False, at=self.now)
-            # Revoked between the run and the import.
-            self.db.execute("UPDATE answers SET status='revoked' "
-                            "WHERE answer_id='answer-company'")
+            # The locked fact behind a filled field is unlocked between the run and the
+            # import: the page holds a value the evidence no longer supports.
+            self.db.execute("UPDATE candidate_facts SET locked=0 WHERE fact_id='fact-name'")
             with self.assertRaises(FILL.ImportRefused):
                 FILL.import_result(self.db, "session-1", "page-1", "worker-1", result,
                                    grant["grant_id"], self.now)
@@ -598,25 +619,89 @@ class MandatoryPauses(LocalFillOnlyWorkflow):
 class WorkflowInvariants(LocalFillOnlyWorkflow):
     """Properties of the flow itself, rather than of one stage."""
 
-    def test_every_recorded_label_classifies_the_way_the_mapping_says(self):
-        """Patterns written from imagination miss the forms employers ship.
+    def approval(self):
+        path = (ROOT / "tests" / "fixtures" / "ats-semantic"
+                / "FIELD-DISPOSITION-APPROVAL.json")
+        return json.loads(path.read_text(encoding="utf-8"))
 
-        The first conflict pattern did not match `Related to someone at this company?`,
-        which is the corpus's own wording, and only running against the real labels found it.
+    def test_every_recorded_label_matches_its_reviewed_disposition(self):
+        """The oracle is a reviewed file, not a second Jobloom table.
+
+        Deriving what to expect from `KIND_DISPOSITIONS` only proved that two internal maps
+        agreed — a kind mislabelled in both would have passed. And patterns written from
+        imagination miss the forms employers ship: the first conflict pattern did not match
+        `Related to someone at this company?`, the corpus's own wording.
         """
+        approval = self.approval()
+        self.assertTrue(approval["entries"])
         misses = []
-        for path in sorted((ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
-                            ).glob("*/fixture.json")):
-            fixture = json.loads(path.read_text(encoding="utf-8"))
-            for step in fixture["steps"]:
-                for control in step["controls"]:
-                    disposition = REPLAY.KIND_DISPOSITIONS[control["kind"]][0]
-                    domain = POLICY.classify(control["kind"].split(".")[-1],
-                                             control.get("label") or "")
-                    manual = bool(domain) and domain[0] in POLICY.ALWAYS_MANUAL_DOMAINS
-                    if (disposition == "always_manual") != manual:
-                        misses.append((control["kind"], control.get("label")))
+        for entry in approval["entries"]:
+            # The approval names bytes, so it cannot silently describe a different corpus.
+            source = (ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
+                      / entry["source_fixture"] / "fixture.json")
+            self.assertEqual(
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                entry["source_fixture_sha256"], entry["kind"])
+            domain = POLICY.classify(entry["kind"].split(".")[-1],
+                                     entry["recorded_label"] or "")
+            manual = bool(domain) and domain[0] in POLICY.ALWAYS_MANUAL_DOMAINS
+            if (entry["expected_disposition"] == "always_manual") != manual:
+                misses.append((entry["kind"], entry["recorded_label"]))
+            if entry["expected_disposition"] == "always_manual":
+                self.assertTrue(entry.get("review_reason"), entry["kind"])
         self.assertEqual(misses, [])
+
+    def test_the_two_internal_mappings_agree_with_each_other(self):
+        # Consistency only. It says nothing about whether either is right, which is what
+        # the approval fixture is for.
+        for entry in self.approval()["entries"]:
+            with self.subTest(kind=entry["kind"]):
+                self.assertEqual(REPLAY.KIND_DISPOSITIONS[entry["kind"]][0],
+                                 entry["expected_disposition"])
+
+    def test_the_observation_comes_from_the_page_and_matches_what_is_rendered(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            observation = self.observe_live(server, "page-1", 0, "/lever/split/0")
+            rendered = urllib.request.urlopen(
+                f"{server.origin}/lever/split/0", timeout=5).read().decode()
+            for field in observation["fields"]:
+                self.assertIn(f'data-test-id="{field["field_id"]}"', rendered)
+            # Control types and requiredness are read from the document, not assumed.
+            by_id = {field["field_id"]: field for field in observation["fields"]}
+            self.assertEqual(by_id["lever-0-0"]["control"], "file")
+            self.assertEqual(by_id["lever-0-0"]["upload_kind"], "resume")
+            self.assertEqual(by_id["lever-0-1"]["control"], "text")
+            self.assertTrue(by_id["lever-0-1"]["required"])
+            self.assertFalse(by_id["lever-0-5"]["required"])
+            self.assertEqual(by_id["lever-0-1"]["question"], "Full name")
+            final = self.observe_live(server, "page-2", 1, "/lever/split/1", final=True)
+            self.assertEqual(
+                [field["control"] for field in final["fields"]], ["text", "submit"])
+
+    def test_the_observer_fails_closed_rather_than_guessing(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                try:
+                    page = browser.new_context().new_page()
+                    # The first page of the plain replay carries the hazard variants.
+                    page.goto(f"{server.origin}/lever/0", wait_until="domcontentloaded")
+                    with self.assertRaises(ObservationRefused) as caught:
+                        observe_replay(page, "page-1", 0, f"{server.origin}/lever/0")
+                    # Hidden, disabled, duplicated or unmapped: whichever comes first, the
+                    # page is not described at all.
+                    self.assertTrue(str(caught.exception))
+                finally:
+                    browser.close()
+
+    def test_the_observer_never_reaches_into_a_frame_or_runs_page_script(self):
+        source = (ROOT / "tests" / "fixtures" / "replay_observer.py").read_text(
+            encoding="utf-8")
+        body = "\n".join(line for line in source.split("\n")
+                          if not line.strip().startswith("#"))
+        for forbidden in ("evaluate(", "frame_locator", "content()", "eval_on_selector"):
+            self.assertNotIn(forbidden, body)
 
     def test_the_worker_has_no_way_to_leave_a_page(self):
         # Not a rule that could be argued with: the vocabulary has no verb for it.
@@ -629,10 +714,9 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
     def test_page_two_cannot_reuse_page_ones_package_grant_or_result(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
-            first = self.run_page(server, "page-1", 0, "/lever/split/0",
-                                  self.page_one_fields())
-            second_observation = self.observation(
-                "page-2", 1, "/lever/split/1", server, self.page_two_fields(), final=True,
+            first = self.run_page(server, "page-1", 0, "/lever/split/0")
+            second_observation = self.observe_live(
+                server, "page-2", 1, "/lever/split/1", final=True,
                 predecessor=first["checkpoint"]["checkpoint_sha256"])
             FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
                               second_observation, self.now)
@@ -653,15 +737,19 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
     def test_an_unfinished_page_stops_the_session_from_looking_complete(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
-            self.run_page(server, "page-1", 0, "/lever/split/0", self.page_one_fields())
+            self.run_page(server, "page-1", 0, "/lever/split/0")
             # A second page observed and left unfinished.
             FILL.observe_page(
                 self.db, "session-1", "worker-1", self.candidate_path,
-                self.observation("page-2", 1, "/lever/split/1", server,
-                                 self.page_two_fields(), final=True,
-                                 predecessor=self.db.execute(
-                                     "SELECT checkpoint_sha256 FROM fill_checkpoints"
-                                 ).fetchone()["checkpoint_sha256"]), self.now)
+                self.observe_live("page-2" if False else "page-2", 1,
+                                  "/lever/split/1", final=True,
+                                  predecessor=self.db.execute(
+                                      "SELECT checkpoint_sha256 FROM fill_checkpoints"
+                                  ).fetchone()["checkpoint_sha256"]) if False else
+                self.observe_live(server, "page-2", 1, "/lever/split/1", final=True,
+                                  predecessor=self.db.execute(
+                                      "SELECT checkpoint_sha256 FROM fill_checkpoints"
+                                  ).fetchone()["checkpoint_sha256"]), self.now)
             with self.assertRaisesRegex(ValueError, "completed checkpoints"):
                 FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1",
                                     self.now)
@@ -672,10 +760,8 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
     def test_a_completed_form_still_says_unknown_about_disclosures_it_never_met(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
-            first = self.run_page(server, "page-1", 0, "/lever/split/0",
-                                  self.page_one_fields())
-            self.run_page(server, "page-2", 1, "/lever/split/1", self.page_two_fields(),
-                          final=True,
+            first = self.run_page(server, "page-1", 0, "/lever/split/0")
+            self.run_page(server, "page-2", 1, "/lever/split/1", final=True,
                           predecessor=first["checkpoint"]["checkpoint_sha256"])
             FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", self.now)
             # A self-reported chain cannot establish absence, so nothing writes not_present.
@@ -684,12 +770,80 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
             self.assertEqual(self.db.execute(
                 "SELECT COUNT(*) FROM nondisclosure_handling").fetchone()[0], 0)
 
+    def test_a_swapped_resume_never_reaches_the_file_input(self):
+        """Verify before touching, not after handing it over.
+
+        The earlier order checked the suffix and leading bytes, gave the file to the form,
+        and only then computed the digest for the import to compare — so a resume replaced
+        between export and execution was already in the employer's file input by the time
+        anything noticed. No submission is needed for the wrong document to be disclosed.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.start_session(server)
+            observation = self.observe_live(server, "page-1", 0, "/lever/split/0")
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                              observation, self.now)
+            package = self.private / "swap-actions.json"
+            FILL.export_page(self.db, "session-1", "worker-1", "page-1", package, self.now)
+            grant = FILL.issue_execution_grant(self.db, "session-1", "page-1", package,
+                                               self.now)
+            # A different, perfectly valid PDF put in place after the export.
+            snapshot = Path(self.db.execute(
+                "SELECT snapshot_path FROM resume_versions WHERE version_id='resume-1'"
+            ).fetchone()["snapshot_path"])
+            snapshot.chmod(0o600)
+            snapshot.write_bytes(synthetic_pdf(["Someone Else Entirely"]))
+            result = self.private / "swap-result.json"
+            with AUTHORITY.ExecutionAuthority(
+                self.db, FILL.reserve_execution_grant,
+                consume=FILL.consume_execution_grant, clock=lambda: self.now
+            ) as authority:
+                WORKER.run(package, result, authority.url, authority.token,
+                           grant["grant_id"], headed=False, at=self.now)
+            envelope = json.loads(result.read_text(encoding="utf-8"))
+            upload = next(entry for entry in envelope["results"]
+                          if entry["control"] == "file")
+            self.assertEqual(upload["outcome"], "error")
+            self.assertEqual(upload["error_code"], "upload_rejected")
+            # The material lock refuses too, one layer further in — but the point is that
+            # the worker stopped before the file input, not that something later noticed.
+            with self.assertRaisesRegex(ValueError, "locked resume snapshot hash mismatch"):
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", result,
+                                   grant["grant_id"], self.now)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM imported_results").fetchone()[0], 0)
+            with self.assertRaises(ValueError):
+                FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1",
+                                     self.now)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_an_upload_value_that_disagrees_with_itself_is_refused(self):
+        good = self.private / "ok.pdf"
+        good.write_bytes(synthetic_pdf(["Verified Candidate"]))
+        digest = hashlib.sha256(good.read_bytes()).hexdigest()
+        cases = {
+            "matching": ({"version_id": "resume-1", "path": str(good),
+                          "file_sha256": digest}, digest, None),
+            "wrong file digest": ({"version_id": "resume-1", "path": str(good),
+                                   "file_sha256": "a" * 64}, "a" * 64, "upload_rejected"),
+            "package disagrees": ({"version_id": "resume-1", "path": str(good),
+                                   "file_sha256": digest}, "b" * 64, "upload_rejected"),
+            "extra key": ({"version_id": "resume-1", "path": str(good),
+                           "file_sha256": digest, "note": "x"}, digest, "upload_rejected"),
+            "missing version": ({"path": str(good), "file_sha256": digest}, digest,
+                                "upload_rejected"),
+            "bare path": (str(good), digest, "upload_rejected"),
+        }
+        for label, (value, expected, problem) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(WORKER._verify_upload(value, expected)[0], problem)
+
     def test_a_rejected_import_does_not_satisfy_the_checkpoint_gate(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.start_session(server)
             FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
-                              self.observation("page-1", 0, "/lever/split/0", server,
-                                               self.page_one_fields()), self.now)
+                              self.observe_live(server, "page-1", 0,
+                                                "/lever/split/0"), self.now)
             package = self.private / "reject-actions.json"
             FILL.export_page(self.db, "session-1", "worker-1", "page-1", package, self.now)
             grant = FILL.issue_execution_grant(self.db, "session-1", "page-1", package,

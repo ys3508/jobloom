@@ -242,23 +242,41 @@ lease, a replay served over loopback, an execution grant reserved and consumed, 
 Chromium, a result import, a checkpoint per page, a form inventory and a pre-submit review.
 Moving between the two pages is a person following a link — the worker has no verb for it.
 
+**Both pages are observed from the live DOM.** `tests/fixtures/replay_observer.py` reads the
+page in front of Chromium — identifiers, labels, control types, requiredness, options, the
+final control — and produces the protocol observation. Handing `fill_core` a constant would
+have proved planner → worker → import and nothing about whether the description matches the
+form, which is the same gap that let an upload action's shape drift from what `_plan_upload`
+emits. It runs no page script, reaches into no frame, and refuses to describe a page at all
+when a control is hidden, disabled, duplicated or unmapped. **It is not an ATS adapter**: it
+reads Jobloom's own replay, whose controls carry a stable identifier and a reviewed kind that
+no employer page has.
+
 Every expected value comes from somewhere other than the thing being checked: package digests
 from the exported bytes, the final-action count from the server's own endpoint, states from
-the database, the review digest recomputed from the summary. The two pages are a Jobloom
-pagination of the reviewed controls, because every upstream fixture puts its controls on one
-step with the final action alone on the next; the controls are unchanged.
+the database, the review digest recomputed from the summary, and the approved disposition of
+every recorded label from `tests/fixtures/ats-semantic/FIELD-DISPOSITION-APPROVAL.json` — a
+reviewed file naming the corpus bytes it describes, rather than a second Jobloom table, since
+comparing two internal maps proves they agree and not that either is right.
+
+The two pages are **four** of the Lever fixture's twenty-seven controls re-paginated, because
+every upstream fixture puts all its controls on one step with the final action alone on the
+next. It is not a two-page replay of the Lever form.
 
 Alongside it, sixteen mandatory pauses each assert the same four things — no action ran,
 nothing was verified or checkpointed, the target's counter never moved, and the state is the
 right kind of waiting.
 
-**Two production defects this found**, both invisible to tests that built their own packages.
-The worker treated an upload action's value as a path when `_plan_upload` emits an object, so
-every real upload failed as `value_rejected_by_page`. And the conflict-question pattern did not
-match `Related to someone at this company?` — the reviewed corpus's own wording — so a
-per-employer disclosure fell through to the answer path. A test now checks every recorded label
-in all three fixtures against its declared disposition, because patterns written from
-imagination miss the forms employers actually ship.
+**Three production defects this found**, all invisible to tests that built their own packages
+and observations. The worker treated an upload action's value as a path when `_plan_upload`
+emits an object, so every real upload failed as `value_rejected_by_page`. The conflict-question
+pattern did not match `Related to someone at this company?` — the reviewed corpus's own
+wording — so a per-employer disclosure fell through to the answer path, and `referral.contact`
+was missing entirely. And the upload branch handed the file to the form before checking its
+digest, so a resume swapped between export and execution was already in the employer's file
+input by the time anything noticed: no submission is needed for the wrong document to be
+disclosed. Verification now happens entirely before `set_input_files`, against both the file's
+own bytes and the action's expected digest.
 
 **What the local proof is worth.** The replay's final-action counter is a real oracle: a test
 clicks the control without the guard and the server's counter reaches one, which is what makes
