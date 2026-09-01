@@ -24,6 +24,8 @@ APPLICATIONS = load_script("application_core")
 CANDIDATES = load_script("candidate_core")
 ANSWERS = load_script("answer_library")
 PRE_SUBMIT = load_script("pre_submit_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -33,8 +35,8 @@ class ResumeCoreTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
         self.store = self.root / "store"
-        self.source = self.root / "resume.txt"
-        self.source.write_text("Python and verified work history\n", encoding="utf-8")
+        self.source = self.root / "resume.pdf"
+        self.source.write_bytes(synthetic_pdf(["Python and verified work history"]))
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -180,7 +182,7 @@ class ResumeCoreTests(unittest.TestCase):
     def test_rebinding_invalidates_old_material_lock(self):
         self.register("resume-1")
         self.approve("resume-1")
-        self.source.write_text("Second verified resume\n", encoding="utf-8")
+        self.source.write_bytes(synthetic_pdf(["Second verified resume"]))
         self.register("resume-2")
         self.approve("resume-2")
         self.add_application_in_materials()

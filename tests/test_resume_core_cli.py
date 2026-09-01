@@ -10,14 +10,16 @@ ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "skills" / "jobloom" / "scripts" / "resume_core.py"
 
 
+from tests.pdf_fixture import synthetic_pdf
+
 class ResumeCoreCliTests(unittest.TestCase):
     def test_register_and_status_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = root / "jobloom.db"
             store = root / "resumes"
-            source = root / "resume.txt"
-            source.write_text("Verified resume\n", encoding="utf-8")
+            source = root / "resume.pdf"
+            source.write_bytes(synthetic_pdf(["Verified resume"]))
             base = [sys.executable, str(SCRIPT), "--db", str(database), "--store", str(store)]
             initialized = subprocess.run(base + ["init"], check=True, capture_output=True, text=True)
             registered = subprocess.run(base + [

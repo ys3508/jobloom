@@ -24,7 +24,7 @@ import application_core  # noqa: E402
 import archive_core  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
-from _common import require_table  # noqa: E402
+from _common import require_application_material_format, require_table  # noqa: E402
 
 
 ALLOWED_CONTROLS = {"text", "textarea", "select", "radio", "checkbox", "file",
@@ -371,6 +371,7 @@ def _plan_upload(connection: sqlite3.Connection, session: sqlite3.Row,
         version = connection.execute(
             "SELECT snapshot_path FROM resume_versions WHERE version_id=?", (lock["resume_version_id"],)
         ).fetchone()
+        require_application_material_format(version["snapshot_path"], "resume")
         return "resume", lock["resume_version_id"], {
             "version_id": lock["resume_version_id"], "path": version["snapshot_path"],
             "file_sha256": lock["resume_file_sha256"],
@@ -380,6 +381,7 @@ def _plan_upload(connection: sqlite3.Connection, session: sqlite3.Row,
             "SELECT snapshot_path FROM cover_letter_versions WHERE version_id=?",
             (lock["cover_letter_version_id"],),
         ).fetchone()
+        require_application_material_format(version["snapshot_path"], "cover letter")
         return "cover_letter", lock["cover_letter_version_id"], {
             "version_id": lock["cover_letter_version_id"], "path": version["snapshot_path"],
             "file_sha256": lock["cover_letter_file_sha256"],

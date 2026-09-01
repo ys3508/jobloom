@@ -36,6 +36,8 @@ OUTCOMES = load_script("outcome_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 FILL = load_script("fill_core")
 DIRECTIONS = load_script("direction_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -65,8 +67,8 @@ class FailClosedDependencyTests(unittest.TestCase):
         self.assertIn(table, str(caught.exception))
 
     def prepare(self):
-        resume_source = self.root / "resume.txt"
-        resume_source.write_text("Verified Python experience\n", encoding="utf-8")
+        resume_source = self.root / "resume.pdf"
+        resume_source.write_bytes(synthetic_pdf(["Verified Python experience"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", resume_source, "resume-1",
             "master_source", "general", at=AT,

@@ -19,7 +19,7 @@ from typing import Any
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-from _common import require_table  # noqa: E402
+from _common import require_application_material_format, require_table  # noqa: E402
 from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 
 
@@ -885,6 +885,7 @@ def bind_version(
         raise ValueError("application requires an approved resume version")
     _require_resume_authorized_for_application(connection, version)
     verify_version_file(version)
+    require_application_material_format(version["snapshot_path"], "resume")
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
         "UPDATE material_locks SET invalidated_at=?, invalidation_reason='resume_rebound' WHERE application_id=? AND invalidated_at IS NULL",
@@ -924,6 +925,7 @@ def lock_materials(
         raise ValueError("bound resume version is not approved")
     _require_resume_authorized_for_application(connection, version)
     verify_version_file(version)
+    require_application_material_format(version["snapshot_path"], "resume")
     cover_letter = None
     if application["cover_letter_version_id"]:
         require_table(connection, "cover_letter_versions")
@@ -945,6 +947,7 @@ def lock_materials(
         cover_manifest = Path(cover_letter["claims_manifest_path"] or "")
         if not cover_manifest.is_file() or file_sha256(cover_manifest) != cover_letter["claims_manifest_sha256"]:
             raise ValueError("cover-letter claims manifest hash mismatch")
+        require_application_material_format(cover_letter["snapshot_path"], "cover letter")
     existing = connection.execute(
         "SELECT lock_id FROM material_locks WHERE application_id=? AND invalidated_at IS NULL", (application_id,)
     ).fetchone()

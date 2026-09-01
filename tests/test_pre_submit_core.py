@@ -25,6 +25,8 @@ ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
 CANDIDATE = load_script("candidate_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -46,8 +48,8 @@ class PreSubmitCoreTests(unittest.TestCase):
         self.prepare_filling_application()
 
     def prepare_filling_application(self):
-        source = self.root / "resume.txt"
-        source.write_text("Verified Python experience\n", encoding="utf-8")
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Python experience"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
         )

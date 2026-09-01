@@ -146,7 +146,8 @@ three different keys: ≈30 (estimated), 27 (bare employer+title, now known unsa
 
 ## Nothing stops a non-PDF resume from being submitted
 
-Recorded 2026-08-31. Not fixed. Blocked on a file another session is holding.
+Recorded 2026-08-31. **Paid 2026-08-31.** Kept here with its closure evidence because the
+measurement below is what the gate is answerable to.
 
 **What was measured.** `resume_core.register` accepts `.pdf`, `.docx`, `.txt` and `.md`
 (`resume_core.py:390`). Neither `bind_version` nor `lock_materials` looks at the format:
@@ -176,16 +177,32 @@ Updating those fixtures is mechanical, but not while someone else is editing one
 and shipping only the `fill_core` third of the gate would be worse than none: it would let
 a DOCX bind and lock, then refuse at upload, after the material lock recorded it.
 
-**What would settle it.** Land it when `tests/test_direction_core.py` is free. The
-production change is three call sites; the rest is fixtures moving from `resume.txt` to a
-minimal PDF. Cover letters are not covered by the written change and need the same
-treatment through `cover_letter_core`.
+**How it was closed.** `_common.require_application_material_format` is the single
+validator; there is deliberately no second copy. It checks the `.pdf` suffix and the leading
+`%PDF-` bytes, because a renamed DOCX passes the suffix alone. It is called at
+`resume_core.bind_version`, at `resume_core.lock_materials` for both the resume and the bound
+cover letter, at `cover_letter_core.bind_version`, and at `fill_core._plan_upload` — all four,
+because shipping only the `fill_core` third would have let a DOCX bind and lock and then be
+refused at upload, after the material lock had already recorded it.
 
-**How it could bite.** Silently, and only once it matters: an employer receiving a DOCX
-where the ATS expected a PDF, or a locked artifact whose text layer was never checked
-because `artifact_integrity_audit` only knows how to read PDFs. Its
-`AUDIT_ASSUMPTIONS["format_gate_absent_in_bind_and_lock"]` records this same hole from the
-other side, and its canary is watching for the gate to appear.
+`tests/test_material_format.py` holds the closure evidence: a valid PDF binds, locks and plans
+an upload; a `.pdf` holding ZIP bytes and a `.docx` holding PDF bytes are both refused; no
+material lock row exists after a refused bind; an approved DOCX `master_source` stays
+registrable and is refused at selection; a bound cover letter must be a PDF; the lock and
+upload gates are exercised independently of binding; and replacing an approved PDF with a
+different valid PDF still fails on the hash, proving the format check was added to hash
+validation rather than substituted for it.
+
+**What is not closed.** Registration formats are unchanged on purpose — `.docx`, `.txt` and
+`.md` still register, and the DOCX `master_source` is still the canonical career record. The
+gate is on selection, not on the registry. `artifact_integrity_audit`'s
+`AUDIT_ASSUMPTIONS["format_gate_absent_in_bind_and_lock"]` records this hole from the other
+side and its canary should now be re-pointed; that is not done here.
+
+**What it would have cost.** An employer receiving a DOCX where the ATS expected a PDF, or a
+locked artifact whose text layer was never checked because `artifact_integrity_audit` only
+knows how to read PDFs. Nothing was exposed at the time of recording, but only because the
+three approved DOCX direction versions happened to be revoked.
 
 ---
 

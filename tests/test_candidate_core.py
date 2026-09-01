@@ -25,6 +25,8 @@ APPLICATIONS = load_script("application_core")
 ANSWERS = load_script("answer_library")
 RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -79,8 +81,8 @@ class CandidateCoreTests(unittest.TestCase):
         )
 
     def add_resume(self):
-        source = self.root / "resume.txt"
-        source.write_text("Verified Candidate\n", encoding="utf-8")
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Candidate"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
         )

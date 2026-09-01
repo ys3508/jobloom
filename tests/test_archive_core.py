@@ -26,6 +26,8 @@ RESUMES = load_script("resume_core")
 OUTCOMES = load_script("outcome_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 CANDIDATE = load_script("candidate_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -48,8 +50,8 @@ class ArchiveCoreTests(unittest.TestCase):
         self.prepare_application()
 
     def prepare_application(self):
-        resume_source = self.root / "resume.txt"
-        resume_source.write_text("Verified Python experience\n", encoding="utf-8")
+        resume_source = self.root / "resume.pdf"
+        resume_source.write_bytes(synthetic_pdf(["Verified Python experience"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", resume_source, "resume-1", "master_source", "general", at=AT
         )
@@ -176,7 +178,7 @@ class ArchiveCoreTests(unittest.TestCase):
         self.assertNotIn("birth_date", fields)
         self.assertNotIn("2000-01-01", (archive_path / "answers_snapshot.json").read_text(encoding="utf-8"))
         self.assertEqual(result["redaction"], {"included": 1, "redacted": 1, "omitted": 1})
-        resume_copy = archive_path / "resume_used.txt"
+        resume_copy = archive_path / "resume_used.pdf"
         source = Path(self.db.execute(
             "SELECT snapshot_path FROM resume_versions WHERE version_id='resume-1'"
         ).fetchone()[0])

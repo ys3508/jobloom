@@ -28,6 +28,8 @@ RESUMES = load_script("resume_core")
 COVERS = load_script("cover_letter_core")
 ARCHIVE = load_script("archive_core")
 PRE_SUBMIT = load_script("pre_submit_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -80,8 +82,8 @@ class FillCoreTests(unittest.TestCase):
         return candidate_path, manifest_path
 
     def prepare_application(self):
-        source = self.root / "resume.txt"
-        source.write_text("Verified Candidate\n", encoding="utf-8")
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Candidate"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -64,3 +65,28 @@ def require_table(connection: sqlite3.Connection, table: str) -> None:
     ).fetchone()
     if not found:
         raise RuntimeError(f"required safety table is missing: {table}")
+
+
+PDF_MAGIC = b"%PDF-"
+
+
+def require_application_material_format(snapshot_path: str | Path, label: str) -> None:
+    """Refuse anything but a real PDF once an artifact is chosen as an application material.
+
+    `known-liabilities.md` recorded the path this closes: registration accepts `.pdf`,
+    `.docx`, `.txt` and `.md`, and neither binding nor the material lock looked at the
+    format, so an approved DOCX walked all the way to `fill_core._plan_upload`. The suffix
+    alone is not enough — a DOCX renamed to `.pdf` passes it — so the leading bytes are
+    checked too. Registration formats are deliberately left unchanged; this gate fires only
+    where a version becomes the artifact an employer would receive.
+    """
+    snapshot = Path(snapshot_path)
+    if snapshot.suffix.casefold() != ".pdf":
+        raise ValueError(f"{label} bound to an application must be a .pdf file")
+    try:
+        with snapshot.open("rb") as handle:
+            head = handle.read(len(PDF_MAGIC))
+    except OSError:
+        raise ValueError(f"{label} snapshot is missing") from None
+    if head != PDF_MAGIC:
+        raise ValueError(f"{label} bound to an application is not a PDF file")

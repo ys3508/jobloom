@@ -26,6 +26,8 @@ RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 CANDIDATE = load_script("candidate_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -35,8 +37,8 @@ class CoverLetterCoreTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
         self.cover_store = self.root / "cover-letters"
-        self.cover_source = self.root / "cover-letter.txt"
-        self.cover_source.write_text("Verified Python experience for Example Corp.\n", encoding="utf-8")
+        self.cover_source = self.root / "cover-letter.pdf"
+        self.cover_source.write_bytes(synthetic_pdf(["Verified Python experience for Example Corp."]))
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -104,8 +106,8 @@ class CoverLetterCoreTests(unittest.TestCase):
         )
 
     def add_approved_resume(self):
-        source = self.root / "resume.txt"
-        source.write_text("Verified Python experience\n", encoding="utf-8")
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Python experience"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
         )
@@ -264,7 +266,7 @@ class CoverLetterCoreTests(unittest.TestCase):
         result = ARCHIVE.create_archive(
             self.db, self.root / "archive", "app-1", "archive-1", AT
         )
-        archived = Path(result["archive_path"]) / "cover_letter_used.txt"
+        archived = Path(result["archive_path"]) / "cover_letter_used.pdf"
         self.assertEqual(ARCHIVE.file_sha256(archived), cover["file_sha256"])
         self.assertTrue((Path(result["archive_path"]) / "cover_letter_claims_manifest.json").is_file())
         self.assertEqual(self.db.execute(

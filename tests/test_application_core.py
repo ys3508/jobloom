@@ -25,6 +25,8 @@ RESUMES = load_script("resume_core")
 ARCHIVE = load_script("archive_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 CANDIDATE = load_script("candidate_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -97,8 +99,8 @@ class ApplicationCoreTests(unittest.TestCase):
 
     def install_materials(self, application_id="app-1", suffix=""):
         root = Path(self.temp_dir.name)
-        source = root / f"{application_id}{suffix}.txt"
-        source.write_text("Verified resume claim\n", encoding="utf-8")
+        source = root / f"{application_id}{suffix}.pdf"
+        source.write_bytes(synthetic_pdf(["Verified resume claim"]))
         version_id = f"resume-{application_id}{suffix}"
         RESUMES.register_version(self.db, root / "store", source, version_id, "master_source", "general", at=AT)
         fact = {

@@ -21,6 +21,8 @@ def load_script():
 
 
 MVP = load_script()
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -115,8 +117,8 @@ class MvpCoreTests(unittest.TestCase):
             self.db, "portfolio-1", "user", portfolio["portfolio_sha256"], AT
         )
 
-        resume_path = self.root / "backend-resume.txt"
-        resume_path.write_text("Python\n", encoding="utf-8")
+        resume_path = self.root / "backend-resume.pdf"
+        resume_path.write_bytes(synthetic_pdf(["Python"]))
         MVP.resume_core.register_version(
             self.db, self.root / "resumes", resume_path, "backend-upload-1",
             "direction", "backend", source_mode="user_provided", at=AT,

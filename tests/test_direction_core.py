@@ -25,6 +25,8 @@ RESUMES = load_script("resume_core")
 CANDIDATES = load_script("candidate_core")
 ANSWERS = load_script("answer_library")
 PRE_SUBMIT = load_script("pre_submit_core")
+from tests.pdf_fixture import synthetic_pdf
+
 AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
 
@@ -83,8 +85,8 @@ class DirectionCoreTests(unittest.TestCase):
         return candidate_path, manifest_path
 
     def add_master_resume(self):
-        source = self.root / "master.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / "master.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "master-1", "master_source", "unassigned", at=AT
         )
@@ -145,8 +147,8 @@ class DirectionCoreTests(unittest.TestCase):
         return generated, approved
 
     def add_direction_resume(self, plan_id="plan-1", version_id="direction-1"):
-        source = self.root / f"{version_id}.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / f"{version_id}.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         result = RESUMES.register_version(
             self.db, self.root / "resumes", source, version_id, "direction", "backend",
             "master-1", at=AT, adaptation_plan_id=plan_id,
@@ -394,8 +396,8 @@ class DirectionCoreTests(unittest.TestCase):
 
     def test_derived_resume_requires_approved_matching_plan(self):
         self.approve_direction()
-        source = self.root / "direction.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / "direction.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         with self.assertRaisesRegex(ValueError, "adaptation plan"):
             RESUMES.register_version(
                 self.db, self.root / "resumes", source, "direction-1", "direction", "backend",
@@ -409,8 +411,8 @@ class DirectionCoreTests(unittest.TestCase):
 
     def test_user_provided_direction_resume_skips_plan_but_not_direction_or_user_approval(self):
         self.approve_direction()
-        source = self.root / "uploaded-direction.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / "uploaded-direction.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         registered = RESUMES.register_version(
             self.db, self.root / "resumes", source, "uploaded-direction-1",
             "direction", "backend", source_mode="user_provided", at=AT,
@@ -438,8 +440,8 @@ class DirectionCoreTests(unittest.TestCase):
         )
 
     def test_user_provided_mode_cannot_bypass_direction_scope_or_bind_a_plan(self):
-        source = self.root / "uploaded-direction.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / "uploaded-direction.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         with self.assertRaisesRegex(ValueError, "not user-approved"):
             RESUMES.register_version(
                 self.db, self.root / "resumes", source, "outside-direction",
@@ -456,8 +458,8 @@ class DirectionCoreTests(unittest.TestCase):
     def test_resume_approval_rejects_candidate_changed_after_plan(self):
         self.approve_direction()
         self.generate_and_approve_plan()
-        source = self.root / "direction.txt"
-        source.write_text("Python\n", encoding="utf-8")
+        source = self.root / "direction.pdf"
+        source.write_bytes(synthetic_pdf(["Python"]))
         RESUMES.register_version(
             self.db, self.root / "resumes", source, "direction-1", "direction", "backend",
             "master-1", at=AT, adaptation_plan_id="plan-1",

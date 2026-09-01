@@ -18,7 +18,7 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import resume_core  # noqa: E402
-from _common import require_table  # noqa: E402
+from _common import require_application_material_format, require_table  # noqa: E402
 
 
 COVER_LETTER_KINDS = {"reusable_template", "application_specific"}
@@ -269,6 +269,7 @@ def bind_version(
     ):
         raise ValueError("application-specific cover letter is scoped to another application")
     verify_version_file(version)
+    require_application_material_format(version["snapshot_path"], "cover letter")
     timestamp = (at or now_utc()).isoformat()
     require_table(connection, "material_locks")
     connection.execute(
