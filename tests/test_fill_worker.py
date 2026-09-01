@@ -224,8 +224,11 @@ class _SessionBase(unittest.TestCase):
         ).fetchall()
         for row in rows:
             FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
+        # These suites drive the per-step `complete_step` path, which predates result
+        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
+            require_verified_import=False,
         )
 
     def authority(self, reserve=None):
@@ -771,6 +774,342 @@ class RevocationTests(_SessionBase):
             outcome = FILL.revoke_execution_grant(self.db, second["grant_id"], self.now)
             self.assertEqual(outcome["status"], "already_consumed")
             self.assertFalse(outcome["revoked"])
+
+
+@unittest.skipUnless(PLAYWRIGHT, "playwright is not installed")
+class ResultImportTests(_SessionBase):
+    """The whole chain, and every way a result must fail to change anything."""
+
+    def setUp(self):
+        self.now = AT
+        super().setUp()
+
+    def final_actions(self, server):
+        return json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))[
+            "final_action_activations"]
+
+    def run_worker(self, server, name="result.json", extra_field_ids=()):
+        """Real session, export, grant, Chromium, result — nothing fabricated."""
+        self.replay_session(server, extra_field_ids=extra_field_ids)
+        package = self.export(f"{name}.package.json")
+        issued = self.issue(package)
+        output = self.root / name
+        with self.authority() as service:
+            WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                       headed=False, at=self.now)
+        return package, issued, output
+
+    def counts(self):
+        return {
+            "fields": self.db.execute("SELECT COUNT(*) FROM application_fields").fetchone()[0],
+            "markers": self.db.execute(
+                "SELECT COUNT(*) FROM nondisclosure_handling").fetchone()[0],
+            "completed": self.db.execute(
+                "SELECT COUNT(*) FROM fill_steps WHERE status='completed'").fetchone()[0],
+            "events": self.db.execute("SELECT COUNT(*) FROM fill_events").fetchone()[0],
+            "imports": self.db.execute("SELECT COUNT(*) FROM imported_results").fetchone()[0],
+        }
+
+    def rewrite(self, output, mutate):
+        envelope = json.loads(output.read_text(encoding="utf-8"))
+        mutate(envelope)
+        path = output.with_suffix(f".{abs(hash(json.dumps(envelope, sort_keys=True)))}.json")
+        path.write_text(json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    def refuses(self, reason, session_id="session-1", page_id="page-1", **kwargs):
+        before = self.counts()
+        with self.assertRaises(FILL.ImportRefused) as caught:
+            FILL.import_result(self.db, session_id, page_id, "worker-1",
+                               kwargs["result"], kwargs["grant_id"], self.now)
+        self.assertTrue(str(caught.exception).startswith(reason), str(caught.exception))
+        self.assertEqual(self.counts(), before, "a refused import must change nothing")
+
+    # ---- the whole chain --------------------------------------------------
+
+    def test_a_real_run_imports_verifies_every_step_and_permits_checkpoint(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package, issued, output = self.run_worker(
+                server, extra_field_ids=("lever-0-2", "lever-0-3"))
+            outcome = FILL.import_result(self.db, "session-1", "page-1", "worker-1",
+                                         output, issued["grant_id"], self.now)
+            self.assertEqual(outcome["status"], "verified")
+            self.assertEqual(outcome["verified_action_count"], 3)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_steps WHERE status='completed'").fetchone()[0], 3)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM application_fields").fetchone()[0], 3)
+            FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1", self.now)
+            self.assertEqual(self.final_actions(server), 0)
+
+    def test_the_expected_package_hash_comes_from_the_authority_not_the_envelope(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package, issued, output = self.run_worker(server)
+            # Computed here, independently, and matched against what the grant recorded.
+            external = hashlib.sha256(package.read_bytes()).hexdigest()
+            recorded = self.db.execute(
+                "SELECT package_sha256 FROM execution_grants WHERE grant_id=?",
+                (issued["grant_id"],)).fetchone()["package_sha256"]
+            self.assertEqual(recorded, external)
+            # An envelope claiming a different package is refused even though it is
+            # internally consistent — the expectation does not come from it.
+            forged = self.rewrite(output, lambda e: e.update({"package_sha256": "0" * 64}))
+            self.refuses("package_hash_mismatch", result=forged,
+                         grant_id=issued["grant_id"])
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+
+    # ---- batch atomicity --------------------------------------------------
+
+    def test_a_bad_hash_on_the_last_field_records_none_of_the_earlier_ones(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(
+                server, extra_field_ids=("lever-0-2", "lever-0-3"))
+
+            def break_last(envelope):
+                envelope["results"][-1]["observed_sha256"] = "f" * 64
+
+            self.refuses("observed_hash_mismatch",
+                         result=self.rewrite(output, break_last),
+                         grant_id=issued["grant_id"])
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_steps WHERE status='completed'").fetchone()[0], 0)
+            # Steps are still pending, so that is what refuses first.
+            with self.assertRaisesRegex(ValueError, "incomplete steps"):
+                FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1",
+                                     self.now)
+
+    def test_completed_steps_without_an_import_still_cannot_checkpoint(self):
+        # The second half of the gate: a page sealed on steps marked complete by some other
+        # route would be a checkpoint with no verified result behind it.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            for row in self.db.execute(
+                "SELECT step_id, expected_sha256 FROM fill_steps ORDER BY ordinal"
+            ).fetchall():
+                FILL.complete_step(self.db, "session-1", "worker-1", row["step_id"],
+                                   row["expected_sha256"], self.now)
+            with self.assertRaisesRegex(ValueError, "without a verified result import"):
+                FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1",
+                                     self.now)
+
+    def test_every_non_verified_outcome_fails_the_whole_batch(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server, extra_field_ids=("lever-0-2",))
+            for outcome in ("refused", "not_attempted", "not_actionable", "error",
+                            "mismatch"):
+                with self.subTest(outcome=outcome):
+                    def spoil(envelope, outcome=outcome):
+                        envelope["results"][0]["outcome"] = outcome
+                        envelope["results"][0].pop("observed_sha256", None)
+                    self.refuses(f"action_not_verified:{outcome}",
+                                 result=self.rewrite(output, spoil),
+                                 grant_id=issued["grant_id"])
+
+    def test_missing_extra_duplicated_and_reordered_actions_are_refused(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server, extra_field_ids=("lever-0-2",))
+            cases = {
+                "result_order_or_completeness_mismatch":
+                    lambda e: e["results"].pop(),
+                "duplicate_result":
+                    lambda e: e["results"].__setitem__(1, dict(e["results"][0])),
+                "unexpected_action_id":
+                    lambda e: e["results"].append(
+                        {"action_id": "invented", "outcome": "verified",
+                         "observed_sha256": "1" * 64}),
+            }
+            for reason, mutate in cases.items():
+                with self.subTest(reason=reason):
+                    self.refuses(reason, result=self.rewrite(output, mutate),
+                                 grant_id=issued["grant_id"])
+            reordered = self.rewrite(output, lambda e: e["results"].reverse())
+            self.refuses("result_order_or_completeness_mismatch", result=reordered,
+                         grant_id=issued["grant_id"])
+
+    def test_an_unproven_or_moved_final_action_count_is_refused(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            self.refuses("final_action_count_unproven",
+                         result=self.rewrite(
+                             output, lambda e: e.update({"final_action_activations": None})),
+                         grant_id=issued["grant_id"])
+            self.refuses("final_action_activated",
+                         result=self.rewrite(
+                             output, lambda e: e.update({"final_action_activations": 1})),
+                         grant_id=issued["grant_id"])
+            self.refuses("side_effects_unattributed",
+                         result=self.rewrite(
+                             output,
+                             lambda e: e.update({"side_effect_attribution": "unproven"})),
+                         grant_id=issued["grant_id"])
+
+
+    # ---- everything the plan rested on, re-read ---------------------------
+
+    def test_state_that_changed_since_planning_refuses_the_import(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            arguments = {"result": output, "grant_id": issued["grant_id"]}
+
+            # A lease that has run out is not this worker's lease any more.
+            self.db.execute(
+                "UPDATE applications SET lease_expires_at=? WHERE application_id='app-1'",
+                ((self.now - timedelta(minutes=1)).isoformat(),))
+            with self.assertRaises(ValueError):
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)
+            self.db.execute(
+                "UPDATE applications SET lease_expires_at=? WHERE application_id='app-1'",
+                ((self.now + timedelta(minutes=5)).isoformat(),))
+
+            # Authorisation withdrawn between planning and import.
+            self.db.execute("UPDATE authorizations SET status='revoked' "
+                            "WHERE authorization_id='auth-1'")
+            self.refuses("standing_authorization", **arguments)
+            self.db.execute("UPDATE authorizations SET status='active' "
+                            "WHERE authorization_id='auth-1'")
+
+            # The snapshot the plan was built from is no longer the active one.
+            self.db.execute("UPDATE candidate_snapshots SET status='superseded'")
+            self.refuses("candidate_snapshot_changed", **arguments)
+            self.db.execute("UPDATE candidate_snapshots SET status='active'")
+
+            # The material lock is gone.
+            self.db.execute("UPDATE material_locks SET invalidated_at=?, "
+                            "invalidation_reason='resume_rebound' WHERE application_id='app-1'",
+                            (self.now.isoformat(),))
+            with self.assertRaises(ValueError):
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)
+            self.db.execute("UPDATE material_locks SET invalidated_at=NULL, "
+                            "invalidation_reason=NULL WHERE application_id='app-1'")
+
+            # With everything restored the same result imports.
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
+    def test_a_grant_that_is_unconsumed_revoked_or_for_another_page_is_refused(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            package, issued, output = self.run_worker(server)
+            self.refuses("grant_unknown", result=output, grant_id="grant-invented")
+            # A second grant for the same package that was never run.
+            fresh = self.issue(package)
+            self.refuses("grant_not_consumed", result=output, grant_id=fresh["grant_id"])
+            FILL.revoke_execution_grant(self.db, fresh["grant_id"], self.now)
+            self.refuses("grant_revoked", result=output, grant_id=fresh["grant_id"])
+            # And a grant whose page is not the one being imported.
+            self.refuses("grant_belongs_to_another_page", page_id="page-2",
+                         result=output, grant_id=issued["grant_id"])
+
+    # ---- replay and conflict ----------------------------------------------
+
+    def test_importing_the_same_result_twice_is_a_no_op(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server, extra_field_ids=("lever-0-2",))
+            first = FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                       issued["grant_id"], self.now)
+            self.assertEqual(first["status"], "verified")
+            after_first = self.counts()
+            second = FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                        issued["grant_id"], self.now)
+            self.assertEqual(second["status"], "already_imported")
+            # No duplicated fields, markers or events.
+            self.assertEqual(self.counts(), after_first)
+
+    def test_a_different_result_for_the_same_grant_is_a_conflict(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+            recorded = self.counts()
+            # Same grant, different bytes: the first record is never overwritten.
+            other = self.rewrite(output, lambda e: e.update({"page_id": "page-1"}))
+            other.write_text(output.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            with self.assertRaises(FILL.ImportRefused) as caught:
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", other,
+                                   issued["grant_id"], self.now)
+            self.assertEqual(str(caught.exception), "result_conflicts_with_recorded_import")
+            self.assertEqual(self.counts(), recorded)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM imported_results").fetchone()[0], 1)
+
+    def test_the_result_file_is_kept_for_audit(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            _, issued, output = self.run_worker(server)
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+            self.assertTrue(output.is_file())
+
+    # ---- value isolation ---------------------------------------------------
+
+    def test_no_value_token_or_path_reaches_events_or_the_import_record(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            issued = self.issue(package)
+            output = self.root / "isolated.json"
+            with self.authority() as service:
+                token, reservation = service.token, None
+                capability = service.write_capability(self.root / "cap.json")
+                summary = WORKER.run(package, output, service.url, service.token,
+                                     issued["grant_id"], headed=False, at=self.now)
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+            stored = " ".join(str(part) for row in self.db.execute(
+                "SELECT * FROM fill_events") for part in row)
+            stored += " ".join(str(part) for row in self.db.execute(
+                "SELECT * FROM imported_results") for part in row)
+            for leak in ("Verified Candidate", token, server.nonce, str(capability),
+                         str(self.root)):
+                self.assertNotIn(leak, stored)
+            # And the summary the CLI would print carries counts, not values.
+            self.assertNotIn("Verified Candidate", json.dumps(summary))
+            self.assertNotIn(token, json.dumps(summary))
+
+    def test_a_nondisclosure_step_imports_as_a_marker_and_never_a_field(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            POLICY.register_policy(
+                self.db, policy_id="policy-eeo_gender", question_family="eeo_gender",
+                locale="en-US", option_tokens=["decline_to_answer"], confirmed_by="user",
+                confirmed_at=self.now, scope={})
+            observation = {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0", "locale": "en-US",
+                "fields": [
+                    # `lever-0-23` is the fixture's Gender control, a `<select>`.
+                    {"field_id": "lever-0-23", "question": "Gender",
+                     "selector": "#g", "control": "select", "required": False,
+                     "sensitivity": "normal",
+                     "options": [{"label": label,
+                                  "value": POLICY.replay_option_value(label, server.nonce)}
+                                 for label in ("Male", "Female", "Decline to answer")]},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                              observation, self.now)
+            package = self.export("eeo.package.json")
+            issued = self.issue(package)
+            output = self.root / "eeo.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                               issued["grant_id"], self.now)
+            self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                             {"status": "recorded", "markers": {"lever-0-23": "policy_declined"}})
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM application_fields WHERE field_id='lever-0-23'"
+            ).fetchone()[0], 0)
+            dump = "\n".join(self.db.iterdump())
+            for value in ("Male", "Female"):
+                self.assertNotIn(value, dump)
 
 
 @unittest.skipUnless(PLAYWRIGHT, "playwright is not installed")

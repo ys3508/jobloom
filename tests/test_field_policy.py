@@ -181,8 +181,11 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         ).fetchall()
         for row in rows:
             FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
+        # These suites drive the per-step `complete_step` path, which predates result
+        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
+            require_verified_import=False,
         )
 
     def reacquire(self, worker_id="worker-2"):
@@ -329,6 +332,17 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             source_kind="answer")])
         self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
 
+    def test_a_radiogroup_nondisclosure_control_is_named_unsupported_not_mis_filled(self):
+        # A radiogroup's identity is the group; the reviewed option lives on one of its
+        # inputs, and nothing addresses that yet. Naming it beats filling the wrong node.
+        self.add_decline_policy()
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", control="radio",
+            options=self.race_options())], locale="en-US")
+        self.assertEqual(self.pause_reasons(result),
+                         {"nondisclosure_control_unsupported"})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM fill_steps").fetchone()[0], 0)
+
     def test_a_page_that_mislabels_its_own_option_cannot_be_trusted(self):
         # The attack the "opaque value" story missed entirely: offer the reviewed label and
         # submit a real category. Not understanding the value is not the value being safe.
@@ -337,7 +351,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                    for label in self.RACE_VALUES]
         spoofed.append({"label": self.DECLINE, "value": "Asian"})
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity", options=spoofed)], locale="en-US")
+            "eeo_race", "Race / Ethnicity", control="select", options=spoofed)], locale="en-US")
         self.assertEqual(self.pause_reasons(result), {"option_mapping_unverified"})
         self.assertNotIn("Asian", self.database_dump())
 
@@ -388,7 +402,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def test_a_label_match_does_not_settle_what_the_form_would_submit(self):
         self.add_decline_policy()
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity", options=self.race_options())], locale="en-US")
+            "eeo_race", "Race / Ethnicity", control="select",
+            options=self.race_options())], locale="en-US")
         self.assertNotEqual(result["status"], "paused")
         step = self.db.execute(
             "SELECT value_json FROM fill_steps ORDER BY ordinal").fetchall()[-1]
@@ -401,7 +416,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.add_decline_policy()
         duplicated = self.race_options() + [{"label": self.DECLINE, "value": "opt-other"}]  # noqa: E501
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity", options=duplicated)], locale="en-US")
+            "eeo_race", "Race / Ethnicity", control="select", options=duplicated)], locale="en-US")
         self.assertEqual(self.pause_reasons(result), {"nondisclosure_option_ambiguous"})
 
     def test_a_file_control_cannot_outrun_its_domain_classification(self):
@@ -432,15 +447,15 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             with self.subTest(field_id=field_id):
                 self.setUp()
                 result = self.observe([self.field(
-                    field_id, question, options=self.race_options(),
-                    source_kind="answer")], locale="en-US")
+                    field_id, question, control="select",
+                    options=self.race_options(), source_kind="answer")], locale="en-US")
                 self.assertEqual(result["status"], "paused")
                 self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_absent"})
 
     def test_an_exact_reviewed_non_disclosure_option_may_be_selected(self):
         self.add_decline_policy()
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         self.assertNotEqual(result["status"], "paused")
         step = self.db.execute(
@@ -466,20 +481,20 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                     self.race_options(
                         [self.OTHER_DECLINE] if reason == "nondisclosure_option_ambiguous" else []))
                 result = self.observe([self.field(
-                    "eeo_race", "Race / Ethnicity", options=options)], locale="en-US")
+                    "eeo_race", "Race / Ethnicity", control="select", options=options)], locale="en-US")
                 self.assertEqual(self.pause_reasons(result), {reason})
         self.setUp()
         self.add_decline_policy()
         POLICY.revoke_policy(self.db, "policy-eeo_race", "user_withdrew", AT)
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_revoked"})
 
     def test_no_demographic_value_reaches_any_action_result_or_store(self):
         self.add_decline_policy()
         self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
@@ -500,7 +515,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # on a race question must not route it through the answer library.
         self.add_answer("answer-race", "race", "Race / Ethnicity", "Asian")
         result = self.observe([self.field(
-            "eeo_race", "Race / Ethnicity", source_kind="answer",
+            "eeo_race", "Race / Ethnicity", control="select", source_kind="answer",
             options=self.options(self.RACE_VALUES))], locale="en-US")
         self.assertEqual(result["status"], "paused")
         # The answer exists and is confirmed; what must not exist is a step that used it.
@@ -513,7 +528,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def test_no_planned_action_can_submit_or_navigate(self):
         self.add_decline_policy()
         self.observe([
-            self.field("eeo_race", "Race / Ethnicity",
+            self.field("eeo_race", "Race / Ethnicity", control="select",
                        options=self.race_options()),
             self.field("next_page", "Continue to the next step", control="submit"),
         ], locale="en-US")
@@ -523,7 +538,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.assertTrue(package["stop_before_submit"])
         self.assertIsNone(package["submission_action"])
         self.assertFalse(result["contains_submission_action"])
-        self.assertEqual({action["operation"] for action in package["actions"]}, {"fill"})
+        # A reviewed option on a `<select>` is planned as `select`, not typed into it.
+        self.assertEqual({action["operation"] for action in package["actions"]}, {"select"})
         self.assertNotIn("next_page", json.dumps(package["actions"]))
 
     # ---- discovery source -----------------------------------------------
@@ -536,7 +552,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # export never reached it.
         self.add_decline_policy()
         self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
@@ -579,7 +595,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # Option strings were never stored, so the record cannot say what the control offers.
         # Replanning from it would skip the policy the user just registered.
         self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         self.add_decline_policy()
         self.reacquire()
@@ -588,7 +604,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                                 {"country": "US", "application_id": "app-1"},
                                 self.candidate_path, AT)
         fresh = self.page(fields=[
-            self.field("eeo_race", "Race / Ethnicity",
+            self.field("eeo_race", "Race / Ethnicity", control="select",
                        options=self.race_options()),
             self.field("submit", "Submit application", control="submit")], locale="en-US")
         result = FILL.resume_session(
@@ -604,7 +620,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # A control that stopped appearing may have been completed by the user, or missed by
         # the observer, or re-rendered away. Those are not the same event.
         self.observe([self.field(
-            "eeo_race", "Race / Ethnicity",
+            "eeo_race", "Race / Ethnicity", control="select",
             options=self.race_options())], locale="en-US")
         self.reacquire()
         fresh = self.page(fields=[
@@ -645,7 +661,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.issue_surface()
         self.add_decline_policy(surface=False)
         self.observe([self.field(
-            "eeo_race", "Race / Ethnicity", options=self.race_options())], locale="en-US")
+            "eeo_race", "Race / Ethnicity", control="select",
+            options=self.race_options())], locale="en-US")
         output = self.root / "private" / "page-actions.json"
         FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
         package = output.read_text(encoding="utf-8")

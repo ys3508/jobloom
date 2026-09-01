@@ -245,3 +245,45 @@ production adapter still needs its own supervised live acceptance test. The elev
 acceptance tests skip themselves where Chromium is absent, which is right on a laptop and
 wrong as a merge gate, so CI runs them with `JOBLOOM_REQUIRE_BROWSER=1`, which turns a skip
 into a failure.
+
+## Importing a result
+
+`fill_core.import_result` is the only way a browser observation becomes a verified step. Its
+inputs are narrow on purpose: where the result is, and which grant authorised it. Every
+expectation it is checked against — the package digest, the action IDs and their order, each
+expected hash, the surface, the application identity — is read here, because a caller that
+could supply its own expectations could satisfy any of them. The digest in particular comes
+from `execution_grants` and `exported_packages`, never from the envelope's own
+`package_sha256`: comparing a document to a field inside itself is how the worker's package
+digest bug survived a passing test.
+
+Everything the plan rested on is re-read rather than remembered — the worker's lease, the
+application state, the session and page, the standing authorization, the active
+CandidateSnapshot, the material lock — and then the whole envelope is validated: protocol
+version, session and page, package digest, action completeness and order, `verified` on every
+action with an exact hash match, a proven `final_action_activations` of zero, and
+`side_effect_attribution: complete`.
+
+**Either the page's actions are all recorded or none are.** Nothing writes until every check
+has passed, and then one transaction applies them. A loop over `complete_step` would have
+committed as it went, so a mismatch on the last field would leave every earlier field
+recorded — the opposite of what verification is for. `_apply_step` exists so the batch has a
+primitive that commits nothing.
+
+Import is idempotent and non-replayable. The result file is kept for audit; `imported_results`
+records its digest, the grant, the package digest and the time. The same result imports once
+and then reports `already_imported` without duplicating a field, a marker or an event; a
+different result presented for the same grant is refused as a conflict rather than overwriting
+what was recorded.
+
+A page may be checkpointed only on the strength of a verified import. Steps marked complete by
+some other route do not qualify, and a failed or conflicting import leaves nothing to qualify
+on.
+
+Two things this exposed. The step applier keyed on `operation == "fill"`, so planning a
+reviewed non-disclosure option as `select` skipped both branches and recorded a verified step
+with neither a field nor a marker behind it; it now keys on the source. And `_perform`'s
+`select` branch had been unreachable because every planner emitted `fill` — a reviewed option
+on a `<select>` would have been typed into it. Radiogroups remain unaddressed: the group holds
+the identity and the option lives on one of its inputs, so those pause as
+`nondisclosure_control_unsupported` rather than acting on the wrong node.

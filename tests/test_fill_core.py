@@ -170,8 +170,11 @@ class FillCoreTests(unittest.TestCase):
         ).fetchall()
         for row in rows:
             FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
+        # These suites drive the per-step `complete_step` path, which predates result
+        # import. The gate they bypass has its own tests in `tests/test_fill_core.py`.
         return FILL.checkpoint_page(
-            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT,
+            require_verified_import=False,
         )
 
     def reacquire(self, worker_id="worker-2"):

@@ -35,6 +35,9 @@ from _common import require_application_material_format, require_table  # noqa: 
 ALLOWED_CONTROLS = {"text", "textarea", "select", "radio", "checkbox", "file",
                     "standard_attestation", "submit"}
 VALUE_CONTROLS = {"text", "textarea", "select", "radio", "checkbox"}
+# Operations that put a value into the form, and so produce an ApplicationField. An upload is
+# recorded through the material lock instead.
+VALUE_OPERATIONS = {"fill", "select", "check", "uncheck"}
 USER_ANSWER_PAUSES = {
     "new_question", "question_mapping_conflict", "no_applicable_answer", "answer_expired",
     "answer_review_due", "answer_not_yet_effective", "conflicting_active_answers",
@@ -208,6 +211,17 @@ def initialize(connection: sqlite3.Connection) -> None:
             expires_at TEXT NOT NULL,
             consumed_at TEXT,
             revoked_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS imported_results (
+            result_sha256 TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            UNIQUE (grant_id)
         );
 
         CREATE TABLE IF NOT EXISTS fill_checkpoints (
@@ -459,7 +473,20 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
         # Selecting a reviewed "prefer not to answer" option discloses nothing, which is the
         # whole reason it may be automated while a value may not. The submitted value is the
         # page's own opaque option value, not the reviewed label.
-        planned.append({"ordinal": ordinal, "field": field, "operation": "fill",
+        # The operation has to match the control. `_perform`'s `select` branch was
+        # unreachable because every planner emitted `fill`, so a reviewed option on a
+        # `<select>` would have been typed into it.
+        if field["control"] == "select":
+            operation = "select"
+        elif field["control"] in {"text", "textarea"}:
+            operation = "fill"
+        else:
+            # A radiogroup's identity is the group; the reviewed option lives on one of its
+            # inputs, and nothing here can address that yet. Named rather than mis-filled.
+            eeo_handling[field_id] = "nondisclosure_control_unsupported"
+            return _field_reason("nondisclosure_control_unsupported", field_id,
+                                 "sensitive_personal")
+        planned.append({"ordinal": ordinal, "field": field, "operation": operation,
                         "source_kind": "nondisclosure_policy",
                         "source_id": resolved["policy_id"],
                         "source_status": "active", "sensitivity": "sensitive_personal",
@@ -990,6 +1017,43 @@ def export_page(connection: sqlite3.Connection, session_id: str, worker_id: str,
             "package_sha256": digest, "action_count": len(actions), "contains_submission_action": False}
 
 
+def _apply_step(connection: sqlite3.Connection, session: sqlite3.Row, worker_id: str,
+                step: sqlite3.Row, at: datetime | None) -> None:
+    """Record one verified step. Writes nothing to disk and commits nothing.
+
+    Split out so a batch can be applied inside one transaction. A loop over `complete_step`
+    would commit each step as it went, so a mismatch on the last field would leave every
+    earlier field recorded — which is the opposite of the guarantee an import is supposed to
+    make.
+    """
+    # Keyed on the source, not the operation. Keying on `operation == "fill"` meant that
+    # planning a reviewed option as `select` silently skipped both branches: no marker and no
+    # field, a step recorded as verified with nothing behind it.
+    if step["source_kind"] == "nondisclosure_policy":
+        # An ApplicationField stores what was entered. For a protected-characteristic control
+        # Jobloom must not be able to say, so only the handling marker is kept.
+        field_policy.record_handling(
+            connection, session["application_id"], step["field_id"], "policy_declined",
+            step["source_id"], at or now_utc())
+    elif step["operation"] in VALUE_OPERATIONS:
+        archive_core.record_field(
+            connection, session["application_id"], step["field_id"], step["question"],
+            json.loads(step["value_json"]), step["source_kind"], step["source_id"],
+            step["source_status"], step["sensitivity"], at,
+        )
+    connection.execute(
+        "UPDATE fill_steps SET status='completed', completed_at=? WHERE step_id=?",
+        ((at or now_utc()).isoformat(), step["step_id"]),
+    )
+    step_metadata = {"page_id": step["page_id"], "operation": step["operation"]}
+    if step["sensitivity"] == "normal":
+        step_metadata["step_id"] = step["step_id"]
+    else:
+        step_metadata["step_id_sha256"] = canonical_hash(step["step_id"])
+    _event(connection, session, worker_id, "step_completed", "observed_value_hash_matched",
+           step_metadata, at)
+
+
 def complete_step(connection: sqlite3.Connection, session_id: str, worker_id: str,
                   step_id: str, observed_sha256: str, at: datetime | None = None) -> dict[str, Any]:
     session = _active_session(connection, session_id, worker_id, at)
@@ -1003,36 +1067,149 @@ def complete_step(connection: sqlite3.Connection, session_id: str, worker_id: st
             "incorrect_autofill", step["field_id"], step["sensitivity"]
         )],
                       worker_id, step["page_id"], at)
-    if step["operation"] == "fill" and step["source_kind"] == "nondisclosure_policy":
-        # An ApplicationField stores what was entered. For a protected-characteristic control
-        # Jobloom must not be able to say, so only the handling marker is kept.
-        field_policy.record_handling(
-            connection, session["application_id"], step["field_id"], "policy_declined",
-            step["source_id"], at or now_utc())
-    elif step["operation"] == "fill":
-        archive_core.record_field(
-            connection, session["application_id"], step["field_id"], step["question"],
-            json.loads(step["value_json"]), step["source_kind"], step["source_id"],
-            step["source_status"], step["sensitivity"], at,
-        )
-    timestamp = (at or now_utc()).isoformat()
-    connection.execute(
-        "UPDATE fill_steps SET status='completed', completed_at=? WHERE step_id=?",
-        (timestamp, step_id),
-    )
-    step_metadata = {"page_id": step["page_id"], "operation": step["operation"]}
-    if step["sensitivity"] == "normal":
-        step_metadata["step_id"] = step_id
-    else:
-        step_metadata["step_id_sha256"] = canonical_hash(step_id)
-    _event(connection, session, worker_id, "step_completed", "observed_value_hash_matched",
-           step_metadata, at)
+    _apply_step(connection, session, worker_id, step, at)
     connection.commit()
     return {"session_id": session_id, "step_id": step_id, "status": "completed"}
 
 
+class ImportRefused(ValueError):
+    """An import that changed nothing. Distinct so a caller cannot mistake it for a pause."""
+
+
+def _authoritative_package_hash(connection: sqlite3.Connection, session_id: str, page_id: str,
+                                grant_id: str) -> str:
+    """The digest to check a result against, read from what this authority recorded.
+
+    Never the envelope's own `package_sha256`: comparing a document to a field inside itself
+    is how the worker's package digest bug survived a passing test.
+    """
+    grant = connection.execute(
+        "SELECT session_id, page_id, package_sha256, consumed_at, revoked_at "
+        "FROM execution_grants WHERE grant_id=?", (grant_id,)).fetchone()
+    if not grant:
+        raise ImportRefused("grant_unknown")
+    if grant["session_id"] != session_id or grant["page_id"] != page_id:
+        raise ImportRefused("grant_belongs_to_another_page")
+    if grant["revoked_at"]:
+        raise ImportRefused("grant_revoked")
+    if not grant["consumed_at"]:
+        # A result can only exist because a run happened, and a run consumes its grant.
+        raise ImportRefused("grant_not_consumed")
+    exported = connection.execute(
+        "SELECT 1 FROM exported_packages WHERE session_id=? AND page_id=? AND package_sha256=?",
+        (session_id, page_id, grant["package_sha256"])).fetchone()
+    if not exported:
+        raise ImportRefused("package_not_exported")
+    return grant["package_sha256"]
+
+
+def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
+                  worker_id: str, result_path: Path, grant_id: str,
+                  at: datetime | None = None) -> dict[str, Any]:
+    """Turn one worker result into verified fill steps, or into nothing at all.
+
+    The narrow shape is deliberate. A caller supplies where the result is and which grant
+    authorised it; every expectation it is checked against — the package digest, the action
+    IDs and their order, each expected hash, the surface, the application identity — is read
+    here. A caller that could pass its own expectations could satisfy any of them.
+
+    Either the whole page's actions are recorded or none of them are. An earlier design would
+    have looped over `complete_step`, committing as it went, so a mismatch on the last field
+    left every earlier field written — the opposite of what verification is for.
+    """
+    current_time = at or now_utc()
+    result_bytes = result_path.read_bytes()
+    result_digest = hashlib.sha256(result_bytes).hexdigest()
+
+    # Replay and conflict are decided before anything is validated, so a second import cannot
+    # even begin to write.
+    previous = connection.execute(
+        "SELECT * FROM imported_results WHERE grant_id=?", (grant_id,)).fetchone()
+    if previous:
+        if previous["result_sha256"] != result_digest:
+            raise ImportRefused("result_conflicts_with_recorded_import")
+        return {"session_id": session_id, "page_id": page_id, "status": "already_imported",
+                "verified_action_count": 0, "result_sha256": result_digest}
+
+    package_sha256 = _authoritative_package_hash(connection, session_id, page_id, grant_id)
+    session = _active_session(connection, session_id, worker_id, current_time)
+    if session["current_page_id"] and session["status"] != "active":
+        raise ImportRefused("session_not_active")
+    page = connection.execute(
+        "SELECT * FROM fill_pages WHERE session_id=? AND page_id=? AND status='active'",
+        (session_id, page_id)).fetchone()
+    if not page:
+        raise ImportRefused("page_not_active")
+
+    # Everything the plan depended on, re-read rather than remembered.
+    application_core.require_active_material_lock(connection, session["application_id"])
+    context = json.loads(session["authorization_context_json"])
+    authorized, authorization_reason = answer_library.authorization_current(
+        connection, session["authorization_id"], context, current_time)
+    if not authorized:
+        raise ImportRefused(authorization_reason)
+    _candidate_facts_unchanged(connection, session["application_id"])
+
+    steps = connection.execute(
+        "SELECT * FROM fill_steps WHERE session_id=? AND page_id=? AND status='pending' "
+        "ORDER BY ordinal", (session_id, page_id)).fetchall()
+    if not steps:
+        raise ImportRefused("no_pending_steps")
+
+    envelope = json.loads(result_bytes.decode("utf-8"))
+    try:
+        worker_protocol.validate_result(
+            envelope, expected_session=session_id, expected_page=page_id,
+            expected_package_sha256=package_sha256,
+            expected_action_ids=[row["step_id"] for row in steps], at=current_time)
+    except worker_protocol.ProtocolError as problem:
+        raise ImportRefused(str(problem)) from None
+
+    outcomes = {entry["action_id"]: entry for entry in envelope["results"]}
+    for step in steps:
+        entry = outcomes[step["step_id"]]
+        if entry["outcome"] != "verified":
+            # `refused`, `not_attempted`, `not_actionable`, `error` and `mismatch` all mean
+            # the page is not in the state the plan describes.
+            raise ImportRefused(f"action_not_verified:{entry['outcome']}")
+        if entry.get("observed_sha256") != step["expected_sha256"]:
+            raise ImportRefused("observed_hash_mismatch")
+
+    # Nothing above wrote. From here it is one transaction.
+    for step in steps:
+        _apply_step(connection, session, worker_id, step, current_time)
+    connection.execute(
+        "INSERT INTO imported_results (result_sha256, session_id, page_id, grant_id, "
+        "package_sha256, status, imported_at) VALUES (?, ?, ?, ?, ?, 'verified', ?)",
+        (result_digest, session_id, page_id, grant_id, package_sha256,
+         current_time.isoformat()))
+    _event(connection, session, worker_id, "results_imported",
+           "observed_hashes_verified",
+           {"page_id": page_id, "verified_action_count": len(steps),
+            "result_sha256": result_digest}, at)
+    connection.commit()
+    return {"session_id": session_id, "page_id": page_id, "status": "verified",
+            "verified_action_count": len(steps), "result_sha256": result_digest}
+
+
+def _candidate_facts_unchanged(connection: sqlite3.Connection, application_id: str) -> None:
+    """The snapshot the plan was built from must still be the active one."""
+    lock = application_core.require_active_material_lock(connection, application_id)
+    version = connection.execute(
+        "SELECT candidate_profile_sha256 FROM resume_versions WHERE version_id=?",
+        (lock["resume_version_id"],)).fetchone()
+    if not version:
+        raise ImportRefused("bound_resume_missing")
+    snapshot = connection.execute(
+        "SELECT 1 FROM candidate_snapshots WHERE content_sha256=? AND status='active' "
+        "AND registered_by='user'", (version["candidate_profile_sha256"],)).fetchone()
+    if not snapshot:
+        raise ImportRefused("candidate_snapshot_changed")
+
+
 def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: str,
-                    page_id: str, checkpoint_id: str, at: datetime | None = None) -> dict[str, Any]:
+                    page_id: str, checkpoint_id: str, at: datetime | None = None,
+                    require_verified_import: bool = True) -> dict[str, Any]:
     _require_id(checkpoint_id, "checkpoint_id")
     session = _active_session(connection, session_id, worker_id, at)
     page = connection.execute(
@@ -1047,6 +1224,18 @@ def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: 
     ).fetchone()[0]
     if pending:
         raise ValueError("cannot checkpoint a page with incomplete steps")
+    planned = connection.execute(
+        "SELECT COUNT(*) FROM fill_steps WHERE session_id=? AND page_id=?",
+        (session_id, page_id)).fetchone()[0]
+    if planned and require_verified_import:
+        # A page is checkpointed on the strength of a verified import, not on steps having
+        # been marked complete by some other route. A failed or conflicting import leaves no
+        # row here, so the page cannot be sealed as though it had succeeded.
+        imported = connection.execute(
+            "SELECT 1 FROM imported_results WHERE session_id=? AND page_id=? AND status='verified'",
+            (session_id, page_id)).fetchone()
+        if not imported:
+            raise ValueError("cannot checkpoint a page without a verified result import")
     steps = connection.execute(
         "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id=? AND page_id=? ORDER BY ordinal",
         (session_id, page_id),
@@ -1226,6 +1415,15 @@ def main() -> None:
     complete.add_argument("--worker-id", required=True)
     complete.add_argument("--step-id", required=True)
     complete.add_argument("--observed-sha256", required=True)
+    # Narrow on purpose: where the result is and which grant authorised it. Everything it
+    # is checked against is read from the database, because a caller that could supply its
+    # own expectations could satisfy any of them.
+    import_result_command = commands.add_parser("import-result")
+    import_result_command.add_argument("--session-id", required=True)
+    import_result_command.add_argument("--worker-id", required=True)
+    import_result_command.add_argument("--page-id", required=True)
+    import_result_command.add_argument("--result", required=True, type=Path)
+    import_result_command.add_argument("--grant-id", required=True)
     checkpoint = commands.add_parser("checkpoint")
     checkpoint.add_argument("--session-id", required=True)
     checkpoint.add_argument("--worker-id", required=True)
@@ -1255,6 +1453,9 @@ def main() -> None:
         result = observe_page(connection, args.session_id, args.worker_id, args.candidate, value)
     elif args.command == "export-page":
         result = export_page(connection, args.session_id, args.worker_id, args.page_id, args.output)
+    elif args.command == "import-result":
+        result = import_result(connection, args.session_id, args.page_id, args.worker_id,
+                               args.result, args.grant_id)
     elif args.command == "complete-step":
         result = complete_step(
             connection, args.session_id, args.worker_id, args.step_id, args.observed_sha256
