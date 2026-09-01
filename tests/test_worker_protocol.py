@@ -218,6 +218,7 @@ class PageChainTests(unittest.TestCase):
         value = {
             "protocol_version": PROTOCOL.PROTOCOL_VERSION, "session_id": "session-1",
             "page_id": "page-1", "package_sha256": "a" * 64, "final_action_activations": 0,
+            "side_effect_attribution": "complete",
             "results": [{"action_id": "step-1", "outcome": "verified", "observed_sha256": "b" * 64},
                         {"action_id": "step-2", "outcome": "verified", "observed_sha256": "c" * 64}],
         }
@@ -301,6 +302,9 @@ class PageChainTests(unittest.TestCase):
         # Null is what an unobservable target yields, and it must not import as a zero.
         self.refuses("final_action_count_unproven",
                      lambda: self.checked_result(self.result(final_action_activations=None)))
+        # A side effect nobody could attribute is not evidence of a clean run either.
+        self.refuses("side_effects_unattributed", lambda: self.checked_result(
+            self.result(side_effect_attribution="unproven")))
 
     def test_a_result_carrying_a_value_is_refused_at_any_depth(self):
         for key in ("value", "text", "cookie", "token", "file_path", "options", "page_text"):
@@ -370,6 +374,9 @@ class PageChainTests(unittest.TestCase):
                          set(PROTOCOL.schema("worker-request")["properties"]))
         self.assertEqual(PROTOCOL.RESULT_FIELDS,
                          set(PROTOCOL.schema("worker-result")["properties"]))
+        self.assertEqual(
+            set(PROTOCOL.schema("worker-result")["properties"]
+                ["side_effect_attribution"]["enum"]), {"complete", "unproven"})
 
     def test_error_codes_come_from_a_closed_vocabulary(self):
         entries = self.result()["results"]

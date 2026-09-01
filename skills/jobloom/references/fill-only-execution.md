@@ -154,6 +154,12 @@ exactly the pending steps in order with their values and expected hashes, and th
 the attestation that is live now. An added action, an edited value, a changed hash or a
 swapped surface each refuse.
 
+The redemption token travels in a 0600 capability file, never in `argv`: process arguments are
+readable by other processes this user runs, which is precisely who the token excludes.
+Revocation reports which of four things happened — unknown, already revoked, already consumed,
+or revoked — because returning success for a grant that never existed is an absence turned
+into a fact.
+
 Redemption is where single-use lives. It is an atomic update of that row, not a marker beside
 a file path, so copying the package and re-running buys nothing: the second redemption updates
 zero rows. The response carries the parameters the run may use — target, origin, renderer
@@ -166,8 +172,25 @@ so a caller who can already choose that address has already chosen everything. T
 narrower and real — a genuine authority refuses a package it never issued, refuses it twice,
 and refuses it after expiry or revocation.
 
-Scoped guards go in before the first action and come out before control returns, because a
-guard left installed would change how the user's own browsing behaves. **Exactly one document
+Scoped guards go in before the first action and are removed by **destroying the browser
+context**, not by unrouting a page that then keeps living — an earlier version unrouted and
+closed the browser afterwards, leaving a short but real window in which the page was alive and
+unguarded. The worker owns its context, so there is no moment at which the page exists without
+the guard, and nothing has to be handed back.
+
+**No static wait is a safety boundary.** There is a 150ms pause between actions so an
+immediate side effect can be attributed to the action that caused it, and nothing rests on it:
+a page need only call `setTimeout(…, 400)` to land after any number that could be chosen.
+The replay ships two hazards that do exactly that, with a control run proving the timer really
+fires and really reaches the server when nothing stops it. What stops it in a worker run is
+that the context is destroyed unconditionally, and the target's counter is read *after* that
+destruction. A violation that surfaces only during teardown cannot be attributed to an action,
+so the envelope reports `side_effect_attribution: unproven` and `validate_result` refuses it —
+an unattributable run is not importable rather than quietly recorded as clean.
+
+The oracle baseline is read **before a browser exists**. A run that cannot read it is refused
+there and then, rather than executed and rejected at import once the user's data is already on
+the page and the grant is spent. **Exactly one document
 load is allowed, to the exact attested URL, before any action runs.** Same-origin GET is not
 safe by virtue of being same-origin: a form with `method="GET"` submits by navigating, and an
 input handler can set `window.location`, so an earlier version filled one field, reached the

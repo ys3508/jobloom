@@ -44,10 +44,12 @@ LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
 # Every operation this worker knows how to perform. Nothing here can leave the page.
 SUPPORTED_OPERATIONS = {"fill", "select", "check", "uncheck", "upload"}
 
-# Long enough for a navigation an action triggered to reach the guard, short enough that a
-# page of fields does not become slow. Deciding an action's outcome before its own
-# side effects have arrived is how a submit gets reported as a successful fill.
-SETTLE_MILLISECONDS = 150
+# A pause between actions so an immediate side effect can be attributed to the action that
+# caused it. It is **not** a safety boundary and nothing may rest on it: a page only has to
+# call `setTimeout(..., 400)` to land after any number chosen here. Safety comes from the
+# guard outliving every action — it is removed by destroying the browser context, not before
+# it — and from the target's own counter being read after that destruction.
+ATTRIBUTION_MILLISECONDS = 150
 
 
 class WorkerRefusal(RuntimeError):
@@ -56,6 +58,21 @@ class WorkerRefusal(RuntimeError):
 
 def _refuse(code: str) -> None:
     raise WorkerRefusal(code)
+
+
+def read_capability(path: Path) -> tuple[str, str]:
+    """Read the redemption endpoint and its token from a 0600 file.
+
+    Not from `argv`, where any process this user runs can read it, and not from an
+    environment variable, which children inherit.
+    """
+    if (os.stat(path).st_mode & 0o777) != 0o600:
+        _refuse("capability_permissions")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    url, token = document.get("authority_url"), document.get("token")
+    if not isinstance(url, str) or not isinstance(token, str) or not url or not token:
+        _refuse("malformed_capability")
+    return url, token
 
 
 def redeem(authority_url: str, token: str, grant_id: str,
@@ -203,9 +220,10 @@ class PageGuards:
         return self
 
     def __exit__(self, *exception):
-        for event, handler in self._handlers:
-            self.page.remove_listener(event, handler)
-        self.page.unroute_all(behavior="ignoreErrors")
+        # Deliberately nothing. An earlier version unrouted here and closed the browser
+        # afterwards, which left a short but real window in which the page was live and
+        # unguarded. The guard is removed by destroying the context it is installed on, so
+        # there is no moment at which the page exists without it.
         return False
 
 
@@ -314,12 +332,21 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
     target = authorisation["target"]
     oracle_url = authorisation["oracle_url"]
 
+    # Before a browser exists, let alone a filled field. The replay's acceptance rests on
+    # the target's own counter, so a run that cannot read it is refused now rather than
+    # executed and rejected at import — by which point the user's data is on the page and the
+    # grant is spent.
     before = _read_oracle(oracle_url)
+    if before is None:
+        _refuse("oracle_unavailable")
+
     results: list[dict[str, Any]] = []
     stopped_on: str | None = None
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not headed)
         try:
+            # The worker's own context, so removing the guard means destroying the context
+            # rather than unrouting a page that then keeps living.
             context = browser.new_context()
             page = context.new_page()
             # Short and explicit. A page that will not settle should not hold the user's
@@ -350,7 +377,7 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
                     # action call returns, so let the page settle before deciding. Without
                     # this a fill that submitted the form could be reported `verified`
                     # because the abort had not happened yet.
-                    page.wait_for_timeout(SETTLE_MILLISECONDS)
+                    page.wait_for_timeout(ATTRIBUTION_MILLISECONDS)
                     entry: dict[str, Any] = {"action_id": action["step_id"],
                                              "outcome": outcome,
                                              "control": action["control"]}
@@ -365,11 +392,22 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
                                  "error_code": _violation_code(guards.violations[0])}
                         stopped_on = entry["error_code"]
                     results.append(entry)
+                # Count what the actions produced before sealing, so anything the page does
+                # from here on — including during teardown — is late by construction.
+                during_actions = len(guards.violations)
                 guards.seal()
-                observed_violations = list(guards.violations)
+            # Destroying the context is what removes the guard, and it happens here, while
+            # every route handler is still registered. A side effect scheduled to land after
+            # the last action either meets the guard or does not happen at all.
+            context.close()
+            late_violations = guards.violations[during_actions:]
+            observed_violations = list(guards.violations)
         finally:
             browser.close()
 
+    # Read after the context is gone. A delayed submit that slipped past the guard would show
+    # up here as a moved counter; one the guard caught shows up as a late violation. Either
+    # way the run is not reported as clean.
     after = _read_oracle(oracle_url)
     envelope = {
         "protocol_version": worker_protocol.PROTOCOL_VERSION,
@@ -377,8 +415,12 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
         "package_sha256": digest,
         # A number only when the target itself was counting. Otherwise `null`: the guard
         # observing nothing is evidence about the guard, not about the target.
-        "final_action_activations": (
-            after - before if before is not None and after is not None else None),
+        "final_action_activations": (after - before if after is not None else None),
+        # Whether every side effect can be attributed to the action that caused it. A
+        # violation that only appeared while the context was being destroyed cannot be, and
+        # `validate_result` refuses anything but `complete`, so an unattributable run is not
+        # importable rather than quietly recorded as clean.
+        "side_effect_attribution": "unproven" if late_violations else "complete",
         "results": results,
     }
     handle = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -387,6 +429,7 @@ def run(package_path: Path, output_path: Path, authority_url: str, authority_tok
         stream.write("\n")
     return {"output": str(output_path), "action_count": len(package["actions"]),
             "guard_observations": observed_violations,
+            "late_violations": late_violations,
             "final_action_evidence": "replay_oracle" if before is not None else "unobservable",
             "stopped_on": stopped_on}
 
@@ -407,19 +450,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--authority-url", required=True,
-                        help="the local endpoint that redeems one grant, once")
-    parser.add_argument("--authority-token", required=True)
+    parser.add_argument("--capability", type=Path, required=True,
+                        help="a 0600 file naming the redemption endpoint and its token")
     parser.add_argument("--grant-id", required=True)
     parser.add_argument("--headless", action="store_true",
                         help="tests only; a run the user cannot see is a run they cannot stop")
     arguments = parser.parse_args()
     # Value-free by construction: counts and a path the caller already knows.
-    # No `--oracle-url`: the oracle is a capability of the surface the authority names, not
-    # something a caller may point at a service that returns a constant zero.
-    print(json.dumps(run(arguments.package, arguments.output, arguments.authority_url,
-                         arguments.authority_token, arguments.grant_id,
-                         headed=not arguments.headless), indent=2))
+    # The token arrives in a 0600 file, never in `argv`: process arguments are readable by
+    # other processes this user runs, which is exactly who the token excludes.
+    authority_url, token = read_capability(arguments.capability)
+    # No `--oracle-url` either: the oracle is a capability of the surface the authority
+    # names, not something a caller may point at a service that returns a constant zero.
+    summary = run(arguments.package, arguments.output, authority_url, token,
+                  arguments.grant_id, headed=not arguments.headless)
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

@@ -6,12 +6,13 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "protocol_version",
-    "session_id",
-    "page_id",
-    "package_sha256",
     "final_action_activations",
-    "results"
+    "package_sha256",
+    "page_id",
+    "protocol_version",
+    "results",
+    "session_id",
+    "side_effect_attribution"
   ],
   "properties": {
     "protocol_version": {
@@ -95,6 +96,13 @@
         }
       },
       "description": "One entry per issued action, in the order they were issued. Missing, extra, duplicated and reordered results all fail closed. `not_attempted` means execution stopped at an earlier violation and this action was never run — deliberately distinct from `refused`, so which action caused the stop stays legible."
+    },
+    "side_effect_attribution": {
+      "enum": [
+        "complete",
+        "unproven"
+      ],
+      "description": "Whether every side effect could be attributed to the action that caused it. `unproven` when a violation only surfaced while the browser context was being destroyed. A static wait is never a completion boundary — a page need only schedule its submit later — so the guarantee is that the guard was still installed when the context died, not that nothing happened within some number of milliseconds. `validate_result` accepts only `complete`."
     }
   },
   "$comment": "Refused anywhere at any depth: value, values, text, inner_text, html, outer_html, content, label, options, cookie, cookies, token, session_token, authorization, path, file_path, local_path, screenshot, page_text, answer. Options in particular are transient observation data only and never reach a persisted observation."

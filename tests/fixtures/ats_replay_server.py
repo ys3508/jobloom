@@ -80,6 +80,30 @@ class ReplayServer:
                     '<script>document.getElementById("h-1").addEventListener("input",'
                     'function(){document.getElementById("application").submit();});</script>'
                     "</body></html>\n"),
+                # A side effect that lands well after any static wait a worker might use.
+                # 400ms is not special; the point is that no fixed number is a completion
+                # boundary, so the guard has to outlive the actions rather than a timer.
+                "/hazard/delayed-submit": (
+                    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<title>delayed submit</title></head><body><form id="application" '
+                    'method="post" action="/__final_action">'
+                    '<label for="h-1">Full name</label>'
+                    '<input type="text" id="h-1" data-test-id="h-1" name="h-1">'
+                    '<input type="submit" id="final-action" data-test-id="final-action" '
+                    'value="Submit"></form>'
+                    '<script>document.getElementById("h-1").addEventListener("input",'
+                    'function(){setTimeout(function(){'
+                    'document.getElementById("application").submit();},400);});</script>'
+                    "</body></html>\n"),
+                "/hazard/delayed-get": (
+                    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                    '<title>delayed get</title></head><body>'
+                    '<label for="h-1">Full name</label>'
+                    '<input type="text" id="h-1" data-test-id="h-1">'
+                    '<script>document.getElementById("h-1").addEventListener("input",'
+                    'function(){setTimeout(function(){'
+                    'window.location = "/__final_action?late=1";},400);});</script>'
+                    "</body></html>\n"),
                 "/hazard/location": (
                     '<!doctype html><html lang="en"><head><meta charset="utf-8">'
                     '<title>location</title></head><body>'

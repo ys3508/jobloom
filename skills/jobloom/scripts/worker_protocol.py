@@ -70,7 +70,7 @@ REQUEST_FIELDS = {
 }
 RESULT_FIELDS = {
     "protocol_version", "session_id", "page_id", "package_sha256",
-    "final_action_activations", "results",
+    "final_action_activations", "side_effect_attribution", "results",
 }
 RESULT_ENTRY_FIELDS = {"action_id", "outcome", "observed_sha256", "control", "error_code"}
 
@@ -177,6 +177,11 @@ def validate_result(result: dict[str, Any], *, expected_session: str, expected_p
     activations = result.get("final_action_activations")
     _require(activations is not None, "final_action_count_unproven")
     _require(activations == 0, "final_action_activated")
+    # A side effect nobody could attribute to an action is not evidence of a clean run. A
+    # static wait can always be outlasted, so "nothing happened within N milliseconds" is
+    # never the claim; "the guard was still installed when the context died" is.
+    _require(result.get("side_effect_attribution") == "complete",
+             "side_effects_unattributed")
     entries = result.get("results")
     _require(isinstance(entries, list), "malformed_results")
     seen: list[str] = []

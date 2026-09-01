@@ -24,11 +24,13 @@ package's own account of them.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 
@@ -89,6 +91,19 @@ class ExecutionAuthority:
         self.origin = f"http://{host}:{port}"
         self.url = f"{self.origin}/redeem"
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def write_capability(self, path: Path) -> Path:
+        """Hand the token over as a 0600 file rather than on a command line.
+
+        Process arguments are readable by any process the same user runs, so a token in
+        `argv` would contradict the one thing the token is for: another local process must
+        not be able to spend a grant.
+        """
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump({"authority_url": self.url, "token": self.token}, stream)
+            stream.write("\n")
+        return path
 
     def __enter__(self) -> "ExecutionAuthority":
         self._thread.start()

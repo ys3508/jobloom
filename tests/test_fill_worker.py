@@ -48,6 +48,7 @@ AUTHORITY = load_script("execution_authority")
 from tests.pdf_fixture import synthetic_pdf
 
 import hashlib
+import inspect
 import os
 import urllib.error
 import urllib.request
@@ -588,6 +589,208 @@ class BrowserExecutionTests(_SessionBase):
                            headed=False, at=self.now)
             self.assertEqual(str(caught.exception), "authority_unreachable")
             self.assertEqual(self.final_actions(server), 0)
+
+
+
+
+class RevocationTests(_SessionBase):
+    """Revoking says which of four things happened, and never invents a success."""
+
+    def setUp(self):
+        self.now = AT
+        super().setUp()
+
+    def test_revoking_a_grant_that_does_not_exist_is_not_a_success(self):
+        # The old version ran the UPDATE without reading rowcount and returned revoked=True,
+        # turning an absence into a fact.
+        outcome = FILL.revoke_execution_grant(self.db, "grant-never-existed", self.now)
+        self.assertEqual(outcome, {"grant_id": "grant-never-existed", "revoked": False,
+                                   "status": "unknown"})
+
+    def test_the_four_states_are_distinguished(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            first = self.issue(package)
+            self.assertEqual(
+                FILL.revoke_execution_grant(self.db, first["grant_id"], self.now)["status"],
+                "revoked")
+            self.assertEqual(
+                FILL.revoke_execution_grant(self.db, first["grant_id"], self.now)["status"],
+                "already_revoked")
+            second = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            FILL.redeem_execution_grant(self.db, second["grant_id"], digest, self.now)
+            outcome = FILL.revoke_execution_grant(self.db, second["grant_id"], self.now)
+            self.assertEqual(outcome["status"], "already_consumed")
+            self.assertFalse(outcome["revoked"])
+
+
+@unittest.skipUnless(PLAYWRIGHT, "playwright is not installed")
+class TimingBoundaryTests(_SessionBase):
+    """A static wait is not a completion boundary; the guard outliving the context is."""
+
+    def setUp(self):
+        self.now = AT
+        super().setUp()
+
+    def final_actions(self, server):
+        return json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))[
+            "final_action_activations"]
+
+    def execute(self, server, name="result.json"):
+        package = self.export(f"{name}.package.json")
+        issued = self.issue(package)
+        output = self.root / name
+        with self.authority() as service:
+            summary = WORKER.run(package, output, service.url, service.token,
+                                 issued["grant_id"], headed=False, at=self.now)
+        return json.loads(output.read_text(encoding="utf-8")), summary
+
+    def unguarded_control(self, server, path, field_id="h-1"):
+        """What the same page does with no guard and no teardown: the counter moves.
+
+        Without this the zeros below prove nothing — a submit that never fires and a submit
+        that was stopped look identical from the outside.
+        """
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_context().new_page()
+                page.goto(f"{server.origin}{path}", wait_until="domcontentloaded")
+                page.locator(f'[data-test-id="{field_id}"]').fill("Verified Candidate")
+                page.wait_for_timeout(1500)  # far past the page's own 400ms timer
+            finally:
+                browser.close()
+        return self.final_actions(server)
+
+    def test_a_submit_scheduled_past_any_static_wait_never_reaches_the_target(self):
+        """The 150ms pause is not what stops this, and the test says so.
+
+        The page schedules its submit 400ms after the input event — past any number a worker
+        could pick. The control run proves the timer really fires and really reaches the
+        server. The worker's run leaves the counter untouched, because the context is
+        destroyed unconditionally rather than after a wait that could be outlasted.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.assertEqual(self.unguarded_control(server, "/hazard/delayed-submit"), 1)
+            self.replay_session(server, "/hazard/delayed-submit", field_id="h-1")
+            envelope, _ = self.execute(server)
+            # Still one, from the control run: the worker's run added nothing.
+            self.assertEqual(self.final_actions(server), 1)
+            self.assertEqual(envelope["final_action_activations"], 0)
+
+    def test_a_delayed_get_navigation_never_reaches_the_target_either(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.assertEqual(self.unguarded_control(server, "/hazard/delayed-get"), 1)
+            self.replay_session(server, "/hazard/delayed-get", field_id="h-1")
+            envelope, _ = self.execute(server)
+            self.assertEqual(self.final_actions(server), 1)
+            self.assertEqual(envelope["final_action_activations"], 0)
+
+    def test_a_late_violation_makes_the_run_unattributable_rather_than_clean(self):
+        # Reached directly, because whether a page's own timer fires before teardown is not
+        # something a test should race on: what matters is what the envelope says when one
+        # does.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            issued = self.issue(package)
+            original = WORKER.PageGuards.seal
+
+            def seal_then_trip(self):
+                original(self)
+                self.violations.append("submit_attempted")
+
+            WORKER.PageGuards.seal = seal_then_trip
+            self.addCleanup(setattr, WORKER.PageGuards, "seal", original)
+            with self.authority() as service:
+                WORKER.run(package, self.root / "late.json", service.url, service.token,
+                           issued["grant_id"], headed=False, at=self.now)
+            envelope = json.loads((self.root / "late.json").read_text(encoding="utf-8"))
+            self.assertEqual(envelope["side_effect_attribution"], "unproven")
+            with self.assertRaises(PROTOCOL.ProtocolError) as caught:
+                PROTOCOL.validate_result(
+                    envelope, expected_session="session-1", expected_page="page-1",
+                    expected_package_sha256=envelope["package_sha256"],
+                    expected_action_ids=[entry["action_id"] for entry in envelope["results"]],
+                    at=self.now)
+            self.assertEqual(str(caught.exception), "side_effects_unattributed")
+
+    def test_the_guard_is_never_removed_while_the_page_is_alive(self):
+        # There is nothing to unroute: destroying the context is the removal.
+        body = "\n".join(line for line in
+                          inspect.getsource(WORKER.PageGuards.__exit__).split("\n")
+                          if not line.strip().startswith("#"))
+        self.assertNotIn("unroute", body)
+        self.assertNotIn("remove_listener", body)
+        run_source = inspect.getsource(WORKER.run)
+        self.assertIn("context.close()", run_source)
+        self.assertLess(run_source.index("guards.seal()"), run_source.index("context.close()"))
+        # And the oracle is read after the context is gone, not before.
+        self.assertLess(run_source.index("context.close()"),
+                        run_source.rindex("_read_oracle(oracle_url)"))
+
+    def test_an_unreadable_oracle_stops_before_a_field_is_touched(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            issued = self.issue(package)
+
+            def blind_redeem(connection, grant_id, package_sha256, at):
+                answer = FILL.redeem_execution_grant(connection, grant_id, package_sha256, at)
+                if answer.get("authorised"):
+                    # Same surface, an oracle path that is not being served.
+                    answer["oracle_url"] = answer["origin"] + "/__state-missing"
+                return answer
+
+            with self.authority(redeem=blind_redeem) as service:
+                with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                    WORKER.run(package, self.root / "blind.json", service.url, service.token,
+                               issued["grant_id"], headed=False, at=self.now)
+            self.assertEqual(str(caught.exception), "oracle_unavailable")
+            # Nothing was opened and nothing was typed: the page still serves its blank form.
+            page = urllib.request.urlopen(f"{server.origin}/lever/0", timeout=5).read().decode()
+            self.assertNotIn("Verified Candidate", page)
+            self.assertEqual(self.final_actions(server), 0)
+
+
+class CapabilityTests(_SessionBase):
+    """The authority token travels in a 0600 file, never anywhere a neighbour can read."""
+
+    def setUp(self):
+        self.now = AT
+        super().setUp()
+
+    def test_the_token_is_read_from_a_private_file_and_leaks_nowhere(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            self.issue(package)
+            with self.authority() as service:
+                capability = service.write_capability(self.root / "capability.json")
+                self.assertEqual(os.stat(capability).st_mode & 0o777, 0o600)
+                url, token = WORKER.read_capability(capability)
+                self.assertEqual((url, token), (service.url, service.token))
+                # Not in the command line the worker exposes.
+                parser_source = inspect.getsource(WORKER.main)
+                self.assertNotIn("--authority-token", parser_source)
+                self.assertIn("--capability", parser_source)
+                # Not in the package, the events, or the exported action file.
+                self.assertNotIn(service.token, package.read_text(encoding="utf-8"))
+                events = " ".join(row[0] for row in self.db.execute(
+                    "SELECT metadata_json FROM fill_events"))
+                self.assertNotIn(service.token, events)
+
+    def test_a_world_readable_capability_file_is_refused(self):
+        capability = self.root / "loose.json"
+        capability.write_text(json.dumps({"authority_url": "http://127.0.0.1:1/redeem",
+                                          "token": "t"}), encoding="utf-8")
+        capability.chmod(0o644)
+        with self.assertRaises(WORKER.WorkerRefusal) as caught:
+            WORKER.read_capability(capability)
+        self.assertEqual(str(caught.exception), "capability_permissions")
 
 
 if __name__ == "__main__":

@@ -545,12 +545,29 @@ def issue_execution_grant(connection: sqlite3.Connection, session_id: str, page_
 
 def revoke_execution_grant(connection: sqlite3.Connection, grant_id: str,
                            at: datetime) -> dict[str, Any]:
-    """Withdraw an unused grant. State lives here, because this is what redemption consults."""
-    connection.execute(
-        "UPDATE execution_grants SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL",
-        (at.isoformat(), grant_id))
+    """Withdraw an unused grant, and say which of four things actually happened.
+
+    The earlier version ran the update and returned `revoked: True` without looking at
+    `rowcount`, so revoking a grant that never existed reported success — an absence turned
+    into a fact, which is the mistake this project keeps having to unmake.
+    """
+    row = connection.execute(
+        "SELECT consumed_at, revoked_at FROM execution_grants WHERE grant_id=?",
+        (grant_id,)).fetchone()
+    if not row:
+        return {"grant_id": grant_id, "revoked": False, "status": "unknown"}
+    if row["revoked_at"]:
+        return {"grant_id": grant_id, "revoked": False, "status": "already_revoked"}
+    if row["consumed_at"]:
+        # Nothing left to withdraw: it has already been spent.
+        return {"grant_id": grant_id, "revoked": False, "status": "already_consumed"}
+    cursor = connection.execute(
+        "UPDATE execution_grants SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL "
+        "AND consumed_at IS NULL", (at.isoformat(), grant_id))
     connection.commit()
-    return {"grant_id": grant_id, "revoked": True}
+    if cursor.rowcount != 1:
+        return {"grant_id": grant_id, "revoked": False, "status": "race_lost"}
+    return {"grant_id": grant_id, "revoked": True, "status": "revoked"}
 
 
 def redeem_execution_grant(connection: sqlite3.Connection, grant_id: str,
