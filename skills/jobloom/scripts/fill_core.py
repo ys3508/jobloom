@@ -107,6 +107,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
 def _add_missing_columns(connection: sqlite3.Connection) -> None:
     existing = {row["name"] for row in connection.execute("PRAGMA table_info(fill_pages)")}
     for name, definition in (("final_page", "INTEGER NOT NULL DEFAULT 0"),
+                             ("submit_control_seen", "INTEGER NOT NULL DEFAULT 0"),
                              ("predecessor_checkpoint_sha256", "TEXT")):
         if existing and name not in existing:
             connection.execute(f"ALTER TABLE fill_pages ADD COLUMN {name} {definition}")
@@ -150,6 +151,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             restricted_requests_json TEXT NOT NULL,
             status TEXT NOT NULL,
             final_page INTEGER NOT NULL DEFAULT 0,
+            submit_control_seen INTEGER NOT NULL DEFAULT 0,
             predecessor_checkpoint_sha256 TEXT,
             created_at TEXT NOT NULL,
             completed_at TEXT,
@@ -658,12 +660,15 @@ def observe_page(
     stored_observation = canonical_json(sanitized_observation)
     connection.execute("""
         INSERT INTO fill_pages (
-            session_id, page_id, page_index, page_url, final_page,
+            session_id, page_id, page_index, page_url, final_page, submit_control_seen,
             predecessor_checkpoint_sha256, observation_json, observation_sha256,
             legal_items_json, restricted_requests_json, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
     """, (session_id, page_id, observation["page_index"], sanitized_page_url,
-          int(final_page and submit_seen), predecessor, stored_observation,
+          # Two independent observations. Folding them together would erase the one case
+          # worth catching: an observer that declared a page final without seeing the submit
+          # control, which is a contradiction, not a page that is merely not final.
+          int(final_page), int(submit_seen), predecessor, stored_observation,
           canonical_hash(sanitized_observation), canonical_json(sorted(legal_items)),
           canonical_json(sorted(restrictions)), timestamp))
     connection.execute(
@@ -882,8 +887,6 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
     ).fetchall()
     if not pages or any(page["status"] != "completed" for page in pages):
         raise ValueError("all observed pages require completed checkpoints")
-    if not session["submit_control_seen"]:
-        raise ValueError("final submit control has not been observed")
     fields = connection.execute(
         "SELECT * FROM fill_steps WHERE session_id=? ORDER BY ordinal", (session_id,)
     ).fetchall()
@@ -912,11 +915,13 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
         "final_page": bool(page["final_page"]),
         "predecessor_checkpoint_sha256": page["predecessor_checkpoint_sha256"],
         "checkpoint_sha256": checkpoints.get(page["page_id"]),
-        "submit_control_seen": bool(page["final_page"]),
+        "submit_control_seen": bool(page["submit_control_seen"]),
     } for page in pages]
     issue = worker_protocol.chain_issue(chain)
     if issue:
         raise ValueError(f"form coverage is incomplete: {issue}")
+    if not session["submit_control_seen"]:
+        raise ValueError("final submit control has not been observed")
     field_policy.finalize_handling(
         connection, session["application_id"], observed_eeo,
         canonical_hash([page["observation_sha256"] for page in pages]), at or now_utc())

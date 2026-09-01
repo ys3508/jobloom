@@ -5,29 +5,88 @@
   "description": "What comes back from a worker: hashes and stable codes, never observed values or page text. The worker is an untrusted executor and fill_core is the authority, so every field here is checked on the way in and every check fails closed.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocol_version", "session_id", "page_id", "package_sha256",
-               "final_action_activations", "results"],
+  "required": [
+    "protocol_version",
+    "session_id",
+    "page_id",
+    "package_sha256",
+    "final_action_activations",
+    "results"
+  ],
   "properties": {
-    "protocol_version": {"const": "1.0.0"},
-    "session_id": {"type": "string", "maxLength": 128},
-    "page_id": {"type": "string", "maxLength": 128},
-    "package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "protocol_version": {
+      "const": "1.0.0"
+    },
+    "session_id": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "page_id": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "package_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "final_action_activations": {
       "const": 0,
       "description": "On the local replay this is a test oracle: we build the page, so we can count. On a supervised live page there is no counter, and the equivalent is a scoped guard installed for the run — a capture-phase submit-event block plus unexpected-navigation detection — removed before control returns to the user. Upload traffic is separately allowed and validated, because a file upload is a POST and 'block all POST' is not submission protection. The two must not be reported as the same evidence."
     },
     "results": {
-      "type": "array", "maxItems": 250,
+      "type": "array",
+      "maxItems": 250,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["action_id", "outcome"],
+        "required": [
+          "action_id",
+          "outcome"
+        ],
         "properties": {
-          "action_id": {"type": "string", "maxLength": 256},
-          "outcome": {"enum": ["verified", "mismatch", "not_found", "not_actionable", "refused", "error"]},
-          "observed_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-          "control": {"type": "string", "maxLength": 32},
-          "error_code": {"type": "string", "maxLength": 64}
+          "action_id": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "outcome": {
+            "enum": [
+              "verified",
+              "mismatch",
+              "not_found",
+              "not_actionable",
+              "refused",
+              "error"
+            ]
+          },
+          "observed_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "control": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "error_code": {
+            "enum": [
+              "selector_not_found",
+              "selector_ambiguous",
+              "control_disabled",
+              "control_hidden",
+              "control_detached",
+              "control_changed_since_observation",
+              "control_type_mismatch",
+              "value_rejected_by_page",
+              "upload_rejected",
+              "upload_type_not_pdf",
+              "outside_top_frame",
+              "outside_allowed_origin",
+              "navigation_attempted",
+              "final_action_refused",
+              "timeout",
+              "unknown_error"
+            ],
+            "description": "A closed vocabulary. A length bound is not value-free: 64 characters is room for a short answer or a line of page text."
+          }
         }
       },
       "description": "One entry per issued action, in the order they were issued. Missing, extra, duplicated and reordered results all fail closed."

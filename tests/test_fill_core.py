@@ -348,7 +348,7 @@ class FillCoreTests(unittest.TestCase):
             self.page(fields=[self.standard_fields()[0]]), AT,
         )
         self.complete_page()
-        with self.assertRaisesRegex(ValueError, "submit control"):
+        with self.assertRaisesRegex(ValueError, "submit_control"):
             FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", AT)
 
 

@@ -306,8 +306,16 @@ class PageChainTests(unittest.TestCase):
                     self.result(results=[{"action_id": "step-1", "outcome": "verified",
                                           "observed_sha256": "b" * 64, key: "leaked"},
                                          self.result()["results"][1]])))
-        self.refuses("forbidden_result_field",
+        # A top-level leak is now refused one step earlier, as an unknown field: the closed
+        # field set is the stricter of the two checks and runs first.
+        self.refuses("unknown_result_field",
                      lambda: self.checked_result(self.result(cookie="leaked")))
+        # Nested is where the forbidden-key scan is the only thing that catches it.
+        self.refuses("forbidden_result_field", lambda: self.checked_result(
+            self.result(results=[{"action_id": "step-1", "outcome": "verified",
+                                  "observed_sha256": "b" * 64,
+                                  "control": {"text": "Race / Ethnicity"}},
+                                 self.result()["results"][1]])))
         self.refuses("unknown_result_entry_field", lambda: self.checked_result(
             self.result(results=[{"action_id": "step-1", "outcome": "verified",
                                   "observed_sha256": "b" * 64, "selector": "#name"},
@@ -334,6 +342,67 @@ class PageChainTests(unittest.TestCase):
         self.assertEqual(metadata["properties"]["submission_action"]["type"], "null")
 
     # ---- the page chain --------------------------------------------------
+
+    def test_operations_must_match_the_issued_actions_exactly(self):
+        # An operation nobody looks up is an operation nobody checks.
+        self.refuses("operations_do_not_match_action_ids", lambda: self.checked_request(
+            self.request(operations={"step-1": "fill", "step-2": "select",
+                                     "evil": "submit"})))
+        self.refuses("operations_do_not_match_action_ids", lambda: self.checked_request(
+            self.request(operations={"step-1": "fill"})))
+        self.refuses("malformed_operations",
+                     lambda: self.checked_request(self.request(operations=None)))
+
+    def test_unknown_top_level_fields_are_refused_by_the_validator(self):
+        # The validator is what runs; a schema that drifted from it would be the only thing
+        # refusing these.
+        self.refuses("unknown_request_field",
+                     lambda: self.checked_request({**self.request(), "callback_url": "x"}))
+        self.refuses("unknown_result_field",
+                     lambda: self.checked_result({**self.result(), "page_html": "x"}))
+        self.assertEqual(PROTOCOL.REQUEST_FIELDS,
+                         set(PROTOCOL.schema("worker-request")["properties"]))
+        self.assertEqual(PROTOCOL.RESULT_FIELDS,
+                         set(PROTOCOL.schema("worker-result")["properties"]))
+
+    def test_error_codes_come_from_a_closed_vocabulary(self):
+        entries = self.result()["results"]
+        for hostile in ("Applicant answered Asian", "value=150000", "x" * 64):
+            with self.subTest(code=hostile):
+                self.refuses("unknown_error_code", lambda hostile=hostile: self.checked_result(
+                    self.result(results=[{"action_id": "step-1", "outcome": "error",
+                                          "error_code": hostile}, entries[1]])))
+        self.checked_result(self.result(results=[
+            {"action_id": "step-1", "outcome": "error", "error_code": "selector_not_found"},
+            entries[1]]))
+        self.assertEqual(
+            set(PROTOCOL.schema("worker-result")["properties"]["results"]["items"]
+                ["properties"]["error_code"]["enum"]),
+            PROTOCOL.ERROR_CODES)
+
+    def test_declaring_a_page_final_without_a_submit_control_is_a_contradiction(self):
+        # Reached through the real data flow, not by hand-building a chain: folding the two
+        # observations together made this case unreachable and the assertion meaningless.
+        self.start()
+        FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                          self.page(fields=[self.standard_fields()[0]], final_page=True), AT)
+        self.complete_page()
+        with self.assertRaisesRegex(ValueError, "final_page_without_submit_control"):
+            FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", AT)
+        row = self.db.execute(
+            "SELECT final_page, submit_control_seen FROM fill_pages").fetchone()
+        self.assertEqual((row["final_page"], row["submit_control_seen"]), (1, 0))
+
+    def test_seeing_a_submit_control_does_not_make_a_page_final(self):
+        self.start()
+        FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                          self.page(final_page=False), AT)
+        self.complete_page()
+        row = self.db.execute(
+            "SELECT final_page, submit_control_seen FROM fill_pages").fetchone()
+        self.assertEqual((row["final_page"], row["submit_control_seen"]), (0, 1))
+        with self.assertRaisesRegex(ValueError, "no_final_page_observed"):
+            FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", AT)
 
     def test_a_lone_late_page_cannot_pass_for_a_complete_form(self):
         # The gap this closes: one page at index 49 bearing a submit control satisfied every

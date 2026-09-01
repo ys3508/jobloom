@@ -48,6 +48,31 @@ FORBIDDEN_OPERATIONS = {"submit", "click", "navigate", "press", "download", "eva
 
 OUTCOME_CODES = {"verified", "mismatch", "not_found", "not_actionable", "refused", "error"}
 
+# "Bounded" is not "value-free": 64 characters is room for a short answer or a line of page
+# text, so a hostile or careless worker could return one in an error code. The vocabulary is
+# closed instead, and a worker with something else to say has to say it as `unknown_error`.
+ERROR_CODES = {
+    "selector_not_found", "selector_ambiguous", "control_disabled", "control_hidden",
+    "control_detached", "control_changed_since_observation", "control_type_mismatch",
+    "value_rejected_by_page", "upload_rejected", "upload_type_not_pdf",
+    "outside_top_frame", "outside_allowed_origin", "navigation_attempted",
+    "final_action_refused", "timeout", "unknown_error",
+}
+
+# The Python validator, not the schema, is what actually runs, so the allowed field sets live
+# here too. A schema that drifts from the code would otherwise be the only thing refusing an
+# unknown top-level field.
+REQUEST_FIELDS = {
+    "protocol_version", "session_id", "page_id", "page_index", "locale", "package_sha256",
+    "allowed_origin", "expires_at", "action_ids", "operations", "stop_before_submit",
+    "submission_action", "predecessor_checkpoint_sha256",
+}
+RESULT_FIELDS = {
+    "protocol_version", "session_id", "page_id", "package_sha256",
+    "final_action_activations", "results",
+}
+RESULT_ENTRY_FIELDS = {"action_id", "outcome", "observed_sha256", "control", "error_code"}
+
 # A result envelope carries hashes and codes. These names are how a value would arrive if a
 # worker were careless or hostile, so they are refused wherever they appear.
 FORBIDDEN_RESULT_KEYS = {
@@ -90,6 +115,7 @@ def validate_request(request: dict[str, Any], *, expected_session: str, expected
                      at: datetime) -> dict[str, Any]:
     """Check a worker request against what `fill_core` believes it issued."""
     _require(isinstance(request, dict), "request_not_an_object")
+    _require(not (set(request) - REQUEST_FIELDS), "unknown_request_field")
     _require(request.get("protocol_version") in SUPPORTED_PROTOCOL_VERSIONS,
              "unsupported_protocol_version")
     _require(request.get("session_id") == expected_session, "session_mismatch")
@@ -109,10 +135,13 @@ def validate_request(request: dict[str, Any], *, expected_session: str, expected
     action_ids = request.get("action_ids")
     _require(isinstance(action_ids, list) and action_ids, "missing_action_ids")
     _require(len(set(action_ids)) == len(action_ids), "duplicate_action_ids")
-    operations = request.get("operations") or {}
+    operations = request.get("operations")
     _require(isinstance(operations, dict), "malformed_operations")
+    # Exact equality, not containment: an operation nobody looked up is an operation nobody
+    # checked, and `{"evil": "submit"}` alongside the real actions would have been ignored.
+    _require(set(operations) == set(action_ids), "operations_do_not_match_action_ids")
     for action_id in action_ids:
-        operation = operations.get(action_id)
+        operation = operations[action_id]
         _require(operation in ALLOWED_OPERATIONS, f"unsupported_operation:{action_id}")
         _require(operation not in FORBIDDEN_OPERATIONS, f"forbidden_operation:{action_id}")
     return {"action_ids": list(action_ids), "protocol_version": request["protocol_version"]}
@@ -123,6 +152,7 @@ def validate_result(result: dict[str, Any], *, expected_session: str, expected_p
                     at: datetime) -> dict[str, Any]:
     """Check what a worker returned. Hashes and codes only, one entry per issued action."""
     _require(isinstance(result, dict), "result_not_an_object")
+    _require(not (set(result) - RESULT_FIELDS), "unknown_result_field")
     _reject_forbidden_keys(result)
     _require(result.get("protocol_version") in SUPPORTED_PROTOCOL_VERSIONS,
              "unsupported_protocol_version")
@@ -135,8 +165,7 @@ def validate_result(result: dict[str, Any], *, expected_session: str, expected_p
     seen: list[str] = []
     for entry in entries:
         _require(isinstance(entry, dict), "malformed_result_entry")
-        _require(set(entry) <= {"action_id", "outcome", "observed_sha256", "control", "error_code"},
-                 "unknown_result_entry_field")
+        _require(set(entry) <= RESULT_ENTRY_FIELDS, "unknown_result_entry_field")
         action_id = entry.get("action_id")
         _require(action_id in expected_action_ids, "unexpected_action_id")
         _require(action_id not in seen, "duplicate_result")
@@ -146,8 +175,7 @@ def validate_result(result: dict[str, Any], *, expected_session: str, expected_p
             _require(isinstance(entry.get("observed_sha256"), str)
                      and SHA256.fullmatch(entry["observed_sha256"] or ""), "malformed_observed_hash")
         error_code = entry.get("error_code")
-        _require(error_code is None or (isinstance(error_code, str) and 0 < len(error_code) <= 64),
-                 "malformed_error_code")
+        _require(error_code is None or error_code in ERROR_CODES, "unknown_error_code")
     _require(seen == list(expected_action_ids), "result_order_or_completeness_mismatch")
     return {"verified": [entry["action_id"] for entry in entries if entry["outcome"] == "verified"]}
 
