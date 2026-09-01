@@ -25,6 +25,7 @@ import archive_core  # noqa: E402
 import field_policy  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
+import worker_protocol  # noqa: E402
 from _common import require_application_material_format, require_table  # noqa: E402
 
 
@@ -103,8 +104,17 @@ def connect(path: Path | str) -> sqlite3.Connection:
     return connection
 
 
+def _add_missing_columns(connection: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(fill_pages)")}
+    for name, definition in (("final_page", "INTEGER NOT NULL DEFAULT 0"),
+                             ("predecessor_checkpoint_sha256", "TEXT")):
+        if existing and name not in existing:
+            connection.execute(f"ALTER TABLE fill_pages ADD COLUMN {name} {definition}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     field_policy.initialize(connection)
+    _add_missing_columns(connection)
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS fill_sessions (
             session_id TEXT PRIMARY KEY,
@@ -139,6 +149,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             legal_items_json TEXT NOT NULL,
             restricted_requests_json TEXT NOT NULL,
             status TEXT NOT NULL,
+            final_page INTEGER NOT NULL DEFAULT 0,
+            predecessor_checkpoint_sha256 TEXT,
             created_at TEXT NOT NULL,
             completed_at TEXT,
             PRIMARY KEY (session_id, page_id),
@@ -367,6 +379,37 @@ def _candidate_facts(connection: sqlite3.Connection, application_id: str,
     return {fact["id"]: fact for fact in candidate["facts"]}
 
 
+def _require_chain_link(connection: sqlite3.Connection, session_id: str, page_index: int,
+                        predecessor: str | None) -> None:
+    """A page joins the chain only behind the checkpointed page before it.
+
+    Without this, a session could hold one page at index 49 and satisfy every completeness
+    check `finish_session` performs. Coverage of what was seen is not coverage of the form.
+    """
+    if page_index == 0:
+        if predecessor is not None:
+            raise ValueError("the first page cannot name a predecessor checkpoint")
+        return
+    if predecessor is None:
+        raise ValueError("a later page must name the checkpoint of the page before it")
+    previous = connection.execute(
+        "SELECT p.status, c.checkpoint_sha256 FROM fill_pages p "
+        "LEFT JOIN fill_checkpoints c ON c.session_id=p.session_id AND c.page_id=p.page_id "
+        "WHERE p.session_id=? AND p.page_index=?", (session_id, page_index - 1),
+    ).fetchone()
+    if not previous:
+        raise ValueError("page indexes must be consecutive from the first page")
+    if previous["status"] != "completed" or not previous["checkpoint_sha256"]:
+        raise ValueError("the previous page must be checkpointed before the next is observed")
+    if previous["checkpoint_sha256"] != predecessor:
+        raise ValueError("predecessor checkpoint does not match the previous page")
+    final = connection.execute(
+        "SELECT 1 FROM fill_pages WHERE session_id=? AND final_page=1", (session_id,)
+    ).fetchone()
+    if final:
+        raise ValueError("no page follows the final page")
+
+
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:
     """How the user heard about a role is their statement, never an inference.
 
@@ -416,8 +459,17 @@ def observe_page(
 ) -> dict[str, Any]:
     session = _active_session(connection, session_id, worker_id, at)
     required = {"page_id", "page_index", "page_url", "fields", "legal_items", "restricted_requests"}
-    if (set(observation) - (required | {"locale"})) or (required - set(observation)):
+    optional = {"locale", "final_page", "predecessor_checkpoint_sha256"}
+    if (set(observation) - (required | optional)) or (required - set(observation)):
         raise ValueError("page observation has missing or unknown fields")
+    final_page = observation.get("final_page", False)
+    if not isinstance(final_page, bool):
+        raise ValueError("final_page must be Boolean")
+    predecessor = observation.get("predecessor_checkpoint_sha256")
+    if predecessor is not None and (
+        not isinstance(predecessor, str) or not worker_protocol.SHA256.fullmatch(predecessor)
+    ):
+        raise ValueError("predecessor_checkpoint_sha256 must be a sha256 digest")
     locale = observation.get("locale")
     if locale is not None:
         field_policy.require_locale(locale, "page locale")
@@ -441,6 +493,7 @@ def observe_page(
         "SELECT 1 FROM fill_pages WHERE session_id=? AND page_id=?", (session_id, page_id)
     ).fetchone():
         raise ValueError("page was already observed")
+    _require_chain_link(connection, session_id, observation["page_index"], predecessor)
     facts = _candidate_facts(connection, session["application_id"], candidate_path)
     current_time = at or now_utc()
     reasons: list[str] = []
@@ -605,10 +658,12 @@ def observe_page(
     stored_observation = canonical_json(sanitized_observation)
     connection.execute("""
         INSERT INTO fill_pages (
-            session_id, page_id, page_index, page_url, observation_json, observation_sha256,
+            session_id, page_id, page_index, page_url, final_page,
+            predecessor_checkpoint_sha256, observation_json, observation_sha256,
             legal_items_json, restricted_requests_json, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
-    """, (session_id, page_id, observation["page_index"], sanitized_page_url, stored_observation,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    """, (session_id, page_id, observation["page_index"], sanitized_page_url,
+          int(final_page and submit_seen), predecessor, stored_observation,
           canonical_hash(sanitized_observation), canonical_json(sorted(legal_items)),
           canonical_json(sorted(restrictions)), timestamp))
     connection.execute(
@@ -842,6 +897,8 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
                       if row["operation"] == "upload"})
     # Every page has been observed and checkpointed above, so this is the one moment at which
     # "this form has no voluntary-disclosure control" is a claim the record can support.
+    checkpoints = {row["page_id"]: row["checkpoint_sha256"] for row in connection.execute(
+        "SELECT page_id, checkpoint_sha256 FROM fill_checkpoints WHERE session_id=?", (session_id,))}
     observed_eeo = sorted({
         field["field_id"]
         for page in pages
@@ -850,6 +907,16 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
             field["field_id"], field["question"], field["control"],
             field.get("source_kind"))[1] == "voluntary_eeo"
     })
+    chain = [{
+        "page_index": page["page_index"], "status": page["status"],
+        "final_page": bool(page["final_page"]),
+        "predecessor_checkpoint_sha256": page["predecessor_checkpoint_sha256"],
+        "checkpoint_sha256": checkpoints.get(page["page_id"]),
+        "submit_control_seen": bool(page["final_page"]),
+    } for page in pages]
+    issue = worker_protocol.chain_issue(chain)
+    if issue:
+        raise ValueError(f"form coverage is incomplete: {issue}")
     field_policy.finalize_handling(
         connection, session["application_id"], observed_eeo,
         canonical_hash([page["observation_sha256"] for page in pages]), at or now_utc())

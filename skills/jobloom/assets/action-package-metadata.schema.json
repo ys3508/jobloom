@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "jobloom:action-package-metadata",
+  "title": "Private action package metadata",
+  "description": "What identifies and bounds the private action package. The package itself stays under .jobloom/ with mode 0600 and is never tracked, never printed and never used as telemetry; no value-bearing example of it exists in this repository. A non-disclosure option string may appear in the package because the worker needs the target string to select it, and it discloses nothing; a demographic value may not appear anywhere.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "session_id", "application_id", "page_id",
+               "package_sha256", "action_count", "stop_before_submit", "submission_action"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "mode": {"const": "fill_only"},
+    "session_id": {"type": "string", "maxLength": 128},
+    "application_id": {"type": "string", "maxLength": 128},
+    "page_id": {"type": "string", "maxLength": 128},
+    "package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "action_count": {"type": "integer", "minimum": 0, "maximum": 250},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "stop_before_submit": {"const": true},
+    "submission_action": {"type": "null"}
+  }
+}

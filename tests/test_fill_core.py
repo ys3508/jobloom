@@ -141,7 +141,7 @@ class FillCoreTests(unittest.TestCase):
             "page_id": "page-1", "page_index": 0,
             "page_url": "https://apply.example.com/jobs/1/apply",
             "fields": fields if fields is not None else self.standard_fields(),
-            "legal_items": [], "restricted_requests": [],
+            "legal_items": [], "restricted_requests": [], "final_page": True,
         }
         value.update(updates)
         return value
@@ -217,8 +217,8 @@ class FillCoreTests(unittest.TestCase):
         self.start()
         first_fields = [self.standard_fields()[0]]
         FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
-                          self.page(fields=first_fields), AT)
-        self.complete_page()
+                          self.page(fields=first_fields, final_page=False), AT)
+        checkpoint = self.complete_page()
         unknown = [{"field_id": "availability", "question": "When can you start?",
                     "selector": "#start", "control": "text", "required": True,
                     "sensitivity": "normal", "source_kind": "answer"},
@@ -226,7 +226,8 @@ class FillCoreTests(unittest.TestCase):
         result = FILL.observe_page(
             self.db, "session-1", "worker-1", self.candidate_path,
             self.page(fields=unknown, page_id="page-2", page_index=1,
-                      page_url="https://apply.example.com/jobs/1/apply/2"), AT,
+                      page_url="https://apply.example.com/jobs/1/apply/2",
+                      predecessor_checkpoint_sha256=checkpoint["checkpoint_sha256"]), AT,
         )
         self.assertEqual(result["state"], "waiting_for_user_answer")
         self.add_answer("answer-start", "availability", "When can you start?", "Two weeks")

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "jobloom:worker-result",
+  "title": "Fill-Only worker result",
+  "description": "What comes back from a worker: hashes and stable codes, never observed values or page text. The worker is an untrusted executor and fill_core is the authority, so every field here is checked on the way in and every check fails closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "session_id", "page_id", "package_sha256",
+               "final_action_activations", "results"],
+  "properties": {
+    "protocol_version": {"const": "1.0.0"},
+    "session_id": {"type": "string", "maxLength": 128},
+    "page_id": {"type": "string", "maxLength": 128},
+    "package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "final_action_activations": {
+      "const": 0,
+      "description": "On the local replay this is a test oracle: we build the page, so we can count. On a supervised live page there is no counter, and the equivalent is a scoped guard installed for the run — a capture-phase submit-event block plus unexpected-navigation detection — removed before control returns to the user. Upload traffic is separately allowed and validated, because a file upload is a POST and 'block all POST' is not submission protection. The two must not be reported as the same evidence."
+    },
+    "results": {
+      "type": "array", "maxItems": 250,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action_id", "outcome"],
+        "properties": {
+          "action_id": {"type": "string", "maxLength": 256},
+          "outcome": {"enum": ["verified", "mismatch", "not_found", "not_actionable", "refused", "error"]},
+          "observed_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "control": {"type": "string", "maxLength": 32},
+          "error_code": {"type": "string", "maxLength": 64}
+        }
+      },
+      "description": "One entry per issued action, in the order they were issued. Missing, extra, duplicated and reordered results all fail closed."
+    }
+  },
+  "$comment": "Refused anywhere at any depth: value, values, text, inner_text, html, outer_html, content, label, options, cookie, cookies, token, session_token, authorization, path, file_path, local_path, screenshot, page_text, answer. Options in particular are transient observation data only and never reach a persisted observation."
+}

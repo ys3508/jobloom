@@ -63,3 +63,51 @@ Completion requires:
 - no unresolved mandatory pause
 
 The engine creates the value-free FormInventory, including exact upload version IDs and legal items, then releases the lease to `waiting_for_submission_approval`. It creates no submission evidence and performs no submission.
+
+## Worker protocol and form coverage
+
+`worker_protocol.py` is the contract between `fill_core` and a browser worker, with tracked
+value-free schemas in `assets/worker-request.schema.json`,
+`assets/action-package-metadata.schema.json` and `assets/worker-result.schema.json`. Version
+`1.0.0`. The worker is an untrusted executor and `fill_core` is the authority, so every rule
+is a check on the way in and every check fails closed.
+
+A request names the session, page, package hash, expiry, allowed loopback origin, and the
+ordered action IDs with their operations. The operation vocabulary is `fill`, `select`,
+`check`, `uncheck`, `upload` — there is no click, submit, navigate, press, download or
+evaluate. That is the v1 bound made structural: with one page per run and every Next,
+Continue and final action belonging to the user, the worker has no way to leave the page it
+was given, so naming a control `submit` cannot become an instruction.
+
+A result carries action IDs, outcome codes, observed hashes, a control type and a bounded
+error code. `value`, `text`, `html`, `options`, `cookie`, `token`, any path, and the rest are
+refused at any depth. Missing, extra, duplicated and reordered results all fail closed, as do
+a tampered package hash, a replay against another session or page, an expired package, an
+unknown version, and an origin outside the expected loopback port.
+
+**`final_action_activations` must be 0, and the two ways of knowing that are not the same
+evidence.** On the local semantic replay it is a test oracle: we build the page, so we can
+count. On a supervised live page there is no counter, and the equivalent is a guard scoped to
+the run — a capture-phase submit-event block plus unexpected-navigation detection — removed
+before control returns to the user. Upload traffic is separately allowed and validated,
+because a file upload is a POST and "block all POST" is not submission protection.
+
+### The page chain
+
+`finish_session` used to require that every page in the database was checkpointed and that
+some page had shown a submit control. One page observed at index 49 satisfies both. That is
+coverage of what was seen, not coverage of the form, and `not_present` cannot rest on it.
+
+A page chain is now built one link at a time: the first page is index 0 and names no
+predecessor; every later page names the checkpoint hash of the page before it, which must
+exist, be consecutive, and already be checkpointed; indexes are unique per session; and no
+page may follow the page that declared itself final. Finishing verifies the whole chain —
+starting at 0, consecutive, all checkpointed, ending on the single final page that saw the
+submit control — and only then may `finalize_handling` write `not_present`. **While the chain
+is incomplete the voluntary-disclosure status stays `unknown`.**
+
+Two protocol details exist because of the domain rules. `locale` is bounded and shares one
+contract with non-disclosure policy registration. Field `options` are transient observation
+data used only to match a reviewed non-disclosure option: they never enter a persisted
+observation, which keeps `options_count` alone, and a page that paused on such a control is
+therefore resumed with a fresh live observation rather than replanned from its own record.

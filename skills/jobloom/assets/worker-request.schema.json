@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "jobloom:worker-request",
+  "title": "Fill-Only worker request",
+  "description": "What a browser worker is told to do for exactly one page. Value-free: the values themselves live only in the private action package under .jobloom/, which this envelope identifies by hash and never inlines.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "session_id", "page_id", "page_index", "package_sha256",
+               "allowed_origin", "expires_at", "action_ids", "operations",
+               "stop_before_submit", "submission_action"],
+  "properties": {
+    "protocol_version": {"const": "1.0.0"},
+    "session_id": {"type": "string", "maxLength": 128},
+    "page_id": {"type": "string", "maxLength": 128},
+    "page_index": {"type": "integer", "minimum": 0, "maximum": 49},
+    "locale": {
+      "type": "string", "maxLength": 32, "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$",
+      "description": "One bounded contract, shared with page observation and non-disclosure policy registration."
+    },
+    "package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "allowed_origin": {
+      "type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}$",
+      "description": "Loopback only while the executable surface is a local semantic replay. A production adapter requires its own supervised live acceptance test."
+    },
+    "expires_at": {"type": "string", "format": "date-time"},
+    "action_ids": {
+      "type": "array", "minItems": 1, "maxItems": 250, "uniqueItems": true,
+      "items": {"type": "string", "maxLength": 256},
+      "description": "Ordered. The worker performs these and nothing else."
+    },
+    "operations": {
+      "type": "object",
+      "additionalProperties": {"enum": ["fill", "select", "check", "uncheck", "upload"]},
+      "description": "No click, submit, navigate, press, download or evaluate. Every Next, Continue and final action belongs to the user, so the worker has no way to leave the page it was given."
+    },
+    "stop_before_submit": {"const": true},
+    "submission_action": {"type": "null"},
+    "predecessor_checkpoint_sha256": {
+      "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$",
+      "description": "Null only at page_index 0. Otherwise the checkpoint of the page before this one, which is what makes the page chain a chain."
+    }
+  }
+}

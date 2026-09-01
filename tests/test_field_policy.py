@@ -152,7 +152,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             "page_id": "page-1", "page_index": 0,
             "page_url": "https://apply.example.com/jobs/1/apply",
             "fields": fields if fields is not None else self.standard_fields(),
-            "legal_items": [], "restricted_requests": [],
+            "legal_items": [], "restricted_requests": [], "final_page": True,
         }
         value.update(updates)
         return value
