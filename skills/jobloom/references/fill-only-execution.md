@@ -264,14 +264,16 @@ version, session and page, package digest, action completeness and order, `verif
 action with an exact hash match, a proven `final_action_activations` of zero, and
 `side_effect_attribution: complete`.
 
-Each step's source is re-checked against the store as it is **now**, not as it was when the
-page was planned. Authorization freshness alone was not enough: `record_field` asks only
-whether an answer is active with the same value, which an expired, review-due, out-of-scope,
-precondition-failed or no-longer-auto-fillable answer all satisfy, and `record_handling` never
-re-read the policy at all. So the import runs `answer_issue` for answers, re-reads the locked
-fact from the active snapshot for facts, and runs `policy_issue` plus the reviewed vocabulary
-for a non-disclosure policy — a policy revoked, expired, moved out of scope or narrowed after
-planning no longer writes a marker.
+Each step's source is re-checked against the store as it is **now**, and for answers that
+means **re-running the planning decision**, not re-checking the row that won it. `answer_issue`
+on the original answer cannot see a newly added answer of equal specificity with a different
+value, a question form that has come to mean two things, or an immigration answer scoped to
+another application — all of which change what the system would choose, which is the thing the
+page was filled from. So the import calls `match_answer` again and requires `auto_fill_ready`,
+the same selected `answer_id`, and the same value and hash, then re-applies the
+discovery-source restriction. Facts are re-read as locked facts of the active snapshot;
+non-disclosure policies go through `policy_issue` and their reviewed vocabulary, so a policy
+revoked, expired, moved out of scope or narrowed after planning writes no marker.
 
 **Either the page's actions are all recorded or none are**, and that is a real transaction
 now. Nothing writes until every check has passed; the batch then runs inside a `SAVEPOINT`
@@ -294,6 +296,17 @@ records its digest, the grant, the package digest and the time. The same result 
 and then reports `already_imported` without duplicating a field, a marker or an event; a
 different result presented for the same grant is refused as a conflict rather than overwriting
 what was recorded.
+
+**A hash mismatch is not the same kind of failure as a refusal.** A malformed envelope, a
+wrong identity, a stale lease or a source that expired all mean the import should not happen,
+and nothing is written. An observed hash that differs means the worker did act and the page now
+holds something other than what was planned — a disagreement about the form in front of the
+user — so after confirming that no step, field, marker or verified row was written, the import
+records a value-free rejection and moves the session to `waiting_for_user_takeover`. The record
+carries a page id, a hashed step id and a stable code: neither the expected nor the observed
+hash appears, because they are properties of the value and two of them together say a great
+deal about it. Replaying the same rejected result reports `already_rejected` and does not pause
+or record again.
 
 A page may be checkpointed only on the strength of a verified import. Steps marked complete by
 some other route do not qualify, and a failed or conflicting import leaves nothing to qualify

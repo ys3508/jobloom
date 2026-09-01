@@ -1118,7 +1118,11 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
             connection, session_id, page_id, grant_id
         ):
             raise ImportRefused("import_package_mismatch")
-        return {"session_id": session_id, "page_id": page_id, "status": "already_imported",
+        # A rejected result stays rejected, and replaying it does not pause the session a
+        # second time or add a second failure event.
+        return {"session_id": session_id, "page_id": page_id,
+                "status": ("already_imported" if previous["status"] == "verified"
+                           else "already_rejected"),
                 "verified_action_count": 0, "result_sha256": result_digest}
 
     package_sha256 = _authoritative_package_hash(connection, session_id, page_id, grant_id)
@@ -1156,14 +1160,22 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
         raise ImportRefused(str(problem)) from None
 
     outcomes = {entry["action_id"]: entry for entry in envelope["results"]}
+    mismatched: sqlite3.Row | None = None
     for step in steps:
         entry = outcomes[step["step_id"]]
         if entry["outcome"] != "verified":
             # `refused`, `not_attempted`, `not_actionable`, `error` and `mismatch` all mean
-            # the page is not in the state the plan describes.
+            # the run did not do what it was asked, which is a refusal to import.
             raise ImportRefused(f"action_not_verified:{entry['outcome']}")
         if entry.get("observed_sha256") != step["expected_sha256"]:
-            raise ImportRefused("observed_hash_mismatch")
+            # Different in kind from the refusals above: the worker did act, and the page now
+            # holds something other than what was planned. That is a disagreement about the
+            # form in front of the user, so it hands control back rather than only saying no.
+            mismatched = mismatched or step
+    if mismatched is not None:
+        return _reject_with_takeover(connection, session, worker_id, page_id, mismatched,
+                                     result_digest, grant_id, package_sha256, current_time,
+                                     at)
 
     # Each step's source has to be current now, not when the page was planned. Authorization
     # freshness alone left an answer that expired, fell out of scope, or lost a precondition
@@ -1198,6 +1210,31 @@ def import_result(connection: sqlite3.Connection, session_id: str, page_id: str,
             "verified_action_count": len(steps), "result_sha256": result_digest}
 
 
+def _reject_with_takeover(connection: sqlite3.Connection, session: sqlite3.Row,
+                          worker_id: str, page_id: str, step: sqlite3.Row,
+                          result_digest: str, grant_id: str, package_sha256: str,
+                          current_time: datetime, at: datetime | None) -> dict[str, Any]:
+    """Record the rejection and hand the page to the user. Nothing successful is written.
+
+    Reached only after every action was checked and before anything was applied, so there is
+    no successful batch to undo. The record is value-free: a page id, a hashed step id and a
+    stable code. Neither the expected nor the observed hash appears — they are properties of
+    the value, and two of them together say a great deal about it.
+    """
+    connection.execute(
+        "INSERT OR IGNORE INTO imported_results (result_sha256, session_id, page_id, "
+        "grant_id, package_sha256, status, imported_at) "
+        "VALUES (?, ?, ?, ?, ?, 'rejected', ?)",
+        (result_digest, session["session_id"], page_id, grant_id, package_sha256,
+         current_time.isoformat()))
+    connection.commit()
+    paused = _pause(connection, session, ["incorrect_autofill"], worker_id, page_id, at)
+    return {"session_id": session["session_id"], "page_id": page_id, "status": "rejected",
+            "reason": "observed_hash_mismatch", "state": paused["state"],
+            "verified_action_count": 0, "result_sha256": result_digest,
+            "step_id_sha256": canonical_hash(step["step_id"])}
+
+
 def _require_source_still_valid(connection: sqlite3.Connection, session: sqlite3.Row,
                                 step: sqlite3.Row, context: dict[str, Any],
                                 at: datetime) -> None:
@@ -1209,17 +1246,28 @@ def _require_source_still_valid(connection: sqlite3.Connection, session: sqlite3
     """
     source_kind, source_id = step["source_kind"], step["source_id"]
     if source_kind == "answer":
-        row = connection.execute(
-            "SELECT * FROM answers WHERE answer_id=?", (source_id,)).fetchone()
-        if not row:
-            raise ImportRefused("answer_missing")
-        issue = answer_issue(row, context, at)
-        if issue:
-            raise ImportRefused(issue)
-        if not row["auto_fill_allowed"]:
-            raise ImportRefused("automatic_fill_not_allowed")
-        if row["answer_json"] != step["value_json"]:
+        # The whole planning decision, re-run. `answer_issue` on the original row asks only
+        # whether that row is still usable — it cannot see a newly added answer of equal
+        # specificity with a different value, a question form that now maps to two canonical
+        # meanings, or an immigration answer scoped to another application. Re-planning is
+        # what sees those, so re-planning is what runs.
+        match = answer_library.match_answer(
+            connection, step["question"], context, session["authorization_id"], at)
+        if not match.get("auto_fill_ready"):
+            raise ImportRefused(match.get("reason") or "no_applicable_answer")
+        if match.get("answer_id") != source_id:
+            # A different answer wins now, so the value on the page is not the one this
+            # system would choose.
+            raise ImportRefused("answer_selection_changed")
+        if canonical_json(match["answer"]) != step["value_json"]:
             raise ImportRefused("answer_value_changed")
+        if canonical_hash(match["answer"]) != step["expected_sha256"]:
+            raise ImportRefused("answer_hash_changed")
+        domain = field_policy.classify(step["field_id"], step["question"])
+        if domain and domain[0] == "discovery_source" and not _discovery_answer_allowed(
+            connection, source_id
+        ):
+            raise ImportRefused("discovery_source_not_user_confirmed")
     elif source_kind == "fact":
         fact = connection.execute("""
             SELECT cf.* FROM material_locks ml

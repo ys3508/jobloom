@@ -784,6 +784,19 @@ class ResultImportTests(_SessionBase):
         return json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))[
             "final_action_activations"]
 
+    def add_rival(self, answer_id, canonical_id, value, scope=None):
+        """A competing answer under an existing question form, not a second form."""
+        ANSWERS.add_answer(self.db, {
+            "answer_id": answer_id, "canonical_id": canonical_id,
+            "canonical_meaning": "Current company", "answer": value,
+            "answer_type": "stable_fact", "source_type": "user_confirmed",
+            "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
+            "validity_class": "stable",
+            "scope": scope if scope is not None else {"country": "US",
+                                                      "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
+        })
+
     def run_worker(self, server, name="result.json", extra_field_ids=()):
         """Real session, export, grant, Chromium, result — nothing fabricated."""
         self.replay_session(server, extra_field_ids=extra_field_ids)
@@ -857,7 +870,13 @@ class ResultImportTests(_SessionBase):
 
     # ---- batch atomicity --------------------------------------------------
 
-    def test_a_bad_hash_on_the_last_field_records_none_of_the_earlier_ones(self):
+    def test_a_bad_hash_records_nothing_and_hands_the_page_to_the_user(self):
+        """Different in kind from a refusal: the worker acted and the page disagrees.
+
+        Nothing successful is written — no step, field, marker or verified import row — and
+        then the session goes to takeover, because what is on the form in front of the user
+        is not what was planned.
+        """
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             _, issued, output = self.run_worker(
                 server, extra_field_ids=("lever-0-2", "lever-0-3"))
@@ -865,13 +884,40 @@ class ResultImportTests(_SessionBase):
             def break_last(envelope):
                 envelope["results"][-1]["observed_sha256"] = "f" * 64
 
-            self.refuses("observed_hash_mismatch",
-                         result=self.rewrite(output, break_last),
-                         grant_id=issued["grant_id"])
+            broken = self.rewrite(output, break_last)
+            outcome = FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
+                                         issued["grant_id"], self.now)
+            self.assertEqual(outcome["status"], "rejected")
+            self.assertEqual(outcome["reason"], "observed_hash_mismatch")
+            self.assertEqual(outcome["state"], "waiting_for_user_takeover")
             self.assertEqual(self.db.execute(
-                "SELECT COUNT(*) FROM fill_steps WHERE status='completed'").fetchone()[0], 0)
-            # Steps are still pending, so that is what refuses first.
-            with self.assertRaisesRegex(ValueError, "incomplete steps"):
+                "SELECT state FROM applications WHERE application_id='app-1'"
+            ).fetchone()["state"], "waiting_for_user_takeover")
+            # No successful writing of any kind.
+            for table, column in (("fill_steps", "status='completed'"),
+                                  ("application_fields", "1=1"),
+                                  ("nondisclosure_handling", "1=1"),
+                                  ("imported_results", "status='verified'")):
+                self.assertEqual(self.db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column}").fetchone()[0], 0, table)
+            # The failure record says nothing about the value.
+            events = " ".join(str(part) for row in self.db.execute(
+                "SELECT * FROM fill_events") for part in row)
+            self.assertIn("incorrect_autofill", events)
+            self.assertNotIn("f" * 64, events)
+            self.assertNotIn("Verified Candidate", events)
+            for row in self.db.execute("SELECT expected_sha256 FROM fill_steps"):
+                self.assertNotIn(row["expected_sha256"], events)
+            # Replaying the same rejection does not pause or record a second time.
+            before = self.db.execute("SELECT COUNT(*) FROM fill_events").fetchone()[0]
+            repeat = FILL.import_result(self.db, "session-1", "page-1", "worker-1", broken,
+                                        issued["grant_id"], self.now)
+            self.assertEqual(repeat["status"], "already_rejected")
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_events").fetchone()[0], before)
+            # The session is paused for the user, so checkpointing is refused there first;
+            # the page has nothing verified behind it either way.
+            with self.assertRaisesRegex(ValueError, "active fill session not found"):
                 FILL.checkpoint_page(self.db, "session-1", "worker-1", "page-1", "cp-1",
                                      self.now)
 
@@ -1109,7 +1155,9 @@ class ResultImportTests(_SessionBase):
                 ("expires_at", (self.now - timedelta(days=1)).isoformat(), "answer_expired"),
                 ("review_after", (self.now - timedelta(days=1)).isoformat(),
                  "answer_review_due"),
-                ("confirmation_status", "provisional", "answer_not_confirmed"),
+                # The planner filters unconfirmed answers out of the candidate set, so what
+                # comes back is "nothing applies" rather than a fact about that row.
+                ("confirmation_status", "provisional", "no_applicable_answer"),
                 ("scope_json", json.dumps({"country": "DE"}), "answer_scope_mismatch"),
                 ("preconditions_json", json.dumps({"country": "DE"}),
                  "answer_precondition_failed"),
@@ -1127,6 +1175,62 @@ class ResultImportTests(_SessionBase):
                     self.db.execute(
                         f"UPDATE answers SET {column}=? WHERE answer_id='answer-company'",
                         (keep,))
+            self.assertEqual(
+                FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
+                                   issued["grant_id"], self.now)["status"], "verified")
+
+    def test_a_competing_answer_added_after_planning_refuses_the_import(self):
+        """`answer_issue` on the original row cannot see any of these.
+
+        Each one changes what re-planning would choose, which is the decision the page was
+        filled from — so each has to be re-made, not merely re-checked.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.add_answer("answer-company", "current_company", "Current company",
+                            "Example Corp")
+            self.start(form_url=f"{server.origin}/lever/0", at=self.now)
+            FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, {
+                "page_id": "page-1", "page_index": 0,
+                "page_url": f"{server.origin}/lever/0",
+                "fields": [
+                    {"field_id": "lever-0-5", "question": "Current company",
+                     "selector": "#c", "control": "text", "required": False,
+                     "sensitivity": "normal", "source_kind": "answer"},
+                    {"field_id": "final-action", "question": "Submit application",
+                     "selector": "#s", "control": "submit", "required": True,
+                     "sensitivity": "normal"},
+                ],
+                "legal_items": [], "restricted_requests": [], "final_page": True,
+            }, self.now)
+            package = self.export("compete.package.json")
+            issued = self.issue(package)
+            output = self.root / "compete.json"
+            with self.authority() as service:
+                WORKER.run(package, output, service.url, service.token, issued["grant_id"],
+                           headed=False, at=self.now)
+            arguments = {"result": output, "grant_id": issued["grant_id"]}
+
+            # Equal specificity, different value: re-planning is a conflict, and the old row
+            # on its own still looks perfectly usable.
+            self.add_rival("answer-company-2", "current_company", "Another Corp")
+            self.refuses("conflicting_active_answers", **arguments)
+            self.db.execute("UPDATE answers SET status='revoked' "
+                            "WHERE answer_id='answer-company-2'")
+
+            # A more specific answer that now wins: the page holds the value of one this
+            # system would no longer choose.
+            self.add_rival("answer-company-3", "current_company", "Specific Corp",
+                           scope={"country": "US", "application_id": "app-1",
+                                  "company": "Example Corp"})
+            self.refuses("answer_selection_changed", **arguments)
+            self.db.execute("UPDATE answers SET status='revoked' "
+                            "WHERE answer_id='answer-company-3'")
+
+            # The question form now maps to two canonical meanings.
+            ANSWERS.add_question_form(self.db, "another_meaning", "Current company")
+            self.refuses("question_mapping_conflict", **arguments)
+            self.db.execute("DELETE FROM question_forms WHERE canonical_id='another_meaning'")
+
             self.assertEqual(
                 FILL.import_result(self.db, "session-1", "page-1", "worker-1", output,
                                    issued["grant_id"], self.now)["status"], "verified")
