@@ -31,6 +31,7 @@ if SCRIPT_DIR not in sys.path:
 
 import field_policy  # noqa: E402
 
+RENDERER_VERSION = "1.0.0"
 UPSTREAM_COMMIT = "081a5d9d793da29111e2d5331767021718f1d8b5"
 UPSTREAM_URL = "https://github.com/neonwatty/job-apply-plugin"
 UPSTREAM_LICENSE = "MIT"
@@ -131,7 +132,7 @@ def _escape(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def render_control(control: dict[str, Any], test_id: str) -> str:
+def render_control(control: dict[str, Any], test_id: str, nonce: str) -> str:
     """One accessible control. Labels and roles are what an observer reads; `data-test-id`
     is a stable identity for tests only, never a selector Jobloom is allowed to rely on."""
     kind = control["kind"]
@@ -143,7 +144,7 @@ def render_control(control: dict[str, Any], test_id: str) -> str:
     if role == "radiogroup":
         options = "".join(
             f'<label><input type="radio" name="{test_id}" '
-            f'value="{_escape(field_policy.replay_option_value(choice))}" '
+            f'value="{_escape(field_policy.replay_option_value(choice, nonce))}" '
             f'data-test-id="{test_id}--{index}"> {_escape(choice)}</label>'
             for index, choice in enumerate(control.get("choices") or [])
         )
@@ -154,7 +155,7 @@ def render_control(control: dict[str, Any], test_id: str) -> str:
         # observed pair is checkable rather than merely readable. On a real control the two
         # are unrelated strings, which is exactly why a label match alone proves nothing.
         options = "".join(
-            f'<option value="{_escape(field_policy.replay_option_value(choice))}">'
+            f'<option value="{_escape(field_policy.replay_option_value(choice, nonce))}">'
             f'{_escape(choice)}</option>'
             for choice in control.get("choices") or [])
         return (f'<label for="{test_id}">{label}</label>'
@@ -166,8 +167,8 @@ def render_control(control: dict[str, Any], test_id: str) -> str:
             f'<input type="text" {common}{required}>')
 
 
-def render_page(fixture: dict[str, Any], step_index: int, *, include_variants: bool = False,
-                final: bool = False) -> str:
+def render_page(fixture: dict[str, Any], step_index: int, nonce: str, *,
+                include_variants: bool = False, final: bool = False) -> str:
     """One page of a semantic fixture as a standalone local document.
 
     There is no automatic navigation anywhere in this markup: moving between pages is a link
@@ -176,7 +177,7 @@ def render_page(fixture: dict[str, Any], step_index: int, *, include_variants: b
     step = fixture["steps"][step_index]
     family = fixture["platformFamily"]
     controls = "".join(
-        render_control(control, f"{family}-{step_index}-{index}")
+        render_control(control, f"{family}-{step_index}-{index}", nonce)
         for index, control in enumerate(step["controls"])
     )
     variants = ""

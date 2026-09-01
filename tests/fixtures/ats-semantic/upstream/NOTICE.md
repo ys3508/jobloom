@@ -70,13 +70,16 @@ a form no employer ships. Recorded wording is not synthetic wording, and the pag
 banner makes it otherwise.
 
 Option values are distinct from labels, as on a real control. The renderer derives each value
-from its label by the one rule `field_policy.replay_option_value` can recompute, which is what
-lets an observed pair be checked instead of believed. That matters because
+from its label **under a session nonce the server generated at startup**, which is what lets an
+observed pair be checked instead of believed. That matters because
 `<option value="Asian">Prefer not to answer</option>` is a page a form could serve: not being
-able to read a value is not the same as the value being safe. A reviewed label may therefore
-select an option only where Jobloom generated both halves — its own loopback replay. On any
-other surface an approved adapter mapping with a fixed hash and version would be required, and
-none exists, so the control is the user's.
+able to read a value is not the same as the value being safe.
+
+The nonce is also why a loopback address grants nothing on its own. Any local process can
+listen on `127.0.0.1` and compute a published hash, so trust comes from a `replay_surfaces`
+record Jobloom wrote when it started this renderer — bound to the exact origin, expiring, and
+revoked when the server stops. On any other surface an approved adapter mapping with a fixed
+hash and version would be required, and none exists, so the control is the user's.
 
 The final control is a real submit that posts to a loopback counting endpoint. An earlier
 version was an inert button incrementing a `window` variable the server never read, which

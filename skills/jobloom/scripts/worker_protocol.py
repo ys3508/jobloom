@@ -82,7 +82,8 @@ FORBIDDEN_RESULT_KEYS = {
 }
 
 # What a verified chain is evidence of. Named so that a later reader of an archive cannot
-# mistake it for proof that the employer's form had no further pages.
+# mistake it for proof that the employer's form had no further pages. It is deliberately not
+# strong enough to support `not_present`, which nothing writes.
 COVERAGE_BASIS = "self_reported_page_chain"
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -199,9 +200,11 @@ def chain_issue(pages: list[dict[str, Any]]) -> str | None:
     link names a checkpoint hash computed from steps that were actually verified — and that
     nothing was skipped *within what was reported*. It does not establish that the reported
     sequence is the employer's whole form. An observer that never saw a page cannot report
-    its absence, and no artefact available here can. Anything resting on this must therefore
-    say it rests on a self-reported chain, which is why `finalize_handling` records
-    `COVERAGE_BASIS` alongside the coverage hash rather than claiming completeness outright.
+    its absence, and no artefact available here can. So nothing is allowed to rest on it:
+    `finalize_handling` does not write `not_present` at all, and the voluntary-disclosure
+    status stays `unknown` until something that can enumerate a whole form exists. Naming the
+    evidence more honestly was tried first and was not enough — a weak claim stated precisely
+    is still a weak claim.
     """
     if not pages:
         return "no_pages_observed"

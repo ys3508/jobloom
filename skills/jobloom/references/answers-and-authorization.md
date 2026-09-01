@@ -75,10 +75,14 @@ option, and only on an exact match against the option's **label**, which is what
 reviewed. A page supplies both halves of an option, so a page can lie about either:
 `<option value="Asian">Prefer not to answer</option>` offers the reviewed label and submits a
 category. Not being able to read a value is not the same as the value being safe, so the pair
-must be **checkable, not merely opaque** — v1 trusts it only where Jobloom generated both
-halves, on its own loopback replay, where the value is recomputable from the label. Any other
-surface needs an approved adapter mapping with a fixed hash and version; none exists, so the
-control is the user's. One reviewed label mapping to more than one value also pauses. Classification runs before every source branch including uploads, so a control
+must be **checkable, not merely opaque** — and checkable by provenance, not by address. A
+loopback URL is a network location: any local process can listen on `127.0.0.1` and compute a
+published hash. Trust therefore requires a `replay_surfaces` record the backend issued when it
+started the renderer, bound to that exact origin and carrying a **session nonce** that only
+Jobloom and its own renderer hold; option values are derived from the label under that nonce,
+so a rogue local server cannot produce a matching pair. The record expires and is revoked when
+the server stops. Any other surface needs an approved adapter mapping with a fixed hash and
+version; none exists, so the control is the user's. One reviewed label mapping to more than one value also pauses. Classification runs before every source branch including uploads, so a control
 declared `file` cannot outrun it. The row stores a **token and a vocabulary version**, never
 a page-facing string: `NONDISCLOSURE_VOCABULARY` lives in code, is versioned, and is reviewed
 per locale, because a free-text allowlist is precisely how a real demographic value would

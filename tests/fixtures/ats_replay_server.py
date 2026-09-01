@@ -8,24 +8,37 @@ Continue and final action belongs to the user.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "skills" / "jobloom" / "scripts"))
 
+import field_policy  # noqa: E402
 import semantic_replay  # noqa: E402
 
 UPSTREAM = Path(__file__).resolve().parent / "ats-semantic" / "upstream"
 
 
 class ReplayServer:
-    def __init__(self, families=("lever", "greenhouse", "ashby")):
+    """Starts a replay and, when given a connection, registers the surface it is serving.
+
+    The nonce is generated here and handed to the renderer. Nothing else on the machine has
+    it, which is what separates "Jobloom started this server" from "something is listening on
+    loopback".
+    """
+
+    def __init__(self, families=("lever", "greenhouse", "ashby"), connection=None,
+                 at=None, lifetime_hours=1):
         self.pages: dict[str, str] = {}
         self.final_activations = 0
+        self.nonce = secrets.token_hex(24)
         for directory in sorted(UPSTREAM.iterdir()):
             if not directory.is_dir():
                 continue
@@ -36,7 +49,8 @@ class ReplayServer:
             last = len(fixture["steps"]) - 1
             for index in range(len(fixture["steps"])):
                 self.pages[f"/{family}/{index}"] = semantic_replay.render_page(
-                    fixture, index, include_variants=(index == 0), final=(index == last))
+                    fixture, index, self.nonce,
+                    include_variants=(index == 0), final=(index == last))
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,12 +98,26 @@ class ReplayServer:
         self.host, self.port = self._httpd.server_address[:2]
         self.origin = f"http://127.0.0.1:{self.port}"
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._connection = connection
+        self.surface_id = f"replay-{self.nonce[:12]}"
+        if connection is not None:
+            issued = at or datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+            field_policy.register_replay_surface(
+                connection, self.surface_id, self.origin, self.nonce,
+                hashlib.sha256("".join(sorted(self.pages)).encode()).hexdigest(),
+                semantic_replay.RENDERER_VERSION, issued,
+                issued + timedelta(hours=lifetime_hours))
 
     def __enter__(self):
         self._thread.start()
         return self
 
     def __exit__(self, *exception):
+        if self._connection is not None:
+            # A surface outlives nothing: when the server stops, the trust it carried stops.
+            field_policy.revoke_replay_surface(
+                self._connection, self.surface_id,
+                datetime(2026, 8, 25, 12, tzinfo=timezone.utc))
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)

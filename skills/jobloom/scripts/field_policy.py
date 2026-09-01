@@ -83,7 +83,11 @@ NONDISCLOSURE_VOCABULARY: dict[str, dict[str, tuple[str, ...]]] = {
 
 # What the archive may say about a protected-characteristic control. None of these is an
 # answer; they exist so the deliberate blind spot is stated rather than discovered.
-HANDLING_MARKERS = {"policy_declined", "user_handled", "not_present"}
+HANDLING_MARKERS = {"policy_declined", "user_handled"}
+
+# Retired, not merely unused. Rows written by an earlier version are read as `unknown`,
+# because this version cannot say what evidence they rested on.
+RETIRED_MARKERS = {"not_present"}
 
 
 def require_locale(value: Any, label: str = "locale") -> str:
@@ -235,6 +239,17 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS nondisclosure_family
             ON nondisclosure_policies (question_family);
+        CREATE TABLE IF NOT EXISTS replay_surfaces (
+            surface_id TEXT PRIMARY KEY,
+            origin TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            fixture_sha256 TEXT NOT NULL,
+            renderer_version TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS replay_surface_origin ON replay_surfaces (origin);
         CREATE TABLE IF NOT EXISTS nondisclosure_handling (
             application_id TEXT NOT NULL,
             field_id TEXT NOT NULL,
@@ -392,7 +407,7 @@ def resolve_nondisclosure(
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
     if len({option["value"] for option in matches}) != 1:
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
-    if not option_mapping_trusted(form_url, matches[0]):
+    if not option_mapping_trusted(connection, form_url, matches[0], at):
         return {"applied": False, "reason": "option_mapping_unverified"}
     return {"applied": True, "policy_id": policy["policy_id"],
             "option_label": matches[0]["label"], "submitted_value": matches[0]["value"]}
@@ -435,7 +450,6 @@ INVENTORY_SCOPE = "*inventory*"
 MARKER_EVIDENCE = {
     "policy_declined": "verified_policy_step",
     "user_handled": "user_confirmation",
-    "not_present": "complete_inventory",
 }
 
 
@@ -496,13 +510,15 @@ def handling_summary(connection: sqlite3.Connection, application_id: str) -> dic
     missed control, an abandoned session, and a failed write all look like. Only a finalized
     inventory that covered every page can turn that into `not_present`.
     """
-    markers = handling_markers(connection, application_id)
+    # A row an earlier version wrote is not re-interpreted into a claim this version has
+    # decided it cannot support. It is dropped from the reading, and if nothing else is
+    # recorded the answer is `unknown`.
+    markers = {field_id: marker for field_id, marker in
+               handling_markers(connection, application_id).items()
+               if field_id != INVENTORY_SCOPE and marker not in RETIRED_MARKERS}
     if not markers:
         return {"status": "unknown", "markers": {}}
-    if set(markers) == {INVENTORY_SCOPE}:
-        return {"status": "not_present", "markers": {}}
-    return {"status": "recorded",
-            "markers": {key: value for key, value in markers.items() if key != INVENTORY_SCOPE}}
+    return {"status": "recorded", "markers": markers}
 
 
 # --- option mapping trust -------------------------------------------------
@@ -510,25 +526,95 @@ def handling_summary(connection: sqlite3.Connection, application_id: str) -> dic
 # A page supplies both halves of an option, so a page can lie about either. The value below
 # is what makes a label match mean anything: Jobloom's own replay renderer derives the value
 # from the label by this rule, so an observed pair can be recomputed rather than believed.
-def replay_option_value(label: str) -> str:
-    """The value Jobloom's own renderer emits for a label. Deterministic, and checkable."""
-    return "opt-" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+def replay_option_value(label: str, nonce: str) -> str:
+    """The value Jobloom's renderer emits for a label under one issued surface nonce.
+
+    The nonce is what makes this worth checking. The derivation rule is public, so without a
+    secret any process could compute a matching pair; with one, only the renderer Jobloom
+    started for this run can.
+    """
+    if not nonce:
+        raise ValueError("a replay option value requires an issued surface nonce")
+    digest = hashlib.sha256(f"{nonce}\0{label}".encode("utf-8")).hexdigest()
+    return f"opt-{digest[:16]}"
 
 
-def option_mapping_trusted(form_url: str, option: dict[str, str]) -> bool:
+def register_replay_surface(connection: sqlite3.Connection, surface_id: str, origin: str,
+                            nonce: str, fixture_sha256: str, renderer_version: str,
+                            issued_at: datetime, expires_at: datetime) -> dict[str, Any]:
+    """Record that Jobloom started this replay server, and on which exact origin.
+
+    Issued by the process that starts the renderer, so the backend holds the record. Nothing
+    a page says can create one.
+    """
+    parsed = urlparse(origin)
+    if parsed.scheme != "http" or not LOOPBACK_HOST.fullmatch(parsed.hostname or ""):
+        raise ValueError("a replay surface must be a loopback origin")
+    if parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("a replay surface origin carries no path")
+    if not nonce or len(nonce) < 32:
+        raise ValueError("a replay surface requires a session nonce")
+    connection.execute(
+        "INSERT INTO replay_surfaces (surface_id, origin, nonce, fixture_sha256, "
+        "renderer_version, issued_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+        (surface_id, origin, nonce, fixture_sha256, renderer_version,
+         issued_at.isoformat(), expires_at.isoformat()),
+    )
+    connection.commit()
+    return {"surface_id": surface_id, "origin": origin}
+
+
+def revoke_replay_surface(connection: sqlite3.Connection, surface_id: str,
+                          at: datetime) -> None:
+    connection.execute(
+        "UPDATE replay_surfaces SET revoked_at=? WHERE surface_id=? AND revoked_at IS NULL",
+        (at.isoformat(), surface_id))
+    connection.commit()
+
+
+def active_replay_surface(connection: sqlite3.Connection, form_url: str,
+                          at: datetime) -> sqlite3.Row | None:
+    """The surface record for this exact origin, if Jobloom issued one and it is live."""
+    parsed = urlparse(form_url or "")
+    if parsed.scheme != "http" or not parsed.hostname or not parsed.port:
+        return None
+    origin = f"http://{parsed.hostname}:{parsed.port}"
+    row = connection.execute(
+        "SELECT * FROM replay_surfaces WHERE origin=? AND revoked_at IS NULL "
+        "ORDER BY issued_at DESC LIMIT 1", (origin,),
+    ).fetchone()
+    if not row:
+        return None
+    expires = parse_time(row["expires_at"])
+    if expires and at >= expires:
+        return None
+    return row
+
+
+def option_mapping_trusted(connection: sqlite3.Connection, form_url: str,
+                           option: dict[str, str], at: datetime) -> bool:
     """Whether this label may be believed to select this value.
 
     `<option value="Asian">Prefer not to answer</option>` is the attack: the reviewed label
-    is offered while a real category is submitted. Not understanding the value is not the
-    same as the value being safe, so v1 trusts a pair only where Jobloom generated both
-    halves — its own loopback replay, whose values are recomputable from the label. A live
-    surface needs an approved adapter mapping with a fixed hash and version, which does not
-    exist, so on any other page the control is the user's.
+    is offered while a real category is submitted. Not being able to read a value is not the
+    same as the value being safe.
+
+    An earlier version accepted any `http://127.0.0.1` origin whose value matched the public
+    derivation, which is not a provenance test at all — a loopback address is a network
+    location, and any local process can listen on one and compute a public hash. Trust now
+    requires a surface record the backend issued when it started the renderer, bound to that
+    exact origin and carrying a nonce that only Jobloom and its own renderer hold. A live ATS
+    would need an approved adapter mapping with a fixed hash and version; none exists, so on
+    every other surface the control is the user's.
     """
-    parsed = urlparse(form_url or "")
-    if parsed.scheme != "http" or not LOOPBACK_HOST.fullmatch(parsed.hostname or ""):
+    surface = active_replay_surface(connection, form_url, at)
+    if not surface:
         return False
-    return option.get("value") == replay_option_value(option.get("label", ""))
+    try:
+        expected = replay_option_value(option.get("label", ""), surface["nonce"])
+    except ValueError:
+        return False
+    return option.get("value") == expected
 
 
 def finalize_handling(connection: sqlite3.Connection, application_id: str,

@@ -198,8 +198,20 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     # A real control's label and its submitted value are different strings.
 
 
-    def options(self, labels):
-        return [{"label": label, "value": POLICY.replay_option_value(label)}
+    NONCE = "n" * 48
+    ORIGIN = "http://127.0.0.1:8931"
+
+    def issue_surface(self, origin=None, nonce=None, **updates):
+        value = {"surface_id": "surface-1", "origin": origin or self.ORIGIN,
+                 "nonce": nonce or self.NONCE, "fixture_sha256": "f" * 64,
+                 "renderer_version": "1.0.0", "issued_at": AT,
+                 "expires_at": AT + timedelta(hours=1)}
+        value.update(updates)
+        return POLICY.register_replay_surface(self.db, **value)
+
+    def options(self, labels, nonce=None):
+        return [{"label": label,
+                 "value": POLICY.replay_option_value(label, nonce or self.NONCE)}
                 for label in labels]
 
     def race_options(self, extra=()):
@@ -221,7 +233,10 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def pause_reasons(self, result):
         return {reason.split(":", 1)[0] for reason in result.get("reasons", [])}
 
-    def add_decline_policy(self, family="eeo_race", locale="en-US", **updates):
+    def add_decline_policy(self, family="eeo_race", locale="en-US", surface=True, **updates):
+        if surface and not self.db.execute(
+            "SELECT 1 FROM replay_surfaces").fetchone():
+            self.issue_surface()
         value = {"policy_id": f"policy-{family}", "question_family": family, "locale": locale,
                  "option_tokens": ["decline_to_self_identify"], "confirmed_by": "user",
                  "confirmed_at": AT, "scope": {"country": "US"}}
@@ -318,7 +333,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         # The attack the "opaque value" story missed entirely: offer the reviewed label and
         # submit a real category. Not understanding the value is not the value being safe.
         self.add_decline_policy()
-        spoofed = [{"label": label, "value": POLICY.replay_option_value(label)}
+        spoofed = [{"label": label, "value": POLICY.replay_option_value(label, self.NONCE)}
                    for label in self.RACE_VALUES]
         spoofed.append({"label": self.DECLINE, "value": "Asian"})
         result = self.observe([self.field(
@@ -326,16 +341,49 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.assertEqual(self.pause_reasons(result), {"option_mapping_unverified"})
         self.assertNotIn("Asian", self.database_dump())
 
-    def test_a_live_surface_has_no_approved_option_mapping(self):
-        # Trust comes from the surface, never from the page: the same recomputable pair is
-        # refused off the Jobloom replay because no approved adapter mapping exists.
-        self.add_decline_policy()
+    def test_trust_comes_from_an_issued_surface_not_from_a_loopback_address(self):
+        # A loopback address is a network location, not provenance: any local process can
+        # listen on 127.0.0.1 and compute a public hash. Without a surface record Jobloom
+        # issued, and without the nonce only it and its renderer hold, nothing is trusted.
+        pair = {"label": self.DECLINE,
+                "value": POLICY.replay_option_value(self.DECLINE, self.NONCE)}
         self.assertFalse(POLICY.option_mapping_trusted(
-            "https://jobs.lever.co/example/1",
-            {"label": self.DECLINE, "value": POLICY.replay_option_value(self.DECLINE)}))
+            self.db, f"{self.ORIGIN}/lever/0", pair, AT))
+        self.issue_surface()
         self.assertTrue(POLICY.option_mapping_trusted(
-            "http://127.0.0.1:8931/lever/0",
-            {"label": self.DECLINE, "value": POLICY.replay_option_value(self.DECLINE)}))
+            self.db, f"{self.ORIGIN}/lever/0", pair, AT))
+        # A different local server on another port is not this surface.
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, "http://127.0.0.1:8932/lever/0", pair, AT))
+        # A live ATS has no approved mapping at all.
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, "https://jobs.lever.co/example/1", pair, AT))
+        # Expiry and revocation both withdraw it.
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, f"{self.ORIGIN}/lever/0", pair, AT + timedelta(hours=2)))
+        POLICY.revoke_replay_surface(self.db, "surface-1", AT)
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, f"{self.ORIGIN}/lever/0", pair, AT))
+
+    def test_a_hostile_local_server_cannot_guess_the_surface_nonce(self):
+        # The derivation rule is public; the nonce is not. A rogue process on the same host
+        # that computes the algorithm without it produces a pair that does not match.
+        self.issue_surface()
+        rogue = {"label": self.DECLINE,
+                 "value": POLICY.replay_option_value(self.DECLINE, "guessed-nonce" * 4)}
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, f"{self.ORIGIN}/lever/0", rogue, AT))
+        with self.assertRaisesRegex(ValueError, "surface nonce"):
+            POLICY.replay_option_value(self.DECLINE, "")
+
+    def test_a_surface_record_must_be_a_bare_loopback_origin(self):
+        for bad in ("https://127.0.0.1:8931", "http://example.com:80",
+                    "http://127.0.0.1:8931/lever"):
+            with self.subTest(origin=bad):
+                with self.assertRaises(ValueError):
+                    self.issue_surface(origin=bad)
+        with self.assertRaisesRegex(ValueError, "session nonce"):
+            self.issue_surface(nonce="short")
 
     def test_a_label_match_does_not_settle_what_the_form_would_submit(self):
         self.add_decline_policy()
@@ -346,7 +394,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             "SELECT value_json FROM fill_steps ORDER BY ordinal").fetchall()[-1]
         # The reviewed label chose the option; the page's own opaque value is submitted.
         self.assertEqual(json.loads(step["value_json"]),
-                         POLICY.replay_option_value(self.DECLINE))
+                         POLICY.replay_option_value(self.DECLINE, self.NONCE))
         self.assertNotIn(self.DECLINE, step["value_json"])
 
     def test_one_reviewed_label_mapping_to_two_values_pauses(self):
@@ -590,6 +638,21 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence"):
             POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", "", AT)
         self.assertNotIn("Asian", self.database_dump())
+
+    def test_a_retired_not_present_row_is_read_as_unknown(self):
+        # A row an earlier version wrote must not be re-interpreted into a claim this
+        # version has decided it cannot support.
+        self.db.execute(
+            "INSERT INTO nondisclosure_handling (application_id, field_id, marker, "
+            "evidence_kind, evidence_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("app-1", POLICY.INVENTORY_SCOPE, "not_present", "complete_inventory",
+             "legacy", AT.isoformat()))
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "unknown", "markers": {}})
+        # And it can no longer be written.
+        with self.assertRaisesRegex(ValueError, "unknown handling marker"):
+            POLICY.record_handling(self.db, "app-1", "eeo_race", "not_present", "ref", AT)
+        self.assertNotIn("not_present", POLICY.HANDLING_MARKERS)
 
     def test_finalizing_never_writes_not_present_in_v1(self):
         # A self-reported chain cannot establish absence: an observer that never saw a page

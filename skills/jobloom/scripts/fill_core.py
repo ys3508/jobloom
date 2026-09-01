@@ -427,7 +427,7 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
         resolved = field_policy.resolve_nondisclosure(
             connection, family, locale or "",
             field_policy.normalize_options(field.get("options")), context, current_time,
-            form_url=form_url)
+            form_url=form_url)  # trust comes from the issued surface record, not this URL
         if not resolved["applied"]:
             eeo_handling[field_id] = resolved["reason"]
             return _field_reason(resolved["reason"], field_id, "sensitive_personal")

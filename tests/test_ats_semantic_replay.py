@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 UPSTREAM = ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
 UPSTREAM_COMMIT = "081a5d9d793da29111e2d5331767021718f1d8b5"
+NONCE = "t" * 48
 
 
 def load_script(name):
@@ -163,7 +164,7 @@ class VendoredCorpusTests(unittest.TestCase):
             REPLAY.disposition_for("eeo.invented_category")
         with self.assertRaises(REPLAY.UnmappedKind):
             REPLAY.render_control({"kind": "unknown.kind", "role": "textbox",
-                                   "label": "x", "required": False}, "t-1")
+                                   "label": "x", "required": False}, "t-1", NONCE)
         with self.assertRaises(REPLAY.UnmappedKind):
             REPLAY.control_for("slider")
 
@@ -192,7 +193,7 @@ class GeneratedReplayTests(unittest.TestCase):
             fixture = json.loads((UPSTREAM / name / "fixture.json").read_text())
             for index in range(len(fixture["steps"])):
                 with self.subTest(fixture=name, page=index):
-                    page = REPLAY.render_page(fixture, index)
+                    page = REPLAY.render_page(fixture, index, NONCE)
                     self.assertIn("<!doctype html>", page)
                     for control in fixture["steps"][index]["controls"]:
                         self.assertIn(f'data-kind="{control["kind"]}"', page)
@@ -204,7 +205,7 @@ class GeneratedReplayTests(unittest.TestCase):
         fixture = json.loads((UPSTREAM / FAMILIES[0] / "fixture.json").read_text())
         labels = [control.get("label") for step in fixture["steps"]
                   for control in step["controls"] if control.get("label")]
-        page = REPLAY.render_page(fixture, 0)
+        page = REPLAY.render_page(fixture, 0, NONCE)
         rendered = [label for label in labels if label in page]
         self.assertTrue(rendered, "labels should be rendered as recorded")
         self.assertIn("recorded upstream wording", page)
@@ -213,7 +214,7 @@ class GeneratedReplayTests(unittest.TestCase):
     def test_the_markup_is_jobloom_owned_and_reaches_nothing_outside_the_process(self):
         for name in FAMILIES:
             fixture = json.loads((UPSTREAM / name / "fixture.json").read_text())
-            page = REPLAY.render_page(fixture, 0, include_variants=True, final=True)
+            page = REPLAY.render_page(fixture, 0, NONCE, include_variants=True, final=True)
             with self.subTest(fixture=name):
                 self.assertNotIn("http://", page.replace("http://www.w3.org", ""))
                 self.assertNotIn("https://", page)
@@ -230,7 +231,7 @@ class GeneratedReplayTests(unittest.TestCase):
 
     def test_every_safety_variant_is_discoverable_on_the_first_page(self):
         fixture = json.loads((UPSTREAM / FAMILIES[0] / "fixture.json").read_text())
-        page = REPLAY.render_page(fixture, 0, include_variants=True)
+        page = REPLAY.render_page(fixture, 0, NONCE, include_variants=True)
         for variant in REPLAY.SAFETY_VARIANTS:
             with self.subTest(variant=variant):
                 self.assertIn(f'data-test-id="{variant}"', page)
@@ -243,15 +244,15 @@ class GeneratedReplayTests(unittest.TestCase):
         for name in FAMILIES:
             fixture = json.loads((UPSTREAM / name / "fixture.json").read_text())
             for index in range(len(fixture["steps"])):
-                page = REPLAY.render_page(fixture, index, include_variants=(index == 0))
+                page = REPLAY.render_page(fixture, index, NONCE, include_variants=(index == 0))
                 for control in re.findall(r'<input type="file"[^>]*>', page):
                     with self.subTest(fixture=name, control=control[:60]):
                         self.assertIn('accept="application/pdf"', control)
 
     def test_nothing_in_the_markup_navigates_or_submits_on_its_own(self):
         fixture = json.loads((UPSTREAM / FAMILIES[0] / "fixture.json").read_text())
-        first = REPLAY.render_page(fixture, 0, final=False)
-        last = REPLAY.render_page(fixture, len(fixture["steps"]) - 1, final=True)
+        first = REPLAY.render_page(fixture, 0, NONCE, final=False)
+        last = REPLAY.render_page(fixture, len(fixture["steps"]) - 1, NONCE, final=True)
         # Continuing is a link a person or a test follows, never something the page does.
         self.assertIn('id="next-page"', first)
         self.assertNotIn("location.href", first)
@@ -264,6 +265,51 @@ class GeneratedReplayTests(unittest.TestCase):
         self.assertIn('type="submit"', last)
         self.assertIn('action="/__final_action"', last)
         self.assertNotIn('action="/__final_action"', first)
+
+
+class SurfaceProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.db = __import__("sqlite3").connect(":memory:")
+        self.db.row_factory = __import__("sqlite3").Row
+        POLICY.initialize(self.db)
+        self.addCleanup(self.db.close)
+        self.at = __import__("datetime").datetime(
+            2026, 8, 25, 12, tzinfo=__import__("datetime").timezone.utc)
+
+    def test_only_the_server_jobloom_started_grants_option_trust(self):
+        """A rogue local server serving the same markup earns nothing.
+
+        Loopback is a network location. What makes a pair checkable is the nonce the running
+        server generated and registered, which nothing else on the machine holds.
+        """
+        with ReplayServer(connection=self.db, at=self.at) as server:
+            label = "Decline to answer"
+            genuine = {"label": label,
+                       "value": POLICY.replay_option_value(label, server.nonce)}
+            self.assertTrue(POLICY.option_mapping_trusted(
+                self.db, f"{server.origin}/lever/0", genuine, self.at))
+            # Same host, same algorithm, a nonce it had to guess.
+            rogue = {"label": label,
+                     "value": POLICY.replay_option_value(label, "r" * 48)}
+            self.assertFalse(POLICY.option_mapping_trusted(
+                self.db, f"{server.origin}/lever/0", rogue, self.at))
+            # The value really is the one the served page offers.
+            page = urllib.request.urlopen(f"{server.origin}/lever/0", timeout=5).read().decode()
+            self.assertIn(genuine["value"], page)
+        # Stopping the server withdraws the trust it carried.
+        self.assertFalse(POLICY.option_mapping_trusted(
+            self.db, f"{server.origin}/lever/0",
+            {"label": "Decline to answer",
+             "value": POLICY.replay_option_value("Decline to answer", server.nonce)}, self.at))
+
+    def test_two_servers_do_not_share_a_nonce(self):
+        with ReplayServer(connection=self.db, at=self.at) as first:
+            with ReplayServer(connection=self.db, at=self.at) as second:
+                self.assertNotEqual(first.nonce, second.nonce)
+                crossed = {"label": "Decline to answer",
+                           "value": POLICY.replay_option_value("Decline to answer", first.nonce)}
+                self.assertFalse(POLICY.option_mapping_trusted(
+                    self.db, f"{second.origin}/lever/0", crossed, self.at))
 
 
 class ReplayServerTests(unittest.TestCase):
