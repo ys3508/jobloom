@@ -40,6 +40,11 @@ import worker_protocol  # noqa: E402
 
 RENDERER_VERSION = "1.0.0"
 LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
+# Exactly one shape: loopback literal, a real port, and the reserve path. No hostname
+# variants (`localhost` resolves wherever the host file says), no userinfo, no query, no
+# fragment, no other path.
+AUTHORITY_URL = re.compile(r"^http://127\.0\.0\.1:(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}"
+                           r"|65[0-4]\d{2}|655[0-2]\d|6553[0-5])/reserve$")
 
 # Every operation this worker knows how to perform. Nothing here can leave the page.
 SUPPORTED_OPERATIONS = {"fill", "select", "check", "uncheck", "upload"}
@@ -75,6 +80,12 @@ def read_capability(path: Path) -> tuple[str, str]:
     url, token = document.get("authority_url"), document.get("token")
     if not isinstance(url, str) or not isinstance(token, str) or not url or not token:
         _refuse("malformed_capability")
+    # The design says "a narrow local authority endpoint", so the worker holds it to exactly
+    # that shape. A misconfigured or hostile capability file would otherwise send the token,
+    # the grant id and the package digest to any address on the network — and then act on
+    # whatever that address said was authorised.
+    if not AUTHORITY_URL.fullmatch(url):
+        _refuse("authority_url_not_loopback")
     return url, token
 
 

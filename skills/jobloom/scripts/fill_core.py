@@ -595,12 +595,6 @@ def reserve_execution_grant(connection: sqlite3.Connection, grant_id: str,
         return {"authorised": False, "reason": "grant_revoked"}
     if row["consumed_at"]:
         return {"authorised": False, "reason": "grant_already_consumed"}
-    expires = parse_time(row["expires_at"])
-    if not expires or at >= expires:
-        return {"authorised": False, "reason": "grant_expired"}
-    held = parse_time(row["reservation_expires_at"])
-    if held and at < held:
-        return {"authorised": False, "reason": "grant_already_reserved"}
     page = connection.execute(
         "SELECT page_url FROM fill_pages WHERE session_id=? AND page_id=?",
         (row["session_id"], row["page_id"])).fetchone()
@@ -608,13 +602,19 @@ def reserve_execution_grant(connection: sqlite3.Connection, grant_id: str,
     if not attestation:
         return {"authorised": False, "reason": "surface_expired"}
     reservation = secrets.token_hex(16)
+    # One conditional UPDATE decides the winner. Reading the row and then overwriting it
+    # unconditionally let two authorities both see "not held", both write, and both report
+    # success — the second silently displacing the first's reservation.
     cursor = connection.execute(
         "UPDATE execution_grants SET reservation=?, reservation_expires_at=? "
-        "WHERE grant_id=? AND consumed_at IS NULL",
-        (reservation, (at + timedelta(seconds=reservation_seconds)).isoformat(), grant_id))
+        "WHERE grant_id=? AND consumed_at IS NULL AND revoked_at IS NULL "
+        "AND expires_at > ? "
+        "AND (reservation_expires_at IS NULL OR reservation_expires_at <= ?)",
+        (reservation, (at + timedelta(seconds=reservation_seconds)).isoformat(), grant_id,
+         at.isoformat(), at.isoformat()))
     connection.commit()
     if cursor.rowcount != 1:
-        return {"authorised": False, "reason": "grant_already_consumed"}
+        return {"authorised": False, "reason": _grant_refusal(connection, grant_id, at)}
     return {
         "authorised": True, "grant_id": grant_id, "reservation": reservation,
         # Everything security-relevant comes from here, not from the package: the package is
@@ -628,27 +628,52 @@ def reserve_execution_grant(connection: sqlite3.Connection, grant_id: str,
     }
 
 
+def _grant_refusal(connection: sqlite3.Connection, grant_id: str, at: datetime) -> str:
+    """Why a conditional update matched nothing. Diagnosis only — never the decision."""
+    row = connection.execute(
+        "SELECT consumed_at, revoked_at, expires_at, reservation_expires_at "
+        "FROM execution_grants WHERE grant_id=?", (grant_id,)).fetchone()
+    if not row:
+        return "grant_unknown"
+    if row["revoked_at"]:
+        return "grant_revoked"
+    if row["consumed_at"]:
+        return "grant_already_consumed"
+    expires = parse_time(row["expires_at"])
+    if not expires or at >= expires:
+        return "grant_expired"
+    held = parse_time(row["reservation_expires_at"])
+    if held and at < held:
+        return "grant_already_reserved"
+    return "reservation_mismatch"
+
+
 def consume_execution_grant(connection: sqlite3.Connection, grant_id: str, reservation: str,
                             at: datetime) -> dict[str, Any]:
-    """Spend a reserved grant, once. This is where single-use actually lives."""
+    """Spend a reserved grant, once. This is where single-use actually lives.
+
+    Both clocks are conditions of the same statement. An earlier version checked only the
+    reservation string, the consumed flag and revocation, so a reservation held from T0 could
+    still be spent after its own window and after the grant's had closed — two expiry
+    guarantees that existed only in the column names.
+    """
     require_table(connection, "execution_grants")
     cursor = connection.execute(
-        "UPDATE execution_grants SET consumed_at=? WHERE grant_id=? AND consumed_at IS NULL "
-        "AND reservation=? AND revoked_at IS NULL",
-        (at.isoformat(), grant_id, reservation))
+        "UPDATE execution_grants SET consumed_at=? "
+        "WHERE grant_id=? AND consumed_at IS NULL AND revoked_at IS NULL "
+        "AND reservation=? AND reservation_expires_at > ? AND expires_at > ?",
+        (at.isoformat(), grant_id, reservation, at.isoformat(), at.isoformat()))
     connection.commit()
     if cursor.rowcount == 1:
         return {"consumed": True, "grant_id": grant_id}
     row = connection.execute(
-        "SELECT consumed_at, revoked_at, reservation FROM execution_grants WHERE grant_id=?",
+        "SELECT reservation, reservation_expires_at FROM execution_grants WHERE grant_id=?",
         (grant_id,)).fetchone()
-    if not row:
-        return {"consumed": False, "reason": "grant_unknown"}
-    if row["revoked_at"]:
-        return {"consumed": False, "reason": "grant_revoked"}
-    if row["consumed_at"]:
-        return {"consumed": False, "reason": "grant_already_consumed"}
-    return {"consumed": False, "reason": "reservation_mismatch"}
+    reason = _grant_refusal(connection, grant_id, at)
+    if reason == "reservation_mismatch" and row and row["reservation"] == reservation:
+        # The string matched, so what lapsed was the hold itself.
+        reason = "reservation_expired"
+    return {"consumed": False, "reason": reason}
 
 
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:

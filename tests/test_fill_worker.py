@@ -421,6 +421,71 @@ class AuthorityTests(_SessionBase):
                 # The reservation lapsed; the grant was never consumed, so it still works.
                 self.assertEqual(self.redeem(authority, grant["grant_id"], digest)[0], 200)
 
+    def test_an_expired_reservation_cannot_be_consumed(self):
+        # Both clocks are conditions of the same statement. The old version checked only the
+        # reservation string, so a hold taken at T0 could still be spent long after its own
+        # window closed.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            held = FILL.reserve_execution_grant(
+                self.db, grant["grant_id"], digest, self.now, reservation_seconds=120)
+            late = self.now + timedelta(minutes=5)
+            outcome = FILL.consume_execution_grant(
+                self.db, grant["grant_id"], held["reservation"], late)
+            self.assertEqual(outcome, {"consumed": False, "reason": "reservation_expired"})
+            # Nothing was spent, so a fresh reservation still works.
+            again = FILL.reserve_execution_grant(
+                self.db, grant["grant_id"], digest, late)
+            self.assertTrue(again["authorised"])
+            self.assertTrue(FILL.consume_execution_grant(
+                self.db, grant["grant_id"], again["reservation"], late)["consumed"])
+
+    def test_an_expired_grant_cannot_be_consumed_even_with_a_live_reservation(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            # A grant that outlives its own window before the hold does.
+            grant = self.issue(package, ttl_seconds=60)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            held = FILL.reserve_execution_grant(
+                self.db, grant["grant_id"], digest, self.now, reservation_seconds=3600)
+            self.assertTrue(held["authorised"])
+            late = self.now + timedelta(minutes=10)
+            outcome = FILL.consume_execution_grant(
+                self.db, grant["grant_id"], held["reservation"], late)
+            self.assertEqual(outcome, {"consumed": False, "reason": "grant_expired"})
+
+    def test_two_authorities_racing_for_one_grant_produce_exactly_one_winner(self):
+        # Separate connections, so each authority's own lock cannot serialise them: the
+        # decision has to come from the conditional update, not from Python.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            shared = self.root / "shared.db"
+            file_db = sqlite3.connect(shared, check_same_thread=False)
+            file_db.row_factory = sqlite3.Row
+            self.addCleanup(file_db.close)
+            for line in self.db.iterdump():
+                try:
+                    file_db.execute(line)
+                except sqlite3.Error:
+                    pass
+            file_db.commit()
+            second = sqlite3.connect(shared, check_same_thread=False)
+            second.row_factory = sqlite3.Row
+            self.addCleanup(second.close)
+            outcomes = [
+                FILL.reserve_execution_grant(file_db, grant["grant_id"], digest, self.now),
+                FILL.reserve_execution_grant(second, grant["grant_id"], digest, self.now),
+            ]
+            self.assertEqual([outcome["authorised"] for outcome in outcomes], [True, False])
+            self.assertEqual(outcomes[1]["reason"], "grant_already_reserved")
+
     def test_consuming_needs_the_reservation_that_was_issued(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.replay_session(server)
@@ -440,14 +505,26 @@ class AuthorityTests(_SessionBase):
                 self.assertEqual(
                     self.redeem(authority, revoked["grant_id"], digest)[1]["reason"],
                     "grant_revoked")
-            later = AUTHORITY.ExecutionAuthority(
-                self.db, FILL.reserve_execution_grant,
-                clock=lambda: self.now + timedelta(hours=2))
             fresh = self.issue(package)
-            with later as authority:
+            # Thirty minutes: past the grant's fifteen-minute life, inside the surface's
+            # hour, so the refusal names the grant rather than the surface.
+            half_hour = AUTHORITY.ExecutionAuthority(
+                self.db, FILL.reserve_execution_grant,
+                consume=FILL.consume_execution_grant,
+                clock=lambda: self.now + timedelta(minutes=30))
+            with half_hour as authority:
                 self.assertEqual(
                     self.redeem(authority, fresh["grant_id"], digest)[1]["reason"],
                     "grant_expired")
+            # And past the surface's life the surface is what has gone.
+            two_hours = AUTHORITY.ExecutionAuthority(
+                self.db, FILL.reserve_execution_grant,
+                consume=FILL.consume_execution_grant,
+                clock=lambda: self.now + timedelta(hours=2))
+            with two_hours as authority:
+                self.assertEqual(
+                    self.redeem(authority, self.issue(package)["grant_id"], digest)[1]["reason"],
+                    "surface_expired")
 
     def test_another_local_process_cannot_spend_a_grant(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
@@ -868,6 +945,36 @@ class CapabilityTests(_SessionBase):
                 events = " ".join(row[0] for row in self.db.execute(
                     "SELECT metadata_json FROM fill_events"))
                 self.assertNotIn(service.token, events)
+
+    def test_the_authority_url_must_be_the_exact_loopback_reserve_endpoint(self):
+        """A capability file names where the token goes. Anything else is a network egress.
+
+        Without a shape check a misconfigured or hostile file would POST the token, the grant
+        id and the package digest anywhere, then act on whatever came back as authorisation.
+        """
+        for bad in ("http://localhost:8931/reserve",
+                    "https://127.0.0.1:8931/reserve",
+                    "http://127.0.0.1:8931/consume",
+                    "http://127.0.0.1:8931/reserve?x=1",
+                    "http://127.0.0.1:8931/reserve#fragment",
+                    "http://user:pass@127.0.0.1:8931/reserve",
+                    "http://127.0.0.1:99999/reserve",
+                    "http://127.0.0.1:0/reserve",
+                    "http://evil.example.com/reserve",
+                    "http://127.0.0.1.evil.com:8931/reserve"):
+            with self.subTest(url=bad):
+                capability = self.root / f"cap-{abs(hash(bad))}.json"
+                capability.write_text(
+                    json.dumps({"authority_url": bad, "token": "t"}), encoding="utf-8")
+                capability.chmod(0o600)
+                with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                    WORKER.read_capability(capability)
+                self.assertEqual(str(caught.exception), "authority_url_not_loopback")
+        good = self.root / "cap-good.json"
+        good.write_text(json.dumps({"authority_url": "http://127.0.0.1:8931/reserve",
+                                    "token": "t"}), encoding="utf-8")
+        good.chmod(0o600)
+        self.assertEqual(WORKER.read_capability(good)[0], "http://127.0.0.1:8931/reserve")
 
     def test_a_world_readable_capability_file_is_refused(self):
         capability = self.root / "loose.json"

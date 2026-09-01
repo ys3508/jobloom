@@ -171,6 +171,19 @@ grant on failures that had touched nothing — an unreadable counter left the us
 looked retryable and a grant that never could be. A reservation lapses on its own, so a worker
 that dies holds nothing and the grant runs later.
 
+Both phases are single conditional updates, and both clocks are conditions of the statement
+rather than checks before it. Reading a row and then writing it let two authorities each see
+"not held", each write, and each report success — and consuming while checking only the
+reservation string let a hold taken at T0 be spent after its own window and after the grant's
+had closed, two expiry guarantees that existed only in the column names. The winner is
+whichever update matched a row; a `SELECT` afterwards only names the reason.
+
+The capability file's authority URL is held to one exact shape —
+`http://127.0.0.1:<port>/reserve` — with no hostname variants, userinfo, query, fragment or
+other path. Without that check a misconfigured or hostile file would send the token, the grant
+id and the package digest to any address on the network, and then act on whatever that address
+called an authorisation.
+
 Consumption is where single-use lives. It is an atomic update of that row, not a marker beside
 a file path, so copying the package and re-running buys nothing: the second consumption
 updates zero rows. The response carries the parameters the run may use — target, origin, renderer
