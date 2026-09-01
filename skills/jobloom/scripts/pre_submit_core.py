@@ -408,7 +408,7 @@ def create_review(
         ) if key in context},
         # Stated, not discovered: these controls were handled outside Jobloom on purpose,
         # so the review names the blind spot instead of presenting a silently short field list.
-        "voluntary_disclosure_handling": field_policy.handling_markers(
+        "voluntary_disclosure_handling": field_policy.handling_summary(
             connection, application["application_id"]),
         "submission_policy": application["submission_policy"],
         "known_form": bool(inventory["known_form"]),

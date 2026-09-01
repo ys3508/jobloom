@@ -321,7 +321,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
     def test_expiry_revocation_scope_and_inexact_options_all_pause(self):
         cases = {
             "nondisclosure_policy_expired": lambda: self.add_decline_policy(
-                expires_at=AT - timedelta(days=1)),
+                confirmed_at=AT - timedelta(days=3), expires_at=AT - timedelta(days=1)),
             "nondisclosure_policy_scope_mismatch": lambda: self.add_decline_policy(
                 scope={"country": "DE"}),
             "nondisclosure_option_ambiguous": lambda: self.add_decline_policy(
@@ -470,7 +470,9 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             "SELECT source_kind FROM fill_steps ORDER BY ordinal").fetchall()[-1]["source_kind"],
             "nondisclosure_policy")
 
-    def test_a_user_handled_pause_is_marked_when_the_page_is_replanned(self):
+    def test_a_vanished_control_never_becomes_user_handled(self):
+        # A control that stopped appearing may have been completed by the user, or missed by
+        # the observer, or re-rendered away. Those are not the same event.
         self.observe([self.field(
             "eeo_race", "Race / Ethnicity",
             options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
@@ -481,19 +483,69 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         FILL.resume_session(self.db, "session-1", "worker-2", "auth-1",
                             {"country": "US", "application_id": "app-1"},
                             self.candidate_path, AT, observation=fresh)
-        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
-                         {"eeo_race": "user_handled"})
-        self.assertNotIn(self.DECLINE, self.database_dump())
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"), {})
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "unknown", "markers": {}})
 
-    def test_markers_reach_the_pre_submit_review_and_values_do_not(self):
-        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
-                         {"voluntary_eeo": "not_present"})
-        POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", AT)
-        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
-                         {"eeo_race": "user_handled"})
+    def test_only_an_explicit_user_confirmation_writes_user_handled(self):
+        with self.assertRaisesRegex(ValueError, "only the user"):
+            POLICY.confirm_user_handled(self.db, "app-1", "eeo_race", "worker-1", "ref-1", AT)
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"), {})
+        POLICY.confirm_user_handled(self.db, "app-1", "eeo_race", "user", "ref-1", AT)
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "recorded", "markers": {"eeo_race": "user_handled"}})
+        evidence = self.db.execute(
+            "SELECT evidence_kind, evidence_ref FROM nondisclosure_handling").fetchone()
+        self.assertEqual(evidence["evidence_kind"], "user_confirmation")
+        self.assertEqual(evidence["evidence_ref"], "ref-1")
+
+    def test_an_empty_handling_table_is_unknown_and_never_not_present(self):
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"), {})
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "unknown", "markers": {}})
         with self.assertRaisesRegex(ValueError, "unknown handling marker"):
-            POLICY.record_handling(self.db, "app-1", "eeo_race", "Asian", AT)
+            POLICY.record_handling(self.db, "app-1", "eeo_race", "Asian", "ref", AT)
+        with self.assertRaisesRegex(ValueError, "evidence"):
+            POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", "", AT)
         self.assertNotIn("Asian", self.database_dump())
+
+    def test_not_present_requires_a_finalized_inventory_that_covered_every_page(self):
+        summary = POLICY.finalize_handling(self.db, "app-1", [], "inventory-hash", AT)
+        self.assertEqual(summary, {"status": "not_present", "markers": {}})
+        evidence = self.db.execute(
+            "SELECT field_id, evidence_kind FROM nondisclosure_handling").fetchone()
+        self.assertEqual(evidence["field_id"], POLICY.INVENTORY_SCOPE)
+        self.assertEqual(evidence["evidence_kind"], "complete_inventory")
+        # An observed control with no marker cannot be finalized away.
+        with self.assertRaisesRegex(ValueError, "without a handling marker"):
+            POLICY.finalize_handling(self.db, "app-2", ["eeo_race"], "inventory-hash", AT)
+
+    def test_finishing_a_session_settles_the_record_from_every_observed_page(self):
+        # The claim "this form had no voluntary-disclosure control" is only made here, where
+        # every page is known to have been observed and checkpointed.
+        self.start()
+        FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path, self.page(), AT)
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "unknown", "markers": {}})
+        self.complete_page()
+        FILL.finish_session(self.db, "session-1", "worker-1", "inventory-1", AT)
+        self.assertEqual(POLICY.handling_summary(self.db, "app-1"),
+                         {"status": "not_present", "markers": {}})
+        row = self.db.execute(
+            "SELECT evidence_kind, evidence_ref FROM nondisclosure_handling").fetchone()
+        self.assertEqual(row["evidence_kind"], "complete_inventory")
+        observed = [r[0] for r in self.db.execute(
+            "SELECT observation_sha256 FROM fill_pages ORDER BY page_index")]
+        self.assertEqual(row["evidence_ref"], FILL.canonical_hash(observed))
+
+    def test_a_policy_that_can_never_apply_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "expire after it takes effect"):
+            self.add_decline_policy(expires_at=AT - timedelta(days=1))
+        with self.assertRaisesRegex(ValueError, "expire after it takes effect"):
+            self.add_decline_policy(effective_from=AT + timedelta(days=2),
+                                    expires_at=AT + timedelta(days=1))
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM nondisclosure_policies").fetchone()[0], 0)
 
     def test_locale_uses_one_contract_for_policies_and_observations(self):
         for bad in ("not a locale", "EN_US", "e", "x" * 33):

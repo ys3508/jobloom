@@ -701,7 +701,7 @@ def complete_step(connection: sqlite3.Connection, session_id: str, worker_id: st
         # Jobloom must not be able to say, so only the handling marker is kept.
         field_policy.record_handling(
             connection, session["application_id"], step["field_id"], "policy_declined",
-            at or now_utc())
+            step["source_id"], at or now_utc())
     elif step["operation"] == "fill":
         archive_core.record_field(
             connection, session["application_id"], step["field_id"], step["question"],
@@ -761,21 +761,6 @@ def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: 
             "status": "completed", "checkpoint_sha256": digest}
 
 
-def _paused_page_marker(connection: sqlite3.Connection, application_id: str,
-                        pause_reasons: list[str], stored: dict[str, Any], at: datetime) -> None:
-    """A protected-characteristic control that paused was left to the user, so say so."""
-    if not any(reason.split(":", 1)[0].startswith("nondisclosure_") for reason in pause_reasons):
-        return
-    for field in stored["fields"]:
-        if not isinstance(field, dict):
-            continue
-        placement, domain, _ = field_policy.disposition(
-            field["field_id"], field["question"], field["control"], field.get("source_kind"))
-        if domain == "voluntary_eeo":
-            field_policy.record_handling(
-                connection, application_id, field["field_id"], "user_handled", at)
-
-
 def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: str,
                    authorization_id: str | None, authorization_context: dict[str, Any],
                    candidate_path: Path, at: datetime | None = None,
@@ -783,8 +768,6 @@ def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: s
     session = connection.execute("SELECT * FROM fill_sessions WHERE session_id=?", (session_id,)).fetchone()
     if not session or session["status"] != "paused":
         raise ValueError("paused fill session not found")
-    pause_reasons = json.loads(session["pause_reasons_json"] or "[]")
-    application_id = session["application_id"]
     _require_lease(connection, session["application_id"], worker_id, at)
     _, context = _application_context(connection, session["application_id"], authorization_context)
     page = connection.execute(
@@ -813,7 +796,6 @@ def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: s
     session = connection.execute("SELECT * FROM fill_sessions WHERE session_id=?", (session_id,)).fetchone()
     _event(connection, session, worker_id, "resumed", "user_resolved_pause", {}, at)
     connection.commit()
-    _paused_page_marker(connection, application_id, pause_reasons, stored, at or now_utc())
     filled_ids = [row[0] for row in connection.execute(
         "SELECT field_id FROM fill_steps WHERE session_id=? AND page_id=? AND operation='fill'",
         (session_id, page["page_id"]),
@@ -858,6 +840,19 @@ def finish_session(connection: sqlite3.Connection, session_id: str, worker_id: s
         raise ValueError("form inventory requires at least one required filled field")
     uploads = sorted({(row["source_kind"], row["source_id"]) for row in fields
                       if row["operation"] == "upload"})
+    # Every page has been observed and checkpointed above, so this is the one moment at which
+    # "this form has no voluntary-disclosure control" is a claim the record can support.
+    observed_eeo = sorted({
+        field["field_id"]
+        for page in pages
+        for field in json.loads(page["observation_json"])["fields"]
+        if isinstance(field, dict) and field_policy.disposition(
+            field["field_id"], field["question"], field["control"],
+            field.get("source_kind"))[1] == "voluntary_eeo"
+    })
+    field_policy.finalize_handling(
+        connection, session["application_id"], observed_eeo,
+        canonical_hash([page["observation_sha256"] for page in pages]), at or now_utc())
     legal_items = sorted({item for page in pages for item in json.loads(page["legal_items_json"])})
     restrictions = sorted({item for page in pages for item in json.loads(page["restricted_requests_json"])})
     pre_submit_core.register_inventory(

@@ -83,9 +83,18 @@ record.
 A completed non-disclosure step records a **handling marker** — `policy_declined`,
 `user_handled`, or `not_present` — in `nondisclosure_handling`, and never an
 ApplicationField: `record_field` still accepts only `fact` or `answer`, because an
-ApplicationField stores what was entered and here Jobloom must not be able to say. The
-pre-submit review carries the markers, so the blind spot is stated rather than discovered as a
-short field list. Because option strings are never stored, a page that paused on one of these
+ApplicationField stores what was entered and here Jobloom must not be able to say.
+
+Each marker carries the evidence it rests on, and **no marker may be inferred from something
+not happening**. An empty handling table is `unknown`, not `not_present`: it is equally what a
+half-observed form, a missed control, an abandoned session, or a failed write looks like.
+`not_present` is written only by `finalize_handling`, from `finish_session`, where every page
+is known to have been observed and checkpointed, and it stores a hash over those observations.
+`user_handled` is written only by `confirm_user_handled`, which requires the user as actor: a
+control that stopped appearing in the next observation may have been completed by the user, or
+missed by the observer, or re-rendered away, and those are not the same event. The pre-submit
+review carries a summary whose status may be `unknown`, so the blind spot is stated rather than
+discovered as a short field list. Because option strings are never stored, a page that paused on one of these
 controls cannot be replanned from its own record: resuming it requires a fresh live
 observation, or the policy the user just registered would be silently skipped.
 

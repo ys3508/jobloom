@@ -217,6 +217,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             application_id TEXT NOT NULL,
             field_id TEXT NOT NULL,
             marker TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            evidence_ref TEXT NOT NULL,
             recorded_at TEXT NOT NULL,
             PRIMARY KEY (application_id, field_id)
         );
@@ -248,6 +250,13 @@ def register_policy(
     # the row stores the token and the version, so no page-facing string — and therefore no
     # demographic value — can be written here at all.
     vocabulary_options(locale, option_tokens, vocabulary_version)
+    # A policy that can never apply should not reach the database, even though resolution
+    # would refuse it later.
+    start = effective_from or confirmed_at
+    if expires_at and expires_at <= start:
+        raise ValueError("a non-disclosure policy must expire after it takes effect")
+    if effective_from and expires_at and expires_at <= confirmed_at:
+        raise ValueError("a non-disclosure policy must expire after it was confirmed")
     connection.execute(
         "INSERT INTO nondisclosure_policies (policy_id, question_family, locale, "
         "option_tokens_json, vocabulary_version, confirmed_by, confirmed_at, effective_from, "
@@ -362,31 +371,97 @@ def conflict_derivation(
     return {"derivable": False, "reason": "employer_entity_not_approved"}
 
 
+# `not_present` is a statement about the whole form, so it is keyed by an identifier no
+# observed field can carry: `_require_id` forbids `*`.
+INVENTORY_SCOPE = "*inventory*"
+
+# What each marker is allowed to be believed on. A marker never rests on an absence.
+MARKER_EVIDENCE = {
+    "policy_declined": "verified_policy_step",
+    "user_handled": "user_confirmation",
+    "not_present": "complete_inventory",
+}
+
+
 def record_handling(connection: sqlite3.Connection, application_id: str, field_id: str,
-                    marker: str, at: datetime) -> dict[str, Any]:
+                    marker: str, evidence_ref: str, at: datetime) -> dict[str, Any]:
     """Record how a protected-characteristic control was handled — never what was chosen.
 
     This table has no value column on purpose. `record_field` refuses a
     `nondisclosure_policy` source for the same reason: an ApplicationField stores what was
     entered, and for these controls Jobloom must not be able to say.
+
+    Every marker carries the evidence it rests on. Nothing here may be inferred from
+    something not happening: a control that stopped appearing may have been completed by the
+    user, or the observer may have missed it, or the page may have re-rendered, and those are
+    not the same event.
     """
     if marker not in HANDLING_MARKERS:
         raise ValueError(f"unknown handling marker: {marker}")
+    if not evidence_ref or not isinstance(evidence_ref, str):
+        raise ValueError(f"{marker} requires the evidence it rests on")
     connection.execute(
-        "INSERT INTO nondisclosure_handling (application_id, field_id, marker, recorded_at) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(application_id, field_id) DO UPDATE SET "
-        "marker=excluded.marker, recorded_at=excluded.recorded_at",
-        (application_id, field_id, marker, at.isoformat()),
+        "INSERT INTO nondisclosure_handling (application_id, field_id, marker, evidence_kind, "
+        "evidence_ref, recorded_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(application_id, field_id) DO UPDATE SET marker=excluded.marker, "
+        "evidence_kind=excluded.evidence_kind, evidence_ref=excluded.evidence_ref, "
+        "recorded_at=excluded.recorded_at",
+        (application_id, field_id, marker, MARKER_EVIDENCE[marker], evidence_ref, at.isoformat()),
     )
     return {"application_id": application_id, "field_id": field_id, "marker": marker}
 
 
+def confirm_user_handled(connection: sqlite3.Connection, application_id: str, field_id: str,
+                         actor: str, confirmation_ref: str, at: datetime) -> dict[str, Any]:
+    """The only way `user_handled` may be written: the user says so.
+
+    A control that vanished from the next observation is not the user having answered it.
+    """
+    if actor != "user":
+        raise ValueError("only the user can confirm they handled a voluntary disclosure")
+    result = record_handling(connection, application_id, field_id, "user_handled",
+                             confirmation_ref, at)
+    connection.commit()
+    return result
+
+
 def handling_markers(connection: sqlite3.Connection, application_id: str) -> dict[str, str]:
-    """The archive's stated blind spot. Empty means `not_present`: no such control was met."""
-    rows = connection.execute(
+    """The markers recorded so far. An empty result is an empty result."""
+    return {row["field_id"]: row["marker"] for row in connection.execute(
         "SELECT field_id, marker FROM nondisclosure_handling WHERE application_id=? "
         "ORDER BY field_id", (application_id,),
-    ).fetchall()
-    if not rows:
-        return {"voluntary_eeo": "not_present"}
-    return {row["field_id"]: row["marker"] for row in rows}
+    )}
+
+
+def handling_summary(connection: sqlite3.Connection, application_id: str) -> dict[str, Any]:
+    """What the archive may say about voluntary disclosures, including that it does not know.
+
+    No marker is not "there was no such control". It is also what a half-observed form, a
+    missed control, an abandoned session, and a failed write all look like. Only a finalized
+    inventory that covered every page can turn that into `not_present`.
+    """
+    markers = handling_markers(connection, application_id)
+    if not markers:
+        return {"status": "unknown", "markers": {}}
+    if set(markers) == {INVENTORY_SCOPE}:
+        return {"status": "not_present", "markers": {}}
+    return {"status": "recorded",
+            "markers": {key: value for key, value in markers.items() if key != INVENTORY_SCOPE}}
+
+
+def finalize_handling(connection: sqlite3.Connection, application_id: str,
+                      observed_eeo_field_ids: list[str], inventory_ref: str,
+                      at: datetime) -> dict[str, Any]:
+    """Settle the voluntary-disclosure record once the whole form is known.
+
+    Called only where every page has been observed and checkpointed, which is the one moment
+    "no such control exists on this form" becomes a claim evidence can support.
+    """
+    recorded = handling_markers(connection, application_id)
+    missing = sorted(set(observed_eeo_field_ids) - set(recorded))
+    if missing:
+        raise ValueError("voluntary disclosure controls were observed without a handling marker")
+    if not observed_eeo_field_ids:
+        record_handling(connection, application_id, INVENTORY_SCOPE, "not_present",
+                        inventory_ref, at)
+    return handling_summary(connection, application_id)
