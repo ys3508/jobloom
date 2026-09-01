@@ -194,6 +194,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
 
     RACE_VALUES = ["Hispanic or Latino", "Black or African American", "Asian"]
     DECLINE = "I do not wish to self-identify"
+    OTHER_DECLINE = "Prefer not to answer"
 
     def field(self, field_id, question, **updates):
         value = {"field_id": field_id, "question": question, "selector": f"#{field_id}",
@@ -213,8 +214,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
 
     def add_decline_policy(self, family="eeo_race", locale="en-US", **updates):
         value = {"policy_id": f"policy-{family}", "question_family": family, "locale": locale,
-                 "allowed_options": [self.DECLINE], "confirmed_by": "user", "confirmed_at": AT,
-                 "scope": {"country": "US"}}
+                 "option_tokens": ["decline_to_self_identify"], "confirmed_by": "user",
+                 "confirmed_at": AT, "scope": {"country": "US"}}
         value.update(updates)
         return POLICY.register_policy(self.db, **value)
 
@@ -324,7 +325,7 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             "nondisclosure_policy_scope_mismatch": lambda: self.add_decline_policy(
                 scope={"country": "DE"}),
             "nondisclosure_option_ambiguous": lambda: self.add_decline_policy(
-                allowed_options=[self.DECLINE, "Asian"]),
+                option_tokens=["decline_to_self_identify", "prefer_not_to_answer"]),
             "nondisclosure_option_unavailable": lambda: self.add_decline_policy(),
         }
         for reason, register in cases.items():
@@ -332,7 +333,8 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
                 self.setUp()
                 register()
                 options = None if reason == "nondisclosure_option_unavailable" else (
-                    self.RACE_VALUES + [self.DECLINE])
+                    self.RACE_VALUES + [self.DECLINE]
+                    + ([self.OTHER_DECLINE] if reason == "nondisclosure_option_ambiguous" else []))
                 result = self.observe([self.field(
                     "eeo_race", "Race / Ethnicity", options=options)], locale="en-US")
                 self.assertEqual(self.pause_reasons(result), {reason})
@@ -395,6 +397,132 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
         self.assertNotIn("next_page", json.dumps(package["actions"]))
 
     # ---- discovery source -----------------------------------------------
+
+    # ---- lifecycle regressions -------------------------------------------
+
+    def test_policy_action_completes_but_archives_only_a_handling_marker(self):
+        # The gap this closes: `record_field` accepts only `fact` or `answer`, so a
+        # successful non-disclosure step used to raise on completion. Testing only as far as
+        # export never reached it.
+        self.add_decline_policy()
+        self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        output = self.root / "private" / "page-actions.json"
+        FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
+        for row in self.db.execute(
+            "SELECT step_id, expected_sha256 FROM fill_steps ORDER BY ordinal"
+        ).fetchall():
+            FILL.complete_step(self.db, "session-1", "worker-1", row["step_id"],
+                               row["expected_sha256"], AT)
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
+                         {"eeo_race": "policy_declined"})
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM application_fields WHERE field_id='eeo_race'").fetchone()[0], 0)
+        dump = self.database_dump()
+        for value in self.RACE_VALUES:
+            self.assertNotIn(value, dump)
+            self.assertNotIn(FILL.canonical_hash(value), dump)
+
+    def test_only_reviewed_vocabulary_tokens_can_be_registered(self):
+        for tokens in (["Asian"], ["prefer_not_to_say"], []):
+            with self.subTest(tokens=tokens):
+                with self.assertRaises(ValueError):
+                    self.add_decline_policy(option_tokens=tokens)
+        with self.assertRaisesRegex(ValueError, "vocabulary version"):
+            self.add_decline_policy(vocabulary_version="1999-01-01")
+        with self.assertRaisesRegex(ValueError, "language tag"):
+            self.add_decline_policy(locale="not a locale")
+        dump = self.database_dump()
+        self.assertNotIn("Asian", dump)
+        self.assertNotIn(self.DECLINE, dump)
+        # Even a valid policy stores the token and version, never a page-facing string.
+        self.add_decline_policy()
+        stored = self.db.execute(
+            "SELECT option_tokens_json, vocabulary_version FROM nondisclosure_policies"
+        ).fetchone()
+        self.assertEqual(json.loads(stored["option_tokens_json"]), ["decline_to_self_identify"])
+        self.assertEqual(stored["vocabulary_version"], POLICY.NONDISCLOSURE_VOCABULARY_VERSION)
+        self.assertNotIn(self.DECLINE, self.database_dump())
+
+    def test_a_paused_eeo_page_cannot_resume_from_the_sanitized_record(self):
+        # Option strings were never stored, so the record cannot say what the control offers.
+        # Replanning from it would skip the policy the user just registered.
+        self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        self.add_decline_policy()
+        self.reacquire()
+        with self.assertRaisesRegex(ValueError, "new live observation"):
+            FILL.resume_session(self.db, "session-1", "worker-2", "auth-1",
+                                {"country": "US", "application_id": "app-1"},
+                                self.candidate_path, AT)
+        fresh = self.page(fields=[
+            self.field("eeo_race", "Race / Ethnicity",
+                       options=self.RACE_VALUES + [self.DECLINE]),
+            self.field("submit", "Submit application", control="submit")], locale="en-US")
+        result = FILL.resume_session(
+            self.db, "session-1", "worker-2", "auth-1",
+            {"country": "US", "application_id": "app-1"}, self.candidate_path, AT,
+            observation=fresh)
+        self.assertNotEqual(result["status"], "paused")
+        self.assertEqual(self.db.execute(
+            "SELECT source_kind FROM fill_steps ORDER BY ordinal").fetchall()[-1]["source_kind"],
+            "nondisclosure_policy")
+
+    def test_a_user_handled_pause_is_marked_when_the_page_is_replanned(self):
+        self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        self.reacquire()
+        fresh = self.page(fields=[
+            self.field("other", "Are you authorized to work?", source_kind="answer"),
+            self.field("submit", "Submit application", control="submit")])
+        FILL.resume_session(self.db, "session-1", "worker-2", "auth-1",
+                            {"country": "US", "application_id": "app-1"},
+                            self.candidate_path, AT, observation=fresh)
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
+                         {"eeo_race": "user_handled"})
+        self.assertNotIn(self.DECLINE, self.database_dump())
+
+    def test_markers_reach_the_pre_submit_review_and_values_do_not(self):
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
+                         {"voluntary_eeo": "not_present"})
+        POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", AT)
+        self.assertEqual(POLICY.handling_markers(self.db, "app-1"),
+                         {"eeo_race": "user_handled"})
+        with self.assertRaisesRegex(ValueError, "unknown handling marker"):
+            POLICY.record_handling(self.db, "app-1", "eeo_race", "Asian", AT)
+        self.assertNotIn("Asian", self.database_dump())
+
+    def test_locale_uses_one_contract_for_policies_and_observations(self):
+        for bad in ("not a locale", "EN_US", "e", "x" * 33):
+            with self.subTest(locale=bad):
+                with self.assertRaises(ValueError):
+                    POLICY.require_locale(bad)
+                with self.assertRaises(ValueError):
+                    self.observe([self.field("q", "Full name", control="text",
+                                             source_kind="fact", source_id="fact-name")],
+                                 locale=bad)
+                self.setUp()
+        self.assertEqual(POLICY.require_locale("en-US"), "en-US")
+
+    def test_dispositions_are_returned_not_merely_declared(self):
+        cases = {
+            ("eeo_race", "Race / Ethnicity", "radio", "answer"): "always_manual",
+            ("comp", "Expected salary range", "radio", "answer"): "always_manual",
+            ("conflict", "Do you have a relative here?", "radio", "answer"): "always_manual",
+            ("resume", "Resume", "file", None): "material",
+            ("name", "Full name", "text", "fact"): "fact",
+            ("auth", "Are you authorized to work?", "radio", "answer"): "answer",
+            ("weird", "Anything", "text", "invented"): "unsupported",
+        }
+        for arguments, expected in cases.items():
+            with self.subTest(field=arguments[0]):
+                self.assertEqual(POLICY.disposition(*arguments)[0], expected)
+        self.assertEqual({value[0] for value in
+                          (POLICY.disposition(*arguments) for arguments in cases)},
+                         POLICY.DISPOSITIONS)
 
     def test_discovery_source_needs_a_user_confirmed_application_answer(self):
         self.add_answer("answer-source", "discovery_source", "How did you hear about us?",

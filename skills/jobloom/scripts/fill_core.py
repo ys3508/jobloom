@@ -419,8 +419,8 @@ def observe_page(
     if (set(observation) - (required | {"locale"})) or (required - set(observation)):
         raise ValueError("page observation has missing or unknown fields")
     locale = observation.get("locale")
-    if locale is not None and (not isinstance(locale, str) or not 0 < len(locale) <= 32):
-        raise ValueError("page locale must be a bounded string")
+    if locale is not None:
+        field_policy.require_locale(locale, "page locale")
     page_id = observation["page_id"]
     _require_id(page_id, "page_id")
     sanitized_page_url = _safe_url(observation["page_url"], "page_url")
@@ -696,7 +696,13 @@ def complete_step(connection: sqlite3.Connection, session_id: str, worker_id: st
             "incorrect_autofill", step["field_id"], step["sensitivity"]
         )],
                       worker_id, step["page_id"], at)
-    if step["operation"] == "fill":
+    if step["operation"] == "fill" and step["source_kind"] == "nondisclosure_policy":
+        # An ApplicationField stores what was entered. For a protected-characteristic control
+        # Jobloom must not be able to say, so only the handling marker is kept.
+        field_policy.record_handling(
+            connection, session["application_id"], step["field_id"], "policy_declined",
+            at or now_utc())
+    elif step["operation"] == "fill":
         archive_core.record_field(
             connection, session["application_id"], step["field_id"], step["question"],
             json.loads(step["value_json"]), step["source_kind"], step["source_id"],
@@ -755,12 +761,30 @@ def checkpoint_page(connection: sqlite3.Connection, session_id: str, worker_id: 
             "status": "completed", "checkpoint_sha256": digest}
 
 
+def _paused_page_marker(connection: sqlite3.Connection, application_id: str,
+                        pause_reasons: list[str], stored: dict[str, Any], at: datetime) -> None:
+    """A protected-characteristic control that paused was left to the user, so say so."""
+    if not any(reason.split(":", 1)[0].startswith("nondisclosure_") for reason in pause_reasons):
+        return
+    for field in stored["fields"]:
+        if not isinstance(field, dict):
+            continue
+        placement, domain, _ = field_policy.disposition(
+            field["field_id"], field["question"], field["control"], field.get("source_kind"))
+        if domain == "voluntary_eeo":
+            field_policy.record_handling(
+                connection, application_id, field["field_id"], "user_handled", at)
+
+
 def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: str,
                    authorization_id: str | None, authorization_context: dict[str, Any],
-                   candidate_path: Path, at: datetime | None = None) -> dict[str, Any]:
+                   candidate_path: Path, at: datetime | None = None,
+                   observation: dict[str, Any] | None = None) -> dict[str, Any]:
     session = connection.execute("SELECT * FROM fill_sessions WHERE session_id=?", (session_id,)).fetchone()
     if not session or session["status"] != "paused":
         raise ValueError("paused fill session not found")
+    pause_reasons = json.loads(session["pause_reasons_json"] or "[]")
+    application_id = session["application_id"]
     _require_lease(connection, session["application_id"], worker_id, at)
     _, context = _application_context(connection, session["application_id"], authorization_context)
     page = connection.execute(
@@ -769,6 +793,17 @@ def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: s
     ).fetchone()
     if not page:
         raise ValueError("session-level identity pause requires a new fill session")
+    stored = json.loads(page["observation_json"])
+    needs_live_page = any(
+        "options_count" in field for field in stored["fields"] if isinstance(field, dict))
+    if observation is None:
+        if needs_live_page:
+            # Option strings are page text and were never stored, so the record cannot say
+            # what this control offers. Replanning from it would silently skip a policy the
+            # user has just registered, and would answer a question about the current page
+            # using yesterday's page. The worker must look again.
+            raise ValueError("resuming this page requires a new live observation")
+        observation = stored
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
         "UPDATE fill_sessions SET worker_id=?, authorization_id=?, authorization_context_json=?, "
@@ -778,7 +813,7 @@ def resume_session(connection: sqlite3.Connection, session_id: str, worker_id: s
     session = connection.execute("SELECT * FROM fill_sessions WHERE session_id=?", (session_id,)).fetchone()
     _event(connection, session, worker_id, "resumed", "user_resolved_pause", {}, at)
     connection.commit()
-    observation = json.loads(page["observation_json"])
+    _paused_page_marker(connection, application_id, pause_reasons, stored, at or now_utc())
     filled_ids = [row[0] for row in connection.execute(
         "SELECT field_id FROM fill_steps WHERE session_id=? AND page_id=? AND operation='fill'",
         (session_id, page["page_id"]),

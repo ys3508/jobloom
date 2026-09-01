@@ -17,6 +17,7 @@ from typing import Any
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+import field_policy  # noqa: E402
 from _common import answer_issue, context_matches, parse_time, require_table  # noqa: E402
 from answer_library import IMMIGRATION_CANONICAL_IDS  # noqa: E402
 
@@ -67,6 +68,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    field_policy.initialize(connection)
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS form_inventories (
             inventory_id TEXT PRIMARY KEY,
@@ -404,6 +406,10 @@ def create_review(
             "country", "jurisdiction", "company", "role_family", "employment_type",
             "application_id", "queue_id"
         ) if key in context},
+        # Stated, not discovered: these controls were handled outside Jobloom on purpose,
+        # so the review names the blind spot instead of presenting a silently short field list.
+        "voluntary_disclosure_handling": field_policy.handling_markers(
+            connection, application["application_id"]),
         "submission_policy": application["submission_policy"],
         "known_form": bool(inventory["known_form"]),
         "legal_items": json.loads(inventory["legal_items_json"]),

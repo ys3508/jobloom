@@ -59,23 +59,35 @@ Submission uncertainty is terminal pending user review. Never retry automaticall
 
 ## Field dispositions
 
-Not every form field is an answer. `field_policy.classify` sorts a field into one of five
-dispositions from its identifier and question text, deterministically and with no model:
-`fact`, `answer`, `material`, `always_manual`, `unsupported`. Page text is untrusted, so it is
-read in one direction only — a match may add caution and never remove it. A page that declares
-a race question as `source_kind: "answer"` still lands in `always_manual`.
+Not every form field is an answer. `field_policy.disposition` returns one of five —
+`fact`, `answer`, `material`, `always_manual`, `unsupported` — from the field's identifier,
+question text, control and declared source, deterministically and with no model. Page text is
+untrusted, so it is read in one direction only: a match may add caution and never remove it. A
+page that declares a race question as `source_kind: "answer"` still lands in `always_manual`.
 
 The audit behind these rules is `docs/lever-first-form-readiness.md`: of 27 controls in the
 reviewed Lever fixture, 2 resolve to career evidence.
 
 **Voluntary EEO.** Race, ethnicity, gender, disability and veteran self-identification values
 are never stored, read, hashed, archived or placed in a package. A separate
-`nondisclosure_policies` row — not an AnswerEntry, holding no demographic value — may select a
-reviewed non-disclosure option, and only on an exact match against its own allowlist; the
-page's option strings are never persisted, only their count. Zero or multiple matches pause.
-Selecting "prefer not to answer" discloses nothing, which is why it may be automated at all
-while a value may not. Reason codes hash the field identifier regardless of declared
-sensitivity, so neither question nor answer is legible in a pause record.
+`nondisclosure_policies` row — not an AnswerEntry — may select a reviewed non-disclosure
+option, and only on an exact match. The row stores a **token and a vocabulary version**, never
+a page-facing string: `NONDISCLOSURE_VOCABULARY` lives in code, is versioned, and is reviewed
+per locale, because a free-text allowlist is precisely how a real demographic value would
+reach the database. The page's option strings are never persisted either, only their count.
+Zero or multiple matches pause. Selecting "prefer not to answer" discloses nothing, which is
+why it may be automated at all while a value may not. Reason codes hash the field identifier
+regardless of declared sensitivity, so neither question nor answer is legible in a pause
+record.
+
+A completed non-disclosure step records a **handling marker** — `policy_declined`,
+`user_handled`, or `not_present` — in `nondisclosure_handling`, and never an
+ApplicationField: `record_field` still accepts only `fact` or `answer`, because an
+ApplicationField stores what was entered and here Jobloom must not be able to say. The
+pre-submit review carries the markers, so the blind spot is stated rather than discovered as a
+short field list. Because option strings are never stored, a page that paused on one of these
+controls cannot be replanned from its own record: resuming it requires a fresh live
+observation, or the policy the user just registered would be silently skipped.
 
 **Compensation.** `compensation.total_range` is a radiogroup whose bands are defined by each
 employer, so it is always manual. The direction criteria `salary_floor` is a search filter in

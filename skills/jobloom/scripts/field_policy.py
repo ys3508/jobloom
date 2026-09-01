@@ -37,6 +37,79 @@ from _common import context_matches, parse_time  # noqa: E402
 
 DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
 
+LOCALE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Z]{2})?$")
+
+# Non-disclosure options are chosen from this table, never typed by a user. A free-text
+# allowlist is how a real demographic value would reach the database: a user who pasted
+# "Asian" into it would have stored exactly the value this whole boundary exists to keep out.
+# Registration therefore references a token and a version; the strings live only in code.
+NONDISCLOSURE_VOCABULARY_VERSION = "2026-09-01"
+NONDISCLOSURE_VOCABULARY: dict[str, dict[str, tuple[str, ...]]] = {
+    "en-US": {
+        "prefer_not_to_answer": (
+            "Prefer not to answer",
+            "I prefer not to answer",
+            "I do not wish to answer",
+            "I don't wish to answer",
+            "I don't want to answer",
+            "I do not want to answer",
+        ),
+        "decline_to_self_identify": (
+            "Decline to self-identify",
+            "I decline to self-identify",
+            "I do not wish to self-identify",
+            "I don't wish to self-identify",
+            "I choose not to self-identify",
+        ),
+    },
+}
+
+# What the archive may say about a protected-characteristic control. None of these is an
+# answer; they exist so the deliberate blind spot is stated rather than discovered.
+HANDLING_MARKERS = {"policy_declined", "user_handled", "not_present"}
+
+
+def require_locale(value: Any, label: str = "locale") -> str:
+    """One locale contract, shared by policy registration and page observation."""
+    if not isinstance(value, str) or not 0 < len(value) <= 32 or not LOCALE_PATTERN.fullmatch(value):
+        raise ValueError(f"{label} must be a bounded IETF language tag such as en-US")
+    return value
+
+
+def vocabulary_options(locale: str, tokens: list[str], version: str) -> list[str]:
+    """Expand reviewed tokens into the exact strings a page may offer."""
+    if version != NONDISCLOSURE_VOCABULARY_VERSION:
+        raise ValueError(f"unknown non-disclosure vocabulary version: {version}")
+    families = NONDISCLOSURE_VOCABULARY.get(locale)
+    if not families:
+        raise ValueError(f"no reviewed non-disclosure vocabulary for locale: {locale}")
+    unknown = sorted(set(tokens) - set(families))
+    if unknown:
+        raise ValueError(f"unreviewed non-disclosure option tokens: {', '.join(unknown)}")
+    return sorted({option for token in tokens for option in families[token]})
+
+
+def disposition(field_id: str, question: str, control: str,
+                source_kind: str | None) -> tuple[str, str | None, str | None]:
+    """Which authority, if any, may answer this field: one of `DISPOSITIONS`.
+
+    Returned as `(disposition, domain, family)` so the caller can both route the field and
+    name why. Domain rules win over whatever the page declared, in that order.
+    """
+    if control == "file":
+        return "material", None, None
+    domain = classify(field_id, question)
+    if domain:
+        kind, family = domain
+        if kind in {"voluntary_eeo", "compensation", "employer_conflict"}:
+            return "always_manual", kind, family
+        return "answer", kind, family
+    if source_kind == "fact":
+        return "fact", None, None
+    if source_kind in {None, "answer"}:
+        return "answer", None, None
+    return "unsupported", None, None
+
 # Voluntary protected-characteristic disclosures. Values never enter Jobloom.
 VOLUNTARY_EEO_FAMILIES = {
     "eeo_race": re.compile(r"race|ethnic", re.IGNORECASE),
@@ -127,7 +200,8 @@ def initialize(connection: sqlite3.Connection) -> None:
             policy_id TEXT PRIMARY KEY,
             question_family TEXT NOT NULL,
             locale TEXT NOT NULL,
-            allowed_options_json TEXT NOT NULL,
+            option_tokens_json TEXT NOT NULL,
+            vocabulary_version TEXT NOT NULL,
             confirmed_by TEXT NOT NULL,
             confirmed_at TEXT NOT NULL,
             effective_from TEXT,
@@ -139,6 +213,13 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS nondisclosure_family
             ON nondisclosure_policies (question_family);
+        CREATE TABLE IF NOT EXISTS nondisclosure_handling (
+            application_id TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            marker TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (application_id, field_id)
+        );
     """)
     connection.commit()
 
@@ -148,31 +229,32 @@ def register_policy(
     policy_id: str,
     question_family: str,
     locale: str,
-    allowed_options: list[str],
+    option_tokens: list[str],
     confirmed_by: str,
     confirmed_at: datetime,
     scope: dict[str, Any] | None = None,
     effective_from: datetime | None = None,
     expires_at: datetime | None = None,
+    vocabulary_version: str = NONDISCLOSURE_VOCABULARY_VERSION,
 ) -> dict[str, Any]:
     if question_family not in NONDISCLOSURE_FAMILIES:
         raise ValueError(f"unknown non-disclosure family: {question_family}")
     if confirmed_by != "user":
         raise ValueError("a non-disclosure policy requires an explicit user confirmation")
-    if not locale or not isinstance(locale, str):
-        raise ValueError("a non-disclosure policy requires a locale")
-    if not allowed_options or not all(
-        isinstance(option, str) and option.strip() for option in allowed_options
-    ):
-        raise ValueError("a non-disclosure policy requires reviewed option strings")
-    # The reviewed allowlist is stored; what a page happens to offer never is.
+    require_locale(locale)
+    if not option_tokens:
+        raise ValueError("a non-disclosure policy requires reviewed option tokens")
+    # Validates the tokens against the reviewed vocabulary and throws away the expansion:
+    # the row stores the token and the version, so no page-facing string — and therefore no
+    # demographic value — can be written here at all.
+    vocabulary_options(locale, option_tokens, vocabulary_version)
     connection.execute(
         "INSERT INTO nondisclosure_policies (policy_id, question_family, locale, "
-        "allowed_options_json, confirmed_by, confirmed_at, effective_from, expires_at, "
-        "revoked_at, revocation_reason, scope_json, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+        "option_tokens_json, vocabulary_version, confirmed_by, confirmed_at, effective_from, "
+        "expires_at, revoked_at, revocation_reason, scope_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
         (policy_id, question_family, locale,
-         json.dumps(sorted(set(allowed_options)), ensure_ascii=False),
+         json.dumps(sorted(set(option_tokens))), vocabulary_version,
          confirmed_by, confirmed_at.isoformat(),
          effective_from.isoformat() if effective_from else None,
          expires_at.isoformat() if expires_at else None,
@@ -243,7 +325,8 @@ def resolve_nondisclosure(
     policy = applicable[0]
     if not options:
         return {"applied": False, "reason": "nondisclosure_option_unavailable"}
-    allowed = set(json.loads(policy["allowed_options_json"]))
+    allowed = set(vocabulary_options(
+        policy["locale"], json.loads(policy["option_tokens_json"]), policy["vocabulary_version"]))
     matches = [option for option in options if option in allowed]
     if len(matches) != 1:
         return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
@@ -277,3 +360,33 @@ def conflict_derivation(
     if family not in EMPLOYER_CONFLICT_FAMILIES:
         raise ValueError(f"unknown conflict family: {family}")
     return {"derivable": False, "reason": "employer_entity_not_approved"}
+
+
+def record_handling(connection: sqlite3.Connection, application_id: str, field_id: str,
+                    marker: str, at: datetime) -> dict[str, Any]:
+    """Record how a protected-characteristic control was handled — never what was chosen.
+
+    This table has no value column on purpose. `record_field` refuses a
+    `nondisclosure_policy` source for the same reason: an ApplicationField stores what was
+    entered, and for these controls Jobloom must not be able to say.
+    """
+    if marker not in HANDLING_MARKERS:
+        raise ValueError(f"unknown handling marker: {marker}")
+    connection.execute(
+        "INSERT INTO nondisclosure_handling (application_id, field_id, marker, recorded_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(application_id, field_id) DO UPDATE SET "
+        "marker=excluded.marker, recorded_at=excluded.recorded_at",
+        (application_id, field_id, marker, at.isoformat()),
+    )
+    return {"application_id": application_id, "field_id": field_id, "marker": marker}
+
+
+def handling_markers(connection: sqlite3.Connection, application_id: str) -> dict[str, str]:
+    """The archive's stated blind spot. Empty means `not_present`: no such control was met."""
+    rows = connection.execute(
+        "SELECT field_id, marker FROM nondisclosure_handling WHERE application_id=? "
+        "ORDER BY field_id", (application_id,),
+    ).fetchall()
+    if not rows:
+        return {"voluntary_eeo": "not_present"}
+    return {row["field_id"]: row["marker"] for row in rows}
