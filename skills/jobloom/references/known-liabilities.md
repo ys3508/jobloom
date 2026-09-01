@@ -208,8 +208,9 @@ three approved DOCX direction versions happened to be revoked.
 
 ## The fill pipeline has no browser worker, and reads as if it does
 
-Recorded 2026-08-31. Not fixed. Not a defect in the fill engine — the missing half was
-never built, and every document describing the engine describes it as if it were.
+Recorded 2026-08-31. Not fixed; the fork below was decided the same day. Not a defect in the
+fill engine — the missing half was never built, and every document describing the engine
+describes it as if it were.
 
 **What was measured.** `action_package` appears in exactly one place that writes it,
 `fill_core.py`'s `private_action_package_written` event, and in `mvp_core.py`'s
@@ -252,7 +253,23 @@ mappings all become due at once — or a decision to keep applying by hand perma
 which would make the whole Fill-Only engine dead weight worth deleting rather than
 maintaining.
 
+**Which branch was taken.** The first, on 2026-08-31:
+`docs/adr-fill-only-browser-worker.md` accepts a staged worker built against a local semantic
+replay, with the adapter order set by the measured queue — Lever 71/105, Greenhouse 19/105,
+Ashby 14/105, SmartRecruiters 1/105, Workday 0/105. The ADR supersedes the standing
+apply-by-hand decision and nothing else.
+
+**Why this entry stays open.** Accepting a decision is not building the thing. Nothing reads
+an action package today, and a passing semantic replay is evidence that a field combination
+came from a real recording — not that current Lever DOM can be filled. The entry narrows at
+rollout stage 7 to "local replay complete, production adapters unimplemented and named". It
+closes only after a supervised live acceptance test passes for at least one adapter, recorded
+with which posting, who was present, what the scoped submit guard observed, and the archive
+proving what was physically prepared. Until then no document may call this pipeline runnable
+end to end.
+
 **How it could bite.** It already has, twice, as a wrong answer to "what is finished".
 The operational risk is smaller than the reporting risk: nothing can submit anything, so
 nothing unsafe happens. What breaks is planning — work sequenced behind a stage that
-does not exist.
+does not exist. The ADR adds a third way for it to bite: reading a green semantic replay as
+though it were a live adapter.

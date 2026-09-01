@@ -6,6 +6,40 @@ Jobloom is not a mass-submission bot. It optimizes for time and tokens spent *pe
 
 ---
 
+## Why Jobloom should exist
+
+Most job-search tools optimize a visible step: find more openings, produce a better-looking
+resume, raise a match score, or fill a form faster. Some already cover more features than
+Jobloom. That is not the gap Jobloom is trying to fill.
+
+Jobloom exists to make the **whole career decision reproducible**:
+
+> Why this direction? Why this job? Why this version of me? Which evidence supports every
+> claim? Is that evidence and every reused answer still valid? What exact bytes and answers
+> were prepared or sent? What happened afterward?
+
+An ordinary AI workflow can promise that it did not invent anything. Jobloom must be able to
+**prove it from persisted state**. An ordinary browser agent can promise that it stopped before
+Submit. Jobloom must make Submit absent from the action protocol and reject results that cannot
+be replayed and verified. An ordinary career tool can produce a 1–5 or 0–100 score. Jobloom must
+show the eligibility rule, evidence relation, career value, real gap, posting risk, and decision
+as separate claims whose inputs can be inspected.
+
+The ambition is not fewer features. It is to put job discovery, career positioning, dynamic
+resumes, application answers, form filling, interview stories, company research, compensation,
+and outcomes on **one evidence and authorization substrate**, so adding convenience never lowers
+truthfulness.
+
+Jobloom is not there yet. Other projects currently lead it in interface quality, browser
+coverage, company research, compensation, interview coaching, notifications, and deployment.
+Jobloom earns the right to exist only when it closes those gaps **without giving up** evidence
+provenance, freshness, deterministic safety gates, privacy, and user control.
+
+The measurable product thesis and competitive acceptance gates are in
+[`docs/product-thesis.md`](docs/product-thesis.md).
+
+---
+
 ## What makes it different
 
 **It only says what you've said.**
@@ -232,6 +266,8 @@ python3 skills/jobloom/scripts/pre_submit_core.py \
 ```
 
 During filling, register a value-free form inventory and record all filled fields. After filling, generate a deterministic summary, show it to the user, and approve its exact SHA-256. `application_core.py` now rejects `pre_submit_ready` when given only a caller Boolean; it requires that persisted user-approved review and revalidates its material lock and authorization before submission.
+
+The steps below describe the backend half only. No browser worker reads the action package yet; one is accepted and staged in `docs/adr-fill-only-browser-worker.md`.
 
 Initialize the checkpointed Fill-Only execution store:
 

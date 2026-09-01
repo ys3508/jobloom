@@ -1,5 +1,22 @@
 # Jobloom roadmap
 
+Executable implementation backlog: [`docs/implementation-plan-2026-08-31.md`](docs/implementation-plan-2026-08-31.md).
+
+GitHub open-source landscape and reuse review:
+[`docs/github-open-source-landscape-2026-08-31.md`](docs/github-open-source-landscape-2026-08-31.md).
+
+Product thesis and competitive acceptance gates:
+[`docs/product-thesis.md`](docs/product-thesis.md).
+
+Reconciled OSS decisions and open brainstorm questions:
+[`docs/oss-review-reconciliation-2026-08-31.md`](docs/oss-review-reconciliation-2026-08-31.md).
+
+Lever first-form domain gaps and pre-protocol decisions:
+[`docs/lever-first-form-readiness.md`](docs/lever-first-form-readiness.md).
+
+Accepted decision record for the staged Fill-Only browser worker:
+[`docs/adr-fill-only-browser-worker.md`](docs/adr-fill-only-browser-worker.md).
+
 Recorded 2026-08-28 from the product owner. **Nothing here is implemented yet.** This file
 records the intended direction so later work can be judged against it; it is not a
 specification and no module below should be built before the one above it works.
