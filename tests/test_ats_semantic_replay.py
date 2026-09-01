@@ -282,7 +282,7 @@ class SurfaceProvenanceTests(unittest.TestCase):
         Loopback is a network location. What makes a pair checkable is the nonce the running
         server generated and registered, which nothing else on the machine holds.
         """
-        with ReplayServer(connection=self.db, at=self.at) as server:
+        with ReplayServer(connection=self.db, clock=lambda: self.at) as server:
             label = "Decline to answer"
             genuine = {"label": label,
                        "value": POLICY.replay_option_value(label, server.nonce)}
@@ -303,13 +303,57 @@ class SurfaceProvenanceTests(unittest.TestCase):
              "value": POLICY.replay_option_value("Decline to answer", server.nonce)}, self.at))
 
     def test_two_servers_do_not_share_a_nonce(self):
-        with ReplayServer(connection=self.db, at=self.at) as first:
-            with ReplayServer(connection=self.db, at=self.at) as second:
+        with ReplayServer(connection=self.db, clock=lambda: self.at) as first:
+            with ReplayServer(connection=self.db, clock=lambda: self.at) as second:
                 self.assertNotEqual(first.nonce, second.nonce)
+                self.assertNotEqual(first.origin, second.origin)
                 crossed = {"label": "Decline to answer",
                            "value": POLICY.replay_option_value("Decline to answer", first.nonce)}
                 self.assertFalse(POLICY.option_mapping_trusted(
                     self.db, f"{second.origin}/lever/0", crossed, self.at))
+
+    def test_two_live_surfaces_on_one_origin_fail_closed(self):
+        # Two processes claiming the same origin is not something this can adjudicate, and
+        # taking the most recent row would be a guess presented as a fact.
+        label = "Decline to answer"
+        with ReplayServer(connection=self.db, clock=lambda: self.at) as server:
+            pair = {"label": label,
+                    "value": POLICY.replay_option_value(label, server.nonce)}
+            self.assertTrue(POLICY.option_mapping_trusted(
+                self.db, f"{server.origin}/lever/0", pair, self.at))
+            POLICY.register_replay_surface(
+                self.db, "impostor", server.origin, "i" * 48, "f" * 64, "1.0.0",
+                self.at, self.at + __import__("datetime").timedelta(hours=1))
+            self.assertFalse(POLICY.option_mapping_trusted(
+                self.db, f"{server.origin}/lever/0", pair, self.at))
+
+    def test_the_surface_digest_covers_content_not_page_names(self):
+        # The old digest hashed `/lever/0` and friends, so changing a fixture's labels or the
+        # rendered markup left it identical.
+        with ReplayServer(connection=self.db, clock=lambda: self.at) as server:
+            recorded = self.db.execute(
+                "SELECT fixture_sha256 FROM replay_surfaces WHERE surface_id=?",
+                (server.surface_id,)).fetchone()["fixture_sha256"]
+            self.assertEqual(recorded, server.content_sha256())
+            names_only = hashlib.sha256("".join(sorted(server.pages)).encode()).hexdigest()
+            self.assertNotEqual(recorded, names_only)
+            original = server.pages["/lever/0"]
+            server.pages["/lever/0"] = original.replace("Full name", "Full  name")
+            self.assertNotEqual(server.content_sha256(), recorded)
+            server.pages["/lever/0"] = original
+            self.assertEqual(server.content_sha256(), recorded)
+
+    def test_a_surface_created_without_an_injected_clock_is_live_now(self):
+        # A default of a fixed historical date made every real run register an
+        # already-expired surface; the tests could not see it because they shared the same
+        # constant.
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        with ReplayServer(connection=self.db) as server:
+            label = "Decline to answer"
+            pair = {"label": label,
+                    "value": POLICY.replay_option_value(label, server.nonce)}
+            self.assertTrue(POLICY.option_mapping_trusted(
+                self.db, f"{server.origin}/lever/0", pair, now))
 
 
 class ReplayServerTests(unittest.TestCase):

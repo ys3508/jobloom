@@ -639,6 +639,27 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             POLICY.record_handling(self.db, "app-1", "eeo_race", "user_handled", "", AT)
         self.assertNotIn("Asian", self.database_dump())
 
+    def test_the_surface_nonce_stays_out_of_events_packages_and_archives(self):
+        # The plaintext nonce is accepted only for the local replay, and only on the terms
+        # that it never leaves the protected store.
+        self.issue_surface()
+        self.add_decline_policy(surface=False)
+        self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", options=self.race_options())], locale="en-US")
+        output = self.root / "private" / "page-actions.json"
+        FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
+        package = output.read_text(encoding="utf-8")
+        self.assertNotIn(self.NONCE, package)
+        events = " ".join(row[0] for row in self.db.execute(
+            "SELECT metadata_json FROM fill_events"))
+        self.assertNotIn(self.NONCE, events)
+        self.assertNotIn(self.NONCE, " ".join(row[0] for row in self.db.execute(
+            "SELECT reason_code FROM fill_events")))
+        # It is in exactly one place: the protected surface record it was issued into.
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM replay_surfaces WHERE nonce=?", (self.NONCE,)
+        ).fetchone()[0], 1)
+
     def test_a_retired_not_present_row_is_read_as_unknown(self):
         # A row an earlier version wrote must not be re-interpreted into a claim this
         # version has decided it cannot support.

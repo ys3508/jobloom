@@ -35,10 +35,15 @@ class ReplayServer:
     """
 
     def __init__(self, families=("lever", "greenhouse", "ashby"), connection=None,
-                 at=None, lifetime_hours=1):
+                 clock=None, lifetime_hours=1):
+        # A default of "now" and not a fixed date: a surface stamped with a historical time
+        # is expired the moment it is created, and the earlier version only looked correct
+        # because the tests happened to share its constant. Tests inject a clock instead.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.pages: dict[str, str] = {}
         self.final_activations = 0
         self.nonce = secrets.token_hex(24)
+        self._source_bytes: list[bytes] = []
         for directory in sorted(UPSTREAM.iterdir()):
             if not directory.is_dir():
                 continue
@@ -46,6 +51,7 @@ class ReplayServer:
             family = fixture["platformFamily"]
             if family not in families:
                 continue
+            self._source_bytes.append((directory / "fixture.json").read_bytes())
             last = len(fixture["steps"]) - 1
             for index in range(len(fixture["steps"])):
                 self.pages[f"/{family}/{index}"] = semantic_replay.render_page(
@@ -101,23 +107,37 @@ class ReplayServer:
         self._connection = connection
         self.surface_id = f"replay-{self.nonce[:12]}"
         if connection is not None:
-            issued = at or datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+            issued = self._clock()
             field_policy.register_replay_surface(
                 connection, self.surface_id, self.origin, self.nonce,
-                hashlib.sha256("".join(sorted(self.pages)).encode()).hexdigest(),
-                semantic_replay.RENDERER_VERSION, issued,
+                self.content_sha256(), semantic_replay.RENDERER_VERSION, issued,
                 issued + timedelta(hours=lifetime_hours))
 
     def __enter__(self):
         self._thread.start()
         return self
 
+    def content_sha256(self) -> str:
+        """What this surface is actually serving.
+
+        Hashing the path names told nobody anything: changing a fixture's labels, choices or
+        the rendered markup left `/lever/0` unchanged and the digest identical. This binds the
+        vendored fixture bytes, the renderer version, and the bytes of every page served.
+        """
+        digest = hashlib.sha256()
+        digest.update(semantic_replay.RENDERER_VERSION.encode("utf-8"))
+        for raw in self._source_bytes:
+            digest.update(hashlib.sha256(raw).digest())
+        for path in sorted(self.pages):
+            digest.update(path.encode("utf-8"))
+            digest.update(hashlib.sha256(self.pages[path].encode("utf-8")).digest())
+        return digest.hexdigest()
+
     def __exit__(self, *exception):
         if self._connection is not None:
             # A surface outlives nothing: when the server stops, the trust it carried stops.
             field_policy.revoke_replay_surface(
-                self._connection, self.surface_id,
-                datetime(2026, 8, 25, 12, tzinfo=timezone.utc))
+                self._connection, self.surface_id, self._clock())
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)

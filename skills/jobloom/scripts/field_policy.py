@@ -579,16 +579,17 @@ def active_replay_surface(connection: sqlite3.Connection, form_url: str,
     if parsed.scheme != "http" or not parsed.hostname or not parsed.port:
         return None
     origin = f"http://{parsed.hostname}:{parsed.port}"
-    row = connection.execute(
-        "SELECT * FROM replay_surfaces WHERE origin=? AND revoked_at IS NULL "
-        "ORDER BY issued_at DESC LIMIT 1", (origin,),
-    ).fetchone()
-    if not row:
+    rows = connection.execute(
+        "SELECT * FROM replay_surfaces WHERE origin=? AND revoked_at IS NULL", (origin,),
+    ).fetchall()
+    live = [row for row in rows
+            if not (parse_time(row["expires_at"]) and at >= parse_time(row["expires_at"]))]
+    if len(live) != 1:
+        # Zero is nothing to trust. More than one means two processes claim the same origin
+        # and this cannot tell which is serving the page in front of it, so picking the most
+        # recent would be a guess presented as a fact.
         return None
-    expires = parse_time(row["expires_at"])
-    if expires and at >= expires:
-        return None
-    return row
+    return live[0]
 
 
 def option_mapping_trusted(connection: sqlite3.Connection, form_url: str,

@@ -77,8 +77,16 @@ able to read a value is not the same as the value being safe.
 
 The nonce is also why a loopback address grants nothing on its own. Any local process can
 listen on `127.0.0.1` and compute a published hash, so trust comes from a `replay_surfaces`
-record Jobloom wrote when it started this renderer — bound to the exact origin, expiring, and
-revoked when the server stops. On any other surface an approved adapter mapping with a fixed
+record Jobloom wrote when it started this renderer — bound to the exact origin, carrying a
+digest over the vendored fixture bytes, the renderer version and the bytes of every page
+served, expiring, and revoked when the server stops. Two live records for one origin fail
+closed rather than resolving to the most recent, because two processes claiming one origin is
+not something this can adjudicate.
+
+The nonce is stored in plaintext in the private database. That is accepted for a local replay
+whose pages carry no real data, on the terms that it stays inside the protected store — a test
+asserts it reaches no event, package or archive — and it is **not** a key scheme for a future
+production adapter. On any other surface an approved adapter mapping with a fixed
 hash and version would be required, and none exists, so the control is the user's.
 
 The final control is a real submit that posts to a loopback counting endpoint. An earlier
