@@ -28,6 +28,7 @@ import field_policy  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
 import worker_protocol  # noqa: E402
+from _common import parse_time as _parse_time  # noqa: E402
 from _common import require_application_material_format, require_table  # noqa: E402
 
 
@@ -186,6 +187,14 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS fill_step_next_idx
             ON fill_steps(session_id, page_id, status, ordinal);
+
+        CREATE TABLE IF NOT EXISTS exported_packages (
+            session_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            exported_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, page_id, package_sha256)
+        );
 
         CREATE TABLE IF NOT EXISTS execution_grants (
             grant_id TEXT PRIMARY KEY,
@@ -473,66 +482,122 @@ def _apply_domain_rule(connection, domain, field, field_id, ordinal, sensitivity
 
 
 def issue_execution_grant(connection: sqlite3.Connection, session_id: str, page_id: str,
-                          package_path: Path, grant_path: Path, at: datetime,
+                          package_path: Path, at: datetime,
                           ttl_seconds: int = 900) -> dict[str, Any]:
-    """Authorise one worker run, for one package, once.
+    """Authorise one worker run, for one package this authority actually exported, once.
 
-    Written here because this is the authority. The secret lives in the protected store and
-    in the grant file the worker is handed; the package itself carries no part of it, so a
-    package produced by anything other than `export_page` has no grant that matches its bytes.
+    The earlier version signed whatever bytes the caller handed it after checking only that
+    the session and page existed, so a package with an added or edited action could be
+    presented with a real session ID and signed. Every field is now checked against what the
+    database already recorded: the digest must be one `export_page` wrote, the identity must
+    match, the actions must be exactly the pending steps in order with their values and
+    expected hashes, and the surface must be the attestation that is live now.
+
+    No secret is written anywhere the worker can reach. Redemption goes through
+    `execution_authority`, which is the only thing that can say whether a grant exists.
     """
     require_table(connection, "execution_grants")
-    package_bytes = package_path.read_bytes()
-    digest = hashlib.sha256(package_bytes).hexdigest()
+    digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
+    exported = connection.execute(
+        "SELECT 1 FROM exported_packages WHERE session_id=? AND page_id=? AND package_sha256=?",
+        (session_id, page_id, digest)).fetchone()
+    if not exported:
+        raise ValueError("package was not exported by this authority")
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    session = connection.execute(
+        "SELECT * FROM fill_sessions WHERE session_id=?", (session_id,)).fetchone()
     page = connection.execute(
         "SELECT page_url FROM fill_pages WHERE session_id=? AND page_id=?",
         (session_id, page_id)).fetchone()
-    if not page:
-        raise ValueError("page not found for execution grant")
+    if not session or not page:
+        raise ValueError("session or page not found for execution grant")
+    if (package.get("session_id") != session_id or package.get("page_id") != page_id
+            or package.get("application_id") != session["application_id"]
+            or package.get("page_url") != page["page_url"]):
+        raise ValueError("package identity does not match the recorded export")
+    steps = connection.execute(
+        "SELECT step_id, field_id, selector, control, operation, value_json, expected_sha256 "
+        "FROM fill_steps WHERE session_id=? AND page_id=? AND status='pending' ORDER BY ordinal",
+        (session_id, page_id)).fetchall()
+    recorded = [{"step_id": row["step_id"], "field_id": row["field_id"],
+                 "selector": row["selector"], "control": row["control"],
+                 "operation": row["operation"], "value": json.loads(row["value_json"]),
+                 "expected_sha256": row["expected_sha256"]} for row in steps]
+    if package.get("actions") != recorded:
+        raise ValueError("package actions do not match the recorded pending steps")
     attestation = field_policy.surface_attestation(connection, page["page_url"], at)
     if not attestation:
         raise ValueError("no attested replay surface for this page")
-    secret = secrets.token_hex(32)
-    grant = {
-        "grant_id": f"grant-{secrets.token_hex(8)}", "session_id": session_id,
-        "page_id": page_id, "package_sha256": digest,
-        "surface_origin": attestation["origin"],
-        "renderer_version": attestation["renderer_version"],
-        "issued_at": at.isoformat(),
-        "expires_at": (at + timedelta(seconds=ttl_seconds)).isoformat(),
-    }
-    grant["signature"] = worker_protocol.grant_signature(secret, digest, grant)
+    if package.get("surface") != attestation:
+        raise ValueError("package surface does not match the current attestation")
+    grant_id = f"grant-{secrets.token_hex(8)}"
     connection.execute(
         "INSERT INTO execution_grants (grant_id, session_id, page_id, package_sha256, "
         "secret, issued_at, expires_at, consumed_at, revoked_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-        (grant["grant_id"], session_id, page_id, digest, secret,
-         grant["issued_at"], grant["expires_at"]),
+        "VALUES (?, ?, ?, ?, '', ?, ?, NULL, NULL)",
+        (grant_id, session_id, page_id, digest, at.isoformat(),
+         (at + timedelta(seconds=ttl_seconds)).isoformat()),
     )
     connection.commit()
-    handle = os.open(grant_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        json.dump({"grant": grant, "secret": secret}, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-    return {"grant_id": grant["grant_id"], "grant_path": str(grant_path),
-            "expires_at": grant["expires_at"]}
+    return {"grant_id": grant_id, "package_sha256": digest,
+            "expires_at": (at + timedelta(seconds=ttl_seconds)).isoformat()}
 
 
-def revoke_execution_grant(connection: sqlite3.Connection, grant_id: str, grant_path: Path,
+def revoke_execution_grant(connection: sqlite3.Connection, grant_id: str,
                            at: datetime) -> dict[str, Any]:
-    """Withdraw an unused grant. The marker beside the file is what the worker can see.
-
-    The worker reads no database, so revocation has to be legible on disk; the row is
-    updated too, because that is what refuses a result if one arrives anyway.
-    """
+    """Withdraw an unused grant. State lives here, because this is what redemption consults."""
     connection.execute(
         "UPDATE execution_grants SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL",
         (at.isoformat(), grant_id))
     connection.commit()
-    marker = grant_path.with_suffix(grant_path.suffix + ".revoked")
-    if not marker.exists():
-        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     return {"grant_id": grant_id, "revoked": True}
+
+
+def redeem_execution_grant(connection: sqlite3.Connection, grant_id: str,
+                           package_sha256: str, at: datetime) -> dict[str, Any]:
+    """Consume a grant atomically and return the parameters a run is authorised to use.
+
+    Single-use is a property of this row, not of a marker file: copying a package and a
+    grant to new paths cannot produce a second execution, because the second redemption
+    updates zero rows.
+    """
+    require_table(connection, "execution_grants")
+    row = connection.execute(
+        "SELECT * FROM execution_grants WHERE grant_id=?", (grant_id,)).fetchone()
+    if not row:
+        return {"authorised": False, "reason": "grant_unknown"}
+    if row["package_sha256"] != package_sha256:
+        return {"authorised": False, "reason": "grant_package_mismatch"}
+    if row["revoked_at"]:
+        return {"authorised": False, "reason": "grant_revoked"}
+    if row["consumed_at"]:
+        return {"authorised": False, "reason": "grant_already_consumed"}
+    expires = parse_time(row["expires_at"])
+    if not expires or at >= expires:
+        return {"authorised": False, "reason": "grant_expired"}
+    page = connection.execute(
+        "SELECT page_url FROM fill_pages WHERE session_id=? AND page_id=?",
+        (row["session_id"], row["page_id"])).fetchone()
+    attestation = field_policy.surface_attestation(connection, page["page_url"], at) if page else None
+    if not attestation:
+        return {"authorised": False, "reason": "surface_expired"}
+    cursor = connection.execute(
+        "UPDATE execution_grants SET consumed_at=? WHERE grant_id=? AND consumed_at IS NULL",
+        (at.isoformat(), grant_id))
+    connection.commit()
+    if cursor.rowcount != 1:
+        return {"authorised": False, "reason": "grant_already_consumed"}
+    return {
+        "authorised": True, "grant_id": grant_id,
+        # Everything security-relevant comes from here, not from the package: the package is
+        # untrusted data once its digest has been matched.
+        "target": attestation["origin"] + attestation["page_path"],
+        "origin": attestation["origin"],
+        "renderer_version": attestation["renderer_version"],
+        "page_sha256": attestation["page_sha256"],
+        # The oracle is a capability of the attested surface, not a caller-supplied URL.
+        "oracle_url": attestation["origin"] + field_policy.ORACLE_PATH,
+    }
 
 
 def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:
@@ -838,6 +903,10 @@ def export_page(connection: sqlite3.Connection, session_id: str, worker_id: str,
     output.write_text(json.dumps(package, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.chmod(output, 0o600)
     digest = resume_core.file_sha256(output)
+    connection.execute(
+        "INSERT OR IGNORE INTO exported_packages (session_id, page_id, package_sha256, "
+        "exported_at) VALUES (?, ?, ?, ?)",
+        (session_id, page_id, digest, (at or now_utc()).isoformat()))
     _event(connection, session, worker_id, "page_exported", "private_action_package_written",
            {"page_id": page_id, "action_count": len(actions), "package_sha256": digest}, at)
     connection.commit()

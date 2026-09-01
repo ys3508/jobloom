@@ -447,6 +447,10 @@ def conflict_derivation(
 # observed field can carry: `_require_id` forbids `*`.
 INVENTORY_SCOPE = "*inventory*"
 
+# The one endpoint a replay surface exposes for counting its own final actions. Fixed here so
+# an oracle is a property of the attested surface rather than a URL a caller can name.
+ORACLE_PATH = "/__state"
+
 # What each marker is allowed to be believed on. A marker never rests on an absence.
 MARKER_EVIDENCE = {
     "policy_declined": "verified_policy_step",

@@ -1,20 +1,25 @@
-"""The worker, driven against the real replay with a real browser.
+"""The worker, its authority, and the attacks both have to survive.
 
-Skipped when Playwright is unavailable, because the browser is an optional local tool rather
-than something the rest of the suite depends on. Everything here runs headless; the worker
-itself is headed by default, since a run the user cannot see is a run they cannot stop.
+Three layers, because they fail differently. `IssuanceTests` covers what the authority will
+authorise — an earlier version signed whatever bytes the caller handed it. `AuthorityTests`
+covers redemption, the only place a grant's existence can be decided; a previous attempt put
+an HMAC key in the same file as the signature it verified, which authenticates nothing.
+`BrowserExecutionTests` drives a real Chromium against the real replay, through a real
+session, export, grant and redemption.
+
+The setup mirrors `tests/test_fill_core.py` rather than importing it: importing one test
+module from another made results depend on which invocation ran.
 """
 
-import hashlib
 import importlib.util
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -28,20 +33,33 @@ def load_script(name):
     return module
 
 
-WORKER = load_script("fill_worker")
+FILL = load_script("fill_core")
+CANDIDATES = load_script("candidate_core")
+APPLICATIONS = load_script("application_core")
+ANSWERS = load_script("answer_library")
+RESUMES = load_script("resume_core")
+COVERS = load_script("cover_letter_core")
+ARCHIVE = load_script("archive_core")
+PRE_SUBMIT = load_script("pre_submit_core")
 POLICY = load_script("field_policy")
 PROTOCOL = load_script("worker_protocol")
-
-from tests.fixtures.ats_replay_server import ReplayServer
+WORKER = load_script("fill_worker")
+AUTHORITY = load_script("execution_authority")
 from tests.pdf_fixture import synthetic_pdf
 
-AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+import hashlib
+import os
+import urllib.error
+import urllib.request
+
+from tests.fixtures.ats_replay_server import ReplayServer
+
 
 def _browser_available() -> bool:
     """Playwright importable *and* a Chromium actually installed.
 
     Importing the package says nothing about whether a browser was downloaded, and a merge
-    gate that accepts "it imported" would let the acceptance tests skip in CI.
+    gate that accepted "it imported" would let the acceptance tests skip in CI.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -58,457 +76,517 @@ PLAYWRIGHT = _browser_available()
 
 if os.environ.get("JOBLOOM_REQUIRE_BROWSER") and not PLAYWRIGHT:
     # A merge gate sets this. Skipping is correct on a laptop and unacceptable where the
-    # eleven acceptance tests are the point of the run.
+    # browser acceptance tests are the point of the run.
     raise RuntimeError(
         "JOBLOOM_REQUIRE_BROWSER is set but no Chromium is available: "
         "run `python -m playwright install chromium`")
 
 
-class PackageAcceptanceTests(unittest.TestCase):
-    """What the worker refuses before a browser is ever launched."""
+AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
 
+
+class _SessionBase(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        # The authority answers on its own thread, so the connection has to be usable there.
+        self.db = sqlite3.connect(":memory:", check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        APPLICATIONS.initialize(self.db)
+        ANSWERS.initialize(self.db)
+        RESUMES.initialize(self.db)
+        COVERS.initialize(self.db)
+        ARCHIVE.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
+        FILL.initialize(self.db)
+        CANDIDATES.initialize(self.db)
+        self.addCleanup(self.db.close)
+        self.candidate_path, self.manifest_path = self.make_candidate()
+        CANDIDATES.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
+        self.prepare_application()
 
-    def write(self, package, mode=0o600, name="package.json"):
-        path = self.root / name
-        path.write_text(json.dumps(package), encoding="utf-8")
-        path.chmod(mode)
-        return path
+    def make_candidate(self):
+        facts = [
+            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-unlocked", "type": "location", "value": "New York",
+             "status": "confirmed", "locked": False, "evidence_strength": "direct"},
+        ]
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": facts,
+        }
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        candidate_path = self.root / "candidate.json"
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        manifest_path = self.root / "claims.json"
+        manifest_path.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
+            "claim_id": "claim-name", "claim_text": "Verified Candidate", "fact_ids": ["fact-name"],
+            "evidence_strength": "direct", "exact_locked_value_preserved": True,
+        }]}), encoding="utf-8")
+        return candidate_path, manifest_path
 
-    def package(self, **updates):
+    def prepare_application(self):
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Candidate"]))
+        RESUMES.register_version(
+            self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
+        )
+        RESUMES.approve_version(
+            self.db, "resume-1", self.candidate_path, self.manifest_path, "user", AT
+        )
+        card = {
+            "job_id": "job-1", "canonical_url": "https://apply.example.com/jobs/1",
+            "employer": "Example Corp", "title": "Backend Engineer", "location": "New York, NY",
+            "country": "US", "employment_type": "full_time", "status": "open",
+        }
+        APPLICATIONS.ingest_job(self.db, card, at=AT)
+        APPLICATIONS.create_application(self.db, "app-1", "job-1", "precision", "approved_queue", AT)
+        APPLICATIONS.transition(self.db, "app-1", "pending_analysis", "system", "analysis", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "precision_recommended", "system", "match", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "approved", "user", "approved", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "materials_in_progress", "system", "materials", at=AT)
+        RESUMES.bind_version(self.db, "app-1", "resume-1", at=AT)
+        RESUMES.lock_materials(self.db, "app-1", lock_id="lock-1", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "ready", at=AT)
+        APPLICATIONS.acquire_next(self.db, "worker-1", at=AT)
+        self.add_answer(
+            "answer-auth", "work_authorized_now", "Are you authorized to work?", True
+        )
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": "auth-1", "confirmed_at": AT.isoformat(),
+            "expires_at": (AT + timedelta(days=7)).isoformat(),
+            "scope": {"country": "US", "application_id": "app-1"},
+        })
+
+    def add_answer(self, answer_id, canonical_id, question, value, scope=None):
+        ANSWERS.add_answer(self.db, {
+            "answer_id": answer_id, "canonical_id": canonical_id,
+            "canonical_meaning": question, "answer": value, "answer_type": "stable_fact",
+            "source_type": "user_confirmed", "confirmation_status": "confirmed",
+            "confirmed_at": AT.isoformat(), "validity_class": "stable",
+            "scope": scope if scope is not None else {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
+        })
+        ANSWERS.add_question_form(self.db, canonical_id, question)
+
+    def start(self, **updates):
         value = {
-            "schema_version": "0.1.0", "mode": "fill_only", "session_id": "session-1",
-            "application_id": "app-1", "page_id": "page-1",
-            "page_url": "http://127.0.0.1:8931/lever/0",
-            "surface": {"origin": "http://127.0.0.1:8931", "renderer_version": "1.0.0",
-                        "page_path": "/lever/0", "page_sha256": "a" * 64,
-                        "expires_at": (AT + timedelta(hours=1)).isoformat()},
-            "actions": [{"step_id": "s-1", "field_id": "f-1", "selector": "#f",
-                         "control": "text", "operation": "fill", "value": "x",
-                         "expected_sha256": "b" * 64}],
-            "stop_before_submit": True, "submission_action": None,
+            "session_id": "session-1", "application_id": "app-1", "worker_id": "worker-1",
+            "form_url": "https://apply.example.com/jobs/1/apply",
+            "observed_employer": "Example Corp", "observed_role": "Backend Engineer",
+            "known_form": True, "authorization_id": "auth-1",
+            "authorization_context": {"country": "wrong", "application_id": "wrong"}, "at": AT,
+        }
+        value.update(updates)
+        return FILL.start_session(self.db, **value)
+
+    def page(self, fields=None, **updates):
+        value = {
+            "page_id": "page-1", "page_index": 0,
+            "page_url": "https://apply.example.com/jobs/1/apply",
+            "fields": fields if fields is not None else self.standard_fields(),
+            "legal_items": [], "restricted_requests": [], "final_page": True,
         }
         value.update(updates)
         return value
 
-    def refuses(self, code, package, mode=0o600):
-        with self.assertRaises(WORKER.WorkerRefusal) as caught:
-            WORKER.load_package(self.write(package, mode))
-        self.assertEqual(str(caught.exception), code)
+    def standard_fields(self):
+        return [
+            {"field_id": "candidate_name", "question": "Full name", "selector": "#name",
+             "control": "text", "required": True, "sensitivity": "normal",
+             "source_kind": "fact", "source_id": "fact-name"},
+            {"field_id": "work_auth", "question": "Are you authorized to work?", "selector": "#auth",
+             "control": "radio", "required": True, "sensitivity": "normal",
+             "source_kind": "answer"},
+            {"field_id": "resume_upload", "question": "Resume", "selector": "#resume",
+             "control": "file", "required": True, "sensitivity": "normal",
+             "upload_kind": "resume"},
+            {"field_id": "truth", "question": "I certify this is accurate", "selector": "#truth",
+             "control": "standard_attestation", "required": True, "sensitivity": "normal"},
+            {"field_id": "submit", "question": "Submit application", "selector": "#submit",
+             "control": "submit", "required": True, "sensitivity": "normal"},
+        ]
 
-    def test_a_valid_package_is_accepted(self):
-        self.assertEqual(
-            WORKER.load_package(self.write(self.package()))["page_id"], "page-1")
+    def complete_page(self, page_id="page-1", worker_id="worker-1"):
+        rows = self.db.execute(
+            "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id='session-1' AND page_id=? "
+            "ORDER BY ordinal", (page_id,),
+        ).fetchall()
+        for row in rows:
+            FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
+        return FILL.checkpoint_page(
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
+        )
 
-    def test_a_world_readable_package_is_refused(self):
-        self.refuses("package_permissions", self.package(), mode=0o644)
+    def authority(self, redeem=None):
+        """The real service, backed by the real redemption logic."""
+        return AUTHORITY.ExecutionAuthority(
+            self.db, redeem or FILL.redeem_execution_grant,
+            clock=lambda: self.now)
 
-    def test_a_package_without_an_attested_surface_is_refused(self):
-        self.refuses("no_attested_surface", self.package(surface=None))
-        surface = dict(self.package()["surface"])
-        del surface["page_sha256"]
-        self.refuses("incomplete_surface_attestation", self.package(surface=surface))
+    def reacquire(self, worker_id="worker-2"):
+        APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
+        return APPLICATIONS.acquire_next(self.db, worker_id, at=AT)
 
-    def test_a_surface_off_loopback_or_from_another_renderer_is_refused(self):
-        for origin, code in (("https://jobs.lever.co", "surface_outside_loopback"),
-                             ("http://localhost:8931", "surface_outside_loopback"),
-                             ("http://10.0.0.5:8931", "surface_outside_loopback")):
-            with self.subTest(origin=origin):
-                surface = {**self.package()["surface"], "origin": origin}
-                self.refuses(code, self.package(surface=surface))
-        surface = {**self.package()["surface"], "renderer_version": "0.9.0"}
-        self.refuses("renderer_version_mismatch", self.package(surface=surface))
 
-    def test_a_submission_shaped_package_is_refused(self):
-        self.refuses("stop_before_submit_not_asserted", self.package(stop_before_submit=False))
-        self.refuses("submission_action_present", self.package(submission_action="#submit"))
-        for operation in ("click", "submit", "navigate", "press", "evaluate", "download"):
-            with self.subTest(operation=operation):
-                actions = [{**self.package()["actions"][0], "operation": operation}]
-                self.refuses("unsupported_operation", self.package(actions=actions))
+    # ---- a session whose page is the running replay ----------------------
 
-    def test_a_package_can_only_be_consumed_once(self):
-        path = self.write(self.package())
-        WORKER.consume(path)
-        with self.assertRaises(WORKER.WorkerRefusal) as caught:
-            WORKER.consume(path)
-        self.assertEqual(str(caught.exception), "package_already_consumed")
-        # The package survives for audit; only a second run is refused.
-        self.assertTrue(path.is_file())
+    def replay_session(self, server, path="/lever/0", field_id="lever-0-1",
+                       extra_field_ids=()):
+        """A real session against a real surface, so nothing here is fabricated."""
+        self.start(form_url=f"{server.origin}{path}", at=self.now)
+        observation = {
+            "page_id": "page-1", "page_index": 0,
+            "page_url": f"{server.origin}{path}",
+            "fields": [
+                {"field_id": field_id, "question": "Full name", "selector": "#n",
+                 "control": "text", "required": True, "sensitivity": "normal",
+                 "source_kind": "fact", "source_id": "fact-name"},
+                *({"field_id": extra, "question": "Full name", "selector": f"#{extra}",
+                   "control": "text", "required": True, "sensitivity": "normal",
+                   "source_kind": "fact", "source_id": "fact-name"}
+                  for extra in extra_field_ids),
+                {"field_id": "final-action", "question": "Submit application",
+                 "selector": "#s", "control": "submit", "required": True,
+                 "sensitivity": "normal"},
+            ],
+            "legal_items": [], "restricted_requests": [], "final_page": True,
+        }
+        FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                          observation, self.now)
+        return observation
+
+    def export(self, name="package.json"):
+        output = self.root / "private" / name
+        FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, self.now)
+        return output
+
+    def issue(self, package, **updates):
+        return FILL.issue_execution_grant(
+            self.db, "session-1", "page-1", package, self.now, **updates)
+
+
+class IssuanceTests(_SessionBase):
+    """What the authority will and will not authorise. No browser needed."""
+
+    def setUp(self):
+        # One injected clock for the whole run — the session, the surface and the grant all
+        # read it — rather than mixing a fixed fixture time with wall-clock expiry.
+        self.now = AT
+        super().setUp()
+
+    def test_a_package_this_authority_exported_is_authorised(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            grant = self.issue(self.export())
+            self.assertTrue(grant["grant_id"].startswith("grant-"))
+
+    def test_bytes_this_authority_never_exported_are_refused(self):
+        # The hole: issuance checked only that the session and page existed, then signed
+        # whatever file it was pointed at.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            self.export()
+            forged = self.root / "private" / "forged.json"
+            forged.write_text('{"mode": "fill_only"}', encoding="utf-8")
+            forged.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "was not exported by this authority"):
+                self.issue(forged)
+
+    def test_an_edited_or_added_action_is_refused_even_with_a_real_session_id(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            original = json.loads(package.read_text(encoding="utf-8"))
+            for label, mutate in (
+                ("value", lambda p: p["actions"][0].update({"value": "Someone Else"})),
+                ("extra", lambda p: p["actions"].append(dict(p["actions"][0]))),
+                ("hash", lambda p: p["actions"][0].update({"expected_sha256": "0" * 64})),
+                ("identity", lambda p: p.update({"application_id": "app-2"})),
+                ("surface", lambda p: p["surface"].update({"page_sha256": "0" * 64})),
+            ):
+                with self.subTest(mutation=label):
+                    tampered = json.loads(json.dumps(original))
+                    mutate(tampered)
+                    path = self.root / "private" / f"tampered-{label}.json"
+                    path.write_text(json.dumps(tampered, indent=2, ensure_ascii=False) + "\n",
+                                    encoding="utf-8")
+                    path.chmod(0o600)
+                    with self.assertRaises(ValueError):
+                        self.issue(path)
+
+
+class AuthorityTests(_SessionBase):
+    """Redemption: the only place a grant's existence is decided."""
+
+    def setUp(self):
+        # One injected clock for the whole run — the session, the surface and the grant all
+        # read it — rather than mixing a fixed fixture time with wall-clock expiry.
+        self.now = AT
+        super().setUp()
+
+    def redeem(self, authority, grant_id, digest, token=None):
+        request = urllib.request.Request(
+            authority.url,
+            data=json.dumps({"grant_id": grant_id, "package_sha256": digest}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {token or authority.token}"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as refusal:
+            try:
+                return refusal.code, json.load(refusal)
+            except Exception:  # noqa: BLE001
+                return refusal.code, {}
+
+    def test_an_attacker_cannot_mint_a_grant_for_a_package_of_their_own(self):
+        """The attack the HMAC design could not stop.
+
+        The old grant file carried the signature and the key that verified it, so an attacker
+        never needed a real grant: choose a secret, sign a forged package, present both. Here
+        there is nothing to sign. Authorisation is a row in the authority's database, and a
+        package it never exported has none.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now):
+            forged = self.root / "attacker.json"
+            forged.write_text('{"mode": "fill_only", "actions": []}', encoding="utf-8")
+            digest = hashlib.sha256(forged.read_bytes()).hexdigest()
+            with self.authority() as authority:
+                status, answer = self.redeem(authority, "grant-invented", digest)
+                self.assertEqual(status, 403)
+                self.assertEqual(answer["reason"], "grant_unknown")
+
+    def test_a_real_grant_cannot_be_moved_onto_other_bytes(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            grant = self.issue(self.export())
+            with self.authority() as authority:
+                status, answer = self.redeem(authority, grant["grant_id"], "0" * 64)
+                self.assertEqual((status, answer["reason"]), (403, "grant_package_mismatch"))
+
+    def test_redemption_is_single_use_and_survives_copying_the_files(self):
+        # Single-use is a row in the authority's state, not a marker beside a path, so
+        # copying the package elsewhere buys nothing.
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            copied = self.root / "private" / "copy.json"
+            copied.write_bytes(package.read_bytes())
+            with self.authority() as authority:
+                self.assertEqual(self.redeem(authority, grant["grant_id"], digest)[0], 200)
+                status, answer = self.redeem(authority, grant["grant_id"], digest)
+                self.assertEqual((status, answer["reason"]), (403, "grant_already_consumed"))
+                self.assertEqual(
+                    hashlib.sha256(copied.read_bytes()).hexdigest(), digest,
+                    "the copy is byte-identical and still cannot run")
+
+    def test_a_revoked_or_expired_grant_is_refused(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            revoked = self.issue(package)
+            FILL.revoke_execution_grant(self.db, revoked["grant_id"], self.now)
+            with self.authority() as authority:
+                self.assertEqual(
+                    self.redeem(authority, revoked["grant_id"], digest)[1]["reason"],
+                    "grant_revoked")
+            later = AUTHORITY.ExecutionAuthority(
+                self.db, FILL.redeem_execution_grant,
+                clock=lambda: self.now + timedelta(hours=2))
+            fresh = self.issue(package)
+            with later as authority:
+                self.assertEqual(
+                    self.redeem(authority, fresh["grant_id"], digest)[1]["reason"],
+                    "grant_expired")
+
+    def test_another_local_process_cannot_spend_a_grant(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            with self.authority() as authority:
+                self.assertEqual(
+                    self.redeem(authority, grant["grant_id"], digest, token="guessed")[0], 403)
+                # Unspent, so the legitimate run still works.
+                self.assertEqual(self.redeem(authority, grant["grant_id"], digest)[0], 200)
+
+    def test_the_oracle_is_a_capability_of_the_attested_surface(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+            with self.authority() as authority:
+                _, answer = self.redeem(authority, grant["grant_id"], digest)
+            # Named by the authority from the surface, never by the caller: a caller-supplied
+            # URL could be any service returning a constant zero.
+            self.assertEqual(answer["oracle_url"], f"{server.origin}/__state")
+            self.assertTrue(answer["target"].startswith(server.origin))
+
+    def test_a_worker_refuses_an_oracle_that_is_not_on_the_surface(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            grant = self.issue(package)
+            digest = hashlib.sha256(package.read_bytes()).hexdigest()
+
+            def lying_redeem(connection, grant_id, package_sha256, at):
+                answer = FILL.redeem_execution_grant(connection, grant_id, package_sha256, at)
+                if answer.get("authorised"):
+                    answer["oracle_url"] = "http://127.0.0.1:9/always-zero"
+                return answer
+
+            with self.authority(redeem=lying_redeem) as authority:
+                with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                    WORKER.redeem(authority.url, authority.token, grant["grant_id"], digest)
+                self.assertEqual(str(caught.exception), "oracle_outside_surface")
+
 
 
 @unittest.skipUnless(PLAYWRIGHT, "playwright is not installed")
-class BrowserExecutionTests(unittest.TestCase):
-    """The worker against a real Chromium and the real replay server."""
+class BrowserExecutionTests(_SessionBase):
+    """Real Chromium, real replay, real session, real grant, real redemption."""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.db = sqlite3.connect(":memory:")
-        self.db.row_factory = sqlite3.Row
-        POLICY.initialize(self.db)
-        self.addCleanup(self.db.close)
-        self.now = datetime.now(timezone.utc)
-
-    def package_for(self, server, path, actions, **updates):
-        attestation = POLICY.surface_attestation(
-            self.db, f"{server.origin}{path}", self.now)
-        self.assertIsNotNone(attestation, "the running server should be an attested surface")
-        package = {
-            "schema_version": "0.1.0", "mode": "fill_only", "session_id": "session-1",
-            "application_id": "app-1", "page_id": "page-1",
-            "page_url": f"{server.origin}{path}", "surface": attestation,
-            "actions": actions, "stop_before_submit": True, "submission_action": None,
-        }
-        package.update(updates)
-        file = self.root / f"package-{len(list(self.root.glob('package-*')))}.json"
-        file.write_text(json.dumps(package), encoding="utf-8")
-        file.chmod(0o600)
-        return file
-
-    def action(self, field_id, control, operation, value):
-        return {"step_id": f"step-{field_id}", "field_id": field_id, "selector": "",
-                "control": control, "operation": operation, "value": value,
-                "expected_sha256": "0" * 64}
-
-    def grant_for(self, package, ttl_seconds=900, at=None):
-        """A grant the way `fill_core` issues one, without needing a whole fill session."""
-        import worker_protocol as protocol_module  # the same module the worker verifies with
-        moment = at or self.now
-        digest = hashlib.sha256(package.read_bytes()).hexdigest()
-        secret = "s" * 64
-        grant = {"grant_id": "grant-1", "session_id": "session-1", "page_id": "page-1",
-                 "package_sha256": digest, "surface_origin": "http://127.0.0.1:0",
-                 "renderer_version": "1.0.0", "issued_at": moment.isoformat(),
-                 "expires_at": (moment + timedelta(seconds=ttl_seconds)).isoformat()}
-        grant["signature"] = PROTOCOL.grant_signature(secret, digest, grant)
-        path = package.with_suffix(".grant.json")
-        path.write_text(json.dumps({"grant": grant, "secret": secret}), encoding="utf-8")
-        path.chmod(0o600)
-        return path
-
-    def execute(self, package, name="result.json", grant=None, oracle=None, **updates):
-        output = self.root / name
-        WORKER.run(package, output, grant or self.grant_for(package), headed=False,
-                   oracle_url=oracle, at=self.now, **updates)
-        return json.loads(output.read_text(encoding="utf-8")), output
+        self.now = AT
+        super().setUp()
 
     def final_actions(self, server):
         return json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))[
             "final_action_activations"]
 
-    def test_it_fills_selects_and_checks_and_never_activates_the_final_action(self):
+    def execute(self, server, name="result.json", grant=None, authority=None):
+        package = self.export(f"{name}.package.json")
+        issued = grant or self.issue(package)
+        output = self.root / name
+        if authority is None:
+            with self.authority() as service:
+                summary = WORKER.run(package, output, service.url, service.token,
+                                     issued["grant_id"], headed=False, at=self.now)
+        else:
+            summary = WORKER.run(package, output, authority.url, authority.token,
+                                 issued["grant_id"], headed=False, at=self.now)
+        return json.loads(output.read_text(encoding="utf-8")), output, summary
+
+    def test_a_real_chain_fills_the_page_and_proves_the_counter_never_moved(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
             self.assertEqual(self.final_actions(server), 0)
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "Verified Candidate"),
-                self.action("lever-0-4", "select", "select",
-                            POLICY.replay_option_value(
-                                "Phoenix, Arizona, United States", server.nonce)),
-            ])
-            envelope, output = self.execute(
-                package, oracle=f"{server.origin}/__state")
-            self.assertEqual([entry["outcome"] for entry in envelope["results"]],
-                             ["verified", "verified"])
-            # A zero because the target was counting, not because the field was hardcoded.
+            envelope, output, _ = self.execute(server)
+            self.assertEqual([entry["outcome"] for entry in envelope["results"]], ["verified"])
+            # A zero from the target's own counter, reached through the oracle the authority
+            # named — not a field the worker wrote.
             self.assertEqual(envelope["final_action_activations"], 0)
-            # The oracle that can actually fail: the server's own counter.
             self.assertEqual(self.final_actions(server), 0)
             self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
-
-    def test_the_result_carries_hashes_and_nothing_else(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "Verified Candidate")])
-            envelope, output = self.execute(package, oracle=f"{server.origin}/__state")
-            raw = output.read_text(encoding="utf-8")
-            for leak in ("Verified Candidate", server.nonce, str(self.root)):
-                self.assertNotIn(leak, raw)
             PROTOCOL.validate_result(
                 envelope, expected_session="session-1", expected_page="page-1",
                 expected_package_sha256=envelope["package_sha256"],
-                expected_action_ids=["step-lever-0-1"], at=self.now)
+                expected_action_ids=["session-1:page-1:lever-0-1"], at=self.now)
 
-    def test_hidden_disabled_duplicated_and_missing_controls_fail_closed(self):
+    def test_the_result_carries_no_value_nonce_or_local_path(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("hidden_control", "text", "fill", "x"),
-                self.action("disabled_control", "text", "fill", "x"),
-                self.action("duplicate_control", "text", "fill", "x"),
-                self.action("does_not_exist", "text", "fill", "x"),
-                self.action("lever-0-1", "select", "fill", "x"),
-            ])
-            envelope, _ = self.execute(package)
-            self.assertEqual(
-                [entry["error_code"] for entry in envelope["results"]],
-                ["control_hidden", "control_disabled", "selector_ambiguous",
-                 "selector_not_found", "control_type_mismatch"])
-            self.assertTrue(all(entry["outcome"] == "not_actionable"
-                                for entry in envelope["results"]))
+            self.replay_session(server)
+            envelope, output, _ = self.execute(server)
+            raw = output.read_text(encoding="utf-8")
+            for leak in ("Verified Candidate", server.nonce, str(self.root)):
+                self.assertNotIn(leak, raw)
+
+    def test_a_grant_cannot_be_spent_twice_even_from_a_copied_package(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.replay_session(server)
+            package = self.export()
+            issued = self.issue(package)
+            copied = self.root / "private" / "copied.json"
+            copied.write_bytes(package.read_bytes())
+            copied.chmod(0o600)
+            with self.authority() as service:
+                WORKER.run(package, self.root / "first.json", service.url, service.token,
+                           issued["grant_id"], headed=False, at=self.now)
+                with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                    WORKER.run(copied, self.root / "second.json", service.url,
+                               service.token, issued["grant_id"], headed=False, at=self.now)
+            self.assertEqual(str(caught.exception), "grant_already_consumed")
             self.assertEqual(self.final_actions(server), 0)
 
-    def test_a_pdf_uploads_and_anything_else_is_refused(self):
-        good = self.root / "resume.pdf"
-        good.write_bytes(synthetic_pdf(["Verified Candidate"]))
-        renamed = self.root / "renamed.pdf"
-        renamed.write_bytes(b"PK\x03\x04" + b"\x00" * 32)
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-0", "file", "upload", str(good)),
-                self.action("identity_document", "file", "upload", str(renamed)),
-            ])
-            envelope, _ = self.execute(package)
-            self.assertEqual(envelope["results"][0]["outcome"], "verified")
-            self.assertEqual(envelope["results"][0]["observed_sha256"],
-                             hashlib.sha256(good.read_bytes()).hexdigest())
-            self.assertEqual(envelope["results"][1]["error_code"], "upload_type_not_pdf")
-            self.assertEqual(self.final_actions(server), 0)
+    def test_a_forged_package_from_a_rogue_server_gets_no_authorisation(self):
+        """The full attack: attacker-chosen bytes, attacker-run server, attacker's own files.
 
-    def test_a_page_that_is_not_the_attested_one_is_never_touched(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            attestation = POLICY.surface_attestation(
-                self.db, f"{server.origin}/lever/0", self.now)
-            tampered = {**attestation, "page_sha256": "c" * 64}
-            package = self.package_for(
-                server, "/lever/0",
-                [self.action("lever-0-1", "text", "fill", "Verified Candidate")],
-                surface=tampered)
-            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
-            self.assertEqual(envelope["results"][0]["outcome"], "not_attempted")
-            self.assertEqual(envelope["results"][0]["error_code"],
-                             "control_changed_since_observation")
-            self.assertEqual(self.final_actions(server), 0)
-
-    def test_an_unregistered_loopback_server_is_never_attested(self):
-        # A second server Jobloom did not register: same host, same markup, no surface row.
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as registered:
+        Nothing the attacker controls can produce an authorisation, because authorisation is
+        a row in the authority's database rather than a signature they could compute.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as legitimate:
+            self.replay_session(legitimate)
             with ReplayServer() as rogue:
-                self.assertIsNone(POLICY.surface_attestation(
-                    self.db, f"{rogue.origin}/lever/0", self.now))
-                self.assertIsNotNone(POLICY.surface_attestation(
-                    self.db, f"{registered.origin}/lever/0", self.now))
+                (self.root / "private").mkdir(parents=True, exist_ok=True)
+                forged = self.root / "private" / "forged.json"
+                forged.write_text(json.dumps({
+                    "schema_version": "0.1.0", "mode": "fill_only",
+                    "session_id": "session-1", "application_id": "app-1",
+                    "page_id": "page-1", "page_url": f"{rogue.origin}/lever/0",
+                    "surface": {"origin": rogue.origin, "renderer_version": "1.0.0",
+                                "page_path": "/lever/0",
+                                "page_sha256": rogue.page_digests()["/lever/0"],
+                                "expires_at": (self.now + timedelta(hours=1)).isoformat()},
+                    "actions": [], "stop_before_submit": True, "submission_action": None,
+                }), encoding="utf-8")
+                forged.chmod(0o600)
+                # It passes every structural check the worker makes on the file itself.
+                self.assertEqual(WORKER.load_package(forged)["page_id"], "page-1")
+                # The authority will not issue for it.
+                with self.assertRaisesRegex(ValueError, "was not exported"):
+                    self.issue(forged)
+                # And an invented grant id is not a grant.
+                with self.authority() as service:
+                    with self.assertRaises(WORKER.WorkerRefusal) as caught:
+                        WORKER.run(forged, self.root / "forged.result.json", service.url,
+                                   service.token, "grant-invented", headed=False,
+                                   at=self.now)
+                self.assertEqual(str(caught.exception), "grant_unknown")
 
-    def test_an_expired_or_revoked_surface_yields_no_attestation(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now,
-                          lifetime_hours=1) as server:
-            self.assertIsNotNone(POLICY.surface_attestation(
-                self.db, f"{server.origin}/lever/0", self.now))
-            self.assertIsNone(POLICY.surface_attestation(
-                self.db, f"{server.origin}/lever/0", self.now + timedelta(hours=2)))
-            POLICY.revoke_replay_surface(self.db, server.surface_id, self.now)
-            self.assertIsNone(POLICY.surface_attestation(
-                self.db, f"{server.origin}/lever/0", self.now))
-
-    def test_the_worker_cannot_reach_a_second_page_or_another_origin(self):
+    def test_a_same_origin_get_submit_is_stopped_and_the_counter_stays_zero(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            attestation = POLICY.surface_attestation(
-                self.db, f"{server.origin}/lever/0", self.now)
-            package = self.package_for(
-                server, "/lever/0",
-                [self.action("lever-0-1", "text", "fill", "x")], surface=attestation)
-            with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "elsewhere.json", self.grant_for(package),
-                           headed=False, page_url=f"{server.origin}/lever/1", at=self.now)
-            self.assertEqual(str(caught.exception), "page_outside_attested_surface")
-
-    def test_the_scoped_guard_blocks_a_submit_the_page_itself_attempts(self):
-        """The worker has no click operation, so this is depth: a page that submits itself.
-
-        Run both ways on purpose. Without the guard the counter reaches one, which is what
-        makes the zero elsewhere in this file worth reading — an oracle that cannot fail is
-        not an oracle. With the guard installed the same click leaves it where it was.
-        """
-        from playwright.sync_api import sync_playwright
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                try:
-                    unguarded = browser.new_context().new_page()
-                    unguarded.goto(f"{server.origin}/lever/1", wait_until="domcontentloaded")
-                    unguarded.click("#final-action")
-                    unguarded.wait_for_timeout(300)
-                    self.assertEqual(self.final_actions(server), 1)
-
-                    guarded = browser.new_context().new_page()
-                    with WORKER.PageGuards(guarded, server.origin,
-                                           f"{server.origin}/lever/1") as guards:
-                        guarded.goto(f"{server.origin}/lever/1",
-                                     wait_until="domcontentloaded")
-                        guarded.click("#final-action")
-                        guarded.wait_for_timeout(300)
-                        self.assertEqual(guards.violations, ["submit_attempted"])
-                    self.assertEqual(self.final_actions(server), 1)
-                    # Aborting the submit leaves the tab on Chromium's error page, which is
-                    # the visible shape of the refusal.
-                    self.assertTrue(guarded.url.startswith("chrome-error://"))
-                    # The guard is scoped to the run: ordinary browsing works again, because
-                    # a guard left installed would change how the user's own browser behaves.
-                    guarded.goto(f"{server.origin}/lever/0", wait_until="domcontentloaded")
-                    self.assertEqual(guarded.url, f"{server.origin}/lever/0")
-                finally:
-                    browser.close()
-
-    def test_an_upload_post_is_allowed_while_a_submit_post_is_not(self):
-        # "Block every POST" would refuse uploads and call itself submit protection.
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            upload_url = f"{server.origin}/__upload"
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                try:
-                    page = browser.new_context().new_page()
-                    guards = WORKER.PageGuards(
-                        page, server.origin, f"{server.origin}/lever/0",
-                        allowed_upload_urls=(upload_url,))
-                    seen = []
-
-                    class Request:
-                        def __init__(self, url, method, resource_type="xhr"):
-                            self.url, self.method = url, method
-                            self.resource_type = resource_type
-
-                    class Route:
-                        def continue_(self):
-                            seen.append("continued")
-
-                        def abort(self):
-                            seen.append("aborted")
-
-                    guards._route(Route(), Request(upload_url, "POST"))
-                    guards._route(Route(), Request(f"{server.origin}/__final_action", "POST"))
-                    self.assertEqual(seen, ["continued", "aborted"])
-                    self.assertEqual(guards.violations, ["submit_attempted"])
-                finally:
-                    browser.close()
-
-    # ---- the five review findings ---------------------------------------
-
-    def test_a_same_origin_get_submit_is_stopped_and_never_reported_as_zero(self):
-        """The hole: `same origin and GET` was allowed unconditionally.
-
-        A form with `method="GET"` submits by navigating, so filling one field reached the
-        application endpoint, the page left, and the run still reported no final action.
-        """
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/hazard/get-submit", [
-                self.action("h-1", "text", "fill", "Verified Candidate")])
-            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
+            self.replay_session(server, "/hazard/get-submit", field_id="h-1")
+            envelope, _, _ = self.execute(server)
             self.assertEqual(envelope["results"][0]["outcome"], "refused")
-            # Named for what the guard saw, not for what the page said it was: a GET form
-            # submit is a document navigation, and calling it a refused final action would
-            # claim knowledge of the form's intent that only the page could supply.
             self.assertEqual(envelope["results"][0]["error_code"], "navigation_attempted")
-            # The target's own counter is the proof, and it did not move.
             self.assertEqual(self.final_actions(server), 0)
             self.assertEqual(envelope["final_action_activations"], 0)
 
-    def test_a_same_origin_location_change_is_stopped(self):
+    def test_the_first_violation_stops_the_page(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/hazard/location", [
-                self.action("h-1", "text", "fill", "Verified Candidate")])
-            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
-            self.assertEqual(envelope["results"][0]["outcome"], "refused")
-            self.assertEqual(envelope["results"][0]["error_code"], "navigation_attempted")
+            self.replay_session(server, "/hazard/get-submit", field_id="h-1",
+                                extra_field_ids=("h-2", "h-3"))
+            envelope, _, _ = self.execute(server)
+            self.assertEqual([entry["outcome"] for entry in envelope["results"]],
+                             ["refused", "not_attempted", "not_attempted"])
             self.assertEqual(self.final_actions(server), 0)
 
-    def test_the_first_violation_stops_the_page_and_the_rest_is_not_attempted(self):
+    def test_an_unreachable_authority_authorises_nothing(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/hazard/get-submit", [
-                self.action("h-1", "text", "fill", "first"),
-                self.action("h-1", "text", "fill", "second"),
-                self.action("h-1", "text", "fill", "third")])
-            envelope, _ = self.execute(package, oracle=f"{server.origin}/__state")
-            outcomes = [entry["outcome"] for entry in envelope["results"]]
-            self.assertEqual(outcomes, ["refused", "not_attempted", "not_attempted"])
-            # Not all three disguised as "refused": which one caused it stays legible.
-            self.assertEqual(self.final_actions(server), 0)
-
-    def test_a_forged_package_from_a_rogue_local_server_has_no_grant(self):
-        """0600 and loopback are not provenance: any local process can produce both."""
-        with ReplayServer() as rogue:
-            forged = self.root / "forged.json"
-            forged.write_text(json.dumps({
-                "schema_version": "0.1.0", "mode": "fill_only", "session_id": "session-1",
-                "application_id": "app-1", "page_id": "page-1",
-                "page_url": f"{rogue.origin}/lever/0",
-                "surface": {"origin": rogue.origin, "renderer_version": "1.0.0",
-                            "page_path": "/lever/0",
-                            "page_sha256": rogue.page_digests()["/lever/0"],
-                            "expires_at": (self.now + timedelta(hours=1)).isoformat()},
-                "actions": [self.action("lever-0-1", "text", "fill", "x")],
-                "stop_before_submit": True, "submission_action": None,
-            }), encoding="utf-8")
-            forged.chmod(0o600)
-            # Every check the previous version made still passes on this package.
-            self.assertEqual(WORKER.load_package(forged)["page_id"], "page-1")
-            # A grant issued for different bytes does not carry it.
-            other = self.root / "other.json"
-            other.write_text("{}", encoding="utf-8")
-            other.chmod(0o600)
+            self.replay_session(server)
+            package = self.export()
+            issued = self.issue(package)
             with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(forged, self.root / "forged-result.json",
-                           self.grant_for(other), headed=False, at=self.now)
-            self.assertEqual(str(caught.exception), "grant_package_mismatch")
-
-    def test_an_expired_grant_or_surface_refuses_before_the_browser_starts(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "x")])
-            with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "late.json",
-                           self.grant_for(package, ttl_seconds=60), headed=False,
-                           at=self.now + timedelta(minutes=5))
-            self.assertEqual(str(caught.exception), "grant_expired")
-            # And a surface that lapsed after export, with the same bytes still served.
-            stale = self.package_for(
-                server, "/lever/0", [self.action("lever-0-1", "text", "fill", "x")],
-                surface={**POLICY.surface_attestation(
-                    self.db, f"{server.origin}/lever/0", self.now),
-                    "expires_at": (self.now - timedelta(minutes=1)).isoformat()})
-            with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(stale, self.root / "stale.json", self.grant_for(stale),
+                WORKER.run(package, self.root / "unreachable.json",
+                           "http://127.0.0.1:9/redeem", "token", issued["grant_id"],
                            headed=False, at=self.now)
-            self.assertEqual(str(caught.exception), "surface_expired")
-            self.assertEqual(self.final_actions(server), 0)
-
-    def test_a_revoked_grant_refuses_even_though_the_page_is_unchanged(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "x")])
-            grant = self.grant_for(package)
-            grant.with_suffix(grant.suffix + ".revoked").write_text("", encoding="utf-8")
-            with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "revoked.json", grant, headed=False,
-                           at=self.now)
-            self.assertEqual(str(caught.exception), "grant_revoked")
-
-    def test_an_unobservable_target_reports_no_count_rather_than_zero(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "Verified Candidate")])
-            envelope, _ = self.execute(package)  # no oracle supplied
-            self.assertIsNone(envelope["final_action_activations"])
-            # And `fill_core` cannot import an unprovable run as a safe one.
-            with self.assertRaises(PROTOCOL.ProtocolError) as caught:
-                PROTOCOL.validate_result(
-                    envelope, expected_session="session-1", expected_page="page-1",
-                    expected_package_sha256=envelope["package_sha256"],
-                    expected_action_ids=["step-lever-0-1"], at=self.now)
-            self.assertEqual(str(caught.exception), "final_action_count_unproven")
-
-    def test_a_consumed_package_cannot_be_replayed(self):
-        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            package = self.package_for(server, "/lever/0", [
-                self.action("lever-0-1", "text", "fill", "Verified Candidate")])
-            self.execute(package, "first.json")
-            with self.assertRaises(WORKER.WorkerRefusal) as caught:
-                WORKER.run(package, self.root / "second.json", self.grant_for(package),
-                           headed=False, at=self.now)
-            self.assertEqual(str(caught.exception), "package_already_consumed")
+            self.assertEqual(str(caught.exception), "authority_unreachable")
             self.assertEqual(self.final_actions(server), 0)
 
 

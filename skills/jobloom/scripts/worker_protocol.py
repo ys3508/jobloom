@@ -22,8 +22,6 @@ assumption, and it is the precondition for writing `not_present`.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import re
 import sys
@@ -93,49 +91,10 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
 
 
-GRANT_FIELDS = {"grant_id", "session_id", "page_id", "package_sha256", "surface_origin",
-                "renderer_version", "issued_at", "expires_at", "signature"}
-
-
-def grant_signature(secret: str, package_sha256: str, grant: dict[str, Any]) -> str:
-    """Bind one grant to one package's bytes.
-
-    The signed payload names the package digest, so a grant issued for one package cannot be
-    presented with another. Substituting the package is the forgery this actually prevents.
-    """
-    payload = json.dumps(
-        {key: grant[key] for key in sorted(GRANT_FIELDS - {"signature"})},
-        sort_keys=True, separators=(",", ":")) + "\0" + package_sha256
-    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def verify_grant(grant: dict[str, Any], secret: str, package_bytes: bytes,
-                 at: datetime) -> None:
-    """Refuse a package that was not issued for execution, or whose window has closed.
-
-    `0600` and a loopback address prove nothing about where a package came from: any process
-    running as this user can write one file and start one server. A grant is what `fill_core`
-    issues, for one package, once, with an expiry — so a package that arrived some other way
-    has no grant that matches its bytes.
-
-    What this does not claim: under a same-user threat model a process that can read the
-    grant file can present it. What it buys is that a package must be accompanied by a grant
-    issued for exactly those bytes, that the grant expires, and that `fill_core` will refuse
-    a result whose grant it never issued or has already consumed.
-    """
-    if not isinstance(grant, dict) or set(grant) != GRANT_FIELDS:
-        raise ProtocolError("malformed_execution_grant")
-    digest = hashlib.sha256(package_bytes).hexdigest()
-    if grant["package_sha256"] != digest:
-        raise ProtocolError("grant_package_mismatch")
-    expires = parse_time(grant["expires_at"])
-    if not expires:
-        raise ProtocolError("grant_missing_expiry")
-    if at >= expires:
-        raise ProtocolError("grant_expired")
-    expected = grant_signature(secret, digest, grant)
-    if not hmac.compare_digest(expected, grant["signature"]):
-        raise ProtocolError("grant_signature_mismatch")
+# Grants are not self-verifying documents. An earlier version signed one with an HMAC and
+# shipped the key beside the signature, which authenticates nothing: anyone could choose a
+# key, sign a package of their own, and present both. Redemption goes through
+# `execution_authority` instead, and the authority's own state is the answer.
 
 
 class ProtocolError(ValueError):

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,11 @@ LOOPBACK_ORIGIN = re.compile(r"^http://127\.0\.0\.1:\d{1,5}$")
 # Every operation this worker knows how to perform. Nothing here can leave the page.
 SUPPORTED_OPERATIONS = {"fill", "select", "check", "uncheck", "upload"}
 
+# Long enough for a navigation an action triggered to reach the guard, short enough that a
+# page of fields does not become slow. Deciding an action's outcome before its own
+# side effects have arrived is how a submit gets reported as a successful fill.
+SETTLE_MILLISECONDS = 150
+
 
 class WorkerRefusal(RuntimeError):
     """A boundary this worker will not cross. Never a partial run: nothing has been done."""
@@ -52,28 +58,47 @@ def _refuse(code: str) -> None:
     raise WorkerRefusal(code)
 
 
-def load_grant(grant_path: Path, package_path: Path, at: datetime) -> dict[str, Any]:
-    """The proof that `fill_core` authorised this exact package to run, once, until when.
+def redeem(authority_url: str, token: str, grant_id: str,
+           package_sha256: str) -> dict[str, Any]:
+    """Ask the authority whether this package may run, and get back what it may use.
 
-    File permissions and a loopback address prove nothing about provenance: any process
-    running as this user can write a 0600 file and start a local server. That is the hole
-    this closes at the execution boundary, the same one that was closed for option mappings
-    at the planning boundary.
+    A secret cannot verify anything while it travels beside the signature it verifies, which
+    is what the previous version did. So nothing here is self-verifying: the authority holds
+    the state, consumes the grant atomically, and answers. A package it never exported has no
+    grant, and writing more local files does not create one.
+
+    Everything security-relevant in the answer replaces the package's own account of it. The
+    package is untrusted data whose digest has been matched, nothing more.
     """
-    if (os.stat(grant_path).st_mode & 0o777) != 0o600:
-        _refuse("grant_permissions")
-    if grant_path.with_suffix(grant_path.suffix + ".revoked").exists():
-        # Revocation has to be legible on disk, because this worker reads no database.
-        _refuse("grant_revoked")
-    document = json.loads(grant_path.read_text(encoding="utf-8"))
-    grant, secret = document.get("grant"), document.get("secret")
-    if not isinstance(grant, dict) or not isinstance(secret, str):
-        _refuse("malformed_execution_grant")
+    request = urllib.request.Request(
+        authority_url,
+        data=json.dumps({"grant_id": grant_id, "package_sha256": package_sha256}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST")
     try:
-        worker_protocol.verify_grant(grant, secret, package_path.read_bytes(), at)
-    except worker_protocol.ProtocolError as problem:
-        _refuse(str(problem))
-    return grant
+        with urllib.request.urlopen(request, timeout=10) as response:
+            answer = json.load(response)
+    except urllib.error.HTTPError as refusal:
+        try:
+            answer = json.load(refusal)
+        except Exception:  # noqa: BLE001
+            _refuse("grant_refused")
+    except Exception:  # noqa: BLE001 - an unreachable authority authorises nothing
+        _refuse("authority_unreachable")
+    if not answer.get("authorised"):
+        _refuse(answer.get("reason") or "grant_refused")
+    for field in ("target", "origin", "renderer_version", "page_sha256", "oracle_url"):
+        if not isinstance(answer.get(field), str) or not answer[field]:
+            _refuse("incomplete_authorisation")
+    if not LOOPBACK_ORIGIN.fullmatch(answer["origin"]):
+        _refuse("surface_outside_loopback")
+    if answer["renderer_version"] != RENDERER_VERSION:
+        _refuse("renderer_version_mismatch")
+    if not answer["oracle_url"].startswith(answer["origin"] + "/"):
+        # The oracle is a capability of the attested surface. A caller-named URL could be any
+        # service returning a constant zero.
+        _refuse("oracle_outside_surface")
+    return answer
 
 
 def load_package(path: Path) -> dict[str, Any]:
@@ -88,36 +113,19 @@ def load_package(path: Path) -> dict[str, Any]:
         _refuse("stop_before_submit_not_asserted")
     if "submission_action" not in package or package["submission_action"] is not None:
         _refuse("submission_action_present")
+    # The package's own `surface` block is not consulted for anything security-relevant: it
+    # is the package describing itself, and the authority's answer replaces it. It is checked
+    # for shape only, so a malformed package is refused before a browser starts.
     surface = package.get("surface")
     if not isinstance(surface, dict):
         _refuse("no_attested_surface")
     for field in ("origin", "renderer_version", "page_path", "page_sha256"):
         if not isinstance(surface.get(field), str) or not surface[field]:
             _refuse("incomplete_surface_attestation")
-    if not LOOPBACK_ORIGIN.fullmatch(surface["origin"]):
-        _refuse("surface_outside_loopback")
-    if surface["renderer_version"] != RENDERER_VERSION:
-        _refuse("renderer_version_mismatch")
-    if not worker_protocol.SHA256.fullmatch(surface["page_sha256"]):
-        _refuse("malformed_page_digest")
     for action in package.get("actions") or []:
         if action.get("operation") not in SUPPORTED_OPERATIONS:
             _refuse("unsupported_operation")
     return package
-
-
-def consume(path: Path) -> None:
-    """A package is executed once. Consumption is recorded beside it, never by deletion.
-
-    Deleting it would destroy the audit trail; a marker leaves the package for review and
-    makes a replay fail on its second attempt rather than its second effect.
-    """
-    marker = path.with_suffix(path.suffix + ".consumed")
-    try:
-        handle = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        _refuse("package_already_consumed")
-    os.close(handle)
 
 
 class PageGuards:
@@ -287,28 +295,24 @@ def _read_oracle(oracle_url: str | None) -> int | None:
         return None
 
 
-def run(package_path: Path, output_path: Path, grant_path: Path, *, headed: bool = True,
-        page_url: str | None = None, oracle_url: str | None = None,
-        at: datetime | None = None) -> dict[str, Any]:
+def run(package_path: Path, output_path: Path, authority_url: str, authority_token: str,
+        grant_id: str, *, headed: bool = True, at: datetime | None = None) -> dict[str, Any]:
     """Execute one package against one page and write a result envelope.
 
     Headed by default: a run the user cannot see is a run they cannot stop.
     """
     from playwright.sync_api import sync_playwright
 
-    now = at or datetime.now(timezone.utc)
-    load_grant(grant_path, package_path, now)
     package = load_package(package_path)
-    surface = package["surface"]
-    expires = worker_protocol.parse_time(surface.get("expires_at"))
-    if expires and now >= expires:
-        # The surface can lapse between export and execution; the same bytes served from the
-        # same address afterwards are not a live surface.
-        _refuse("surface_expired")
-    target = page_url or (surface["origin"] + surface["page_path"])
-    if target != surface["origin"] + surface["page_path"]:
-        _refuse("page_outside_attested_surface")
-    consume(package_path)
+    digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
+    # Redemption is what makes this single-use, and it happens in the authority's own state
+    # rather than beside the package: copying the package somewhere else cannot buy a second
+    # run, because the second redemption updates no rows.
+    authorisation = redeem(authority_url, authority_token, grant_id, digest)
+    surface = {"origin": authorisation["origin"],
+               "page_sha256": authorisation["page_sha256"]}
+    target = authorisation["target"]
+    oracle_url = authorisation["oracle_url"]
 
     before = _read_oracle(oracle_url)
     results: list[dict[str, Any]] = []
@@ -342,6 +346,11 @@ def run(package_path: Path, output_path: Path, grant_path: Path, *, headed: bool
                                         "error_code": stopped_on})
                         continue
                     outcome, digest, error = _perform(page, action)
+                    # A request an action triggers can reach the route handler after the
+                    # action call returns, so let the page settle before deciding. Without
+                    # this a fill that submitted the form could be reported `verified`
+                    # because the abort had not happened yet.
+                    page.wait_for_timeout(SETTLE_MILLISECONDS)
                     entry: dict[str, Any] = {"action_id": action["step_id"],
                                              "outcome": outcome,
                                              "control": action["control"]}
@@ -365,7 +374,7 @@ def run(package_path: Path, output_path: Path, grant_path: Path, *, headed: bool
     envelope = {
         "protocol_version": worker_protocol.PROTOCOL_VERSION,
         "session_id": package["session_id"], "page_id": package["page_id"],
-        "package_sha256": hashlib.sha256(package_path.read_bytes()).hexdigest(),
+        "package_sha256": digest,
         # A number only when the target itself was counting. Otherwise `null`: the guard
         # observing nothing is evidence about the guard, not about the target.
         "final_action_activations": (
@@ -397,17 +406,20 @@ def _violation_code(violation: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
-    parser.add_argument("--grant", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--oracle-url", default=None,
-                        help="a target that counts its own final-action activations")
+    parser.add_argument("--authority-url", required=True,
+                        help="the local endpoint that redeems one grant, once")
+    parser.add_argument("--authority-token", required=True)
+    parser.add_argument("--grant-id", required=True)
     parser.add_argument("--headless", action="store_true",
                         help="tests only; a run the user cannot see is a run they cannot stop")
     arguments = parser.parse_args()
     # Value-free by construction: counts and a path the caller already knows.
-    print(json.dumps(run(arguments.package, arguments.output, arguments.grant,
-                         headed=not arguments.headless,
-                         oracle_url=arguments.oracle_url), indent=2))
+    # No `--oracle-url`: the oracle is a capability of the surface the authority names, not
+    # something a caller may point at a service that returns a constant zero.
+    print(json.dumps(run(arguments.package, arguments.output, arguments.authority_url,
+                         arguments.authority_token, arguments.grant_id,
+                         headed=not arguments.headless), indent=2))
 
 
 if __name__ == "__main__":

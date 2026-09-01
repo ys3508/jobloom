@@ -136,16 +136,35 @@ the page this run is expected to load. The worker hashes the **response body** �
 nothing if it differs. The nonce is deliberately not in the package; the worker has no use for
 it and a package is a file on disk.
 
-A package is not self-authorising. `fill_core` issues an **execution grant** for one package,
-once, with an expiry: an HMAC over the package's own digest, written to a 0600 file the worker
-is handed separately, with the row kept in the protected store. Mode 0600 and a loopback
-address prove nothing about where a package came from — any process running as this user can
-write one file and start one server — so a package that arrived some other way has no grant
-matching its bytes. Revocation is a marker beside the grant file, because the worker reads no
-database. The residual limit is stated rather than hidden: under a same-user threat model a
-process that can read the grant can present it; what this buys is that the package must be the
-one the grant was issued for, that the window closes, and that `fill_core` refuses a result
-whose grant it never issued.
+A package is not self-authorising, and it is not self-verifying either. An earlier attempt
+signed a grant with an HMAC and wrote the key into the same file as the signature, which
+authenticates nothing: an attacker never needed a real grant, only a secret of their own and a
+package to sign with it. **A verifying secret cannot sit beside the object it verifies.**
+
+So verification is not a document. `fill_core` issues an **execution grant** — a row in the
+protected store naming one package digest, with an expiry — and the worker redeems it through
+`execution_authority`, a loopback service with one endpoint, a per-run bearer token, and no
+answer it can give without consulting the authority's own database. A package the authority
+never exported has no row, and no amount of local file writing creates one.
+
+Issuance itself is checked, because the first version signed whatever bytes the caller pointed
+at after confirming only that the session existed. A grant is issued only when the digest is
+one `export_page` recorded, the session, page and application identity match, the actions are
+exactly the pending steps in order with their values and expected hashes, and the surface is
+the attestation that is live now. An added action, an edited value, a changed hash or a
+swapped surface each refuse.
+
+Redemption is where single-use lives. It is an atomic update of that row, not a marker beside
+a file path, so copying the package and re-running buys nothing: the second redemption updates
+zero rows. The response carries the parameters the run may use — target, origin, renderer
+version, page digest, and the oracle URL — and the worker uses those instead of the package's
+own account of them. **The oracle is a capability of the attested surface**, never a
+caller-supplied URL, because any service can return a constant zero.
+
+The residual limit, stated rather than hidden: a worker trusts the authority it is pointed at,
+so a caller who can already choose that address has already chosen everything. The property is
+narrower and real — a genuine authority refuses a package it never issued, refuses it twice,
+and refuses it after expiry or revocation.
 
 Scoped guards go in before the first action and come out before control returns, because a
 guard left installed would change how the user's own browsing behaves. **Exactly one document
