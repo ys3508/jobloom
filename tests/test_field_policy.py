@@ -1,0 +1,408 @@
+"""The domain rules that decide who may answer each class of first-form field.
+
+`docs/lever-first-form-readiness.md` audited the reviewed Lever semantic fixture: of its 27
+controls only 2 resolve to career evidence. These are its ten pre-protocol tests, written
+before the worker protocol freezes a vocabulary around a form the core cannot safely finish.
+
+The setup mirrors `tests/test_fill_core.py` on purpose rather than importing it: importing one
+test module from another made results depend on which invocation ran.
+"""
+
+import importlib.util
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def load_script(name):
+    path = ROOT / "skills" / "jobloom" / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"field_policy_test_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+FILL = load_script("fill_core")
+CANDIDATES = load_script("candidate_core")
+APPLICATIONS = load_script("application_core")
+ANSWERS = load_script("answer_library")
+RESUMES = load_script("resume_core")
+COVERS = load_script("cover_letter_core")
+ARCHIVE = load_script("archive_core")
+PRE_SUBMIT = load_script("pre_submit_core")
+POLICY = load_script("field_policy")
+from tests.pdf_fixture import synthetic_pdf
+
+AT = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
+
+
+class FirstFormFieldPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        APPLICATIONS.initialize(self.db)
+        ANSWERS.initialize(self.db)
+        RESUMES.initialize(self.db)
+        COVERS.initialize(self.db)
+        ARCHIVE.initialize(self.db)
+        PRE_SUBMIT.initialize(self.db)
+        FILL.initialize(self.db)
+        CANDIDATES.initialize(self.db)
+        self.addCleanup(self.db.close)
+        self.candidate_path, self.manifest_path = self.make_candidate()
+        CANDIDATES.register_snapshot(
+            self.db, self.root / "candidates", self.candidate_path, "user", AT
+        )
+        self.prepare_application()
+
+    def make_candidate(self):
+        facts = [
+            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-unlocked", "type": "location", "value": "New York",
+             "status": "confirmed", "locked": False, "evidence_strength": "direct"},
+        ]
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False, "confirmed": True,
+            },
+            "search": {}, "facts": facts,
+        }
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        candidate_path = self.root / "candidate.json"
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        manifest_path = self.root / "claims.json"
+        manifest_path.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
+            "claim_id": "claim-name", "claim_text": "Verified Candidate", "fact_ids": ["fact-name"],
+            "evidence_strength": "direct", "exact_locked_value_preserved": True,
+        }]}), encoding="utf-8")
+        return candidate_path, manifest_path
+
+    def prepare_application(self):
+        source = self.root / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Candidate"]))
+        RESUMES.register_version(
+            self.db, self.root / "resumes", source, "resume-1", "master_source", "general", at=AT
+        )
+        RESUMES.approve_version(
+            self.db, "resume-1", self.candidate_path, self.manifest_path, "user", AT
+        )
+        card = {
+            "job_id": "job-1", "canonical_url": "https://apply.example.com/jobs/1",
+            "employer": "Example Corp", "title": "Backend Engineer", "location": "New York, NY",
+            "country": "US", "employment_type": "full_time", "status": "open",
+        }
+        APPLICATIONS.ingest_job(self.db, card, at=AT)
+        APPLICATIONS.create_application(self.db, "app-1", "job-1", "precision", "approved_queue", AT)
+        APPLICATIONS.transition(self.db, "app-1", "pending_analysis", "system", "analysis", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "precision_recommended", "system", "match", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "approved", "user", "approved", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "materials_in_progress", "system", "materials", at=AT)
+        RESUMES.bind_version(self.db, "app-1", "resume-1", at=AT)
+        RESUMES.lock_materials(self.db, "app-1", lock_id="lock-1", at=AT)
+        APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "ready", at=AT)
+        APPLICATIONS.acquire_next(self.db, "worker-1", at=AT)
+        self.add_answer(
+            "answer-auth", "work_authorized_now", "Are you authorized to work?", True
+        )
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": "auth-1", "confirmed_at": AT.isoformat(),
+            "expires_at": (AT + timedelta(days=7)).isoformat(),
+            "scope": {"country": "US", "application_id": "app-1"},
+        })
+
+    def add_answer(self, answer_id, canonical_id, question, value, scope=None):
+        ANSWERS.add_answer(self.db, {
+            "answer_id": answer_id, "canonical_id": canonical_id,
+            "canonical_meaning": question, "answer": value, "answer_type": "stable_fact",
+            "source_type": "user_confirmed", "confirmation_status": "confirmed",
+            "confirmed_at": AT.isoformat(), "validity_class": "stable",
+            "scope": scope if scope is not None else {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": True,
+        })
+        ANSWERS.add_question_form(self.db, canonical_id, question)
+
+    def start(self, **updates):
+        value = {
+            "session_id": "session-1", "application_id": "app-1", "worker_id": "worker-1",
+            "form_url": "https://apply.example.com/jobs/1/apply",
+            "observed_employer": "Example Corp", "observed_role": "Backend Engineer",
+            "known_form": True, "authorization_id": "auth-1",
+            "authorization_context": {"country": "wrong", "application_id": "wrong"}, "at": AT,
+        }
+        value.update(updates)
+        return FILL.start_session(self.db, **value)
+
+    def page(self, fields=None, **updates):
+        value = {
+            "page_id": "page-1", "page_index": 0,
+            "page_url": "https://apply.example.com/jobs/1/apply",
+            "fields": fields if fields is not None else self.standard_fields(),
+            "legal_items": [], "restricted_requests": [],
+        }
+        value.update(updates)
+        return value
+
+    def standard_fields(self):
+        return [
+            {"field_id": "candidate_name", "question": "Full name", "selector": "#name",
+             "control": "text", "required": True, "sensitivity": "normal",
+             "source_kind": "fact", "source_id": "fact-name"},
+            {"field_id": "work_auth", "question": "Are you authorized to work?", "selector": "#auth",
+             "control": "radio", "required": True, "sensitivity": "normal",
+             "source_kind": "answer"},
+            {"field_id": "resume_upload", "question": "Resume", "selector": "#resume",
+             "control": "file", "required": True, "sensitivity": "normal",
+             "upload_kind": "resume"},
+            {"field_id": "truth", "question": "I certify this is accurate", "selector": "#truth",
+             "control": "standard_attestation", "required": True, "sensitivity": "normal"},
+            {"field_id": "submit", "question": "Submit application", "selector": "#submit",
+             "control": "submit", "required": True, "sensitivity": "normal"},
+        ]
+
+    def complete_page(self, page_id="page-1", worker_id="worker-1"):
+        rows = self.db.execute(
+            "SELECT step_id, expected_sha256 FROM fill_steps WHERE session_id='session-1' AND page_id=? "
+            "ORDER BY ordinal", (page_id,),
+        ).fetchall()
+        for row in rows:
+            FILL.complete_step(self.db, "session-1", worker_id, row["step_id"], row["expected_sha256"], AT)
+        return FILL.checkpoint_page(
+            self.db, "session-1", worker_id, page_id, f"checkpoint-{page_id}", AT
+        )
+
+    def reacquire(self, worker_id="worker-2"):
+        APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "user_resolved", at=AT)
+        return APPLICATIONS.acquire_next(self.db, worker_id, at=AT)
+
+
+    # ---- helpers -------------------------------------------------------
+
+    RACE_VALUES = ["Hispanic or Latino", "Black or African American", "Asian"]
+    DECLINE = "I do not wish to self-identify"
+
+    def field(self, field_id, question, **updates):
+        value = {"field_id": field_id, "question": question, "selector": f"#{field_id}",
+                 "control": "radio", "required": True, "sensitivity": "normal"}
+        value.update(updates)
+        return value
+
+    def observe(self, fields, **page_updates):
+        self.start()
+        return FILL.observe_page(
+            self.db, "session-1", "worker-1", self.candidate_path,
+            self.page(fields=fields + [self.field(
+                "submit", "Submit application", control="submit")], **page_updates), AT)
+
+    def pause_reasons(self, result):
+        return {reason.split(":", 1)[0] for reason in result.get("reasons", [])}
+
+    def add_decline_policy(self, family="eeo_race", locale="en-US", **updates):
+        value = {"policy_id": f"policy-{family}", "question_family": family, "locale": locale,
+                 "allowed_options": [self.DECLINE], "confirmed_by": "user", "confirmed_at": AT,
+                 "scope": {"country": "US"}}
+        value.update(updates)
+        return POLICY.register_policy(self.db, **value)
+
+    def database_dump(self):
+        return "\n".join(
+            line for line in self.db.iterdump() if not line.startswith("CREATE"))
+
+    # ---- 1-3: employer conflict ----------------------------------------
+
+    def test_conflict_derivation_needs_approved_entity_and_fresh_certification(self):
+        # No employer-entity or registry subsystem exists, so the answer is never derivable.
+        # The contract that a future one must satisfy is recorded in the function's docstring;
+        # this asserts the only behaviour that may exist until then.
+        outcome = POLICY.conflict_derivation(
+            self.db, "conflict_related_person", {"application_id": "app-1"}, AT)
+        self.assertFalse(outcome["derivable"])
+        self.assertEqual(outcome["reason"], "employer_entity_not_approved")
+        with self.assertRaisesRegex(ValueError, "unknown conflict family"):
+            POLICY.conflict_derivation(self.db, "conflict_invented", {}, AT)
+
+    def test_conflict_fields_fail_closed_and_record_nothing(self):
+        result = self.observe([
+            self.field("conflict_related", "Do you have a relative employed by Example Corp?"),
+            self.field("conflict_commercial",
+                       "Are you a customer, partner or reseller of Example Corp?"),
+        ])
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(self.pause_reasons(result), {"employer_entity_not_approved"})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM fill_steps").fetchone()[0], 0)
+
+    def test_the_two_conflict_questions_are_separate_families(self):
+        related = POLICY.classify("conflict_a", "Do you have a relative working here?")
+        commercial = POLICY.classify("conflict_b", "Are you a customer or reseller?")
+        self.assertEqual(related[0], "employer_conflict")
+        self.assertEqual(commercial[0], "employer_conflict")
+        self.assertNotEqual(related[1], commercial[1])
+
+    # ---- 4-5: compensation ---------------------------------------------
+
+    def test_salary_floor_never_resolves_an_expected_compensation_field(self):
+        # A confirmed, in-scope, auto-fillable answer exists and still must not be used: the
+        # bracket belongs to the employer, and `salary_floor` is a search filter elsewhere.
+        self.add_answer("answer-comp", "expected_compensation",
+                        "What is your expected total compensation?", "150000")
+        result = self.observe([self.field(
+            "comp_range", "What is your expected total compensation?",
+            options=["$100k-$150k", "$150k-$200k"], source_kind="answer")])
+        self.assertEqual(self.pause_reasons(result), {"employer_defined_compensation_manual"})
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM fill_steps").fetchone()[0], 0)
+
+    def test_employer_defined_bracket_is_always_manual(self):
+        result = self.observe([self.field(
+            "comp_range", "Select the salary range you expect",
+            options=["$100k-$150k", "$150k-$200k"])])
+        self.assertEqual(self.pause_reasons(result), {"employer_defined_compensation_manual"})
+
+    # ---- 6: sponsorship -------------------------------------------------
+
+    def test_broad_sponsorship_question_rejects_every_canonical_substitution(self):
+        for canonical in ("work_authorized_now", "sponsorship_now", "sponsorship_future",
+                          "employer_action_required"):
+            with self.subTest(canonical=canonical):
+                self.setUp()
+                self.add_answer(f"answer-{canonical}", canonical,
+                                "Will you require employment visa sponsorship?", True)
+                result = self.observe([self.field(
+                    "sponsorship", "Will you require employment visa sponsorship?",
+                    source_kind="answer")])
+                self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
+
+    def test_a_sponsorship_question_naming_one_point_in_time_is_not_ambiguous(self):
+        self.assertFalse(POLICY.sponsorship_is_ambiguous(
+            "Do you require sponsorship now, at this time?"))
+        self.assertTrue(POLICY.sponsorship_is_ambiguous(
+            "Will you require employment visa sponsorship?"))
+
+    # ---- 7-9: voluntary EEO --------------------------------------------
+
+    def test_every_voluntary_eeo_kind_is_manual_without_a_reviewed_option(self):
+        for field_id, question in (("eeo_race", "Race / Ethnicity"),
+                                   ("eeo_gender", "Gender"),
+                                   ("eeo_disability", "Do you have a disability?"),
+                                   ("eeo_veteran", "Protected veteran status")):
+            with self.subTest(field_id=field_id):
+                self.setUp()
+                result = self.observe([self.field(
+                    field_id, question, options=self.RACE_VALUES + [self.DECLINE],
+                    source_kind="answer")], locale="en-US")
+                self.assertEqual(result["status"], "paused")
+                self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_absent"})
+
+    def test_an_exact_reviewed_non_disclosure_option_may_be_selected(self):
+        self.add_decline_policy()
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        self.assertNotEqual(result["status"], "paused")
+        step = self.db.execute(
+            "SELECT source_kind, source_id FROM fill_steps ORDER BY ordinal").fetchall()[-1]
+        self.assertEqual(step["source_kind"], "nondisclosure_policy")
+        self.assertEqual(step["source_id"], "policy-eeo_race")
+
+    def test_expiry_revocation_scope_and_inexact_options_all_pause(self):
+        cases = {
+            "nondisclosure_policy_expired": lambda: self.add_decline_policy(
+                expires_at=AT - timedelta(days=1)),
+            "nondisclosure_policy_scope_mismatch": lambda: self.add_decline_policy(
+                scope={"country": "DE"}),
+            "nondisclosure_option_ambiguous": lambda: self.add_decline_policy(
+                allowed_options=[self.DECLINE, "Asian"]),
+            "nondisclosure_option_unavailable": lambda: self.add_decline_policy(),
+        }
+        for reason, register in cases.items():
+            with self.subTest(reason=reason):
+                self.setUp()
+                register()
+                options = None if reason == "nondisclosure_option_unavailable" else (
+                    self.RACE_VALUES + [self.DECLINE])
+                result = self.observe([self.field(
+                    "eeo_race", "Race / Ethnicity", options=options)], locale="en-US")
+                self.assertEqual(self.pause_reasons(result), {reason})
+        self.setUp()
+        self.add_decline_policy()
+        POLICY.revoke_policy(self.db, "policy-eeo_race", "user_withdrew", AT)
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_revoked"})
+
+    def test_no_demographic_value_reaches_any_action_result_or_store(self):
+        self.add_decline_policy()
+        self.observe([self.field(
+            "eeo_race", "Race / Ethnicity",
+            options=self.RACE_VALUES + [self.DECLINE])], locale="en-US")
+        output = self.root / "private" / "page-actions.json"
+        FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
+        package = output.read_text(encoding="utf-8")
+        dump = self.database_dump()
+        for value in self.RACE_VALUES:
+            self.assertNotIn(value, dump)
+            self.assertNotIn(value, package)
+            self.assertNotIn(FILL.canonical_hash(value), dump)
+            self.assertNotIn(FILL.canonical_hash(value), package)
+        # The page's own option list is never persisted; only how many it held.
+        self.assertIn("options_count", dump)
+        self.assertNotIn("options", json.loads(self.db.execute(
+            "SELECT observation_json FROM fill_pages").fetchone()[0])["fields"][0])
+
+    def test_a_declared_answer_source_cannot_turn_an_eeo_field_into_an_answer(self):
+        # Page text may add caution and never remove it: declaring `source_kind: "answer"`
+        # on a race question must not route it through the answer library.
+        self.add_answer("answer-race", "race", "Race / Ethnicity", "Asian")
+        result = self.observe([self.field(
+            "eeo_race", "Race / Ethnicity", source_kind="answer",
+            options=self.RACE_VALUES)], locale="en-US")
+        self.assertEqual(result["status"], "paused")
+        # The answer exists and is confirmed; what must not exist is a step that used it.
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM fill_steps WHERE source_id='answer-race'").fetchone()[0], 0)
+        self.assertEqual(self.pause_reasons(result), {"nondisclosure_policy_absent"})
+
+    # ---- 10: the browser boundary ---------------------------------------
+
+    def test_no_planned_action_can_submit_or_navigate(self):
+        self.add_decline_policy()
+        self.observe([
+            self.field("eeo_race", "Race / Ethnicity",
+                       options=self.RACE_VALUES + [self.DECLINE]),
+            self.field("next_page", "Continue to the next step", control="submit"),
+        ], locale="en-US")
+        output = self.root / "private" / "page-actions.json"
+        result = FILL.export_page(self.db, "session-1", "worker-1", "page-1", output, AT)
+        package = json.loads(output.read_text(encoding="utf-8"))
+        self.assertTrue(package["stop_before_submit"])
+        self.assertIsNone(package["submission_action"])
+        self.assertFalse(result["contains_submission_action"])
+        self.assertEqual({action["operation"] for action in package["actions"]}, {"fill"})
+        self.assertNotIn("next_page", json.dumps(package["actions"]))
+
+    # ---- discovery source -----------------------------------------------
+
+    def test_discovery_source_needs_a_user_confirmed_application_answer(self):
+        self.add_answer("answer-source", "discovery_source", "How did you hear about us?",
+                        "Job board")
+        result = self.observe([self.field(
+            "source", "How did you hear about us?", source_kind="answer")])
+        self.assertEqual(self.pause_reasons(result), {"discovery_source_not_user_confirmed"})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Which protected authority, if any, may answer a form field.
+
+`docs/lever-first-form-readiness.md` audited the 27 controls of the reviewed Lever semantic
+fixture and found that only 2 resolve to career evidence. The rest are contact facts, legal
+status, a negotiating stance, per-employer disclosures, an acquisition-source preference, and
+four voluntary protected-characteristic questions. Answering them all through the same
+"fact or answer" path is what this module refuses.
+
+Every classification here is deterministic and reads only the field identifier and question
+text. That text comes from the page and is untrusted, so it is used in exactly one direction:
+**a pattern hit may add caution, never remove it.** A page that declares a race question as
+`source_kind: "answer"` still lands in `always_manual`; a page that declares an ordinary
+question as EEO merely costs a pause. `archive_core.SENSITIVE_FIELD_PATTERN` already uses this
+asymmetry and this module follows it.
+
+No model is involved. A question that does not match is not guessed at — it falls through to
+the existing answer path, which pauses on `new_question`.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+import sys  # noqa: E402
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from _common import context_matches, parse_time  # noqa: E402
+
+
+DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
+
+# Voluntary protected-characteristic disclosures. Values never enter Jobloom.
+VOLUNTARY_EEO_FAMILIES = {
+    "eeo_race": re.compile(r"race|ethnic", re.IGNORECASE),
+    "eeo_veteran": re.compile(r"veteran", re.IGNORECASE),
+    "eeo_disability": re.compile(r"disabilit|disabled", re.IGNORECASE),
+    "eeo_gender": re.compile(r"\bgender\b|\bsex\b|self.?identif.*\bgender\b", re.IGNORECASE),
+}
+
+# Employer-defined compensation brackets. The bands exist only in page text.
+COMPENSATION_BRACKET = re.compile(
+    r"compensation|salary|\bpay\b|\bcomp\b|remuneration", re.IGNORECASE)
+
+# Kept as two families on purpose: a relative at the company and a commercial relationship
+# with it are different disclosures and must never share an answer.
+EMPLOYER_CONFLICT_FAMILIES = {
+    "conflict_related_person": re.compile(
+        r"relative|related person|family member|spouse|immediate family", re.IGNORECASE),
+    "conflict_commercial_relationship": re.compile(
+        r"customer|partner|reseller|supplier|vendor|distributor", re.IGNORECASE),
+}
+
+SPONSORSHIP = re.compile(r"sponsor", re.IGNORECASE)
+SPONSORSHIP_NOW = re.compile(r"\bnow\b|currently|presently|at this time|to begin", re.IGNORECASE)
+SPONSORSHIP_FUTURE = re.compile(
+    r"\bfuture\b|\bever\b|at any (?:point|time)|later|down the (?:road|line)", re.IGNORECASE)
+
+DISCOVERY_SOURCE = re.compile(
+    r"how did you (?:hear|find|learn)|where did you (?:hear|find)|referral source|"
+    r"how.{0,20}(?:hear|find).{0,20}about", re.IGNORECASE)
+
+# The four exact immigration meanings. A broad question may not stand in for one of them.
+IMMIGRATION_MEANINGS = {
+    "work_authorized_now", "sponsorship_now", "sponsorship_future", "employer_action_required",
+}
+
+# Discovery source is a user preference about acquisition, not a fact and not a career claim.
+DISCOVERY_ANSWER_TYPES = {"application_specific", "conditional_preference"}
+
+NONDISCLOSURE_FAMILIES = set(VOLUNTARY_EEO_FAMILIES)
+
+
+def classify(field_id: str, question: str) -> tuple[str, str] | None:
+    """Return `(domain, family)` for a field that needs a domain rule, else `None`.
+
+    Order is by consequence, not by likelihood: a question that reads as both a
+    protected characteristic and something else is treated as the protected one.
+    """
+    text = f"{field_id} {question}"
+    for family, pattern in VOLUNTARY_EEO_FAMILIES.items():
+        if pattern.search(text):
+            return "voluntary_eeo", family
+    for family, pattern in EMPLOYER_CONFLICT_FAMILIES.items():
+        if pattern.search(text):
+            return "employer_conflict", family
+    if SPONSORSHIP.search(text):
+        return "sponsorship", "sponsorship"
+    if COMPENSATION_BRACKET.search(text):
+        return "compensation", "compensation"
+    if DISCOVERY_SOURCE.search(text):
+        return "discovery_source", "discovery_source"
+    return None
+
+
+def sponsorship_is_ambiguous(question: str) -> bool:
+    """A sponsorship question resolves only when it names exactly one point in time.
+
+    The reviewed fixture's `authorization.sponsorship_status` is a single broad control, and
+    the four canonical meanings are deliberately separate. Anything that asks about both, or
+    about neither, is a question this system has not been told the meaning of.
+    """
+    now = bool(SPONSORSHIP_NOW.search(question))
+    future = bool(SPONSORSHIP_FUTURE.search(question))
+    return now == future
+
+
+def initialize(connection: sqlite3.Connection) -> None:
+    """The non-disclosure policy store.
+
+    Deliberately not an AnswerEntry and deliberately not in `answers`: it holds no answer to
+    any question about the person. It records that the user chose not to disclose, and which
+    exact option strings they reviewed as meaning that. Its freshness rules are built from the
+    same primitives as answers (`parse_time`, `context_matches`) but map to their own reason
+    codes, because a policy has no `confirmation_status`, no `answer_type`, and no
+    `legal_commitment` case.
+    """
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS nondisclosure_policies (
+            policy_id TEXT PRIMARY KEY,
+            question_family TEXT NOT NULL,
+            locale TEXT NOT NULL,
+            allowed_options_json TEXT NOT NULL,
+            confirmed_by TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL,
+            effective_from TEXT,
+            expires_at TEXT,
+            revoked_at TEXT,
+            revocation_reason TEXT,
+            scope_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS nondisclosure_family
+            ON nondisclosure_policies (question_family);
+    """)
+    connection.commit()
+
+
+def register_policy(
+    connection: sqlite3.Connection,
+    policy_id: str,
+    question_family: str,
+    locale: str,
+    allowed_options: list[str],
+    confirmed_by: str,
+    confirmed_at: datetime,
+    scope: dict[str, Any] | None = None,
+    effective_from: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> dict[str, Any]:
+    if question_family not in NONDISCLOSURE_FAMILIES:
+        raise ValueError(f"unknown non-disclosure family: {question_family}")
+    if confirmed_by != "user":
+        raise ValueError("a non-disclosure policy requires an explicit user confirmation")
+    if not locale or not isinstance(locale, str):
+        raise ValueError("a non-disclosure policy requires a locale")
+    if not allowed_options or not all(
+        isinstance(option, str) and option.strip() for option in allowed_options
+    ):
+        raise ValueError("a non-disclosure policy requires reviewed option strings")
+    # The reviewed allowlist is stored; what a page happens to offer never is.
+    connection.execute(
+        "INSERT INTO nondisclosure_policies (policy_id, question_family, locale, "
+        "allowed_options_json, confirmed_by, confirmed_at, effective_from, expires_at, "
+        "revoked_at, revocation_reason, scope_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+        (policy_id, question_family, locale,
+         json.dumps(sorted(set(allowed_options)), ensure_ascii=False),
+         confirmed_by, confirmed_at.isoformat(),
+         effective_from.isoformat() if effective_from else None,
+         expires_at.isoformat() if expires_at else None,
+         json.dumps(scope or {}, sort_keys=True), confirmed_at.isoformat()),
+    )
+    connection.commit()
+    return {"policy_id": policy_id, "question_family": question_family, "locale": locale}
+
+
+def revoke_policy(connection: sqlite3.Connection, policy_id: str, reason: str,
+                  at: datetime) -> dict[str, Any]:
+    connection.execute(
+        "UPDATE nondisclosure_policies SET revoked_at=?, revocation_reason=? "
+        "WHERE policy_id=? AND revoked_at IS NULL",
+        (at.isoformat(), reason, policy_id),
+    )
+    connection.commit()
+    return {"policy_id": policy_id, "revoked": True}
+
+
+def policy_issue(row: sqlite3.Row, context: dict[str, Any], at: datetime) -> str | None:
+    """Why this policy does not apply, in the policy's own vocabulary."""
+    if row["revoked_at"]:
+        return "nondisclosure_policy_revoked"
+    effective = parse_time(row["effective_from"])
+    if effective and at < effective:
+        return "nondisclosure_policy_not_yet_effective"
+    expires = parse_time(row["expires_at"])
+    if expires and at >= expires:
+        return "nondisclosure_policy_expired"
+    if not context_matches(json.loads(row["scope_json"]), context):
+        return "nondisclosure_policy_scope_mismatch"
+    return None
+
+
+def resolve_nondisclosure(
+    connection: sqlite3.Connection,
+    question_family: str,
+    locale: str,
+    options: list[str] | None,
+    context: dict[str, Any],
+    at: datetime,
+) -> dict[str, Any]:
+    """Pick the one reviewed non-disclosure option a page offers, or say why not.
+
+    Selecting "decline to answer" discloses nothing, which is why it may be automated at all
+    while a demographic value may not. That only holds while the match is exact: a fuzzy match
+    could select a real category, so anything other than exactly one hit pauses.
+    """
+    rows = connection.execute(
+        "SELECT * FROM nondisclosure_policies WHERE question_family=? AND locale=?",
+        (question_family, locale),
+    ).fetchall()
+    if not rows:
+        return {"applied": False, "reason": "nondisclosure_policy_absent"}
+    issues: list[str] = []
+    applicable = []
+    for row in rows:
+        issue = policy_issue(row, context, at)
+        if issue:
+            issues.append(issue)
+            continue
+        applicable.append(row)
+    if not applicable:
+        return {"applied": False, "reason": sorted(set(issues))[0]}
+    if len(applicable) > 1:
+        return {"applied": False, "reason": "nondisclosure_policy_conflict"}
+    policy = applicable[0]
+    if not options:
+        return {"applied": False, "reason": "nondisclosure_option_unavailable"}
+    allowed = set(json.loads(policy["allowed_options_json"]))
+    matches = [option for option in options if option in allowed]
+    if len(matches) != 1:
+        return {"applied": False, "reason": "nondisclosure_option_ambiguous"}
+    return {"applied": True, "policy_id": policy["policy_id"], "option": matches[0]}
+
+
+def conflict_derivation(
+    connection: sqlite3.Connection,
+    family: str,
+    context: dict[str, Any],
+    at: datetime,
+) -> dict[str, Any]:
+    """Whether a per-employer conflict answer may be derived. In v1 it never may.
+
+    The contract a future derivation must satisfy, so that building it later cannot quietly
+    weaken it:
+
+    1. a user-approved employer entity, resolved from the backend application, not from page
+       text and not from `jobs.normalized_employer` — that column is a deduplication and
+       search key, so it may propose a candidate and never establish identity;
+    2. the relationship type kept separate per family;
+    3. a conflict registry the user has explicitly certified complete, still in date;
+    4. a record carrying the application ID, registry version, certification, and a
+       derivation hash.
+
+    None of those objects exists yet. The important half is what absence means: a registry
+    that does not mention this employer is not evidence that no conflict exists, so a miss is
+    `unknown`, never `No`. Until the subsystem is approved and built, every conflict field is
+    the user's to answer on the page.
+    """
+    if family not in EMPLOYER_CONFLICT_FAMILIES:
+        raise ValueError(f"unknown conflict family: {family}")
+    return {"derivable": False, "reason": "employer_entity_not_approved"}

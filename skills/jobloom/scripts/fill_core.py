@@ -22,6 +22,7 @@ if SCRIPT_DIR not in sys.path:
 import answer_library  # noqa: E402
 import application_core  # noqa: E402
 import archive_core  # noqa: E402
+import field_policy  # noqa: E402
 import pre_submit_core  # noqa: E402
 import resume_core  # noqa: E402
 from _common import require_application_material_format, require_table  # noqa: E402
@@ -38,6 +39,7 @@ USER_ANSWER_PAUSES = {
     "standing_authorization_unknown", "standing_authorization_revoked",
     "standing_authorization_expired", "standing_authorization_scope_mismatch",
     "candidate_fact_unknown", "candidate_fact_not_locked", "candidate_fact_expired",
+    "sponsorship_meaning_ambiguous", "discovery_source_not_user_confirmed",
 }
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -102,6 +104,7 @@ def connect(path: Path | str) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    field_policy.initialize(connection)
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS fill_sessions (
             session_id TEXT PRIMARY KEY,
@@ -364,6 +367,20 @@ def _candidate_facts(connection: sqlite3.Connection, application_id: str,
     return {fact["id"]: fact for fact in candidate["facts"]}
 
 
+def _discovery_answer_allowed(connection: sqlite3.Connection, answer_id: str) -> bool:
+    """How the user heard about a role is their statement, never an inference.
+
+    Nothing may derive it from the posting URL, the ATS host, or which collector surfaced the
+    opening — those record how Jobloom found the job, which is a different fact about a
+    different actor. Only a user-confirmed application-specific or conditional answer counts.
+    """
+    row = connection.execute(
+        "SELECT answer_type, source_type FROM answers WHERE answer_id=?", (answer_id,)
+    ).fetchone()
+    return bool(row) and (row["answer_type"] in field_policy.DISCOVERY_ANSWER_TYPES
+                          and row["source_type"] == "user_confirmed")
+
+
 def _plan_upload(connection: sqlite3.Connection, session: sqlite3.Row,
                  upload_kind: str) -> tuple[str, str, dict[str, Any], str] | None:
     lock = application_core.require_active_material_lock(connection, session["application_id"])
@@ -399,8 +416,11 @@ def observe_page(
 ) -> dict[str, Any]:
     session = _active_session(connection, session_id, worker_id, at)
     required = {"page_id", "page_index", "page_url", "fields", "legal_items", "restricted_requests"}
-    if set(observation) != required:
+    if (set(observation) - (required | {"locale"})) or (required - set(observation)):
         raise ValueError("page observation has missing or unknown fields")
+    locale = observation.get("locale")
+    if locale is not None and (not isinstance(locale, str) or not 0 < len(locale) <= 32):
+        raise ValueError("page locale must be a bounded string")
     page_id = observation["page_id"]
     _require_id(page_id, "page_id")
     sanitized_page_url = _safe_url(observation["page_url"], "page_url")
@@ -437,13 +457,14 @@ def observe_page(
     reasons.extend(sorted(restrictions & pre_submit_core.MANDATORY_PAUSES))
     context = json.loads(session["authorization_context_json"])
     planned: list[dict[str, Any]] = []
+    eeo_handling: dict[str, str] = {}
     seen_fields: set[str] = set()
     submit_seen = False
     for ordinal, field in enumerate(observation["fields"]):
         if not isinstance(field, dict):
             raise ValueError("each observed field must be an object")
         allowed = {"field_id", "question", "selector", "control", "required", "sensitivity",
-                   "source_kind", "source_id", "upload_kind"}
+                   "source_kind", "source_id", "upload_kind", "options"}
         if set(field) - allowed:
             raise ValueError("observed field has unknown properties")
         for name in ("field_id", "question", "selector", "control"):
@@ -458,6 +479,12 @@ def observe_page(
         seen_fields.add(field_id)
         if not isinstance(field.get("required"), bool):
             raise ValueError("observed field required must be Boolean")
+        options = field.get("options")
+        if options is not None and (
+            not isinstance(options, list) or len(options) > 100
+            or not all(isinstance(option, str) and 0 < len(option) <= 256 for option in options)
+        ):
+            raise ValueError("observed field options must be up to 100 bounded strings")
         control = field["control"]
         if control not in ALLOWED_CONTROLS:
             reasons.append(_field_reason("unsupported_form", field_id, field.get("sensitivity", "normal")))
@@ -487,6 +514,46 @@ def observe_page(
                             "source_status": "locked", "sensitivity": sensitivity,
                             "value": value, "expected_sha256": expected})
             continue
+        domain = field_policy.classify(field_id, field["question"])
+        if domain:
+            domain_kind, family = domain
+            if domain_kind == "voluntary_eeo":
+                # Protected-characteristic questions are the user's alone. The reason code
+                # hashes the field regardless of what the page declared, so neither the
+                # question nor an answer is legible in the pause record.
+                resolved = field_policy.resolve_nondisclosure(
+                    connection, family, locale or "", field.get("options"), context, current_time)
+                if not resolved["applied"]:
+                    reasons.append(_field_reason(resolved["reason"], field_id, "sensitive_personal"))
+                    eeo_handling[field_id] = resolved["reason"]
+                    continue
+                # Selecting a reviewed "prefer not to answer" option discloses nothing, which
+                # is the whole reason it may be automated while a value may not.
+                planned.append({"ordinal": ordinal, "field": field, "operation": "fill",
+                                "source_kind": "nondisclosure_policy",
+                                "source_id": resolved["policy_id"],
+                                "source_status": "active", "sensitivity": "sensitive_personal",
+                                "value": resolved["option"],
+                                "expected_sha256": canonical_hash(resolved["option"])})
+                eeo_handling[field_id] = "policy_declined"
+                continue
+            if domain_kind == "compensation":
+                # Employer-defined brackets exist only in page text, and the direction
+                # criteria `salary_floor` is a search filter in another subsystem. Neither
+                # may pick a band.
+                reasons.append(_field_reason(
+                    "employer_defined_compensation_manual", field_id, sensitivity))
+                continue
+            if domain_kind == "employer_conflict":
+                derivation = field_policy.conflict_derivation(
+                    connection, family, context, current_time)
+                if not derivation["derivable"]:
+                    reasons.append(_field_reason(derivation["reason"], field_id, sensitivity))
+                    continue
+            if domain_kind == "sponsorship" and field_policy.sponsorship_is_ambiguous(field["question"]):
+                # One broad control cannot stand in for four separate canonical meanings.
+                reasons.append(_field_reason("sponsorship_meaning_ambiguous", field_id, sensitivity))
+                continue
         source_kind = field.get("source_kind")
         if source_kind == "fact":
             fact = facts.get(field.get("source_id"))
@@ -515,6 +582,12 @@ def observe_page(
             if not match.get("auto_fill_ready"):
                 reasons.append(_field_reason(match["reason"], field_id, sensitivity))
                 continue
+            if domain and domain[0] == "discovery_source" and not _discovery_answer_allowed(
+                connection, match["answer_id"]
+            ):
+                reasons.append(_field_reason(
+                    "discovery_source_not_user_confirmed", field_id, sensitivity))
+                continue
             planned.append({"ordinal": ordinal, "field": field, "operation": "fill",
                             "source_kind": "answer", "source_id": match["answer_id"],
                             "source_status": "active", "sensitivity": sensitivity,
@@ -524,6 +597,11 @@ def observe_page(
     timestamp = current_time.isoformat()
     sanitized_observation = dict(observation)
     sanitized_observation["page_url"] = sanitized_page_url
+    sanitized_observation["fields"] = [
+        {**{key: value for key, value in item.items() if key != "options"},
+         **({"options_count": len(item["options"])} if isinstance(item.get("options"), list) else {})}
+        for item in observation["fields"]
+    ]
     stored_observation = canonical_json(sanitized_observation)
     connection.execute("""
         INSERT INTO fill_pages (

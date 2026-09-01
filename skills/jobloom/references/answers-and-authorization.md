@@ -56,3 +56,44 @@ The gate must query stored answer state by answer ID. Do not accept a browser or
 Pause for new or ambiguous questions, expired answers, conflicts, page/job-card discrepancies, CAPTCHA, assessments, payments, identity/tax/banking documents, camera/microphone/biometrics, unapproved uploads, unsafe pages, and uncertain submission outcomes.
 
 Submission uncertainty is terminal pending user review. Never retry automatically.
+
+## Field dispositions
+
+Not every form field is an answer. `field_policy.classify` sorts a field into one of five
+dispositions from its identifier and question text, deterministically and with no model:
+`fact`, `answer`, `material`, `always_manual`, `unsupported`. Page text is untrusted, so it is
+read in one direction only — a match may add caution and never remove it. A page that declares
+a race question as `source_kind: "answer"` still lands in `always_manual`.
+
+The audit behind these rules is `docs/lever-first-form-readiness.md`: of 27 controls in the
+reviewed Lever fixture, 2 resolve to career evidence.
+
+**Voluntary EEO.** Race, ethnicity, gender, disability and veteran self-identification values
+are never stored, read, hashed, archived or placed in a package. A separate
+`nondisclosure_policies` row — not an AnswerEntry, holding no demographic value — may select a
+reviewed non-disclosure option, and only on an exact match against its own allowlist; the
+page's option strings are never persisted, only their count. Zero or multiple matches pause.
+Selecting "prefer not to answer" discloses nothing, which is why it may be automated at all
+while a value may not. Reason codes hash the field identifier regardless of declared
+sensitivity, so neither question nor answer is legible in a pause record.
+
+**Compensation.** `compensation.total_range` is a radiogroup whose bands are defined by each
+employer, so it is always manual. The direction criteria `salary_floor` is a search filter in
+another subsystem and never resolves an application answer. Comparing an advertised range
+against the floor is fit and eligibility, not a fill answer.
+
+**Employer conflict.** "A relative works here" and "I am a customer, partner or reseller" are
+separate canonical meanings and may never share an answer. Derivation requires a user-approved
+employer entity, the relationship type, and a conflict registry the user has explicitly
+certified complete and in date. `jobs.normalized_employer` is a deduplication and search key:
+it may propose a candidate, never establish identity. **A registry miss is `unknown`, never
+`No`.** None of those objects exists, so every conflict field is manual today.
+
+**Sponsorship.** One broad control may not stand in for four canonical meanings. A sponsorship
+question that names both a present and a future point in time, or neither, pauses as
+`sponsorship_meaning_ambiguous` no matter which canonical answer would have matched.
+
+**Discovery source.** How the user heard about a role is their statement. It is never inferred
+from the posting URL, the ATS host, or which collector surfaced the opening — those record how
+Jobloom found the job, a different fact about a different actor. Only a user-confirmed
+`application_specific` or `conditional_preference` answer resolves it.
