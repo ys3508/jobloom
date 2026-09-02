@@ -475,21 +475,53 @@ class FillControl:
     """Prepared runs, and the one place a double press is turned into one execution.
 
     Three layers refuse a second run and they are not redundant. The panel disables its own
-    button, which handles the ordinary double-click; this class moves a run out of
-    `prepared` under a lock, which handles two requests that raced past the panel; and the
-    execution authority consumes the grant exactly once, which is the layer that actually
-    holds if both of the others are wrong or absent. Only the last one is a safety boundary
-    — the other two are there so the user is told, rather than left reading a stack of
-    identical refusals.
+    button, which handles the ordinary double-click; this class holds the whole preparation
+    under a lock and moves a run out of `prepared` under the same one, which handles requests
+    that raced past the panel; and the execution authority consumes the grant exactly once,
+    which is the layer that actually holds if both of the others are wrong or absent. Only
+    the last one is a safety boundary — the other two are there so the user is told, rather
+    than left reading a stack of identical refusals.
+
+    Consuming a grant exactly once is not the same as there being one grant. An earlier
+    version de-duplicated on `execution_id` alone, so two presses of *Prepare* before either
+    was run produced two executions with two grants, each single-use and each perfectly
+    valid: `prepare, prepare, execute(A), execute(B)` filled the page twice, and the test
+    that looked like it covered this only prepared again *after* a run, when the steps were
+    already completed and any second attempt would have been refused anyway. So the
+    invariant is stated per page rather than per execution: at most one live prepared run,
+    and at most one live grant, for one `(session_id, page_id)`.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        # Re-entrant: `prepare` calls back into the caller's builder while holding the lock,
+        # which is the point — the export and the grant must not straddle it.
+        self._lock = threading.RLock()
         self._runs: dict[str, _PreparedRun] = {}
+        self._by_page: dict[tuple[str, str], str] = {}
 
-    def add(self, run: _PreparedRun) -> None:
+    def prepare(self, key: tuple[str, str], now: datetime, build) -> tuple[_PreparedRun, bool]:
+        """The one live prepared run for this page, building it only if there is none.
+
+        Returns `(run, created)`. `build` is called under the lock and must revoke whatever
+        authority the page already carries before issuing more.
+        """
         with self._lock:
+            previous_id = self._by_page.get(key)
+            previous = self._runs.get(previous_id) if previous_id else None
+            if previous is not None:
+                if previous.state == "running":
+                    # A second authority while the first is in a browser is the exact shape
+                    # of the bug this guards.
+                    raise BridgeError("fill_execution_in_progress", 409)
+                if previous.state == "prepared" and now < previous.expires_at:
+                    # Idempotent. The page has not moved, so the answer has not either.
+                    return previous, False
+                if previous.state == "prepared":
+                    previous.state = "expired"
+            run = build()
             self._runs[run.execution_id] = run
+            self._by_page[key] = run.execution_id
+            return run, True
 
     def claim(self, execution_id: str, now: datetime) -> _PreparedRun:
         """Hand back a run once, and only while it is still prepared."""
@@ -582,7 +614,13 @@ class Handler(BaseHTTPRequestHandler):
         except BridgeError as error:
             self._send(error.status, {"error": error.code})
         except Exception as error:  # surfaced as a code, never as a stack trace
-            self._send(500, {"error": "bridge_failure", "detail": str(error)[:200]})
+            if self.path.startswith("/fill/"):
+                # Second line of the same defence. The fill routes convert their own
+                # exceptions, and this is what holds if one ever escapes: `detail` is
+                # `str(error)`, and on this path that routinely means a local path.
+                self._send(500, {"error": "bridge_failure"})
+            else:
+                self._send(500, {"error": "bridge_failure", "detail": str(error)[:200]})
 
     def _connection(self, *, shared: bool = False) -> sqlite3.Connection:
         # `shared` is for the fill run only: the execution authority redeems grants from its
@@ -753,6 +791,22 @@ class Handler(BaseHTTPRequestHandler):
             "runs_in_separate_window": True,
         }
 
+    def _revoke_live_grants(self, connection, fill_core, session_id: str, page_id: str,
+                            now: datetime) -> None:
+        """Withdraw every authority this page still carries, before issuing another.
+
+        Read out of the database rather than out of this process's memory on purpose. A
+        bridge that restarted between the two presses would remember nothing while the
+        grants it issued were still perfectly valid, so an in-memory invariant would hold
+        only for as long as the process did.
+        """
+        live = connection.execute(
+            "SELECT grant_id FROM execution_grants WHERE session_id=? AND page_id=? "
+            "AND consumed_at IS NULL AND revoked_at IS NULL", (session_id, page_id)
+        ).fetchall()
+        for row in live:
+            fill_core.revoke_execution_grant(connection, row["grant_id"], now)
+
     def _fill_prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = _closed_request(payload, FILL_PREPARE_FIELDS, "fill_request_invalid")
         import fill_core  # local: keeps the read-only path free of write imports
@@ -762,29 +816,46 @@ class Handler(BaseHTTPRequestHandler):
         try:
             session, page, steps = self._fill_state(
                 connection, request["application_id"], now)
-            execution_id = uuid.uuid4().hex
-            root = self.private_root / "fill-runs" / execution_id
-            root.mkdir(parents=True, exist_ok=True)
-            root.chmod(0o700)
-            package_path = root / "actions.json"
-            try:
-                fill_core.export_page(connection, session["session_id"],
-                                      session["worker_id"], page["page_id"],
-                                      package_path, now)
-                grant = fill_core.issue_execution_grant(
-                    connection, session["session_id"], page["page_id"], package_path, now)
-            except ValueError as error:
-                raise BridgeError("fill_page_not_exportable", 409) from error
-            summary = self._fill_summary(session, page, steps, grant, execution_id)
-            self.fill_control.add(_PreparedRun(
-                execution_id=execution_id, application_id=session["application_id"],
-                session_id=session["session_id"], page_id=page["page_id"],
-                worker_id=session["worker_id"], grant_id=grant["grant_id"],
-                package_path=package_path, result_path=root / "result.json",
-                capability_path=root / "capability.json", summary=summary,
-                expires_at=now + timedelta(seconds=FILL_PREPARED_TTL_SECONDS),
-                state="prepared", outcome=None))
-            return summary
+
+            def build() -> _PreparedRun:
+                # Under `FillControl`'s lock. Anything issued before this page's new grant
+                # is withdrawn first, so two preparations can never both be executable.
+                self._revoke_live_grants(connection, fill_core, session["session_id"],
+                                         page["page_id"], now)
+                execution_id = uuid.uuid4().hex
+                root = self.private_root / "fill-runs" / execution_id
+                root.mkdir(parents=True, exist_ok=True)
+                root.chmod(0o700)
+                package_path = root / "actions.json"
+                try:
+                    fill_core.export_page(connection, session["session_id"],
+                                          session["worker_id"], page["page_id"],
+                                          package_path, now)
+                    grant = fill_core.issue_execution_grant(
+                        connection, session["session_id"], page["page_id"],
+                        package_path, now)
+                except ValueError as error:
+                    raise BridgeError("fill_page_not_exportable", 409) from error
+                return _PreparedRun(
+                    execution_id=execution_id, application_id=session["application_id"],
+                    session_id=session["session_id"], page_id=page["page_id"],
+                    worker_id=session["worker_id"], grant_id=grant["grant_id"],
+                    package_path=package_path, result_path=root / "result.json",
+                    capability_path=root / "capability.json",
+                    summary=self._fill_summary(session, page, steps, grant, execution_id),
+                    expires_at=now + timedelta(seconds=FILL_PREPARED_TTL_SECONDS),
+                    state="prepared", outcome=None)
+
+            run, _created = self.fill_control.prepare(
+                (session["session_id"], page["page_id"]), now, build)
+            return run.summary
+        except BridgeError:
+            raise
+        except Exception as error:
+            # Nothing from here is allowed to describe itself. `mkdir`, `chmod`, the export
+            # and the grant all name the private root in their messages, and a failure
+            # response is as much a part of this API as a successful one.
+            raise BridgeError("fill_preparation_failed", 409) from error
         finally:
             connection.close()
 
@@ -834,12 +905,17 @@ class Handler(BaseHTTPRequestHandler):
             outcome = self._fill_outcome(connection, run, imported, now)
             self.fill_control.finish(run, "finished", outcome)
             return outcome
-        except BridgeError as error:
+        except BridgeError:
             self.fill_control.finish(run, "failed", None)
             raise
         except Exception as error:
             # The grant may or may not have been spent, so the run is over either way: a
             # retry that could replay a consumed package is exactly what must not exist.
+            #
+            # A stable code and nothing else. The worker, the authority and the import all
+            # raise messages that can carry a path, a target or a field value, and handing
+            # `str(error)` to the panel would put them there — a value-free success response
+            # beside a talkative failure response is not a value-free API.
             self.fill_control.finish(run, "failed", None)
             raise BridgeError("fill_execution_failed", 409) from error
         finally:

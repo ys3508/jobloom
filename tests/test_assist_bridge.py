@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -940,7 +941,9 @@ class FillControlTests(unittest.TestCase):
 
     # ---- the run itself -------------------------------------------------------
 
-    def test_one_gesture_prepares_and_runs_exactly_one_page(self):
+    def test_prepare_then_run_executes_exactly_one_page(self):
+        # Two requests and two gestures, named as such: the Run press is the one that
+        # executes, and the Prepare press before it exists so there is a summary to read.
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.observed_session(server)
             status, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
@@ -1090,3 +1093,217 @@ class FillControlTests(unittest.TestCase):
             self.assertTrue(BRIDGE.Handler.fill_headed)
         finally:
             server.server_close()
+
+    # ---- one authority per page ----------------------------------------------
+
+    def live_grants(self):
+        return [row["grant_id"] for row in self.db.execute(
+            "SELECT grant_id FROM execution_grants "
+            "WHERE consumed_at IS NULL AND revoked_at IS NULL")]
+
+    def test_preparing_twice_before_running_yields_one_executable_authority(self):
+        """The bug this closes: two presses of Prepare, then two runs.
+
+        De-duplicating on `execution_id` made every preparation its own execution with its
+        own grant, and each grant was single-use and entirely valid. `prepare, prepare,
+        execute(A), execute(B)` would have filled the page twice. The earlier test only
+        prepared again *after* a run, by which point the steps were completed and any second
+        attempt was refused for an unrelated reason — so it passed while the hole was open.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            status, first = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 200, first)
+            status, second = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 200, second)
+            # Idempotent: the page has not moved, so neither has the answer.
+            self.assertEqual(second["execution_id"], first["execution_id"])
+            self.assertEqual(len(self.live_grants()), 1)
+            status, done = self.post("/fill/execute",
+                                     {"execution_id": first["execution_id"]})
+            self.assertEqual(status, 200, done)
+            status, refused = self.post("/fill/execute",
+                                        {"execution_id": second["execution_id"]})
+            self.assertEqual(status, 409)
+            self.assertEqual(refused["error"], "execution_already_started")
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_concurrent_prepares_produce_one_execution_and_one_run(self):
+        """Serial de-duplication is easy; this is the version that races.
+
+        Every request is issued at once, and then every execution id that came back is run
+        at once. What has to hold at the end is not that the requests were tidy but that the
+        page was filled once: one consumed grant, nothing else live, and the target's own
+        counter still at zero.
+        """
+        import concurrent.futures
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                prepared = list(pool.map(
+                    lambda _: self.post("/fill/prepare", {"application_id": "app-1"}),
+                    range(4)))
+            ok = [body for status, body in prepared if status == 200]
+            self.assertTrue(ok)
+            self.assertEqual(len({body["execution_id"] for body in ok}), 1)
+            self.assertEqual(len(self.live_grants()), 1)
+            ids = {body["execution_id"] for body in ok}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(
+                    lambda execution_id: self.post("/fill/execute",
+                                                   {"execution_id": execution_id}),
+                    list(ids) * 4))
+            self.assertEqual(sum(1 for status, _ in results if status == 200), 1)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_grant_this_process_never_saw_is_revoked_before_a_new_one_exists(self):
+        """The invariant is read from the database, not from this process's memory.
+
+        A bridge restarted between the two presses would remember no prepared run while the
+        grant it issued was still valid for the rest of its fifteen minutes. Withdrawing
+        from the table rather than from a dictionary is what makes the guarantee outlive
+        the process.
+        """
+        import fill_core
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            stray_package = self.private / "stray-actions.json"
+            fill_core.export_page(self.db, "session-1", "worker-1", "page-1",
+                                  stray_package, self.now)
+            stray = fill_core.issue_execution_grant(self.db, "session-1", "page-1",
+                                                    stray_package, self.now)
+            self.assertIn(stray["grant_id"], self.live_grants())
+            status, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 200, prepared)
+            self.assertEqual(len(self.live_grants()), 1)
+            self.assertNotIn(stray["grant_id"], self.live_grants())
+            self.assertEqual(self.db.execute(
+                "SELECT revoked_at FROM execution_grants WHERE grant_id=?",
+                (stray["grant_id"],)).fetchone()["revoked_at"] is not None, True)
+
+    def test_a_prepare_during_a_run_is_refused_rather_than_authorised(self):
+        import fill_core
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            # Held in `running` the way `_fill_execute` holds it, without the browser.
+            run = BRIDGE.Handler.fill_control.claim(prepared["execution_id"],
+                                                    datetime.now(timezone.utc))
+            try:
+                status, body = self.post("/fill/prepare", {"application_id": "app-1"})
+                self.assertEqual(status, 409)
+                self.assertEqual(body["error"], "fill_execution_in_progress")
+                self.assertEqual(len(self.live_grants()), 1)
+            finally:
+                BRIDGE.Handler.fill_control.finish(run, "prepared", None)
+            self.assertEqual(self.oracle(server), 0)
+
+    # ---- failure responses are part of the API -------------------------------
+
+    def assert_value_free_failure(self, status, body, server, codes):
+        self.assertIn(status, {409, 500})
+        self.assertEqual(set(body), {"error"}, body)
+        self.assertIn(body["error"], codes)
+        rendered = json.dumps(body, ensure_ascii=False)
+        for needle in (str(self.private), "fill-runs", "actions.json", "capability",
+                       "result.json", server.origin, "127.0.0.1", "Verified Candidate",
+                       "New York, NY", "token-under-test", "Errno", "Traceback",
+                       "session-1", "page-1", "grant-"):
+            self.assertNotIn(needle, rendered)
+
+    def test_a_failure_anywhere_in_preparation_says_only_a_code(self):
+        """`str(error)` is where the private root lives.
+
+        `mkdir`, `chmod`, the export and the grant all name the path they failed on, and the
+        generic handler used to forward two hundred characters of it. A value-free success
+        response beside a talkative failure response is not a value-free API.
+        """
+        import fill_core
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            leak = f"[Errno 13] Permission denied: '{self.private}/fill-runs/actions.json'"
+            injections = {
+                "directory": (Path, "mkdir", OSError(leak)),
+                "export": (fill_core, "export_page", ValueError(leak)),
+                "grant": (fill_core, "issue_execution_grant", RuntimeError(leak)),
+                "revocation": (fill_core, "revoke_execution_grant", RuntimeError(leak)),
+            }
+            for label, (target, name, error) in injections.items():
+                with self.subTest(failure=label):
+                    if label == "revocation":
+                        # Revocation only runs when the page already carries an authority,
+                        # so give it one that this process did not issue.
+                        stray = self.private / f"stray-{label}.json"
+                        fill_core.export_page(self.db, "session-1", "worker-1", "page-1",
+                                              stray, self.now)
+                        fill_core.issue_execution_grant(self.db, "session-1", "page-1",
+                                                        stray, self.now)
+                        self.assertTrue(self.live_grants())
+                    with unittest.mock.patch.object(target, name, side_effect=error):
+                        status, body = self.post("/fill/prepare",
+                                                 {"application_id": "app-1"})
+                    self.assert_value_free_failure(
+                        status, body, server,
+                        {"fill_preparation_failed", "fill_page_not_exportable",
+                         "bridge_failure"})
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_failure_anywhere_in_execution_says_only_a_code(self):
+        import execution_authority
+        import fill_core
+        import fill_worker
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            leak = (f"target http://127.0.0.1:9/lever refused; package "
+                    f"{self.private}/fill-runs/actions.json held 'Verified Candidate'")
+            injections = {
+                "authority": (execution_authority, "ExecutionAuthority",
+                              RuntimeError(leak)),
+                "worker": (fill_worker, "run", RuntimeError(leak)),
+                "import": (fill_core, "import_result", ValueError(leak)),
+            }
+            for label, (target, name, error) in injections.items():
+                with self.subTest(failure=label):
+                    _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+                    with unittest.mock.patch.object(target, name, side_effect=error):
+                        status, body = self.post(
+                            "/fill/execute", {"execution_id": prepared["execution_id"]})
+                    self.assert_value_free_failure(
+                        status, body, server,
+                        {"fill_execution_failed", "bridge_failure"})
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_the_bridge_writes_no_diagnostic_of_its_own(self):
+        """Nothing is logged, so nothing logged can carry a path.
+
+        The handler's `log_message` is a no-op and the fill routes add no logging of their
+        own. If that ever changes, whatever replaces it has to be value-free too, and this
+        is where that will be noticed.
+        """
+        source = (ROOT / "skills" / "jobloom" / "scripts" / "assist_bridge.py").read_text(
+            encoding="utf-8")
+        parts = source.split("# ---- one-page Fill-Only control")
+        # The state machine above `Handler`, and the routes inside it. The rest of the
+        # module is not in scope: `/positioning` and friends keep their `detail`, which is
+        # existing behaviour on paths that never touch a package or a file.
+        blocks = {"state machine": parts[1].split("class Handler(")[0],
+                  "routes": parts[2].split("\ndef serve(")[0]}
+        for label, block in blocks.items():
+            code = "\n".join(line.split("#")[0] for line in block.splitlines())
+            for forbidden in ("print(", "logging.", "logger.", "sys.stderr", "sys.stdout",
+                              "str(error)", "traceback"):
+                with self.subTest(block=label, forbidden=forbidden):
+                    self.assertNotIn(forbidden, code)
+        self.assertIn("_fill_prepare", blocks["routes"])
+        self.assertIn("_fill_execute", blocks["routes"])
