@@ -55,6 +55,33 @@ CANDIDATES = load_script("candidate_core")
 REPLAY = load_script("semantic_replay")
 
 from tests.fixtures.ats_replay_server import ReplayServer
+
+
+class _RefusingLocator:
+    """A control that reports itself perfectly ordinary and refuses to accept a file.
+
+    The point of the stub is the `set_input_files` that raises: it turns "the worker checked
+    before uploading" into something a test can fail on, which a real page cannot do, because
+    a real page accepts the file either way.
+    """
+
+    def count(self):
+        return 1
+
+    def is_visible(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def set_input_files(self, *args, **kwargs):
+        raise AssertionError("the file reached the control before it was verified")
+
+
+class _RefusingPage:
+    def locator(self, selector):
+        return _RefusingLocator()
+
 from tests.fixtures.replay_observer import ObservationRefused, observe as observe_replay
 from tests.pdf_fixture import synthetic_pdf
 
@@ -818,25 +845,59 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
             self.assertEqual(self.oracle(server), 0)
 
     def test_an_upload_value_that_disagrees_with_itself_is_refused(self):
+        """All three of disk, value and action must name the same file.
+
+        The last of the three used to be conditional — `expected_sha256 is not None and ...` —
+        so an action that simply carried no expectation was checked against nothing and any
+        valid PDF passed. Exported packages do always carry the field, which is exactly why
+        the hole stayed invisible: the guarantee rested on every caller remembering, rather
+        than on the check itself. Absent, mistyped and malformed are all rejections now.
+        """
         good = self.private / "ok.pdf"
         good.write_bytes(synthetic_pdf(["Verified Candidate"]))
         digest = hashlib.sha256(good.read_bytes()).hexdigest()
+        value = {"version_id": "resume-1", "path": str(good), "file_sha256": digest}
         cases = {
-            "matching": ({"version_id": "resume-1", "path": str(good),
-                          "file_sha256": digest}, digest, None),
-            "wrong file digest": ({"version_id": "resume-1", "path": str(good),
-                                   "file_sha256": "a" * 64}, "a" * 64, "upload_rejected"),
-            "package disagrees": ({"version_id": "resume-1", "path": str(good),
-                                   "file_sha256": digest}, "b" * 64, "upload_rejected"),
-            "extra key": ({"version_id": "resume-1", "path": str(good),
-                           "file_sha256": digest, "note": "x"}, digest, "upload_rejected"),
+            "matching": (dict(value), digest, None),
+            "wrong file digest": ({**value, "file_sha256": "a" * 64}, "a" * 64,
+                                  "upload_rejected"),
+            "package disagrees": (dict(value), "b" * 64, "upload_rejected"),
+            "extra key": ({**value, "note": "x"}, digest, "upload_rejected"),
             "missing version": ({"path": str(good), "file_sha256": digest}, digest,
                                 "upload_rejected"),
             "bare path": (str(good), digest, "upload_rejected"),
+            # No expectation at all is not a licence to skip the comparison.
+            "absent expectation": (dict(value), None, "upload_rejected"),
+            "empty expectation": (dict(value), "", "upload_rejected"),
+            "non-string expectation": (dict(value), 0, "upload_rejected"),
+            "digest-shaped but not a digest": (dict(value), "g" * 64, "upload_rejected"),
+            "uppercase expectation": (dict(value), digest.upper(), "upload_rejected"),
+            "truncated expectation": (dict(value), digest[:63], "upload_rejected"),
+            "padded expectation": (dict(value), digest + "\n", "upload_rejected"),
         }
-        for label, (value, expected, problem) in cases.items():
+        for label, (value_case, expected, problem) in cases.items():
             with self.subTest(case=label):
-                self.assertEqual(WORKER._verify_upload(value, expected)[0], problem)
+                self.assertEqual(WORKER._verify_upload(value_case, expected)[0], problem)
+
+    def test_an_upload_action_without_an_expectation_never_reaches_the_control(self):
+        """The rejection has to happen in `_perform`, before `set_input_files`.
+
+        `_verify_upload` returning a problem in isolation would not prove much on its own:
+        what matters is that the caller stops there rather than uploading and reporting the
+        problem afterwards.
+        """
+        good = self.private / "no-expectation.pdf"
+        good.write_bytes(synthetic_pdf(["Verified Candidate"]))
+        digest = hashlib.sha256(good.read_bytes()).hexdigest()
+        action = {"field_id": "x", "control": "file", "operation": "upload",
+                  "value": {"version_id": "resume-1", "path": str(good),
+                            "file_sha256": digest}}
+        # No `expected_sha256` key at all, which is the shape that used to pass.
+        self.assertNotIn("expected_sha256", action)
+        outcome, observed, problem = WORKER._perform(_RefusingPage(), action)
+        self.assertEqual(outcome, "error")
+        self.assertEqual(problem, "upload_rejected")
+        self.assertIsNone(observed)
 
     def test_a_rejected_import_does_not_satisfy_the_checkpoint_gate(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:

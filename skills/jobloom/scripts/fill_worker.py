@@ -295,7 +295,7 @@ def _locator(page, action: dict[str, Any]):
 UPLOAD_VALUE_FIELDS = {"version_id", "path", "file_sha256"}
 
 
-def _verify_upload(value: Any, expected_sha256: str | None) -> tuple[str | None, str | None]:
+def _verify_upload(value: Any, expected_sha256: Any) -> tuple[str | None, str | None]:
     """Check the file completely before the page is allowed anywhere near it.
 
     The earlier order checked the suffix and the leading bytes, handed the file to the form,
@@ -303,12 +303,25 @@ def _verify_upload(value: Any, expected_sha256: str | None) -> tuple[str | None,
     valid PDF between export and execution was therefore already in the employer's file input
     by the time anything noticed — no submission needed for the wrong document to have been
     disclosed. Nothing here touches the control.
+
+    The equality this enforces is three-way and unconditional:
+
+        sha256(bytes on disk) == value.file_sha256 == action.expected_sha256
+
+    An absent, non-string or malformed `expected_sha256` is a rejection, not a licence to skip
+    the comparison. Exported packages do carry the field today, so treating `None` as "nothing
+    to check against" looked harmless — but it made the strongest of the three checks depend on
+    a caller remembering to supply it, and any valid PDF would have passed a package that did
+    not.
     """
     if not isinstance(value, dict) or set(value) != UPLOAD_VALUE_FIELDS:
         return "upload_rejected", None
     if not all(isinstance(value[key], str) and value[key] for key in UPLOAD_VALUE_FIELDS):
         return "upload_rejected", None
     if not worker_protocol.SHA256.fullmatch(value["file_sha256"]):
+        return "upload_rejected", None
+    if not isinstance(expected_sha256, str) or not worker_protocol.SHA256.fullmatch(expected_sha256):
+        # No authority to check the file against is the same as failing the check.
         return "upload_rejected", None
     path = Path(value["path"])
     if not path.is_file():
@@ -322,7 +335,7 @@ def _verify_upload(value: Any, expected_sha256: str | None) -> tuple[str | None,
     if digest != value["file_sha256"]:
         # The bytes on disk are not the bytes the material lock approved.
         return "upload_rejected", None
-    if expected_sha256 is not None and value["file_sha256"] != expected_sha256:
+    if value["file_sha256"] != expected_sha256:
         # The package disagrees with itself about which file this is.
         return "upload_rejected", None
     return None, digest
