@@ -7,6 +7,7 @@ loopback, and it does not keep a copy of what the user browsed unless they say s
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -36,6 +38,10 @@ SECTIONS = load("posting_sections")
 RESUMES = load("resume_core")
 EVIDENCE = load("evidence_matcher")
 EXTENSION = ROOT / "skills" / "jobloom" / "extension"
+
+from tests.fixtures.ats_replay_server import ReplayServer  # noqa: E402
+from tests.fixtures.replay_observer import observe as observe_replay  # noqa: E402
+from tests.pdf_fixture import synthetic_pdf  # noqa: E402
 
 PAGE = {
     "url": "https://www.linkedin.com/jobs/view/4012345678",
@@ -753,3 +759,334 @@ class ExtensionBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- extension-controlled separate guarded worker ----------------------------------------
+
+FILL = load("fill_core")
+APPLICATIONS = load("application_core")
+ANSWERS = load("answer_library")
+CANDIDATES = load("candidate_core")
+COVERS = load("cover_letter_core")
+ARCHIVE = load("archive_core")
+PRE_SUBMIT = load("pre_submit_core")
+
+
+def _browser_available() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+PLAYWRIGHT = _browser_available()
+
+if os.environ.get("JOBLOOM_REQUIRE_BROWSER") and not PLAYWRIGHT:
+    raise RuntimeError(
+        "JOBLOOM_REQUIRE_BROWSER is set but no Chromium is available: "
+        "run `python -m playwright install chromium`")
+
+
+@unittest.skipUnless(PLAYWRIGHT, "playwright is not installed")
+class FillControlTests(unittest.TestCase):
+    """The panel presses a button; the bridge and the authority decide everything else.
+
+    The point of this class is not that a page gets filled — `test_fill_worker_end_to_end`
+    already proves that. It is that the control surface adds no authority: the extension
+    names an application and receives an opaque id, and every target, origin, path, value,
+    capability and grant stays on this side of the boundary.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.private = Path(self.temp.name) / "private"
+        self.private.mkdir(mode=0o700)
+        self.now = datetime.now(timezone.utc)
+        self.db_path = self.private / "jobloom.db"
+        self.db = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(self.db.close)
+        for module in (APPLICATIONS, ANSWERS, RESUMES, COVERS, ARCHIVE, PRE_SUBMIT,
+                       FILL, CANDIDATES):
+            module.initialize(self.db)
+        self._build_candidate()
+        self._build_materials()
+        self._build_application()
+        self._build_answers()
+        self.server = BRIDGE.serve(db_path=self.db_path, candidate_path=self.candidate_path,
+                                   port=0, allow_store=False, token="token-under-test",
+                                   fill_headed=False)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    # ---- state, built entirely through production calls -----------------------
+
+    def _build_candidate(self):
+        facts = [
+            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-city", "type": "location", "value": "New York, NY",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-company", "type": "employment", "value": "Example Employer",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+        ]
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False,
+                "confirmed": True},
+            "search": {}, "facts": facts}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        self.candidate_path = self.private / "candidate.json"
+        self.candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        self.manifest_path = self.private / "claims-manifest.json"
+        self.manifest_path.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
+            "claim_id": "claim-name", "claim_text": "Verified Candidate",
+            "fact_ids": ["fact-name"], "evidence_strength": "direct",
+            "exact_locked_value_preserved": True}]}), encoding="utf-8")
+        CANDIDATES.register_snapshot(self.db, self.private / "candidates",
+                                     self.candidate_path, "user", self.now)
+
+    def _build_materials(self):
+        source = self.private / "resume.pdf"
+        source.write_bytes(synthetic_pdf(["Verified Candidate", "New York, NY"]))
+        RESUMES.register_version(self.db, self.private / "resumes", source, "resume-1",
+                                 "master_source", "general", at=self.now)
+        RESUMES.approve_version(self.db, "resume-1", self.candidate_path,
+                                self.manifest_path, "user", self.now)
+
+    def _build_application(self):
+        APPLICATIONS.ingest_job(self.db, {
+            "job_id": "job-1", "canonical_url": "https://example.invalid/job/1",
+            "employer": "Example Corp", "title": "Backend Engineer",
+            "location": "New York, NY", "status": "open", "country": "US",
+            "employment_type": "full_time"}, at=self.now)
+        APPLICATIONS.create_application(self.db, "app-1", "job-1", category="precision",
+                                        at=self.now)
+        for state, actor, reason in (
+            ("pending_analysis", "system", "analysis"),
+            ("precision_recommended", "system", "match"),
+            ("approved", "user", "approved"),
+            ("materials_in_progress", "system", "materials"),
+        ):
+            APPLICATIONS.transition(self.db, "app-1", state, actor, reason, at=self.now)
+        RESUMES.bind_version(self.db, "app-1", "resume-1", at=self.now)
+        RESUMES.lock_materials(self.db, "app-1", "user", "lock-1", at=self.now)
+        APPLICATIONS.transition(self.db, "app-1", "ready_to_fill", "system", "ready",
+                                at=self.now)
+        APPLICATIONS.acquire_next(self.db, "worker-1", at=self.now)
+
+    def _build_answers(self):
+        ANSWERS.add_answer(self.db, {
+            "answer_id": "answer-company", "canonical_id": "current_company",
+            "canonical_meaning": "Current company", "answer": "Example Employer",
+            "answer_type": "stable_fact", "source_type": "user_confirmed",
+            "confirmation_status": "confirmed", "confirmed_at": self.now.isoformat(),
+            "validity_class": "stable",
+            "scope": {"country": "US", "application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": False})
+        ANSWERS.add_question_form(self.db, "current_company", "Current company")
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": "auth-1", "confirmed_at": self.now.isoformat(),
+            "expires_at": (self.now + timedelta(hours=2)).isoformat(),
+            "scope": {"country": "US", "application_id": "app-1"}})
+
+    # ---- helpers --------------------------------------------------------------
+
+    def observed_session(self, server, path="/lever/split/0"):
+        """A session with one observed page, produced the way Task 6 produces one."""
+        from playwright.sync_api import sync_playwright
+        FILL.start_session(
+            self.db, session_id="session-1", application_id="app-1", worker_id="worker-1",
+            form_url=f"{server.origin}{path}", observed_employer="Example Corp",
+            observed_role="Backend Engineer", known_form=True, authorization_id="auth-1",
+            authorization_context={"country": "US", "application_id": "app-1"},
+            at=self.now)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_context().new_page()
+                page.goto(f"{server.origin}{path}", wait_until="domcontentloaded")
+                observation = observe_replay(page, "page-1", 0, f"{server.origin}{path}")
+            finally:
+                browser.close()
+        observed = FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                                     observation, self.now)
+        self.assertNotEqual(observed.get("status"), "paused", observed.get("reasons"))
+
+    def post(self, path, payload, token="token-under-test"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "X-Jobloom-Token": token})
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, json.load(error)
+
+    def oracle(self, server):
+        with urllib.request.urlopen(f"{server.origin}/__state", timeout=5) as response:
+            return json.load(response)["final_action_activations"]
+
+    # ---- the run itself -------------------------------------------------------
+
+    def test_one_gesture_prepares_and_runs_exactly_one_page(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            status, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 200, prepared)
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertTrue(prepared["execution_id"])
+            status, done = self.post("/fill/execute",
+                                     {"execution_id": prepared["execution_id"]})
+            self.assertEqual(status, 200, done)
+            self.assertEqual(done["status"], "verified")
+            self.assertEqual(done["verified"], prepared["actions"]["count"])
+            self.assertTrue(done["package_consumed"])
+            # One page. The session is still active and the second page was never opened.
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_pages").fetchone()[0], 1)
+            # The target's own counter, which is the only party that could honestly say a
+            # form was sent.
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_the_prepared_summary_carries_no_value_path_or_target(self):
+        """Built by naming fields, so this is a check on the naming.
+
+        The forbidden strings are the ones actually in play: the candidate's locked name and
+        city, the private root every artefact lives under, and the replay's own origin. A
+        summary that leaked any of them would hand the panel something the boundary exists
+        to keep from it.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            _, done = self.post("/fill/execute",
+                                {"execution_id": prepared["execution_id"]})
+            grant = self.db.execute(
+                "SELECT grant_id, secret FROM execution_grants").fetchone()
+            forbidden = [needle for needle in [
+                "Verified Candidate", "New York, NY", "Example Employer",
+                str(self.private), server.origin, "127.0.0.1", "lever",
+                ".pdf", ".json", "actions.json", "result.json", "capability",
+                "resume-1", "auth-1", "session-1", "page-1", "worker-1",
+                grant["grant_id"], grant["secret"], "token-under-test",
+            ] if needle]
+            self.assertTrue(grant["grant_id"])
+            for body, label in ((prepared, "prepare"), (done, "execute")):
+                rendered = json.dumps(body, ensure_ascii=False)
+                for needle in forbidden:
+                    with self.subTest(response=label, needle=needle):
+                        self.assertNotIn(needle, rendered)
+
+    def test_the_panel_cannot_name_a_target_origin_or_tab(self):
+        """A closed field set, so an extra field is a refusal rather than an ignored extra.
+
+        The failure this prevents is not a caller today but a caller tomorrow: a field that
+        is quietly dropped reads, to the next person, like a field that is merely unused.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            for extra in ({"application_id": "app-1", "tab_id": "17"},
+                          {"application_id": "app-1", "origin": "http://127.0.0.1:1"},
+                          {"application_id": "app-1", "target": "/lever/split/0"},
+                          {"application_id": "app-1", "package_path": "/tmp/actions.json"},
+                          {}, {"application_id": ""}, {"application_id": 17}):
+                with self.subTest(payload=sorted(extra)):
+                    status, body = self.post("/fill/prepare", extra)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(body["error"], "fill_request_invalid")
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            status, body = self.post("/fill/execute", {
+                "execution_id": prepared["execution_id"],
+                "origin": "http://127.0.0.1:1"})
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "fill_request_invalid")
+
+    def test_a_second_press_cannot_replay_a_consumed_package(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            execution_id = prepared["execution_id"]
+            status, _ = self.post("/fill/execute", {"execution_id": execution_id})
+            self.assertEqual(status, 200)
+            # The same id again: refused by the bridge's own state machine, and refused
+            # without a second answer that could read as a second success.
+            status, body = self.post("/fill/execute", {"execution_id": execution_id})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "execution_already_started")
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_fresh_prepare_over_a_spent_grant_still_cannot_run_twice(self):
+        """The layer that actually holds when the first two are wrong.
+
+        Refusing a repeated execution id is bookkeeping. What makes a replay impossible is
+        that the grant is consumed once in the authority's own state, so a caller who asks
+        for a brand-new preparation still meets a page with nothing left to do.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, first = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.post("/fill/execute", {"execution_id": first["execution_id"]})
+            status, body = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_page_has_no_pending_steps")
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_lease_that_lapsed_between_the_two_presses_stops_the_run(self):
+        """Re-verified at execute, not carried over from prepare.
+
+        Prepare and execute are two user gestures with a person in between them, so every
+        condition that could change has to be asked again — before a browser exists, not
+        after the page is holding the user's data.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.db.execute("UPDATE applications SET worker_id='someone-else' "
+                            "WHERE application_id='app-1'")
+            self.db.commit()
+            status, body = self.post("/fill/execute",
+                                     {"execution_id": prepared["execution_id"]})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_lease_not_held")
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 0)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_an_unprepared_or_unknown_execution_is_refused(self):
+        status, body = self.post("/fill/execute", {"execution_id": "0" * 32})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "execution_unknown")
+        status, body = self.post("/fill/prepare", {"application_id": "app-does-not-exist"})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "fill_session_not_active")
+
+    def test_the_fill_routes_need_the_run_token_like_every_other_write(self):
+        status, body = self.post("/fill/prepare", {"application_id": "app-1"},
+                                 token="guessed")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "bad_token")
+
+    def test_the_worker_window_is_headed_unless_a_test_says_otherwise(self):
+        # The separate window is only a safeguard while the user can see it.
+        server = BRIDGE.serve(db_path=self.db_path, candidate_path=self.candidate_path,
+                              port=0, allow_store=False, token="t")
+        try:
+            self.assertTrue(BRIDGE.Handler.fill_headed)
+        finally:
+            server.server_close()

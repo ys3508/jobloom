@@ -18,6 +18,15 @@ Boundaries enforced here rather than trusted to the extension:
   because the difference between "help me read this page" and "keep a copy of every page I
   scrolled past" is the difference between assistance and collection.
 - No page text is written anywhere unless the user stores that job on purpose.
+
+One further mode lives here: **extension-controlled separate guarded worker**. The panel can
+ask for one Fill-Only page to be run, but it does not run it and it is not driving the tab the
+user is looking at. The bridge resolves an opaque execution ID against its own protected
+state, the execution authority supplies the target, the allowed origin and the page identity,
+and `fill_worker` opens that target in its own headed, guarded Chromium window. The extension
+never learns a path, a value, a capability or a grant token, and nothing it sends is treated as
+authorization material. Production ATS adapters remain unimplemented: this runs against the
+local semantic replay only.
 """
 
 from __future__ import annotations
@@ -28,7 +37,9 @@ import hashlib
 import secrets
 import sqlite3
 import sys
-from datetime import datetime, timezone
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -399,12 +410,119 @@ def positioning(card: dict[str, Any], candidate: dict[str, Any],
     }
 
 
+# ---- one-page Fill-Only control ---------------------------------------------------------
+#
+# The extension is a control surface and nothing more. It presses a button and holds an
+# opaque execution ID; it does not name a page, a target, an origin, a tab, a path or a
+# value, and nothing it sends is read as authorization material. Everything the run is
+# authorised to touch comes from the execution authority and from this process's own
+# protected state, which is why a panel that lied about what it was looking at would change
+# nothing about what runs.
+
+# Closed field sets. Anything else in the body — an origin, a target, a tab id, a path
+# helpfully supplied by a caller — is a refusal rather than an ignored extra, because a
+# field that is quietly dropped today is a field someone wires up tomorrow.
+FILL_PREPARE_FIELDS = {"application_id"}
+FILL_EXECUTE_FIELDS = {"execution_id"}
+FILL_ID_LIMIT = 128
+# A prepared run is a held grant, so it does not sit around. The grant's own expiry is the
+# boundary that matters; this only stops the panel offering a button that cannot work.
+FILL_PREPARED_TTL_SECONDS = 900
+
+
+class _PreparedRun:
+    """One prepared page, addressable only by an opaque id.
+
+    Everything the extension must never see lives here and nowhere else: the package and
+    result paths, the grant id, the session and page identity. `summary` is the only part
+    that is ever serialised outward, and it is built field by field rather than filtered,
+    so a new column in `fill_steps` cannot leak by being forgotten about.
+    """
+
+    __slots__ = ("execution_id", "application_id", "session_id", "page_id", "worker_id",
+                 "grant_id", "package_path", "result_path", "capability_path", "summary",
+                 "expires_at", "state", "outcome")
+
+    def __init__(self, **fields: Any) -> None:
+        for name in self.__slots__:
+            setattr(self, name, fields.get(name))
+
+
+def _closed_request(payload: Any, allowed: set[str], code: str) -> dict[str, str]:
+    """Exactly these fields, each a bounded non-empty string. No extras, none missing."""
+    if not isinstance(payload, dict) or set(payload) != allowed:
+        raise BridgeError(code)
+    values = {}
+    for name in sorted(allowed):
+        value = payload[name]
+        if not isinstance(value, str):
+            raise BridgeError(code)
+        value = value.strip()
+        if not value or len(value) > FILL_ID_LIMIT:
+            raise BridgeError(code)
+        values[name] = value
+    return values
+
+
+def _fill_counts(rows: list[sqlite3.Row], column: str) -> dict[str, int]:
+    counted: dict[str, int] = {}
+    for row in rows:
+        counted[row[column]] = counted.get(row[column], 0) + 1
+    return dict(sorted(counted.items()))
+
+
+class FillControl:
+    """Prepared runs, and the one place a double press is turned into one execution.
+
+    Three layers refuse a second run and they are not redundant. The panel disables its own
+    button, which handles the ordinary double-click; this class moves a run out of
+    `prepared` under a lock, which handles two requests that raced past the panel; and the
+    execution authority consumes the grant exactly once, which is the layer that actually
+    holds if both of the others are wrong or absent. Only the last one is a safety boundary
+    — the other two are there so the user is told, rather than left reading a stack of
+    identical refusals.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runs: dict[str, _PreparedRun] = {}
+
+    def add(self, run: _PreparedRun) -> None:
+        with self._lock:
+            self._runs[run.execution_id] = run
+
+    def claim(self, execution_id: str, now: datetime) -> _PreparedRun:
+        """Hand back a run once, and only while it is still prepared."""
+        with self._lock:
+            run = self._runs.get(execution_id)
+            if run is None:
+                raise BridgeError("execution_unknown", 404)
+            if run.state != "prepared":
+                # Includes the second half of a double press. Deliberately not the first
+                # run's result: two presses must not read as two successes.
+                raise BridgeError("execution_already_started", 409)
+            if now >= run.expires_at:
+                run.state = "expired"
+                raise BridgeError("execution_expired", 409)
+            run.state = "running"
+            return run
+
+    def finish(self, run: _PreparedRun, state: str, outcome: dict[str, Any] | None) -> None:
+        with self._lock:
+            run.state = state
+            run.outcome = outcome
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "JobloomAssistBridge/1.0"
     token = ""
     candidate_path: Path
     db_path: Path
     allow_store = False
+    # Headed by default and set once, at `serve`: a run the user cannot see is a run they
+    # cannot stop, and that is the whole reason the separate window is acceptable at all.
+    fill_headed = True
+    fill_control = FillControl()
 
     def log_message(self, *args: Any) -> None:  # noqa: D102 - quiet by default
         pass
@@ -455,6 +573,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, self._confirm_submitted(payload))
             elif self.path == "/store":
                 self._send(200, self._store(payload))
+            elif self.path == "/fill/prepare":
+                self._send(200, self._fill_prepare(payload))
+            elif self.path == "/fill/execute":
+                self._send(200, self._fill_execute(payload))
             else:
                 self._send(404, {"error": "unknown_endpoint"})
         except BridgeError as error:
@@ -462,10 +584,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:  # surfaced as a code, never as a stack trace
             self._send(500, {"error": "bridge_failure", "detail": str(error)[:200]})
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path))
+    def _connection(self, *, shared: bool = False) -> sqlite3.Connection:
+        # `shared` is for the fill run only: the execution authority redeems grants from its
+        # own serving thread, and single-use consumption has to be decided on the same
+        # connection that the run is being verified against.
+        connection = sqlite3.connect(str(self.db_path), check_same_thread=not shared)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @property
+    def private_root(self) -> Path:
+        """Where packages, results and capabilities are written. Never sent anywhere."""
+        return self.db_path.parent
 
     def _positioning(self, payload: dict[str, Any]) -> dict[str, Any]:
         card = build_card(payload)
@@ -550,12 +680,218 @@ class Handler(BaseHTTPRequestHandler):
         return {**result, "stored_at": datetime.now(timezone.utc).isoformat()}
 
 
+    # ---- one-page Fill-Only control -----------------------------------------------
+
+    def _fill_state(self, connection, application_id: str, now: datetime):
+        """The session and page a run would act on, resolved here and never by the caller.
+
+        The extension names an application and stops there. Which session, which page, which
+        steps and which target are all read out of protected state, so the worst a wrong or
+        malicious panel can do is name an application that is not ready.
+        """
+        session = connection.execute(
+            "SELECT * FROM fill_sessions WHERE application_id=? AND status='active' "
+            "ORDER BY updated_at DESC LIMIT 1", (application_id,)).fetchone()
+        if not session:
+            raise BridgeError("fill_session_not_active", 409)
+        page = connection.execute(
+            "SELECT * FROM fill_pages WHERE session_id=? AND status='active' "
+            "ORDER BY page_index DESC LIMIT 1", (session["session_id"],)).fetchone()
+        if not page:
+            # Observation is upstream of this control and stays there: the replay observer
+            # is a test fixture, not a production adapter, and Task 7 does not make one.
+            raise BridgeError("fill_page_not_observed", 409)
+        steps = connection.execute(
+            "SELECT * FROM fill_steps WHERE session_id=? AND page_id=? AND status='pending' "
+            "ORDER BY ordinal", (session["session_id"], page["page_id"])).fetchall()
+        if not steps:
+            raise BridgeError("fill_page_has_no_pending_steps", 409)
+        import fill_core  # local: keeps the read-only path free of write imports
+
+        try:
+            fill_core._require_lease(connection, application_id, session["worker_id"], now)
+        except ValueError as error:
+            raise BridgeError("fill_lease_not_held", 409) from error
+        return session, page, steps
+
+    def _fill_summary(self, session, page, steps, grant, execution_id: str) -> dict[str, Any]:
+        """Everything the panel is allowed to know, built by naming each field.
+
+        Built up rather than filtered down. A summary made by deleting known-bad keys grows
+        a leak the day a column is added, and `fill_steps` holds the question text, the
+        selector and the value itself.
+        """
+        return {
+            "execution_id": execution_id,
+            "status": "prepared",
+            "application": {
+                "application_id": session["application_id"],
+                "employer": session["observed_employer"],
+                "role": session["observed_role"],
+            },
+            "page": {
+                "page_index": page["page_index"],
+                "final_page": bool(page["final_page"]),
+                "submit_control_seen": bool(page["submit_control_seen"]),
+            },
+            "actions": {
+                "count": len(steps),
+                "controls": _fill_counts(steps, "control"),
+                "operations": _fill_counts(steps, "operation"),
+                "sources": _fill_counts(steps, "source_kind"),
+                "sensitivities": _fill_counts(steps, "sensitivity"),
+            },
+            "risks": {
+                "legal_items": json.loads(page["legal_items_json"]),
+                "restricted_requests": json.loads(page["restricted_requests_json"]),
+            },
+            "expires_at": grant["expires_at"],
+            # Not a rendering choice. `stop_before_submit` fails closed in the protocol and
+            # no submission action exists to call, so the panel is stating a property of the
+            # protocol rather than promising to behave.
+            "stops_before_submit": True,
+            "runs_in_separate_window": True,
+        }
+
+    def _fill_prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = _closed_request(payload, FILL_PREPARE_FIELDS, "fill_request_invalid")
+        import fill_core  # local: keeps the read-only path free of write imports
+
+        now = datetime.now(timezone.utc)
+        connection = self._connection()
+        try:
+            session, page, steps = self._fill_state(
+                connection, request["application_id"], now)
+            execution_id = uuid.uuid4().hex
+            root = self.private_root / "fill-runs" / execution_id
+            root.mkdir(parents=True, exist_ok=True)
+            root.chmod(0o700)
+            package_path = root / "actions.json"
+            try:
+                fill_core.export_page(connection, session["session_id"],
+                                      session["worker_id"], page["page_id"],
+                                      package_path, now)
+                grant = fill_core.issue_execution_grant(
+                    connection, session["session_id"], page["page_id"], package_path, now)
+            except ValueError as error:
+                raise BridgeError("fill_page_not_exportable", 409) from error
+            summary = self._fill_summary(session, page, steps, grant, execution_id)
+            self.fill_control.add(_PreparedRun(
+                execution_id=execution_id, application_id=session["application_id"],
+                session_id=session["session_id"], page_id=page["page_id"],
+                worker_id=session["worker_id"], grant_id=grant["grant_id"],
+                package_path=package_path, result_path=root / "result.json",
+                capability_path=root / "capability.json", summary=summary,
+                expires_at=now + timedelta(seconds=FILL_PREPARED_TTL_SECONDS),
+                state="prepared", outcome=None))
+            return summary
+        finally:
+            connection.close()
+
+    def _fill_execute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = _closed_request(payload, FILL_EXECUTE_FIELDS, "fill_request_invalid")
+        now = datetime.now(timezone.utc)
+        run = self.fill_control.claim(request["execution_id"], now)
+        import execution_authority  # local: keeps the read-only path free of write imports
+        import fill_core
+        import fill_worker
+
+        connection = self._connection(shared=True)
+        try:
+            # Re-verified here and not carried over from prepare. Between the two presses a
+            # lease can lapse, a page can be checkpointed and a grant can be revoked, and
+            # the run must find that out before a browser exists rather than after.
+            session, page, _ = self._fill_state(connection, run.application_id, now)
+            if (session["session_id"] != run.session_id
+                    or page["page_id"] != run.page_id
+                    or session["worker_id"] != run.worker_id):
+                raise BridgeError("fill_identity_changed", 409)
+            grant = connection.execute(
+                "SELECT * FROM execution_grants WHERE grant_id=?", (run.grant_id,)).fetchone()
+            if not grant:
+                raise BridgeError("fill_grant_unknown", 409)
+            if grant["consumed_at"]:
+                raise BridgeError("fill_grant_already_consumed", 409)
+            if grant["revoked_at"]:
+                raise BridgeError("fill_grant_revoked", 409)
+            expires = datetime.fromisoformat(grant["expires_at"])
+            if now >= expires:
+                raise BridgeError("fill_grant_expired", 409)
+
+            with execution_authority.ExecutionAuthority(
+                connection, fill_core.reserve_execution_grant,
+                consume=fill_core.consume_execution_grant,
+            ) as authority:
+                capability = authority.write_capability(run.capability_path)
+                url, capability_token = fill_worker.read_capability(capability)
+                # The worker opens the authority's target in its own window. No URL, origin
+                # or tab from the extension reaches this call, because none was accepted.
+                fill_worker.run(run.package_path, run.result_path, url, capability_token,
+                                run.grant_id, headed=self.fill_headed)
+            imported = fill_core.import_result(
+                connection, run.session_id, run.page_id, run.worker_id, run.result_path,
+                run.grant_id, now)
+            outcome = self._fill_outcome(connection, run, imported, now)
+            self.fill_control.finish(run, "finished", outcome)
+            return outcome
+        except BridgeError as error:
+            self.fill_control.finish(run, "failed", None)
+            raise
+        except Exception as error:
+            # The grant may or may not have been spent, so the run is over either way: a
+            # retry that could replay a consumed package is exactly what must not exist.
+            self.fill_control.finish(run, "failed", None)
+            raise BridgeError("fill_execution_failed", 409) from error
+        finally:
+            connection.close()
+
+    def _fill_outcome(self, connection, run: _PreparedRun, imported: dict[str, Any],
+                      now: datetime) -> dict[str, Any]:
+        """Counts and stable codes. Never a claim that anything was sent."""
+        steps = connection.execute(
+            "SELECT status FROM fill_steps WHERE session_id=? AND page_id=?",
+            (run.session_id, run.page_id)).fetchall()
+        counted: dict[str, int] = {}
+        for row in steps:
+            counted[row["status"]] = counted.get(row["status"], 0) + 1
+        session = connection.execute(
+            "SELECT status, pause_reasons_json FROM fill_sessions WHERE session_id=?",
+            (run.session_id,)).fetchone()
+        grant = connection.execute(
+            "SELECT consumed_at, expires_at FROM execution_grants WHERE grant_id=?",
+            (run.grant_id,)).fetchone()
+        reasons = json.loads(session["pause_reasons_json"]) if session else []
+        return {
+            "execution_id": run.execution_id,
+            "status": imported.get("status", "unknown"),
+            "verified": counted.get("completed", 0),
+            "pending": counted.get("pending", 0),
+            "paused": counted.get("paused", 0),
+            "session_status": session["status"] if session else "unknown",
+            # Stable codes only. `_field_reason` hashes the field, so nothing here can name
+            # the question, let alone what was put in it.
+            "reasons": [str(reason).split(":", 1)[0] for reason in reasons],
+            "package_consumed": bool(grant and grant["consumed_at"]),
+            "package_expired": bool(
+                grant and now >= datetime.fromisoformat(grant["expires_at"])),
+            # The submit control is a boundary that was looked at, never a control that was
+            # acted on: no submission action exists in the protocol to act on it with.
+            "submit_boundary": "observed_not_acted_on",
+            "stops_before_submit": True,
+            "runs_in_separate_window": True,
+        }
+
+
 def serve(*, db_path: Path, candidate_path: Path, port: int, allow_store: bool,
-          token: str | None = None) -> ThreadingHTTPServer:
+          token: str | None = None, fill_headed: bool = True) -> ThreadingHTTPServer:
     Handler.token = token or secrets.token_urlsafe(24)
     Handler.candidate_path = candidate_path
     Handler.db_path = db_path
     Handler.allow_store = allow_store
+    # Headed unless a test says otherwise. The separate window is the thing that makes a run
+    # the user did not press stop on still a run they watched.
+    Handler.fill_headed = fill_headed
+    Handler.fill_control = FillControl()
     return ThreadingHTTPServer((LOOPBACK, port), Handler)
 
 

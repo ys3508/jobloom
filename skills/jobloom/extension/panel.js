@@ -54,7 +54,25 @@ const I18N = {
     reasonSeniority: "The job level is outside this direction", reasonYears: "Required experience exceeds the current range",
     reasonPreferredYears: "Preferred experience exceeds the current range", reasonCountry: "The job country is outside this direction",
     reasonUnreviewed: "The job requirements have not been reviewed", reasonExclusionReview: "An exclusion term needs context",
-    reasonExclusion: "The job triggers an explicit exclusion for this direction"
+    reasonExclusion: "The job triggers an explicit exclusion for this direction",
+    fillTitle: "Fill one page of an application form",
+    fillSeparateWindow: "Runs one page in a separate guarded Jobloom browser window.",
+    fillNoTabChange: "Your current tab will not be changed.",
+    fillStopsBeforeSubmit: "Stops before Submit.",
+    fillApplication: "Application ID", fillPrepare: "Prepare one page",
+    fillRun: "Run this page", fillPreparing: "Preparing…", fillRunning: "Running one page…",
+    fillPrepared: "Prepared. Review below, then run this one page.",
+    fillDone: "Finished one page. Nothing was submitted.",
+    fillNeedsApplication: "Enter the application ID to prepare a page",
+    fillFailed: "Could not prepare or run: {code}",
+    fillRowApplication: "Application", fillRowPage: "Page", fillRowActions: "Actions",
+    fillRowControls: "Control kinds", fillRowSources: "Answer sources",
+    fillRowOperations: "Operations", fillRowRisks: "Risks", fillRowExpires: "Prepared until",
+    fillRowVerified: "Verified", fillRowPaused: "Paused", fillRowPending: "Not filled",
+    fillRowReasons: "Reason codes", fillRowConsumed: "Package consumed",
+    fillRowBoundary: "Submit control", fillRowSubmitBoundary: "observed, never acted on",
+    fillNone: "none", fillYes: "yes", fillNo: "no", fillPageIndex: "page {n}",
+    fillFinalPage: "final page", fillNotFinalPage: "not the final page"
   },
   zh: {
     language: "语言", scope: "只读取你当前打开的岗位，不浏览、不申请、不提交。", connectionSettings: "连接设置",
@@ -87,7 +105,25 @@ const I18N = {
     reasonOutside: "岗位名称不在这个方向的范围内", reasonContext: "岗位名称相关，但正文里的方向证据不足", reasonSponsorCheck: "雇主的签证支持情况需要进一步确认",
     reasonSponsorConflict: "雇主签证信息有冲突，需要你确认", reasonSponsorNo: "岗位明确不支持所需签证", reasonSponsorSense: "页面里的支持说明可能不是签证含义",
     reasonSeniority: "岗位级别超出当前方向范围", reasonYears: "硬性年限要求高于当前经历范围", reasonPreferredYears: "偏好年限高于当前经历范围",
-    reasonCountry: "岗位国家不在当前方向范围", reasonUnreviewed: "岗位要求尚未人工复核", reasonExclusionReview: "出现排除词，但需要结合上下文确认", reasonExclusion: "岗位触发了这个方向的明确排除条件"
+    reasonCountry: "岗位国家不在当前方向范围", reasonUnreviewed: "岗位要求尚未人工复核", reasonExclusionReview: "出现排除词，但需要结合上下文确认", reasonExclusion: "岗位触发了这个方向的明确排除条件",
+    fillTitle: "填写申请表单的一页",
+    fillSeparateWindow: "在另一个受保护的 Jobloom 浏览器窗口中运行一页。",
+    fillNoTabChange: "不会改动你当前的标签页。",
+    fillStopsBeforeSubmit: "在 Submit 之前停止。",
+    fillApplication: "申请 ID", fillPrepare: "准备一页",
+    fillRun: "运行这一页", fillPreparing: "正在准备…", fillRunning: "正在运行一页…",
+    fillPrepared: "已准备好。先看下面，再运行这一页。",
+    fillDone: "这一页已完成。没有提交任何东西。",
+    fillNeedsApplication: "请填入申请 ID 才能准备一页",
+    fillFailed: "无法准备或运行：{code}",
+    fillRowApplication: "申请", fillRowPage: "页面", fillRowActions: "动作数",
+    fillRowControls: "控件类型", fillRowSources: "答案来源",
+    fillRowOperations: "操作", fillRowRisks: "风险", fillRowExpires: "准备状态有效至",
+    fillRowVerified: "已核验", fillRowPaused: "已暂停", fillRowPending: "未填写",
+    fillRowReasons: "原因代码", fillRowConsumed: "package 已消费",
+    fillRowBoundary: "Submit 控件", fillRowSubmitBoundary: "只观察，从未操作",
+    fillNone: "无", fillYes: "是", fillNo: "否", fillPageIndex: "第 {n} 页",
+    fillFinalPage: "最后一页", fillNotFinalPage: "不是最后一页"
   }
 };
 const t = (key, values = {}) => Object.entries(values).reduce(
@@ -738,6 +774,135 @@ const followUser = (details) => {
 const JOB_URL_FILTER = { url: [{ hostSuffix: "linkedin.com" }, { hostSuffix: "indeed.com" }] };
 chrome.webNavigation.onHistoryStateUpdated.addListener(followUser, JOB_URL_FILTER);
 chrome.webNavigation.onCompleted.addListener(followUser, JOB_URL_FILTER);
+
+// ---- filling one page, in a separate guarded window -------------------------------------
+//
+// A different mode from reading, wired separately on purpose. Nothing above can reach these
+// functions: `readPosting` never calls them, and neither does `followUser`, so the automatic
+// re-read that follows the user between postings cannot start a run.
+//
+// There is no `chrome.tabs`, no `chrome.scripting` and no URL anywhere in this section, and
+// that is the design rather than an omission. The run does not happen in the user's tab, so
+// what the panel can see of that tab is not evidence about anything — reporting it would only
+// invite the bridge to trust it. The bridge resolves an opaque execution id against its own
+// protected state and the execution authority supplies the target.
+//
+// The execution id is held here, in memory, for as long as the panel is open. It is
+// deliberately not written to `chrome.storage.local`: a capability that outlives the window
+// it was granted in is a capability nobody is watching. (The bridge token above is stored,
+// which is existing browser-assist behaviour and is left as it is.)
+const fillState = { executionId: "", busy: false };
+
+function fillBusy(busy) {
+  fillState.busy = busy;
+  // The first of three layers against a double press. It is the one that talks to the user;
+  // the bridge refuses a second execute, and the authority consumes the grant exactly once.
+  $("fill-prepare").disabled = busy;
+  $("fill-run").disabled = busy || !fillState.executionId;
+}
+
+async function fillPost(path, body) {
+  const response = await fetch(`${state.endpoint}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Jobloom-Token": state.token },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `bridge_${response.status}`);
+  return payload;
+}
+
+const fillCounts = (counts) => {
+  const entries = Object.entries(counts || {});
+  return entries.length ? entries.map(([name, n]) => `${name} ${n}`).join(", ") : t("fillNone");
+};
+
+function fillRow(list, label, value) {
+  const term = document.createElement("dt");
+  term.textContent = t(label);
+  const detail = document.createElement("dd");
+  // textContent, never innerHTML: every string here came back over the wire, and a summary
+  // is not a place to start parsing markup.
+  detail.textContent = value;
+  list.append(term, detail);
+}
+
+function renderPrepared(prepared) {
+  const list = $("fill-summary");
+  list.textContent = "";
+  fillRow(list, "fillRowApplication",
+          `${prepared.application.application_id} · ${prepared.application.employer} · ${prepared.application.role}`);
+  fillRow(list, "fillRowPage",
+          `${t("fillPageIndex", { n: prepared.page.page_index + 1 })} · ` +
+          t(prepared.page.final_page ? "fillFinalPage" : "fillNotFinalPage"));
+  fillRow(list, "fillRowActions", String(prepared.actions.count));
+  fillRow(list, "fillRowControls", fillCounts(prepared.actions.controls));
+  fillRow(list, "fillRowOperations", fillCounts(prepared.actions.operations));
+  fillRow(list, "fillRowSources", fillCounts(prepared.actions.sources));
+  const risks = [...(prepared.risks.legal_items || []), ...(prepared.risks.restricted_requests || [])];
+  fillRow(list, "fillRowRisks", risks.length ? risks.join(", ") : t("fillNone"));
+  fillRow(list, "fillRowExpires", prepared.expires_at);
+  fillRow(list, "fillRowBoundary", t("fillRowSubmitBoundary"));
+  list.hidden = false;
+}
+
+function renderFinished(done) {
+  const list = $("fill-summary");
+  list.textContent = "";
+  fillRow(list, "fillRowVerified", String(done.verified));
+  fillRow(list, "fillRowPaused", String(done.paused));
+  fillRow(list, "fillRowPending", String(done.pending));
+  fillRow(list, "fillRowReasons", done.reasons.length ? done.reasons.join(", ") : t("fillNone"));
+  fillRow(list, "fillRowConsumed", t(done.package_consumed ? "fillYes" : "fillNo"));
+  fillRow(list, "fillRowBoundary", t("fillRowSubmitBoundary"));
+  list.hidden = false;
+}
+
+$("fill-prepare").addEventListener("click", async () => {
+  if (fillState.busy) return;
+  const applicationId = $("fill-application").value.trim();
+  if (!applicationId) {
+    $("fill-status").textContent = t("fillNeedsApplication");
+    return;
+  }
+  // A new preparation abandons any previous one rather than keeping two live: the run button
+  // must never be ambiguous about which page it would run.
+  fillState.executionId = "";
+  fillBusy(true);
+  $("fill-status").textContent = t("fillPreparing");
+  try {
+    const prepared = await fillPost("/fill/prepare", { application_id: applicationId });
+    fillState.executionId = prepared.execution_id;
+    renderPrepared(prepared);
+    $("fill-status").textContent = t("fillPrepared");
+  } catch (error) {
+    $("fill-summary").hidden = true;
+    $("fill-status").textContent = t("fillFailed", { code: error.message });
+  } finally {
+    fillBusy(false);
+  }
+});
+
+$("fill-run").addEventListener("click", async () => {
+  if (fillState.busy || !fillState.executionId) return;
+  const executionId = fillState.executionId;
+  // Spent the moment it is used. A second press has nothing to send, which is what makes the
+  // panel's own de-duplication independent of how fast the button was pressed.
+  fillState.executionId = "";
+  fillBusy(true);
+  $("fill-status").textContent = t("fillRunning");
+  try {
+    const done = await fillPost("/fill/execute", { execution_id: executionId });
+    renderFinished(done);
+    // Never "submitted". One page ran; the form was not sent, and nothing here observed
+    // anything that could say otherwise.
+    $("fill-status").textContent = t("fillDone");
+  } catch (error) {
+    $("fill-status").textContent = t("fillFailed", { code: error.message });
+  } finally {
+    fillBusy(false);
+  }
+});
 
 loadSettings();
 refreshAccess();

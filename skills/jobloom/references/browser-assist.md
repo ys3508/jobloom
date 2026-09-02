@@ -34,7 +34,8 @@ name alone is what left the panel unable to notice the user had moved.
 - `scripts/assist_bridge.py` — a loopback HTTP server that answers from the local
   registries. Started by the user, holds a token printed once per run.
 - `extension/` — Manifest V3 extension: a service worker that opens the panel on a toolbar
-  click, and a side panel that reads the open posting and renders the judgement.
+  click, and a side panel that reads the open posting and renders the judgement. The panel
+  also carries the one-page fill control described below, which runs nothing itself.
 
 There is **no declared content script**. Nothing from this extension executes on a job site
 until the user presses *Read this posting*, at which point the reader is injected into that
@@ -53,6 +54,48 @@ pressed; no navigation or polling, asserted by test; and the bridge stores nothi
 `--allow-store` is on. A resident script would have been the
 easier build, but it would also mean our code running on every job page the user visits,
 which is not what "only acts when the user asks" should mean.
+
+## The second mode: extension-controlled separate guarded worker
+
+Reading a posting and filling a form are two modes with two buttons, two status lines and
+two promises. They share a panel and nothing else — in particular, the automatic re-read that
+follows the user between postings cannot start a fill, which is asserted by running the
+shipped panel rather than by reading it.
+
+What the fill mode does **not** do is drive the tab in front of the user. It cannot: the
+extension holds no host permission for any employer form, `worker_protocol` accepts a
+loopback origin only, and verifying an upload means hashing a file the extension is never
+given a path to. So the run happens somewhere else and the panel says so, in the panel:
+
+> Runs one page in a separate guarded Jobloom browser window.
+> Your current tab will not be changed.
+> Stops before Submit.
+
+The panel presses a button and holds an opaque execution id. It sends `{application_id}` to
+prepare and `{execution_id}` to execute, and those field sets are closed — an origin, a
+target, a tab id or a path in the body is a refusal, not an ignored extra, because a field
+that is quietly dropped today is a field someone wires up tomorrow. Nothing the panel says
+about the user's tab is read as authorization material; the panel does not look at the tab
+at all, since what it could see would not be evidence about the window the run happens in.
+
+Everything the run is authorised to touch comes from the execution authority and from the
+bridge's own protected state, re-verified at prepare and again at execute: the live lease,
+the current package, its expiry, that it has not been consumed, and that the session, page
+and application identity have not moved. Three layers refuse a double press — the panel
+disables its button, the bridge moves a run out of `prepared` under a lock, and the authority
+consumes the grant exactly once. Only the last is a safety boundary; the other two exist so
+the user is told rather than left reading identical refusals.
+
+**Permissions did not change for this.** The manifest is the same five permissions, the same
+single host permission for the bridge, and the same two optional job-site hosts, and a test
+asserts it. One thing is worth stating rather than glossing: the bridge token is kept in
+`chrome.storage.local`, which is existing browser-assist behaviour and is left as it is. What
+does not join it is anything to do with a run — the execution id lives in memory for as long
+as the panel is open and no longer, because a capability that outlives the window it was
+granted in is a capability nobody is watching.
+
+**This is the local semantic replay only.** Production ATS adapters remain unimplemented and
+named. A green run here is not evidence that any live employer form can be filled.
 
 ## Boundaries, and where each is enforced
 

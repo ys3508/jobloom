@@ -70,3 +70,17 @@ details.group > summary { font-size:12px; letter-spacing:.04em;
 #diagnostics { overflow-wrap:anywhere; }
 #detail { margin-top:18px; }
 #scope { margin-top:8px; font-size:13px; }
+
+/* Filling is a different mode from reading, and the panel says so with a rule rather than
+   with wording alone: two buttons that look alike invite one to be pressed for the other. */
+#fill { border-top: 2px solid var(--line, #d0d0d0); margin-top: 1.25rem; padding-top: 0.75rem; }
+#fill h2 { font-size: 0.95rem; margin: 0 0 0.4rem; }
+#fill-promise { margin: 0 0 0.6rem; padding-left: 1.1rem; font-size: 0.8rem; line-height: 1.5; }
+#fill-application-label { display: block; margin-bottom: 0.5rem; font-size: 0.8rem; }
+#fill-application { width: 100%; box-sizing: border-box; }
+#fill-actions { display: flex; gap: 0.5rem; }
+#fill-actions button { flex: 1; }
+#fill-actions button[disabled] { opacity: 0.5; cursor: not-allowed; }
+#fill-summary { margin: 0.6rem 0 0; font-size: 0.8rem; }
+#fill-summary dt { font-weight: 600; margin-top: 0.35rem; }
+#fill-summary dd { margin: 0.1rem 0 0; }

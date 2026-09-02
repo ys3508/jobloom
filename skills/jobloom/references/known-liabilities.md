@@ -268,6 +268,15 @@ with which posting, who was present, what the scoped submit guard observed, and 
 proving what was physically prepared. Until then no document may call this pipeline runnable
 end to end.
 
+**Where it stands after rollout stage 8.** Narrowed again, and still open. An action package
+is now read: the panel can ask the bridge to run one page, and the bridge runs it through
+`fill_worker` in a separate headed guarded window — the **extension-controlled separate
+guarded worker** mode. The extension does not fill anything itself and does not touch the
+user's tab. What has not changed is the part this entry is about: **production ATS adapters
+remain unimplemented**, and every run so far has been against the local semantic replay. A
+green panel is not evidence about Lever, Greenhouse or Ashby. The closing condition is
+unchanged — a supervised live acceptance for at least one adapter, recorded.
+
 **How it could bite.** It already has, twice, as a wrong answer to "what is finished".
 The operational risk is smaller than the reporting risk: nothing can submit anything, so
 nothing unsafe happens. What breaks is planning — work sequenced behind a stage that

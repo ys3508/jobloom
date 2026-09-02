@@ -66,5 +66,26 @@
     <p class="notice" id="notice"></p>
   </section>
 
+  <!-- Form filling is a separate mode with its own button, its own status and its own
+       promise. Reading a posting never starts it, and it never touches the tab in front of
+       the user: the run happens in a separate window the bridge opens. -->
+  <section id="fill">
+    <h2 data-i18n="fillTitle"></h2>
+    <ul id="fill-promise">
+      <li data-i18n="fillSeparateWindow"></li>
+      <li data-i18n="fillNoTabChange"></li>
+      <li><strong data-i18n="fillStopsBeforeSubmit"></strong></li>
+    </ul>
+    <label id="fill-application-label"><span data-i18n="fillApplication"></span>
+      <input id="fill-application" type="text" spellcheck="false" autocomplete="off">
+    </label>
+    <div id="fill-actions" role="group">
+      <button id="fill-prepare" data-i18n="fillPrepare"></button>
+      <button id="fill-run" data-i18n="fillRun" disabled></button>
+    </div>
+    <p id="fill-status" class="muted"></p>
+    <dl id="fill-summary" hidden></dl>
+  </section>
+
 </main>
 <script src="panel.js"></script>

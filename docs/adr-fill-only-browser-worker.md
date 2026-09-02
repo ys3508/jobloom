@@ -179,6 +179,18 @@ Each stage is a gate, not a schedule. No stage begins before the one above it ho
 7. Complete local Fill-Only proof ending in `waiting_for_submission_approval` with the
    fixture's final-action count at zero.
 8. One-page worker control in the existing extension, behind an explicit user gesture.
+   *(Landed: `feat: expose one-page fill-only control`.)* The shape it took is
+   **extension-controlled separate guarded worker**, and the name is load-bearing. The panel
+   is a control surface: it presses a button and holds an opaque execution id. It does not
+   drive the tab the user is looking at, and it was never going to — `fill_worker` opens the
+   target in its own headed, guarded Chromium window, and `worker_protocol` accepts a
+   loopback origin only. The user's current tab is not read, not reported and not part of
+   any authorization decision; treating what a panel says about a tab as evidence would have
+   made the extension a trusted source, which it is not. Every target, allowed origin, page
+   and session identity comes from the execution authority and from the bridge's own
+   protected state, re-verified at prepare and again at execute, and no path, value,
+   capability or grant token crosses into the extension. This is still the local semantic
+   replay only.
 9. **Supervised live acceptance for Lever, then Greenhouse, then Ashby** — separately
    authorized, one adapter at a time, user present, scoped guards installed.
 
