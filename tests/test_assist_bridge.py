@@ -1090,7 +1090,7 @@ class FillControlTests(unittest.TestCase):
         server = BRIDGE.serve(db_path=self.db_path, candidate_path=self.candidate_path,
                               port=0, allow_store=False, token="t")
         try:
-            self.assertTrue(BRIDGE.Handler.fill_headed)
+            self.assertTrue(server.RequestHandlerClass.fill_headed)
         finally:
             server.server_close()
 
@@ -1196,15 +1196,15 @@ class FillControlTests(unittest.TestCase):
             self.observed_session(server)
             _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
             # Held in `running` the way `_fill_execute` holds it, without the browser.
-            run = BRIDGE.Handler.fill_control.claim(prepared["execution_id"],
-                                                    datetime.now(timezone.utc))
+            control = self.server.RequestHandlerClass.fill_control
+            run = control.claim(prepared["execution_id"], datetime.now(timezone.utc))
             try:
                 status, body = self.post("/fill/prepare", {"application_id": "app-1"})
                 self.assertEqual(status, 409)
                 self.assertEqual(body["error"], "fill_execution_in_progress")
                 self.assertEqual(len(self.live_grants()), 1)
             finally:
-                BRIDGE.Handler.fill_control.finish(run, "prepared", None)
+                control.finish(run, "prepared", None)
             self.assertEqual(self.oracle(server), 0)
 
     # ---- failure responses are part of the API -------------------------------
@@ -1307,3 +1307,129 @@ class FillControlTests(unittest.TestCase):
                     self.assertNotIn(forbidden, code)
         self.assertIn("_fill_prepare", blocks["routes"])
         self.assertIn("_fill_execute", blocks["routes"])
+
+    # ---- two bridges, one database -------------------------------------------
+
+    def second_bridge(self):
+        """Another bridge on another port over the same database, as `--port` allows.
+
+        Genuinely separate: its own `FillControl`, its own lock, its own idea of what is
+        prepared. Sharing a `FillControl` by accident would make this test agree with
+        itself and prove nothing.
+        """
+        server = BRIDGE.serve(db_path=self.db_path, candidate_path=self.candidate_path,
+                              port=0, allow_store=False, token="token-under-test",
+                              fill_headed=False)
+        self.assertIsNot(server.RequestHandlerClass.fill_control,
+                         self.server.RequestHandlerClass.fill_control)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def post_to(self, port, path, payload):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "X-Jobloom-Token": "token-under-test"})
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, json.load(error)
+
+    def test_two_bridges_on_one_database_cannot_both_authorise_a_page(self):
+        """The process lock is not the invariant; the database is.
+
+        `FillControl` is per-process and the CLI takes `--port`, so two bridges each hold
+        their own lock and their own memory. Both could read "no live grants" and both could
+        issue one, leaving a page with two authorities that were each single-use and each
+        valid. What has to hold is not that the second request is tidy but that the page is
+        filled once.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            other = self.second_bridge()
+            status_a, first = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status_a, 200, first)
+            status_b, second = self.post_to(other, "/fill/prepare",
+                                            {"application_id": "app-1"})
+            # Whichever way the second bridge answers, the page carries one authority.
+            self.assertIn(status_b, {200, 409})
+            self.assertLessEqual(len(self.live_grants()), 1)
+            attempts = [(status_a, first)]
+            if status_b == 200:
+                attempts.append((status_b, second))
+            ran = 0
+            for _, body in attempts:
+                port = self.port if body is first else other
+                status, _ = self.post_to(port, "/fill/execute",
+                                         {"execution_id": body["execution_id"]})
+                ran += status == 200
+            self.assertEqual(ran, 1)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_two_bridges_racing_to_prepare_still_leave_one_authority(self):
+        import concurrent.futures
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            other = self.second_bridge()
+            ports = [self.port, other] * 3
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as pool:
+                prepared = list(pool.map(
+                    lambda port: (port, *self.post_to(port, "/fill/prepare",
+                                                      {"application_id": "app-1"})),
+                    ports))
+            self.assertLessEqual(len(self.live_grants()), 1)
+            offers = [(port, body) for port, status, body in prepared if status == 200]
+            self.assertTrue(offers)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(offers)) as pool:
+                results = list(pool.map(
+                    lambda offer: self.post_to(offer[0], "/fill/execute",
+                                               {"execution_id": offer[1]["execution_id"]}),
+                    offers))
+            self.assertEqual(sum(1 for status, _ in results if status == 200), 1)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_the_database_refuses_a_second_live_grant_without_help_from_any_lock(self):
+        """The constraint on its own, with both locks taken out of the picture.
+
+        The file lock orders the queue and `FillControl` orders this process; neither is the
+        guarantee. This holds revocation back so the insert meets a live grant directly, and
+        the database is the only thing left to refuse it.
+        """
+        import fill_core
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            status, first = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 200, first)
+            self.assertEqual(len(self.live_grants()), 1)
+            other = self.second_bridge()
+            with unittest.mock.patch.object(fill_core, "revoke_execution_grant",
+                                            return_value={"revoked": False}):
+                status, body = self.post_to(other, "/fill/prepare",
+                                            {"application_id": "app-1"})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_page_already_authorised")
+            self.assertEqual(set(body), {"error"})
+            self.assertEqual(len(self.live_grants()), 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_the_live_grant_index_exists_and_says_what_it_constrains(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            self.post("/fill/prepare", {"application_id": "app-1"})
+        row = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='execution_grant_one_live_per_page'").fetchone()
+        self.assertIsNotNone(row, "the invariant is not in the database")
+        self.assertIn("consumed_at IS NULL", row["sql"])
+        self.assertIn("revoked_at IS NULL", row["sql"])

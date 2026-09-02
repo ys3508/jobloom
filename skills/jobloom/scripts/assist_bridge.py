@@ -32,8 +32,10 @@ local semantic replay only.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import hashlib
+import os
 import secrets
 import sqlite3
 import sys
@@ -429,6 +431,27 @@ FILL_ID_LIMIT = 128
 # boundary that matters; this only stops the panel offering a button that cannot work.
 FILL_PREPARED_TTL_SECONDS = 900
 
+# One live authority per page, as a property of the database rather than of a process.
+#
+# `FillControl`'s lock is per-process, and the CLI takes `--port`, so two bridges on one
+# database each hold their own lock and their own idea of what is prepared. Both could read
+# "no live grants" and both could then issue one, and the page would carry two authorities
+# that were each single-use and each perfectly valid. A partial unique index states the
+# invariant where both processes can see it: at most one row per `(session_id, page_id)` that
+# is neither consumed nor revoked. It is created here rather than in `fill_core.initialize`
+# because that file belongs to a released task; the natural long-term home is beside the
+# table it constrains.
+LIVE_GRANT_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS execution_grant_one_live_per_page "
+    "ON execution_grants(session_id, page_id) "
+    "WHERE consumed_at IS NULL AND revoked_at IS NULL")
+FILL_PREPARE_LOCK = ".prepare.lock"
+
+try:  # POSIX only; the index above is the guarantee, this only orders the queue.
+    import fcntl
+except ImportError:  # pragma: no cover - not the platform this runs on
+    fcntl = None
+
 
 class _PreparedRun:
     """One prepared page, addressable only by an opaque id.
@@ -807,6 +830,27 @@ class Handler(BaseHTTPRequestHandler):
         for row in live:
             fill_core.revoke_execution_grant(connection, row["grant_id"], now)
 
+    @contextlib.contextmanager
+    def _across_processes(self):
+        """Hold the preparation critical section against another bridge on this database.
+
+        `fill_core`'s calls commit as they go, so an outer transaction cannot span the
+        revoke and the issue — the first inner commit would end it. A file lock can span
+        them. It is an ordering device, not the guarantee: the guarantee is the unique index,
+        which holds even where this lock does not exist.
+        """
+        if fcntl is None:  # pragma: no cover - not the platform this runs on
+            yield
+            return
+        root = self.private_root / "fill-runs"
+        root.mkdir(parents=True, exist_ok=True)
+        handle = os.open(root / FILL_PREPARE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(handle)
+
     def _fill_prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = _closed_request(payload, FILL_PREPARE_FIELDS, "fill_request_invalid")
         import fill_core  # local: keeps the read-only path free of write imports
@@ -817,25 +861,35 @@ class Handler(BaseHTTPRequestHandler):
             session, page, steps = self._fill_state(
                 connection, request["application_id"], now)
 
+            connection.execute(LIVE_GRANT_INDEX)
+            connection.commit()
+
             def build() -> _PreparedRun:
-                # Under `FillControl`'s lock. Anything issued before this page's new grant
-                # is withdrawn first, so two preparations can never both be executable.
-                self._revoke_live_grants(connection, fill_core, session["session_id"],
-                                         page["page_id"], now)
-                execution_id = uuid.uuid4().hex
-                root = self.private_root / "fill-runs" / execution_id
-                root.mkdir(parents=True, exist_ok=True)
-                root.chmod(0o700)
-                package_path = root / "actions.json"
-                try:
-                    fill_core.export_page(connection, session["session_id"],
-                                          session["worker_id"], page["page_id"],
-                                          package_path, now)
-                    grant = fill_core.issue_execution_grant(
-                        connection, session["session_id"], page["page_id"],
-                        package_path, now)
-                except ValueError as error:
-                    raise BridgeError("fill_page_not_exportable", 409) from error
+                # Under `FillControl`'s lock, the file lock, and the unique index — in that
+                # order of increasing authority. The first orders this process, the second
+                # orders the bridges on this machine, and the third is what actually holds.
+                with self._across_processes():
+                    self._revoke_live_grants(connection, fill_core, session["session_id"],
+                                             page["page_id"], now)
+                    execution_id = uuid.uuid4().hex
+                    root = self.private_root / "fill-runs" / execution_id
+                    root.mkdir(parents=True, exist_ok=True)
+                    root.chmod(0o700)
+                    package_path = root / "actions.json"
+                    try:
+                        fill_core.export_page(connection, session["session_id"],
+                                              session["worker_id"], page["page_id"],
+                                              package_path, now)
+                        grant = fill_core.issue_execution_grant(
+                            connection, session["session_id"], page["page_id"],
+                            package_path, now)
+                    except sqlite3.IntegrityError as error:
+                        # Another bridge got there first and its authority is still live.
+                        # Refused rather than queued: whichever page this is, someone else is
+                        # already holding the one grant it may have.
+                        raise BridgeError("fill_page_already_authorised", 409) from error
+                    except ValueError as error:
+                        raise BridgeError("fill_page_not_exportable", 409) from error
                 return _PreparedRun(
                     execution_id=execution_id, application_id=session["application_id"],
                     session_id=session["session_id"], page_id=page["page_id"],
@@ -960,15 +1014,25 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(*, db_path: Path, candidate_path: Path, port: int, allow_store: bool,
           token: str | None = None, fill_headed: bool = True) -> ThreadingHTTPServer:
-    Handler.token = token or secrets.token_urlsafe(24)
-    Handler.candidate_path = candidate_path
-    Handler.db_path = db_path
-    Handler.allow_store = allow_store
-    # Headed unless a test says otherwise. The separate window is the thing that makes a run
-    # the user did not press stop on still a run they watched.
-    Handler.fill_headed = fill_headed
-    Handler.fill_control = FillControl()
-    return ThreadingHTTPServer((LOOPBACK, port), Handler)
+    """One server, with its own settings and its own prepared runs.
+
+    A subclass per server rather than attributes on `Handler` itself. Setting them on the
+    shared class meant a second `serve` silently replaced the first one's `FillControl`, so
+    two bridges in one process were not two bridges at all — they were one, wearing two
+    ports, which is precisely the arrangement a test of two bridges must not accidentally
+    create. The handler class is reachable as `server.RequestHandlerClass`.
+    """
+    bound = type("BoundHandler", (Handler,), {
+        "token": token or secrets.token_urlsafe(24),
+        "candidate_path": candidate_path,
+        "db_path": db_path,
+        "allow_store": allow_store,
+        # Headed unless a test says otherwise. The separate window is the thing that makes a
+        # run the user did not press stop on still a run they watched.
+        "fill_headed": fill_headed,
+        "fill_control": FillControl(),
+    })
+    return ThreadingHTTPServer((LOOPBACK, port), bound)
 
 
 def _running_bridge(port: int) -> dict[str, Any] | None:

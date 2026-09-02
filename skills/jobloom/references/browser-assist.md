@@ -86,6 +86,14 @@ disables its button, the bridge moves a run out of `prepared` under a lock, and 
 consumes the grant exactly once. Only the last is a safety boundary; the other two exist so
 the user is told rather than left reading identical refusals.
 
+Consuming a grant once is not the same as there being one grant, and the difference is where
+a second bridge lives. `--port` starts another instance on the same database, with its own
+lock and its own memory of what is prepared, so both could read "nothing live" and both could
+issue. The invariant is therefore written where both can see it: a partial unique index on
+`execution_grants(session_id, page_id)` over the rows that are neither consumed nor revoked.
+A file lock orders the queue and the process lock orders one bridge, but neither is the
+guarantee — with both removed, the index alone still leaves a page with one authority.
+
 **Permissions did not change for this.** The manifest is the same five permissions, the same
 single host permission for the bridge, and the same two optional job-site hosts, and a test
 asserts it. One thing is worth stating rather than glossing: the bridge token is kept in
