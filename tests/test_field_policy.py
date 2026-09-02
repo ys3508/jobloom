@@ -328,6 +328,43 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             source_kind="answer")])
         self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
 
+    def test_a_field_that_declares_no_source_is_answered_from_the_library(self):
+        """The route every control on a real employer form takes.
+
+        The replay tags its controls with `data-kind`, so the observation names a fact or a
+        material and the planner is told where to look. A real page tags nothing: the field
+        arrives with no `source_kind` at all, falls into the `{None, "answer"}` branch, and
+        the answer library is the only thing that can answer it. That is why the three
+        contact meanings have to live there — the candidate's email, phone and LinkedIn exist
+        as one composite fact that cannot fill a single field, and splitting it would need a
+        new snapshot and the re-approval of every resume version behind it.
+
+        The wording is the corpus's own recorded employer wording. The values here are
+        invented for this test and mean nothing.
+
+        What this proves: the library matches this shape and the planner plans it. What it
+        does not prove: that a production observer can find these fields — there is none —
+        or that any real ATS would accept them. Nothing here touches one.
+        """
+        for canonical_id, question, value in (
+            ("contact.email", "Email address", "someone@example.invalid"),
+            ("contact.phone", "Phone number", "+1 555 0100"),
+            ("profile.linkedin", "LinkedIn profile", "https://example.invalid/in/someone"),
+        ):
+            with self.subTest(canonical_id=canonical_id):
+                self.setUp()
+                self.add_answer(f"answer-{canonical_id}", canonical_id, question, value)
+                field = self.field("contact_field", question)
+                self.assertNotIn("source_kind", field)
+                result = self.observe([field])
+                self.assertNotEqual(result["status"], "paused",
+                                    self.pause_reasons(result))
+                row = self.db.execute(
+                    "SELECT source_kind, source_id FROM fill_steps WHERE field_id=?",
+                    ("contact_field",)).fetchone()
+                self.assertEqual(row["source_kind"], "answer")
+                self.assertEqual(row["source_id"], f"answer-{canonical_id}")
+
     def test_a_voluntary_eeo_field_is_resolved_by_policy_not_by_a_fixed_reason(self):
         """`voluntary_eeo` names a protected domain, not a pause reason.
 

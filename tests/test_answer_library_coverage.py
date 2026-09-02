@@ -36,6 +36,9 @@ ANSWERS = load("answer_library")
 APPROVAL = json.loads(
     (ROOT / "tests" / "fixtures" / "ats-semantic" / "FIELD-DISPOSITION-APPROVAL.json")
     .read_text(encoding="utf-8"))
+MANIFEST = json.loads(
+    (ROOT / "skills" / "jobloom" / "assets" / "question-forms.json")
+    .read_text(encoding="utf-8"))
 ARTIFACT = ROOT / "docs" / "answer-library-coverage-2026-09-02.md"
 
 # The ten the ruling names: the seven the corpus reviews as `answer`, plus the three contact
@@ -72,36 +75,114 @@ class CoverageMeasurement(unittest.TestCase):
         return {question: ANSWERS.match_answer(self.db, question, context)["reason"]
                 for question in reviewed_questions()}
 
-    def test_an_empty_library_answers_nothing_at_all(self):
-        """Every employer question the corpus records, and not one of them understood.
+    def apply_manifest(self):
+        for form in MANIFEST["forms"]:
+            ANSWERS.add_question_form(self.db, form["canonical_id"], form["question"],
+                                      form["match_level"], form["verified_by_user"])
 
-        This is the state an application has been sitting in since 2026-08-28: the fill
-        planner asks the library, the library has never seen the wording, and the page
-        pauses. Measured rather than assumed, because the whole point of measuring first is
-        that the gap list is real.
-        """
+    def test_an_empty_library_answers_nothing_at_all(self):
         measured = self.measure()
         self.assertEqual(set(measured.values()), {"new_question"})
         self.assertEqual(len(measured), 35)
 
+    def test_the_reviewed_forms_move_ten_meanings_off_new_question(self):
+        """Mapping wording to meaning is provable with nothing confirmed yet.
+
+        `no_applicable_answer` is not success — it is the library saying it understands the
+        question and has nothing to say. That is exactly the state this phase is allowed to
+        reach: the values are the user's to confirm, and none of them exist yet.
+        """
+        self.apply_manifest()
+        measured = self.measure()
+        understood = {question for question, reason in measured.items()
+                      if reason != "new_question"}
+        expected = {form["question"] for form in MANIFEST["forms"]}
+        self.assertEqual(understood, expected)
+        for question in understood:
+            self.assertEqual(measured[question], "no_applicable_answer", question)
+        # Still an empty library. Nothing above wrote an answer.
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+
     def test_the_recorded_measurement_matches_what_the_library_actually_says(self):
         """The artifact is regenerated here, so it cannot drift into being a story."""
-        measured = self.measure()
+        before = self.measure()
+        self.apply_manifest()
+        after = self.measure()
         text = ARTIFACT.read_text(encoding="utf-8")
-        for question, reason in sorted(measured.items()):
+        for question, reason in sorted(after.items()):
             with self.subTest(question=question):
                 self.assertIn(f"| `{reason}` |", text)
-        self.assertIn(str(len(measured)), text)
+        self.assertIn(str(len(before)), text)
+        self.assertIn(str(len(MANIFEST["forms"])), text)
 
     def test_the_measurement_records_no_answer_value(self):
         """The artifact may name a meaning and a question. Never a value.
 
         There are no values to leak yet, which is precisely why the constraint is worth
-        writing down now: this file is regenerated in the phase that does have them.
+        writing down now: the file is regenerated in the phase that does have them.
         """
         text = ARTIFACT.read_text(encoding="utf-8")
         for forbidden in ("@", "sissi", "linkedin.com/in", "212-", "+1"):
             self.assertNotIn(forbidden, text.lower())
+
+
+class ManifestTests(unittest.TestCase):
+    """The forms file is reviewed employer wording, and nothing else."""
+
+    def test_every_question_is_wording_an_employer_actually_shipped(self):
+        """A paraphrase would map a form no employer sends.
+
+        Each question must appear verbatim as a recorded label in the reviewed corpus, under
+        the fixtures the manifest names. Inventing plausible wording is the failure this
+        rules out — the corpus already found one such miss, where a conflict pattern did not
+        match `Related to someone at this company?`.
+        """
+        recorded = {}
+        for entry in APPROVAL["entries"]:
+            recorded.setdefault(entry["recorded_label"], set()).add(entry["source_fixture"])
+        for form in MANIFEST["forms"]:
+            with self.subTest(question=form["question"]):
+                self.assertIn(form["question"], recorded)
+                self.assertEqual(set(form["recorded_in"]), recorded[form["question"]])
+
+    def test_the_manifest_maps_only_the_ten_meanings_in_scope(self):
+        ids = {form["canonical_id"] for form in MANIFEST["forms"]}
+        self.assertEqual(ids, MAPPED)
+        for absent in ("profile.website", "profile.github", "profile.portfolio"):
+            self.assertNotIn(absent, ids)
+
+    def test_no_form_is_written_twice_and_none_is_a_guess(self):
+        pairs = [(form["canonical_id"], ANSWERS.normalize_question(form["question"]))
+                 for form in MANIFEST["forms"]]
+        self.assertEqual(len(pairs), len(set(pairs)))
+        for form in MANIFEST["forms"]:
+            with self.subTest(canonical_id=form["canonical_id"]):
+                # `semantic_equivalent` is a claim about meaning that a person has to make;
+                # nothing in this file is one.
+                self.assertEqual(form["match_level"], "exact")
+                self.assertTrue(form["verified_by_user"])
+
+    def test_the_manifest_carries_no_answer_field(self):
+        allowed = {"canonical_id", "canonical_meaning", "question", "match_level",
+                   "verified_by_user", "recorded_in"}
+        for form in MANIFEST["forms"]:
+            with self.subTest(canonical_id=form["canonical_id"]):
+                self.assertEqual(set(form), allowed)
+        rendered = json.dumps(MANIFEST, ensure_ascii=False).lower()
+        for forbidden in ("answer_json", '"answer"', "@", "sissi", "linkedin.com/in"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_the_immigration_meanings_stay_four_separate_things(self):
+        """The manifest may not quietly reintroduce a broad sponsorship question.
+
+        `authorization.sponsorship_status` is `always_manual` precisely because one control
+        covers more than one meaning. A question form pointing at it would route a pause into
+        an answer.
+        """
+        ids = {form["canonical_id"] for form in MANIFEST["forms"]}
+        for broad in ("sponsorship_now", "sponsorship_future", "employer_action_required"):
+            self.assertNotIn(broad, ids)
+        self.assertIn("work_authorized_now", ids)
 
 
 if __name__ == "__main__":

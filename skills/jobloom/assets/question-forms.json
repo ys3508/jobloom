@@ -1,0 +1,113 @@
+{
+  "schema_version": "0.1.0",
+  "reviewed_at": "2026-09-02",
+  "reviewed_by": "product owner review, recorded during Task 14",
+  "note": "Which reviewed employer wording means which canonical answer. Value-free by construction: a form is a question and a meaning, never an answer, so this file belongs in the repository while the answers themselves never leave `.jobloom/`. Every question is recorded employer wording from the vendored corpus, named with the fixture it came from — none of it is paraphrased or invented, because a paraphrase would map a form no employer ships. Matching is exact on the normalized text; a semantic equivalent needs its own reviewed row. The three `contact.*` and `profile.*` meanings are here because the candidate's contact details exist only as one composite fact, which cannot fill a single field and cannot be split without a new snapshot and the re-approval of every resume version behind it.",
+  "forms": [
+    {
+      "canonical_id": "citizenship_status",
+      "canonical_meaning": "Citizen of this country",
+      "question": "United States citizen?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "contact.email",
+      "canonical_meaning": "Contact email address",
+      "question": "Email address",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "ashby-application-2026-08-v1",
+        "greenhouse-single-page-2026-08-v1",
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "contact.phone",
+      "canonical_meaning": "Contact phone number",
+      "question": "Phone number",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "greenhouse-single-page-2026-08-v1",
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "current_country_of_residence",
+      "canonical_meaning": "Country the candidate currently lives in",
+      "question": "Live in the United States?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "discovery_source",
+      "canonical_meaning": "How the candidate heard about this opening",
+      "question": "How did you hear about this opportunity?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "greenhouse-single-page-2026-08-v1",
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "permanent_residence_status",
+      "canonical_meaning": "Permanent resident of this country",
+      "question": "Permanent resident?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "prior_employment_at_an_affiliate",
+      "canonical_meaning": "Previously employed by an affiliate of this employer",
+      "question": "Have you previously worked for this company or an affiliate?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "greenhouse-single-page-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "prior_employment_at_this_company",
+      "canonical_meaning": "Previously employed by this employer",
+      "question": "Previously worked for this company?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "profile.linkedin",
+      "canonical_meaning": "LinkedIn profile URL",
+      "question": "LinkedIn profile",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "greenhouse-single-page-2026-08-v1",
+        "lever-application-2026-08-v1"
+      ]
+    },
+    {
+      "canonical_id": "work_authorized_now",
+      "canonical_meaning": "Authorized to work in this country now",
+      "question": "Authorized to work in the United States?",
+      "match_level": "exact",
+      "verified_by_user": true,
+      "recorded_in": [
+        "lever-application-2026-08-v1"
+      ]
+    }
+  ]
+}
