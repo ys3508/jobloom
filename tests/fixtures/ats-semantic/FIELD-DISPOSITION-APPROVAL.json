@@ -1,7 +1,7 @@
 {
   "reviewed_at": "2026-09-01",
   "reviewed_by": "product owner review, recorded during Task 6",
-  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why. It must describe the corpus exactly — one entry per recorded control, none missing and none extra — because a test that walks only this file cannot notice a control that was never reviewed.",
+  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why. It must describe the corpus exactly — one entry per recorded control, none missing and none extra — because a test that walks only this file cannot notice a control that was never reviewed. Each entry pins the whole reviewed answer and not just its first half: `expected_target` names which authority may answer the field, or which reason the pause carries, and `expected_domain`/`expected_family` name what `field_policy.classify` must make of the recorded wording — null where no domain rule may fire at all. A disposition on its own is not a review: `contact.email` mapped to `contact.phone` is still a `fact`.",
   "entries": [
     {
       "kind": "contact.email",
@@ -10,7 +10,9 @@
       "source_fixture": "ashby-application-2026-08-v1",
       "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
       "expected_disposition": "fact",
-      "expected_target": "contact.email"
+      "expected_target": "contact.email",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.full_name",
@@ -19,7 +21,9 @@
       "source_fixture": "ashby-application-2026-08-v1",
       "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
       "expected_disposition": "fact",
-      "expected_target": "contact.full_name"
+      "expected_target": "contact.full_name",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "resume.file",
@@ -28,7 +32,9 @@
       "source_fixture": "ashby-application-2026-08-v1",
       "source_fixture_sha256": "25a1bd4770561d62dec053e1f48cc63bc68c5d625badf5448c14c61f20dd71e7",
       "expected_disposition": "material",
-      "expected_target": "resume"
+      "expected_target": "resume",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "authorization.sponsorship_select",
@@ -37,6 +43,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "always_manual",
+      "expected_target": "sponsorship_meaning_ambiguous",
+      "expected_domain": "sponsorship",
+      "expected_family": "sponsorship",
       "review_reason": "One broad control cannot stand in for four canonical meanings."
     },
     {
@@ -46,7 +55,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.email"
+      "expected_target": "contact.email",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.first_name",
@@ -55,7 +66,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.first_name"
+      "expected_target": "contact.first_name",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.last_name",
@@ -64,7 +77,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.last_name"
+      "expected_target": "contact.last_name",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.location_city",
@@ -73,7 +88,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.location_city"
+      "expected_target": "contact.location_city",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.phone",
@@ -82,7 +99,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.phone"
+      "expected_target": "contact.phone",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.phone_country",
@@ -91,7 +110,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.phone_country"
+      "expected_target": "contact.phone_country",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.preferred_name",
@@ -100,7 +121,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "contact.preferred_name"
+      "expected_target": "contact.preferred_name",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "cover_letter.file",
@@ -109,7 +132,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "material",
-      "expected_target": "cover_letter"
+      "expected_target": "cover_letter",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "employment.prior_affiliate",
@@ -118,7 +143,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "answer",
-      "expected_target": "prior_employment_at_an_affiliate"
+      "expected_target": "prior_employment_at_an_affiliate",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.linkedin",
@@ -127,7 +154,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "profile.linkedin"
+      "expected_target": "profile.linkedin",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.website",
@@ -136,7 +165,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "fact",
-      "expected_target": "profile.website"
+      "expected_target": "profile.website",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "referral.contact",
@@ -145,6 +176,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "always_manual",
+      "expected_target": "referral_contact_requires_user",
+      "expected_domain": "referral_contact",
+      "expected_family": "referral_contact",
       "review_reason": "Naming a colleague is a claim about another person."
     },
     {
@@ -154,7 +188,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "material",
-      "expected_target": "resume"
+      "expected_target": "resume",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "source.discovery",
@@ -163,7 +199,9 @@
       "source_fixture": "greenhouse-single-page-2026-08-v1",
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "answer",
-      "expected_target": "discovery_source"
+      "expected_target": "discovery_source",
+      "expected_domain": "discovery_source",
+      "expected_family": "discovery_source"
     },
     {
       "kind": "authorization.green_card",
@@ -172,7 +210,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "permanent_residence_status"
+      "expected_target": "permanent_residence_status",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "authorization.sponsorship_status",
@@ -181,6 +221,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "sponsorship_meaning_ambiguous",
+      "expected_domain": "sponsorship",
+      "expected_family": "sponsorship",
       "review_reason": "One broad control cannot stand in for four canonical meanings."
     },
     {
@@ -190,7 +233,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "citizenship_status"
+      "expected_target": "citizenship_status",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "authorization.work_authorized",
@@ -199,7 +244,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "work_authorized_now"
+      "expected_target": "work_authorized_now",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "compensation.target_salary",
@@ -208,6 +255,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "employer_defined_compensation_manual",
+      "expected_domain": "compensation",
+      "expected_family": "compensation",
       "review_reason": "A negotiating stance, not a fact past work proves."
     },
     {
@@ -217,6 +267,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "employer_defined_compensation_manual",
+      "expected_domain": "compensation",
+      "expected_family": "compensation",
       "review_reason": "An employer-defined bracket; the bands exist only in page text."
     },
     {
@@ -226,6 +279,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "employer_entity_not_approved",
+      "expected_domain": "employer_conflict",
+      "expected_family": "conflict_commercial_relationship",
       "review_reason": "A per-employer disclosure, separate from the relative question."
     },
     {
@@ -235,6 +291,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "employer_entity_not_approved",
+      "expected_domain": "employer_conflict",
+      "expected_family": "conflict_related_person",
       "review_reason": "A per-employer disclosure; a registry miss is unknown, never No."
     },
     {
@@ -244,7 +303,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "contact.email"
+      "expected_target": "contact.email",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.full_name",
@@ -253,7 +314,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "contact.full_name"
+      "expected_target": "contact.full_name",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.location",
@@ -262,7 +325,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "contact.location"
+      "expected_target": "contact.location",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "contact.phone",
@@ -271,7 +336,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "contact.phone"
+      "expected_target": "contact.phone",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "eeo.disability",
@@ -280,6 +347,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "voluntary_eeo",
+      "expected_domain": "voluntary_eeo",
+      "expected_family": "eeo_disability",
       "review_reason": "A protected characteristic. Values never enter Jobloom."
     },
     {
@@ -289,6 +359,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "voluntary_eeo",
+      "expected_domain": "voluntary_eeo",
+      "expected_family": "eeo_gender",
       "review_reason": "A protected characteristic. Values never enter Jobloom."
     },
     {
@@ -298,6 +371,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "voluntary_eeo",
+      "expected_domain": "voluntary_eeo",
+      "expected_family": "eeo_race",
       "review_reason": "A protected characteristic. Values never enter Jobloom."
     },
     {
@@ -307,6 +383,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "always_manual",
+      "expected_target": "voluntary_eeo",
+      "expected_domain": "voluntary_eeo",
+      "expected_family": "eeo_veteran",
       "review_reason": "A protected characteristic. Values never enter Jobloom."
     },
     {
@@ -316,7 +395,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "employment.current_company"
+      "expected_target": "employment.current_company",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "employment.prior_company",
@@ -325,7 +406,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "prior_employment_at_this_company"
+      "expected_target": "prior_employment_at_this_company",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "location.city_state",
@@ -334,7 +417,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "contact.location_city"
+      "expected_target": "contact.location_city",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "location.us_resident",
@@ -343,7 +428,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "current_country_of_residence"
+      "expected_target": "current_country_of_residence",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.github",
@@ -352,7 +439,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "profile.github"
+      "expected_target": "profile.github",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.linkedin",
@@ -361,7 +450,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "profile.linkedin"
+      "expected_target": "profile.linkedin",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.location_url",
@@ -370,7 +461,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "profile.location_url"
+      "expected_target": "profile.location_url",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.portfolio",
@@ -379,7 +472,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "profile.portfolio"
+      "expected_target": "profile.portfolio",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "profile.website",
@@ -388,7 +483,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
-      "expected_target": "profile.website"
+      "expected_target": "profile.website",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "resume.file",
@@ -397,7 +494,9 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "material",
-      "expected_target": "resume"
+      "expected_target": "resume",
+      "expected_domain": null,
+      "expected_family": null
     },
     {
       "kind": "source.discovery_radio",
@@ -406,7 +505,10 @@
       "source_fixture": "lever-application-2026-08-v1",
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "answer",
-      "expected_target": "discovery_source"
+      "expected_target": "discovery_source",
+      "expected_domain": "discovery_source",
+      "expected_family": "discovery_source"
     }
-  ]
+  ],
+  "known_inconsistency": "The four `eeo.*` kinds carry `voluntary_eeo` as their target, which is a domain name, while every other always_manual kind carries a reason code from `field_policy.MANUAL_REASONS` — where the code for this domain is `voluntary_disclosure_manual`. Recorded as it stands rather than quietly normalised, because the target is what the pause would carry and changing it is a product decision, not a test fix. `MANUAL_REASONS` currently has no reader at all."
 }

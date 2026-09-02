@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -710,13 +711,78 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
                 self.assertTrue(entry.get("review_reason"), entry["kind"])
         self.assertEqual(misses, [])
 
+    def test_the_reviewed_domain_is_the_one_the_policy_finds(self):
+        """Membership in the manual set is a coarse question with a coarse answer.
+
+        Asking only whether `classify` landed somewhere in `ALWAYS_MANUAL_DOMAINS` cannot
+        tell `voluntary_eeo` from `compensation`, so a pattern that pulled a race question
+        into the compensation family would still be manual and still pass. Each entry names
+        the exact `(domain, family)` its recorded wording must produce — and names `null`
+        where no domain rule may fire, which is what catches a pattern grown broad enough to
+        start matching `Full name`.
+        """
+        for entry in self.approval()["entries"]:
+            with self.subTest(kind=entry["kind"], label=entry["recorded_label"]):
+                found = POLICY.classify(entry["kind"].split(".")[-1],
+                                        entry["recorded_label"] or "")
+                if entry["expected_domain"] is None:
+                    self.assertIsNone(entry["expected_family"])
+                    self.assertIsNone(found)
+                else:
+                    self.assertEqual(
+                        found, (entry["expected_domain"], entry["expected_family"]))
+
     def test_the_two_internal_mappings_agree_with_each_other(self):
-        # Consistency only. It says nothing about whether either is right, which is what
-        # the approval fixture is for.
+        """Both halves of the pair, not just the disposition.
+
+        Comparing `KIND_DISPOSITIONS[kind][0]` alone left the target — which authority may
+        actually answer the field — unchecked by anything: `contact.email` mapped to
+        `contact.phone` is still a `fact`, and a resume routed to the cover-letter material
+        is still `material`. Still consistency only; whether either side is right is the
+        approval's business, and `test_the_reviewed_domain_is_the_one_the_policy_finds` is
+        where the recorded wording gets an independent opinion.
+        """
         for entry in self.approval()["entries"]:
             with self.subTest(kind=entry["kind"]):
-                self.assertEqual(REPLAY.KIND_DISPOSITIONS[entry["kind"]][0],
-                                 entry["expected_disposition"])
+                self.assertEqual(
+                    REPLAY.KIND_DISPOSITIONS[entry["kind"]],
+                    (entry["expected_disposition"], entry["expected_target"]))
+
+    def test_the_approval_entries_are_shaped_the_way_the_tests_read_them(self):
+        """A missing key would make the checks above vacuous rather than failing.
+
+        `entry.get("review_reason")` and `entry["expected_domain"]` only mean something if
+        every entry really carries them; a typo in one key name turns a per-entry assertion
+        into a silent no-op for that entry. This is the check that the file has the shape the
+        others assume.
+        """
+        required = {"kind", "recorded_label", "role", "source_fixture",
+                    "source_fixture_sha256", "expected_disposition", "expected_target",
+                    "expected_domain", "expected_family"}
+        digest = re.compile(r"^[0-9a-f]{64}$")
+        for entry in self.approval()["entries"]:
+            with self.subTest(kind=entry["kind"], fixture=entry["source_fixture"]):
+                self.assertEqual(required - set(entry), set(), "missing keys")
+                self.assertEqual(set(entry) - required - {"review_reason"}, set(),
+                                 "unexpected keys")
+                for key in ("kind", "recorded_label", "role", "source_fixture",
+                            "expected_target"):
+                    self.assertIsInstance(entry[key], str)
+                    self.assertTrue(entry[key].strip(), key)
+                self.assertRegex(entry["source_fixture_sha256"], digest)
+                self.assertIn(entry["expected_disposition"], POLICY.DISPOSITIONS)
+                self.assertIn(entry["role"], REPLAY.ROLE_CONTROLS)
+                # Domain and family stand or fall together: a family without a domain names
+                # a rule that did not fire.
+                for key in ("expected_domain", "expected_family"):
+                    if entry[key] is not None:
+                        self.assertIsInstance(entry[key], str)
+                        self.assertTrue(entry[key].strip(), key)
+                self.assertEqual(entry["expected_domain"] is None,
+                                 entry["expected_family"] is None)
+                # `review_reason` is required of exactly the entries that pause.
+                self.assertEqual(entry["expected_disposition"] == "always_manual",
+                                 bool(entry.get("review_reason", "").strip()))
 
     def test_the_observation_comes_from_the_page_and_matches_what_is_rendered(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
