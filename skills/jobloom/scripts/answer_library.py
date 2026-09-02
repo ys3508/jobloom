@@ -233,6 +233,15 @@ PROVENANCE_ENTRY_FIELDS = {"kind", "recorded_label", "role", "source_fixture",
                            "source_fixture_sha256", "expected_disposition",
                            "expected_target"}
 PROVENANCE_ENTRY_OPTIONAL = {"expected_domain", "expected_family", "review_reason"}
+SHA256_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+# Mirrors `field_policy.DISPOSITIONS`, declared here so the answer library does not import
+# the whole policy module to read one set. A test holds the two equal.
+REVIEWED_DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
+# Which reviewed dispositions may become a question form at all. A form says "this wording
+# means this answerable thing", so a control reviewed as `always_manual` must never have one:
+# the whole point of that disposition is that the question reaches the user. `material` is a
+# file upload rather than a question with an answer, and `unsupported` is a refusal.
+FORMABLE_DISPOSITIONS = {"answer", "fact"}
 
 
 def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
@@ -273,7 +282,7 @@ def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
     return forms
 
 
-def _provenance_index(provenance: Any) -> dict[str, set[tuple[str, str]]]:
+def _provenance_index(provenance: Any, fixture_root: Path) -> dict[str, set[tuple[str, str]]]:
     """Which `(fixture, meaning)` pairs actually recorded each wording.
 
     The index keeps the meaning, not just the fixture. Checking a question against the set
@@ -286,9 +295,12 @@ def _provenance_index(provenance: Any) -> dict[str, set[tuple[str, str]]]:
     entries = provenance["entries"]
     if not isinstance(entries, list) or not entries:
         raise ValueError("provenance carries no reviewed entries")
+    if not isinstance(fixture_root, Path) or not fixture_root.is_dir():
+        raise ValueError("the recorded fixtures this approval names are not readable")
     index: dict[str, set[tuple[str, str]]] = {}
     controls: set[tuple[str, str]] = set()
     meanings: dict[str, str] = {}
+    digests: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             raise ValueError("provenance entry has an unexpected shape")
@@ -299,6 +311,23 @@ def _provenance_index(provenance: Any) -> dict[str, set[tuple[str, str]]]:
                       "expected_disposition"):
             if not isinstance(entry[field], str) or not entry[field].strip():
                 raise ValueError(f"provenance entry field must be a non-empty string: {field}")
+        if not SHA256_SHAPE.fullmatch(entry["source_fixture_sha256"] or ""):
+            raise ValueError("provenance entry does not name a sha256 digest")
+        if entry["expected_disposition"] not in REVIEWED_DISPOSITIONS:
+            raise ValueError("provenance entry names an unknown disposition")
+        fixture = entry["source_fixture"]
+        # The approval says which bytes it reviewed. Reading them is what makes that a claim
+        # about a recording rather than a string in a file: an approval edited to describe a
+        # different corpus stops matching the corpus it names.
+        recorded_digest = digests.get(fixture)
+        if recorded_digest is None:
+            path = fixture_root / fixture / "fixture.json"
+            if not path.is_file():
+                raise ValueError("provenance names a fixture that is not present")
+            recorded_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            digests[fixture] = recorded_digest
+        if entry["source_fixture_sha256"] != recorded_digest:
+            raise ValueError("provenance describes different bytes than the fixture holds")
         control = (entry["source_fixture"], entry["kind"])
         if control in controls:
             raise ValueError(f"provenance reviews one control twice: {control[1]}")
@@ -308,12 +337,13 @@ def _provenance_index(provenance: Any) -> dict[str, set[tuple[str, str]]]:
             # The same thing `match_answer` reports as `question_mapping_conflict`, in the
             # file that is supposed to be settling it.
             raise ValueError("provenance reviews one wording as two meanings")
-        index.setdefault(label, set()).add((entry["source_fixture"], target))
+        if entry["expected_disposition"] in FORMABLE_DISPOSITIONS:
+            index.setdefault(label, set()).add((entry["source_fixture"], target))
     return index
 
 
 def import_question_forms(connection: sqlite3.Connection, manifest: Any,
-                          provenance: Any) -> dict[str, Any]:
+                          provenance: Any, fixture_root: Path) -> dict[str, Any]:
     """Apply a reviewed manifest to this library, wholly or not at all.
 
     Deliberately not called by `initialize`. A file appearing in a checkout is not a person
@@ -336,10 +366,13 @@ def import_question_forms(connection: sqlite3.Connection, manifest: Any,
     the mapping was nonsense.
     """
     forms = _manifest_forms(manifest)
-    recorded = _provenance_index(provenance)
+    recorded = _provenance_index(provenance, fixture_root)
     for form in forms:
         question = form["question"]
         if question not in recorded:
+            # Either nobody recorded this wording, or every control that did was reviewed as
+            # something a question form may not speak for — `always_manual` most of all,
+            # whose entire purpose is that the question reaches the user.
             raise ValueError("question form is not recorded employer wording")
         claimed = {(fixture, form["canonical_id"]) for fixture in form["recorded_in"]}
         if claimed != recorded[question]:
@@ -578,7 +611,10 @@ def main() -> None:
     elif args.command == "import-question-forms":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
-        result = import_question_forms(connection, manifest, provenance)
+        # Beside the approval, never a separate argument: a caller who could point this
+        # somewhere else could point it at fixtures they wrote themselves.
+        result = import_question_forms(connection, manifest, provenance,
+                                       args.provenance.parent / "upstream")
     elif args.command == "invalidate":
         result = {"status": "invalidated", "answer_ids": invalidate_by_trigger(connection, args.trigger)}
     elif args.command == "match":
