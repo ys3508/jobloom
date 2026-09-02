@@ -108,6 +108,27 @@ SAFETY_VARIANTS = {
 }
 
 
+# One page per hazard, because a page carrying all of them at once only ever proves that the
+# observer refused it for *some* reason. `{anchor}` is the `data-test-id` of a real control on
+# the same page, so the duplicate collides with something rather than with itself.
+OBSERVER_HAZARDS = {
+    # No `data-test-id`: the refusal has to come from the tag, not from the identity walk,
+    # because a frame on a real page would not carry a Jobloom attribute either.
+    "iframe": ('<iframe title="A question inside a nested frame" '
+               'srcdoc="&lt;p&gt;nested&lt;/p&gt;"></iframe>'),
+    # What every control on a real employer form looks like to this observer.
+    "unknown": ('<label for="unreviewed">A control nobody reviewed</label>'
+                '<input type="text" id="unreviewed" name="unreviewed">'),
+    "duplicate": ('<label for="{anchor}">A duplicated question</label>'
+                  '<input type="text" id="duplicate-of-{anchor}" data-test-id="{anchor}" '
+                  'data-kind="contact.full_name">'),
+    # Identified and mapped, so the only thing wrong with it is that nobody can see it.
+    "hidden": ('<label for="hidden-question" hidden>A hidden question</label>'
+               '<input type="text" id="hidden-question" data-test-id="hidden-question" '
+               'data-kind="contact.full_name" hidden>'),
+}
+
+
 class UnmappedKind(ValueError):
     """An upstream kind nobody classified. Not rendered; not guessed at."""
 
@@ -169,7 +190,7 @@ def render_control(control: dict[str, Any], test_id: str, nonce: str) -> str:
 
 def render_controls(family: str, page_index: int, controls: list[dict[str, Any]],
                     nonce: str, *, include_variants: bool = False, final: bool = False,
-                    next_path: str | None = None) -> str:
+                    next_path: str | None = None, hazard: str | None = None) -> str:
     """Render an explicit list of reviewed controls as one local page.
 
     The pagination is Jobloom's, not upstream's: every reviewed fixture puts its controls on
@@ -180,6 +201,11 @@ def render_controls(family: str, page_index: int, controls: list[dict[str, Any]]
     body = "".join(
         render_control(control, f"{family}-0-{index}", nonce)
         for index, control in controls)
+    if hazard:
+        if hazard not in OBSERVER_HAZARDS:
+            raise UnmappedKind(f"no such observer hazard: {hazard}")
+        body += OBSERVER_HAZARDS[hazard].format(
+            anchor=f"{family}-0-{controls[0][0]}")
     variants = ""
     if include_variants:
         variants = "".join(_render_variant(name, kind, label)

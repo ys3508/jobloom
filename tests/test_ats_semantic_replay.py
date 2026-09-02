@@ -374,10 +374,14 @@ class ReplayServerTests(unittest.TestCase):
         with ReplayServer() as server:
             state = json.load(urllib.request.urlopen(f"{server.origin}/__state", timeout=5))
             # `/lever/split/*` is a Jobloom pagination of the same reviewed controls, added
-            # so a two-package flow has two pages of fields to work with.
+            # so a two-package flow has two pages of fields to work with. `/refuse/*` is
+            # `/lever/split/0` with exactly one thing wrong with it, one hazard per page, so
+            # the observer's refusals can be told apart from one another.
             self.assertEqual(sorted(state["pages"]),
                              ["/ashby/0", "/ashby/1", "/greenhouse/0", "/greenhouse/1",
-                              "/lever/0", "/lever/1", "/lever/split/0", "/lever/split/1"])
+                              "/lever/0", "/lever/1", "/lever/split/0", "/lever/split/1",
+                              "/refuse/duplicate", "/refuse/hidden", "/refuse/iframe",
+                              "/refuse/unknown"])
             for path in state["pages"]:
                 with self.subTest(path=path):
                     with urllib.request.urlopen(f"{server.origin}{path}", timeout=5) as page:

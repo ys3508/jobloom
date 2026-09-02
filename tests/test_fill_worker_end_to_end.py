@@ -737,22 +737,83 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
             self.assertEqual(
                 [field["control"] for field in final["fields"]], ["text", "submit"])
 
+    def refuse(self, server, path):
+        """Observe one page that should not be describable, and return why it was not.
+
+        The point of returning the message is that each hazard has to be refused for its own
+        reason. `/lever/0` carries every variant at once, so an assertion there can only say
+        that something was wrong with the page — which stays true if three of the four checks
+        are deleted.
+        """
+        with self.assertRaises(ObservationRefused) as caught:
+            self.observe_live(server, "page-1", 0, path)
+        return str(caught.exception)
+
+    def test_the_observer_refuses_a_page_that_embeds_a_frame(self):
+        """Not reaching into a frame is not the same as being safe about one.
+
+        `page.locator` searches the top frame, so a form inside an iframe used to produce a
+        clean observation of the three controls that happened to be outside it. Nothing
+        downstream could tell that from a page that really had three controls, and the
+        planner would have gone on to fill a form it had only partly seen. The frame is now
+        the end of the observation, and the refusal comes from the tag rather than from a
+        `data-test-id`, because a frame on a real page carries no Jobloom attribute.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.assertIn("nested browsing context",
+                          self.refuse(server, "/refuse/iframe"))
+            # The page is otherwise exactly the one that observes cleanly.
+            self.assertTrue(self.observe_live(server, "page-1", 0, "/lever/split/0")["fields"])
+
+    def test_the_observer_refuses_a_control_it_was_never_shown(self):
+        """An unidentified control was not refused before — it was never looked at.
+
+        The walk started from `[data-test-id]`, so a control without one contributed no field
+        and no error. That is the shape of every control on a real employer form, which makes
+        silence the worst possible answer: the observation would describe a strict subset of
+        the page and claim to describe the page.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            message = self.refuse(server, "/refuse/unknown")
+            self.assertIn("no reviewed identity", message)
+            self.assertIn("unreviewed", message)
+
+    def test_the_observer_refuses_two_controls_wearing_one_identity(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            message = self.refuse(server, "/refuse/duplicate")
+            self.assertIn("duplicate control", message)
+            self.assertIn("lever-0-0", message)
+
+    def test_the_observer_refuses_a_control_nobody_can_see(self):
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            message = self.refuse(server, "/refuse/hidden")
+            self.assertIn("not actionable", message)
+            self.assertIn("hidden-question", message)
+
+    def test_each_hazard_page_differs_from_the_clean_page_by_one_control(self):
+        """Otherwise the four tests above could pass against four broken pages.
+
+        A hazard page that failed to render its controls would refuse for the right-looking
+        reason and prove nothing, so each one is compared against the page that observes
+        cleanly rather than taken on trust.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            clean = urllib.request.urlopen(
+                f"{server.origin}/lever/split/0", timeout=5).read().decode()
+            for hazard in REPLAY.OBSERVER_HAZARDS:
+                with self.subTest(hazard=hazard):
+                    page = urllib.request.urlopen(
+                        f"{server.origin}/refuse/{hazard}", timeout=5).read().decode()
+                    self.assertNotEqual(page, clean)
+                    for field_id in ("lever-0-0", "lever-0-1", "lever-0-5"):
+                        self.assertIn(f'data-test-id="{field_id}"', page)
+
     def test_the_observer_fails_closed_rather_than_guessing(self):
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                try:
-                    page = browser.new_context().new_page()
-                    # The first page of the plain replay carries the hazard variants.
-                    page.goto(f"{server.origin}/lever/0", wait_until="domcontentloaded")
-                    with self.assertRaises(ObservationRefused) as caught:
-                        observe_replay(page, "page-1", 0, f"{server.origin}/lever/0")
-                    # Hidden, disabled, duplicated or unmapped: whichever comes first, the
-                    # page is not described at all.
-                    self.assertTrue(str(caught.exception))
-                finally:
-                    browser.close()
+            # The first page of the plain replay carries every hazard variant at once. This
+            # says only that such a page is not described; which check fired is the business
+            # of the four single-hazard tests above.
+            self.assertTrue(self.refuse(server, "/lever/0"))
 
     def test_the_observer_never_reaches_into_a_frame_or_runs_page_script(self):
         source = (ROOT / "tests" / "fixtures" / "replay_observer.py").read_text(

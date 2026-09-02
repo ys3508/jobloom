@@ -16,6 +16,13 @@ No model, no `page.evaluate`, no frame traversal — `page.locator` searches the
 so anything inside an iframe is invisible here rather than reachable. Every attribute is read
 through Playwright's own accessors, and anything ambiguous, duplicated, hidden or unmapped
 fails closed instead of being guessed at.
+
+Being unable to see into a frame is not the same as being safe about one. An observation that
+silently omits whatever a frame holds describes a form that is not the form on screen, and the
+planner downstream has no way to tell the difference between "this page has three fields" and
+"this page has three fields I could see". The same goes for a control that carries no
+`data-test-id`: the old walk started from `[data-test-id]`, so an unidentified control was not
+refused, it was never looked at. Both are now refusals of the whole observation.
 """
 
 from __future__ import annotations
@@ -39,8 +46,49 @@ FACT_IDS = {
 UPLOAD_KINDS = {"resume.file": "resume", "cover_letter.file": "cover_letter"}
 
 
+# A nested browsing context this observer cannot read and must not ignore.
+FRAME_TAGS = ("iframe", "frame", "frameset", "object", "embed")
+
+# Everything a person can put a value into. `option` is deliberately absent: it is part of the
+# `select` that contains it, not a control in its own right.
+INTERACTIVE = ("input", "select", "textarea", "button")
+
+
 class ObservationRefused(RuntimeError):
     """The page cannot be described unambiguously, so it is not described at all."""
+
+
+def _refuse_frames(page) -> None:
+    """A page with a frame in it is not describable from the top frame alone."""
+    for tag in FRAME_TAGS:
+        count = page.locator(tag).count()
+        if count:
+            raise ObservationRefused(
+                f"page embeds {count} nested browsing context(s): {tag}")
+
+
+def _refuse_unidentified(page, described: list[str]) -> None:
+    """Every interactive control on the page must be one of the ones being described.
+
+    Walking `[data-test-id]` answers "what did the replay label?", never "what is on this
+    page?". A control with no `data-test-id` — which is every control on a real employer form
+    — produced no error and no field; it simply did not exist as far as the observation was
+    concerned. Sweeping from the tag side is the direction that can see it.
+    """
+    known = set(described)
+    for tag in INTERACTIVE:
+        controls = page.locator(tag)
+        for index in range(controls.count()):
+            control = controls.nth(index)
+            test_id = control.get_attribute("data-test-id")
+            if not test_id:
+                name = control.get_attribute("name") or control.get_attribute("id") or tag
+                raise ObservationRefused(f"control carries no reviewed identity: {name}")
+            # A radio member belongs to the fieldset that is its group; the group is the
+            # control being described, so the member is covered when the group is.
+            group = test_id.split("--", 1)[0]
+            if test_id not in known and group not in known:
+                raise ObservationRefused(f"control is outside the described set: {test_id}")
 
 
 def _one(page, selector: str):
@@ -95,15 +143,20 @@ def _options(page, test_id: str, control: str) -> list[dict[str, str]] | None:
 def observe(page, page_id: str, page_index: int, page_url: str, *, locale: str | None = None,
             final: bool = False, predecessor: str | None = None) -> dict[str, Any]:
     """Describe the page in front of the browser, in the protocol's own vocabulary."""
+    _refuse_frames(page)
     identified = page.locator("[data-test-id]")
     seen: list[str] = []
-    fields: list[dict[str, Any]] = []
     for index in range(identified.count()):
         test_id = identified.nth(index).get_attribute("data-test-id")
         if not test_id or test_id in seen or "--" in test_id or test_id == "next-page":
             # Radio options carry `<group>--<n>`; the group itself is the control.
             continue
         seen.append(test_id)
+    # Before anything is described, and from the other direction: nothing on the page may be
+    # outside the set about to be walked.
+    _refuse_unidentified(page, seen)
+    fields: list[dict[str, Any]] = []
+    for test_id in seen:
         element = _one(page, f'[data-test-id="{test_id}"]')
         control = _control_kind(page, test_id)
         if control == "submit":

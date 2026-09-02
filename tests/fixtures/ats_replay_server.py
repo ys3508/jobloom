@@ -65,6 +65,13 @@ class ReplayServer:
                     family, 0, head, self.nonce, next_path="/lever/split/1")
                 self.pages["/lever/split/1"] = semantic_replay.render_controls(
                     family, 1, tail, self.nonce, final=True)
+                # The same page as `/lever/split/0` with exactly one thing wrong with it.
+                # One hazard per page: a page carrying all four at once can only show that
+                # the observer refused it, never that it refuses each of them.
+                for hazard in semantic_replay.OBSERVER_HAZARDS:
+                    self.pages[f"/refuse/{hazard}"] = semantic_replay.render_controls(
+                        family, 0, head, self.nonce, next_path="/lever/split/1",
+                        hazard=hazard)
             last = len(fixture["steps"]) - 1
             for index in range(len(fixture["steps"])):
                 self.pages[f"/{family}/{index}"] = semantic_replay.render_page(
