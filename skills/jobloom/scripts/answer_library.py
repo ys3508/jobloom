@@ -256,6 +256,88 @@ RECORDED_ROLES = {"textbox", "combobox", "radiogroup", "file"}
 # the caller passes, which is why it has no default.
 FORMABLE_DISPOSITIONS = {"answer", "fact"}
 
+# The meanings Task 14 reviewed, pinned in code because a permission an input file can widen
+# is not a permission. The intake plan was that file for one commit: copying it, adding
+# `profile.website`, and adding the matching reviewed form to the manifest imported eleven
+# forms past the corpus check, the provenance check and the disposition floor — every one of
+# which passed, because every one of them was true. Widening this set is an edit to this
+# file, under review, and never an argument.
+TASK14_QUESTION_FORM_TARGETS = frozenset({
+    "work_authorized_now", "citizenship_status", "permanent_residence_status",
+    "current_country_of_residence", "prior_employment_at_this_company",
+    "prior_employment_at_an_affiliate", "discovery_source",
+    "contact.email", "contact.phone", "profile.linkedin",
+})
+# Of those, the three whose values exist only inside one composite contact fact. They are the
+# only `fact` meanings this task may speak for; everything else the corpus reviews as a fact
+# stays out.
+TASK14_CONTACT_TARGETS = frozenset({"contact.email", "contact.phone", "profile.linkedin"})
+# The four legal-status meanings, and the two prior-employment ones, that must not travel
+# between applications.
+TASK14_PER_APPLICATION_TARGETS = frozenset({
+    "work_authorized_now", "citizenship_status", "permanent_residence_status",
+    "current_country_of_residence", "prior_employment_at_this_company",
+    "prior_employment_at_an_affiliate", "discovery_source",
+})
+DISCOVERY_ANSWER_TYPES = {"application_specific", "conditional_preference"}
+INTAKE_PLAN_FIELDS = {"schema_version", "reviewed_at", "reviewed_by", "note",
+                      "application_id", "entries"}
+INTAKE_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "answer", "answer_type",
+                       "source_type", "validity_class", "scope", "auto_fill_allowed",
+                       "auto_submit_allowed", "engine_enforced_recheck", "confirmation"}
+
+
+def intake_plan_targets(plan: Any) -> frozenset[str]:
+    """Read a reviewed intake plan, and return the targets only if it is the reviewed one.
+
+    The plan is checked, never trusted: it says which meanings are to be confirmed and under
+    what terms, and this reads it to confirm it still describes the reviewed arrangement. It
+    is not where the permission comes from. `TASK14_QUESTION_FORM_TARGETS` is, and a plan
+    that names anything else is refused rather than obeyed.
+    """
+    if not isinstance(plan, dict) or set(plan) != INTAKE_PLAN_FIELDS:
+        raise ValueError("intake plan has an unexpected shape")
+    for field in ("schema_version", "reviewed_at", "reviewed_by", "note", "application_id"):
+        if not isinstance(plan[field], str) or not plan[field].strip():
+            raise ValueError(f"intake plan metadata must be a non-empty string: {field}")
+    entries = plan["entries"]
+    if not isinstance(entries, list):
+        raise ValueError("intake plan entries have an unexpected shape")
+    application = plan["application_id"]
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != INTAKE_ENTRY_FIELDS:
+            raise ValueError("intake plan entry has an unexpected shape")
+        target = entry["canonical_id"]
+        if not isinstance(target, str) or target in seen:
+            raise ValueError("intake plan repeats or mis-types a meaning")
+        seen.add(target)
+        if entry["answer"] is not None:
+            # The one field this file may never hold. A plan carrying an answer is a private
+            # value in the repository.
+            raise ValueError("an intake plan may not carry an answer")
+        if entry["source_type"] != "user_confirmed":
+            raise ValueError("an intake entry must be the user's own confirmation")
+        if entry["auto_fill_allowed"] is not True or entry["auto_submit_allowed"] is not False:
+            raise ValueError("an intake entry may fill automatically and never submit")
+        scope = entry["scope"]
+        if not isinstance(scope, dict):
+            raise ValueError("intake plan scope has an unexpected shape")
+        if target in TASK14_PER_APPLICATION_TARGETS:
+            if entry["validity_class"] != "per_application":
+                raise ValueError("this meaning must be confirmed per application")
+            if scope.get("country") != "US" or scope.get("application_id") != application:
+                raise ValueError("this meaning must be bound to the reviewed application")
+        if target == "discovery_source" and entry["answer_type"] not in DISCOVERY_ANSWER_TYPES:
+            raise ValueError("how an opening was heard about is stated, not derived")
+        if target in TASK14_CONTACT_TARGETS and entry["validity_class"] != "stable":
+            raise ValueError("a contact meaning does not change with the application")
+    if seen != set(TASK14_QUESTION_FORM_TARGETS):
+        # Both directions: a plan that added a meaning, and a plan that dropped one so the
+        # remaining nine would import quietly.
+        raise ValueError("intake plan does not name the reviewed meanings")
+    return TASK14_QUESTION_FORM_TARGETS
+
 
 def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
     """Read a manifest strictly, or refuse it whole."""
@@ -354,7 +436,11 @@ def _provenance_index(provenance: Any, corpus_root: Path,
     if not isinstance(entries, list) or not entries:
         raise ValueError("provenance carries no reviewed entries")
     if not isinstance(allowed_targets, (set, frozenset)) or not allowed_targets:
-        raise ValueError("no reviewed targets were permitted for import")
+        # Checked before it is coerced. `set("profile.website")` is a set of thirteen
+        # letters, which is a strange and quiet way to permit nothing. The pinned-set check
+        # lives at the public entry point, so this stays usable for asking what the index
+        # would say about a permission that does not exist.
+        raise ValueError("permitted targets must be a set of canonical meanings")
     corpus = _corpus_controls(corpus_root)
 
     index: dict[str, set[tuple[str, str]]] = {}
@@ -453,6 +539,13 @@ def import_question_forms(connection: sqlite3.Connection, manifest: Any, provena
     the mapping was nonsense.
     """
     forms = _manifest_forms(manifest)
+    if not isinstance(allowed_targets, (set, frozenset)):
+        # Checked before it is coerced, and before anything is read.
+        raise ValueError("permitted targets must be a set of canonical meanings")
+    if set(allowed_targets) != set(TASK14_QUESTION_FORM_TARGETS):
+        # The permission is pinned in this file. An input that names a different set is
+        # refused rather than obeyed, whichever direction it moved.
+        raise ValueError("permitted targets are not the reviewed set")
     recorded = _provenance_index(provenance, corpus_root, set(allowed_targets))
     unpermitted = sorted({form["canonical_id"] for form in forms} - set(allowed_targets))
     if unpermitted:
@@ -678,8 +771,8 @@ def main() -> None:
                                    "be traceable to, wording and meaning both; the recorded "
                                    "corpus is read from `upstream/` beside it")
     forms_import.add_argument("--intake-plan", required=True, type=Path,
-                              help="the value-free plan naming which canonical meanings may "
-                                   "be imported at all")
+                              help="the value-free plan, checked against the reviewed set of "
+                                   "meanings rather than trusted to define it")
     invalidate = subparsers.add_parser("invalidate")
     invalidate.add_argument("--trigger", required=True)
     match = subparsers.add_parser("match")
@@ -710,7 +803,9 @@ def main() -> None:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
         plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
-        permitted = {entry["canonical_id"] for entry in plan["entries"]}
+        # The plan is validated against the pinned set, not read as the permission. A copy of
+        # it with one meaning added is refused rather than obeyed.
+        permitted = intake_plan_targets(plan)
         # The corpus sits beside the approval, never as its own argument: a caller who could
         # point it somewhere else could point it at recordings they wrote themselves.
         result = import_question_forms(connection, manifest, provenance,

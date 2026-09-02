@@ -18,6 +18,7 @@ import importlib.util
 import shutil
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -422,11 +423,15 @@ class ProvenanceIntegrityTests(unittest.TestCase):
                     "question": entry["recorded_label"], "match_level": "exact",
                     "verified_by_user": True,
                     "recorded_in": [entry["source_fixture"]]})
-                # Permitted on purpose, so the allowlist cannot shadow the check under
-                # test: what must refuse this is the disposition, not the permission.
-                self.refuse(manifest=manifest,
-                            permitted=PERMITTED | {entry["expected_target"]},
-                            pattern="not recorded employer wording")
+                # Refused, and by the permission — but that is not the check under test.
+                self.refuse(manifest=manifest, pattern="nobody permitted")
+                # The floor beneath it, exercised where the permission cannot shadow it:
+                # even told this target is allowed, the index refuses to speak for a control
+                # reviewed as one that must pause.
+                indexed = ANSWERS._provenance_index(
+                    APPROVAL, CORPUS_ROOT,
+                    set(PERMITTED) | {entry["expected_target"]})
+                self.assertNotIn(entry["recorded_label"], indexed)
 
     def test_an_approval_that_describes_other_bytes_is_refused(self):
         """The digest is a claim about a recording, so it is checked against the recording."""
@@ -673,3 +678,220 @@ class CorpusIdentityTests(unittest.TestCase):
         module = importlib.util.module_from_spec(replay)
         replay.loader.exec_module(module)
         self.assertEqual(ANSWERS.RECORDED_ROLES, set(module.ROLE_CONTROLS))
+
+
+class ProductionCliTests(unittest.TestCase):
+    """The command as it is actually run: real argument parsing, real files on disk.
+
+    The permission lived in the intake plan for one commit, and the tests of that commit
+    checked the committed plan — which of course named the reviewed ten. What they never did
+    was hand the command a different plan. Copying the plan, adding `profile.website`, and
+    adding the matching reviewed form to the manifest imported eleven forms past every other
+    check, because every other check was satisfied: the wording was recorded, the corpus
+    matched, the disposition was `fact`. So these run the script.
+    """
+
+    SCRIPT = SCRIPTS / "answer_library.py"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.db_path = self.root / "library.db"
+        self.manifest_path = self.root / "manifest.json"
+        self.plan_path = self.root / "plan.json"
+        self.write(self.manifest_path, MANIFEST)
+        self.write(self.plan_path, PLAN)
+        self.approval_path = (ROOT / "tests" / "fixtures" / "ats-semantic"
+                              / "FIELD-DISPOSITION-APPROVAL.json")
+
+    def write(self, path, document):
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+    def run_import(self):
+        return subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--db", str(self.db_path),
+             "import-question-forms", "--manifest", str(self.manifest_path),
+             "--provenance", str(self.approval_path),
+             "--intake-plan", str(self.plan_path)],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=60)
+
+    def library(self):
+        if not self.db_path.exists():
+            return [], []
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            return (connection.execute(
+                        "SELECT normalized_question, canonical_id FROM question_forms "
+                        "ORDER BY normalized_question").fetchall(),
+                    connection.execute(
+                        "SELECT event_type, entity_id FROM audit_events "
+                        "ORDER BY event_id").fetchall())
+        finally:
+            connection.close()
+
+    def seed(self):
+        finished = self.run_import()
+        self.assertEqual(finished.returncode, 0, finished.stderr[-800:])
+        return self.library()
+
+    def assert_refused(self, before):
+        finished = self.run_import()
+        self.assertNotEqual(finished.returncode, 0, finished.stdout)
+        self.assertEqual(self.library(), before, "the refusal changed the library")
+        rendered = finished.stdout + finished.stderr
+        for form in MANIFEST["forms"]:
+            self.assertNotIn(form["question"], rendered)
+        return rendered
+
+    def reviewed_form(self, target):
+        entry = next(item for item in APPROVAL["entries"]
+                     if item["expected_target"] == target)
+        return {
+            "canonical_id": target, "canonical_meaning": "m",
+            "question": entry["recorded_label"], "match_level": "exact",
+            "verified_by_user": True,
+            "recorded_in": sorted({item["source_fixture"] for item in APPROVAL["entries"]
+                                   if item["recorded_label"] == entry["recorded_label"]}),
+        }
+
+    def test_the_reviewed_artifacts_import_and_then_do_nothing(self):
+        before = self.seed()
+        self.assertEqual(len(before[0]), 10)
+        finished = self.run_import()
+        self.assertEqual(finished.returncode, 0, finished.stderr[-800:])
+        result = json.loads(finished.stdout)
+        self.assertEqual(result["imported"], 0)
+        self.assertEqual(result["already_present"], 10)
+        self.assertEqual(self.library(), before)
+
+    def test_a_plan_that_grants_itself_another_fact_is_refused(self):
+        """The bypass, run through the command rather than described."""
+        for target in ("profile.website", "profile.github", "profile.portfolio",
+                       "contact.full_name", "employment.current_company"):
+            with self.subTest(target=target):
+                self.setUp()
+                before = self.seed()
+                plan = copy.deepcopy(PLAN)
+                plan["entries"].append({**plan["entries"][-1], "canonical_id": target,
+                                        "canonical_meaning": "m"})
+                manifest = copy.deepcopy(MANIFEST)
+                manifest["forms"].append(self.reviewed_form(target))
+                self.write(self.plan_path, plan)
+                self.write(self.manifest_path, manifest)
+                self.assertIn("reviewed meanings", self.assert_refused(before))
+
+    def test_a_plan_that_drops_a_meaning_does_not_quietly_import_the_rest(self):
+        before = self.seed()
+        plan = copy.deepcopy(PLAN)
+        dropped = plan["entries"].pop()
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["forms"] = [form for form in manifest["forms"]
+                             if form["canonical_id"] != dropped["canonical_id"]]
+        self.write(self.plan_path, plan)
+        self.write(self.manifest_path, manifest)
+        self.assertIn("reviewed meanings", self.assert_refused(before))
+
+    def test_a_plan_carrying_an_answer_or_enabling_submission_is_refused(self):
+        cases = {
+            "an answer": {"answer": "something the user never said"},
+            "automatic submission": {"auto_submit_allowed": True},
+            "filling switched off": {"auto_fill_allowed": False},
+            "a derived source": {"source_type": "deterministic_derivation"},
+        }
+        for label, change in cases.items():
+            with self.subTest(case=label):
+                self.setUp()
+                before = self.seed()
+                plan = copy.deepcopy(PLAN)
+                plan["entries"][0].update(change)
+                self.write(self.plan_path, plan)
+                self.assert_refused(before)
+
+    def test_a_plan_that_loosens_a_scope_is_refused(self):
+        cases = {
+            "no application scope": {"scope": {"country": "US"}},
+            "another application": {"scope": {"country": "US",
+                                              "application_id": "app-somewhere-else"}},
+            "not per application": {"validity_class": "stable"},
+        }
+        for label, change in cases.items():
+            with self.subTest(case=label):
+                self.setUp()
+                before = self.seed()
+                plan = copy.deepcopy(PLAN)
+                entry = next(item for item in plan["entries"]
+                             if item["canonical_id"] == "work_authorized_now")
+                entry.update(change)
+                self.write(self.plan_path, plan)
+                self.assert_refused(before)
+
+    def test_a_discovery_source_that_could_be_derived_is_refused(self):
+        before = self.seed()
+        plan = copy.deepcopy(PLAN)
+        entry = next(item for item in plan["entries"]
+                     if item["canonical_id"] == "discovery_source")
+        entry["answer_type"] = "stable_fact"
+        self.write(self.plan_path, plan)
+        self.assert_refused(before)
+
+    def test_a_malformed_plan_is_refused(self):
+        cases = {
+            "an extra top-level key": {**PLAN, "extra": "x"},
+            "no entries key": {k: v for k, v in PLAN.items() if k != "entries"},
+            "entries not a list": {**PLAN, "entries": {}},
+            "an entry with an extra key": None,
+            "a repeated meaning": None,
+            "blank application id": {**PLAN, "application_id": "  "},
+        }
+        cases["an entry with an extra key"] = copy.deepcopy(PLAN)
+        cases["an entry with an extra key"]["entries"][0]["invented"] = "x"
+        cases["a repeated meaning"] = copy.deepcopy(PLAN)
+        cases["a repeated meaning"]["entries"].append(
+            copy.deepcopy(cases["a repeated meaning"]["entries"][0]))
+        for label, plan in cases.items():
+            with self.subTest(case=label):
+                self.setUp()
+                before = self.seed()
+                self.write(self.plan_path, plan)
+                self.assert_refused(before)
+
+
+class PinnedTargetTests(unittest.TestCase):
+    def test_the_pinned_set_is_the_ten_that_were_reviewed(self):
+        self.assertEqual(set(ANSWERS.TASK14_QUESTION_FORM_TARGETS), {
+            "work_authorized_now", "citizenship_status", "permanent_residence_status",
+            "current_country_of_residence", "prior_employment_at_this_company",
+            "prior_employment_at_an_affiliate", "discovery_source",
+            "contact.email", "contact.phone", "profile.linkedin"})
+
+    def test_the_committed_plan_and_manifest_agree_with_the_pinned_set(self):
+        self.assertEqual({entry["canonical_id"] for entry in PLAN["entries"]},
+                         set(ANSWERS.TASK14_QUESTION_FORM_TARGETS))
+        self.assertEqual({form["canonical_id"] for form in MANIFEST["forms"]},
+                         set(ANSWERS.TASK14_QUESTION_FORM_TARGETS))
+
+    def test_a_permission_that_is_not_the_reviewed_set_is_refused(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        ANSWERS.initialize(connection)
+        self.addCleanup(connection.close)
+        widened = set(ANSWERS.TASK14_QUESTION_FORM_TARGETS) | {"profile.website"}
+        narrowed = set(ANSWERS.TASK14_QUESTION_FORM_TARGETS) - {"contact.email"}
+        for label, permitted in (("widened", widened), ("narrowed", narrowed)):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ValueError, "not the reviewed set"):
+                    ANSWERS.import_question_forms(connection, MANIFEST, APPROVAL,
+                                                  CORPUS_ROOT, permitted)
+
+    def test_a_permission_that_is_not_a_set_is_a_value_error_not_a_surprise(self):
+        """`set("profile.website")` is thirteen letters, which permits nothing very quietly."""
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        ANSWERS.initialize(connection)
+        self.addCleanup(connection.close)
+        for permitted in ("profile.website", None, 17, ["contact.email"], ()):
+            with self.subTest(permitted=type(permitted).__name__):
+                with self.assertRaisesRegex(ValueError, "must be a set"):
+                    ANSWERS.import_question_forms(connection, MANIFEST, APPROVAL,
+                                                  CORPUS_ROOT, permitted)
