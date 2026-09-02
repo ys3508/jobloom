@@ -232,15 +232,28 @@ PROVENANCE_FIELDS = {"reviewed_at", "reviewed_by", "note", "entries"}
 PROVENANCE_ENTRY_FIELDS = {"kind", "recorded_label", "role", "source_fixture",
                            "source_fixture_sha256", "expected_disposition",
                            "expected_target"}
-PROVENANCE_ENTRY_OPTIONAL = {"expected_domain", "expected_family", "review_reason"}
+# Every entry carries a domain and a family, null together or set together. `review_reason`
+# belongs to exactly the entries that pause. Nothing is loosely optional: a key set that
+# tolerates absences tolerates an approval that dropped the field carrying the answer.
+PROVENANCE_ENTRY_FIELDS_ALWAYS_MANUAL = PROVENANCE_ENTRY_FIELDS | {
+    "expected_domain", "expected_family", "review_reason"}
+PROVENANCE_ENTRY_FIELDS_ORDINARY = PROVENANCE_ENTRY_FIELDS | {
+    "expected_domain", "expected_family"}
 SHA256_SHAPE = re.compile(r"^[0-9a-f]{64}$")
-# Mirrors `field_policy.DISPOSITIONS`, declared here so the answer library does not import
-# the whole policy module to read one set. A test holds the two equal.
+# Mirrors `field_policy.DISPOSITIONS` and `semantic_replay.ROLE_CONTROLS`, declared here so
+# the answer library does not import either module to read one set. Tests hold them equal.
 REVIEWED_DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
+RECORDED_ROLES = {"textbox", "combobox", "radiogroup", "file"}
 # Which reviewed dispositions may become a question form at all. A form says "this wording
 # means this answerable thing", so a control reviewed as `always_manual` must never have one:
 # the whole point of that disposition is that the question reaches the user. `material` is a
 # file upload rather than a question with an answer, and `unsupported` is a refusal.
+#
+# This is a floor and not the permission. `answer` and `fact` between them cover every
+# contact fact, every profile URL and every employment fact in the corpus, so allowing a
+# disposition would have allowed `profile.github` and `employment.current_company` along with
+# the three contact meanings anybody reviewed. The permission is the explicit set of targets
+# the caller passes, which is why it has no default.
 FORMABLE_DISPOSITIONS = {"answer", "fact"}
 
 
@@ -282,7 +295,49 @@ def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
     return forms
 
 
-def _provenance_index(provenance: Any, fixture_root: Path) -> dict[str, set[tuple[str, str]]]:
+def _corpus_controls(corpus_root: Path) -> dict[tuple[str, str], tuple[str, str, str]]:
+    """Every control the pinned corpus actually records, read from the corpus.
+
+    A digest proves a file exists and has not changed. It proves nothing about whether the
+    approval describes what is inside it: with every hash correct, an approval could rename a
+    control's wording and its role, a manifest could use the renamed wording, and the two
+    files would agree with each other about a form no employer ships. The only way to close
+    that is to read the controls.
+
+    Returns `{(fixture, kind): (label, role, digest)}`.
+    """
+    if not isinstance(corpus_root, Path) or not corpus_root.is_dir():
+        raise ValueError("the recorded corpus this approval names is not readable")
+    controls: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for directory in sorted(path for path in corpus_root.iterdir() if path.is_dir()):
+        source = directory / "fixture.json"
+        if not source.is_file():
+            continue
+        raw = source.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            fixture = json.loads(raw)
+            steps = fixture["steps"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise ValueError("a recorded fixture cannot be read") from error
+        for step in steps:
+            for control in step.get("controls") or []:
+                if not isinstance(control, dict) or not {"kind", "label", "role"} <= set(control):
+                    # A fixture missing the fields the approval is checked against cannot be
+                    # checked against, and silently skipping it would let a corrupted corpus
+                    # approve whatever the approval says.
+                    raise ValueError("a recorded fixture is missing control fields")
+                key = (directory.name, control["kind"])
+                if key in controls:
+                    raise ValueError("a recorded fixture repeats a control")
+                controls[key] = (control["label"], control["role"], digest)
+    if not controls:
+        raise ValueError("the recorded corpus holds no controls")
+    return controls
+
+
+def _provenance_index(provenance: Any, corpus_root: Path,
+                      allowed_targets: set[str]) -> dict[str, set[tuple[str, str]]]:
     """Which `(fixture, meaning)` pairs actually recorded each wording.
 
     The index keeps the meaning, not just the fixture. Checking a question against the set
@@ -292,58 +347,82 @@ def _provenance_index(provenance: Any, fixture_root: Path) -> dict[str, set[tupl
     """
     if not isinstance(provenance, dict) or set(provenance) != PROVENANCE_FIELDS:
         raise ValueError("provenance has an unexpected shape")
+    for field in ("reviewed_at", "reviewed_by", "note"):
+        if not isinstance(provenance[field], str) or not provenance[field].strip():
+            raise ValueError(f"provenance metadata must be a non-empty string: {field}")
     entries = provenance["entries"]
     if not isinstance(entries, list) or not entries:
         raise ValueError("provenance carries no reviewed entries")
-    if not isinstance(fixture_root, Path) or not fixture_root.is_dir():
-        raise ValueError("the recorded fixtures this approval names are not readable")
+    if not isinstance(allowed_targets, (set, frozenset)) or not allowed_targets:
+        raise ValueError("no reviewed targets were permitted for import")
+    corpus = _corpus_controls(corpus_root)
+
     index: dict[str, set[tuple[str, str]]] = {}
-    controls: set[tuple[str, str]] = set()
+    reviewed: set[tuple[str, str]] = set()
     meanings: dict[str, str] = {}
-    digests: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             raise ValueError("provenance entry has an unexpected shape")
-        keys = set(entry)
-        if not PROVENANCE_ENTRY_FIELDS <= keys or keys - PROVENANCE_ENTRY_FIELDS - PROVENANCE_ENTRY_OPTIONAL:
+        manual = entry.get("expected_disposition") == "always_manual"
+        expected_keys = (PROVENANCE_ENTRY_FIELDS_ALWAYS_MANUAL if manual
+                         else PROVENANCE_ENTRY_FIELDS_ORDINARY)
+        if set(entry) != expected_keys:
+            # `review_reason` belongs to exactly the entries that pause, and every entry
+            # carries a domain and a family. An approval that dropped one is an approval
+            # missing the field that carried the answer.
             raise ValueError("provenance entry has an unexpected shape")
-        for field in ("kind", "recorded_label", "source_fixture", "expected_target",
+        for field in ("kind", "recorded_label", "role", "source_fixture", "expected_target",
                       "expected_disposition"):
             if not isinstance(entry[field], str) or not entry[field].strip():
                 raise ValueError(f"provenance entry field must be a non-empty string: {field}")
+        if manual and (not isinstance(entry["review_reason"], str)
+                       or not entry["review_reason"].strip()):
+            raise ValueError("a pausing entry must say why")
+        domain, family = entry["expected_domain"], entry["expected_family"]
+        if (domain is None) != (family is None):
+            # A family without a domain names a rule that did not fire.
+            raise ValueError("provenance domain and family must stand or fall together")
+        for value in (domain, family):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("provenance domain and family must be names or null")
         if not SHA256_SHAPE.fullmatch(entry["source_fixture_sha256"] or ""):
             raise ValueError("provenance entry does not name a sha256 digest")
         if entry["expected_disposition"] not in REVIEWED_DISPOSITIONS:
             raise ValueError("provenance entry names an unknown disposition")
-        fixture = entry["source_fixture"]
-        # The approval says which bytes it reviewed. Reading them is what makes that a claim
-        # about a recording rather than a string in a file: an approval edited to describe a
-        # different corpus stops matching the corpus it names.
-        recorded_digest = digests.get(fixture)
-        if recorded_digest is None:
-            path = fixture_root / fixture / "fixture.json"
-            if not path.is_file():
-                raise ValueError("provenance names a fixture that is not present")
-            recorded_digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            digests[fixture] = recorded_digest
-        if entry["source_fixture_sha256"] != recorded_digest:
-            raise ValueError("provenance describes different bytes than the fixture holds")
+        if entry["role"] not in RECORDED_ROLES:
+            raise ValueError("provenance entry names an unrecorded control role")
+
         control = (entry["source_fixture"], entry["kind"])
-        if control in controls:
+        if control in reviewed:
             raise ValueError(f"provenance reviews one control twice: {control[1]}")
-        controls.add(control)
+        reviewed.add(control)
+        recorded = corpus.get(control)
+        if recorded is None:
+            raise ValueError("provenance reviews a control the corpus does not record")
+        # Read from the corpus, not taken from the approval. A digest says the file has not
+        # changed; this says the approval describes what is in it.
+        if (entry["recorded_label"], entry["role"], entry["source_fixture_sha256"]) != recorded:
+            raise ValueError("provenance does not match the recorded control")
+
         label, target = entry["recorded_label"], entry["expected_target"]
         if meanings.setdefault(label, target) != target:
             # The same thing `match_answer` reports as `question_mapping_conflict`, in the
             # file that is supposed to be settling it.
             raise ValueError("provenance reviews one wording as two meanings")
-        if entry["expected_disposition"] in FORMABLE_DISPOSITIONS:
+        if (entry["expected_disposition"] in FORMABLE_DISPOSITIONS
+                and target in allowed_targets):
             index.setdefault(label, set()).add((entry["source_fixture"], target))
+
+    missing = sorted(set(corpus) - reviewed)
+    if missing:
+        # Both directions. Walking the approval can never notice a control nobody reviewed,
+        # which is the same hole the disposition approval itself once had.
+        raise ValueError("the corpus records a control the approval never reviewed")
     return index
 
 
-def import_question_forms(connection: sqlite3.Connection, manifest: Any,
-                          provenance: Any, fixture_root: Path) -> dict[str, Any]:
+def import_question_forms(connection: sqlite3.Connection, manifest: Any, provenance: Any,
+                          corpus_root: Path, allowed_targets: set[str]) -> dict[str, Any]:
     """Apply a reviewed manifest to this library, wholly or not at all.
 
     Deliberately not called by `initialize`. A file appearing in a checkout is not a person
@@ -356,6 +435,14 @@ def import_question_forms(connection: sqlite3.Connection, manifest: Any,
     was widened — is a conflict and stops the whole import, because a half-applied vocabulary
     is worse than none.
 
+    `allowed_targets` is the explicit set of canonical meanings this import may create forms
+    for, and it has no default. A disposition is a floor, not a permission: `answer` and
+    `fact` between them cover every contact fact, every profile URL and every employment fact
+    the corpus records, so gating on disposition alone let `profile.github`,
+    `profile.website`, `profile.portfolio`, `contact.full_name` and
+    `employment.current_company` in beside the three contact meanings that were actually
+    reviewed for this.
+
     `provenance` is the reviewed disposition approval and is required. It was briefly
     optional, which made the whole check decorative: any file in a checkout that called
     itself `exact` and `verified_by_user` could write arbitrary mappings in bulk, and a
@@ -366,7 +453,14 @@ def import_question_forms(connection: sqlite3.Connection, manifest: Any,
     the mapping was nonsense.
     """
     forms = _manifest_forms(manifest)
-    recorded = _provenance_index(provenance, fixture_root)
+    recorded = _provenance_index(provenance, corpus_root, set(allowed_targets))
+    unpermitted = sorted({form["canonical_id"] for form in forms} - set(allowed_targets))
+    if unpermitted:
+        # The disposition floor is not the permission. `answer` and `fact` between them cover
+        # every contact fact, every profile URL and every employment fact in the corpus, so
+        # allowing a disposition would have allowed `profile.github` and
+        # `employment.current_company` beside the three contact meanings anybody reviewed.
+        raise ValueError("question form names a meaning nobody permitted for import")
     for form in forms:
         question = form["question"]
         if question not in recorded:
@@ -581,7 +675,11 @@ def main() -> None:
     forms_import.add_argument("--manifest", required=True, type=Path)
     forms_import.add_argument("--provenance", required=True, type=Path,
                               help="the reviewed disposition approval every question must "
-                                   "be traceable to, wording and meaning both")
+                                   "be traceable to, wording and meaning both; the recorded "
+                                   "corpus is read from `upstream/` beside it")
+    forms_import.add_argument("--intake-plan", required=True, type=Path,
+                              help="the value-free plan naming which canonical meanings may "
+                                   "be imported at all")
     invalidate = subparsers.add_parser("invalidate")
     invalidate.add_argument("--trigger", required=True)
     match = subparsers.add_parser("match")
@@ -611,10 +709,12 @@ def main() -> None:
     elif args.command == "import-question-forms":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
-        # Beside the approval, never a separate argument: a caller who could point this
-        # somewhere else could point it at fixtures they wrote themselves.
+        plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
+        permitted = {entry["canonical_id"] for entry in plan["entries"]}
+        # The corpus sits beside the approval, never as its own argument: a caller who could
+        # point it somewhere else could point it at recordings they wrote themselves.
         result = import_question_forms(connection, manifest, provenance,
-                                       args.provenance.parent / "upstream")
+                                       args.provenance.parent / "upstream", permitted)
     elif args.command == "invalidate":
         result = {"status": "invalidated", "answer_ids": invalidate_by_trigger(connection, args.trigger)}
     elif args.command == "match":

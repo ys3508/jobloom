@@ -15,9 +15,11 @@ copies it somewhere new.
 
 import copy
 import importlib.util
+import shutil
 import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -35,7 +37,11 @@ spec.loader.exec_module(ANSWERS)
 
 MANIFEST = json.loads((ROOT / "skills" / "jobloom" / "assets" / "question-forms.json")
                       .read_text(encoding="utf-8"))
-FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
+CORPUS_ROOT = ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
+PLAN = json.loads((ROOT / "skills" / "jobloom" / "assets" / "answer-intake-plan.json")
+                  .read_text(encoding="utf-8"))
+# The permission, taken from the value-free intake plan rather than from a disposition.
+PERMITTED = {entry["canonical_id"] for entry in PLAN["entries"]}
 APPROVAL = json.loads(
     (ROOT / "tests" / "fixtures" / "ats-semantic" / "FIELD-DISPOSITION-APPROVAL.json")
     .read_text(encoding="utf-8"))
@@ -66,7 +72,7 @@ class QuestionFormImportTests(unittest.TestCase):
     def test_importing_a_manifest_makes_its_questions_understood(self):
         before = ANSWERS.match_answer(self.db, MANIFEST["forms"][0]["question"], {})
         self.assertEqual(before["reason"], "new_question")
-        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(result["imported"], len(MANIFEST["forms"]))
         self.assertEqual(result["already_present"], 0)
         after = ANSWERS.match_answer(self.db, MANIFEST["forms"][0]["question"], {})
@@ -81,8 +87,8 @@ class QuestionFormImportTests(unittest.TestCase):
         Refusing the whole thing because nine of ten rows are already there would mean the
         only way to add a form is by hand, which is the state this replaces.
         """
-        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
-        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
+        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(result["imported"], 0)
         self.assertEqual(result["already_present"], len(MANIFEST["forms"]))
         self.assertEqual(self.forms(), len(MANIFEST["forms"]))
@@ -90,9 +96,9 @@ class QuestionFormImportTests(unittest.TestCase):
     def test_a_manifest_that_grew_imports_only_the_new_form(self):
         partial = copy.deepcopy(MANIFEST)
         removed = partial["forms"].pop()
-        ANSWERS.import_question_forms(self.db, partial, APPROVAL, FIXTURE_ROOT)
+        ANSWERS.import_question_forms(self.db, partial, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), len(MANIFEST["forms"]) - 1)
-        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(result["imported"], 1)
         self.assertEqual(result["already_present"], len(MANIFEST["forms"]) - 1)
         self.assertEqual(
@@ -118,7 +124,7 @@ class QuestionFormImportTests(unittest.TestCase):
 
         with unittest.mock.patch.object(ANSWERS, "audit", failing_audit):
             with self.assertRaises(RuntimeError):
-                ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+                ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     # ---- shape ----------------------------------------------------------------
@@ -139,7 +145,7 @@ class QuestionFormImportTests(unittest.TestCase):
         for label, manifest in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ValueError):
-                    ANSWERS.import_question_forms(self.db, manifest, APPROVAL, FIXTURE_ROOT)
+                    ANSWERS.import_question_forms(self.db, manifest, APPROVAL, CORPUS_ROOT, PERMITTED)
                 self.assertEqual(self.forms(), 0)
 
     def test_a_semantic_equivalent_cannot_arrive_in_bulk(self):
@@ -147,10 +153,10 @@ class QuestionFormImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only exact"):
             ANSWERS.import_question_forms(
                 self.db, self.broken_form(match_level="semantic_equivalent"),
-                APPROVAL, FIXTURE_ROOT)
+                APPROVAL, CORPUS_ROOT, PERMITTED)
         with self.assertRaisesRegex(ValueError, "user-verified"):
             ANSWERS.import_question_forms(
-                self.db, self.broken_form(verified_by_user=False), APPROVAL, FIXTURE_ROOT)
+                self.db, self.broken_form(verified_by_user=False), APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     # ---- conflicts ------------------------------------------------------------
@@ -161,21 +167,21 @@ class QuestionFormImportTests(unittest.TestCase):
         clash["canonical_id"] = "something_else"
         manifest["forms"].append(clash)
         with self.assertRaisesRegex(ValueError, "two meanings"):
-            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_the_same_form_twice_in_one_manifest_is_refused(self):
         manifest = copy.deepcopy(MANIFEST)
         manifest["forms"].append(copy.deepcopy(manifest["forms"][0]))
         with self.assertRaisesRegex(ValueError, "repeated"):
-            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_a_library_that_already_maps_the_question_elsewhere_is_not_overwritten(self):
         ANSWERS.add_question_form(self.db, "somebody_elses_meaning",
                                   MANIFEST["forms"][0]["question"])
         with self.assertRaisesRegex(ValueError, "already maps"):
-            ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 1)
 
     def test_a_widened_match_level_already_in_the_library_is_a_conflict(self):
@@ -183,7 +189,7 @@ class QuestionFormImportTests(unittest.TestCase):
         ANSWERS.add_question_form(self.db, form["canonical_id"], form["question"],
                                   "semantic_equivalent", True)
         with self.assertRaisesRegex(ValueError, "different form"):
-            ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 1)
 
     # ---- provenance -----------------------------------------------------------
@@ -193,14 +199,14 @@ class QuestionFormImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not recorded employer wording"):
             ANSWERS.import_question_forms(
                 self.db, self.broken_form(question="Are you a self-starter?"),
-                APPROVAL, FIXTURE_ROOT)
+                APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_naming_the_wrong_recording_is_refused(self):
         with self.assertRaisesRegex(ValueError, "reviewed provenance"):
             ANSWERS.import_question_forms(
                 self.db, self.broken_form(recorded_in=["a-fixture-that-did-not-record-it"]),
-                APPROVAL, FIXTURE_ROOT)
+                APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_provenance_cannot_be_omitted(self):
@@ -232,7 +238,7 @@ class QuestionFormImportTests(unittest.TestCase):
             if not (form["canonical_id"] == "work_authorized_now"
                     and form["question"] == "Authorized to work in the United States?")]
         with self.assertRaisesRegex(ValueError, "reviewed provenance"):
-            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_provenance_of_an_unexpected_shape_is_refused_whole(self):
@@ -265,25 +271,32 @@ class QuestionFormImportTests(unittest.TestCase):
         for label, provenance in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ValueError):
-                    ANSWERS.import_question_forms(self.db, MANIFEST, provenance, FIXTURE_ROOT)
+                    ANSWERS.import_question_forms(self.db, MANIFEST, provenance, CORPUS_ROOT, PERMITTED)
                 self.assertEqual(self.forms(), 0)
 
     def test_provenance_that_contradicts_itself_is_refused(self):
-        """A file settling what wording means may not review one wording as two meanings."""
+        """A file settling what wording means may not review one wording as two meanings.
+
+        Reading the corpus now catches this first — an invented control is not recorded
+        anywhere — so the two-meanings guard has become defence in depth rather than the
+        thing standing between a contradiction and the library. What matters here is that
+        the contradiction does not get in, not which guard turns it away.
+        """
         provenance = copy.deepcopy(APPROVAL)
         clash = copy.deepcopy(provenance["entries"][0])
         clash["kind"] = "invented.kind"
         clash["expected_target"] = "something_else_entirely"
         provenance["entries"].append(clash)
-        with self.assertRaisesRegex(ValueError, "two meanings"):
-            ANSWERS.import_question_forms(self.db, MANIFEST, provenance, FIXTURE_ROOT)
+        with self.assertRaises(ValueError):
+            ANSWERS.import_question_forms(self.db, MANIFEST, provenance, CORPUS_ROOT,
+                                          PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_provenance_that_reviews_one_control_twice_is_refused(self):
         provenance = copy.deepcopy(APPROVAL)
         provenance["entries"].append(copy.deepcopy(provenance["entries"][0]))
         with self.assertRaisesRegex(ValueError, "one control twice"):
-            ANSWERS.import_question_forms(self.db, MANIFEST, provenance, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, MANIFEST, provenance, CORPUS_ROOT, PERMITTED)
         self.assertEqual(self.forms(), 0)
 
     def test_every_rejection_leaves_the_library_exactly_as_it_was(self):
@@ -292,7 +305,7 @@ class QuestionFormImportTests(unittest.TestCase):
         Checked from a library that already holds forms, because "nothing was written" is
         easy to satisfy from empty and is not what a real refusal has to preserve.
         """
-        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         before = self.db.execute(
             "SELECT normalized_question, canonical_id, match_level FROM question_forms "
             "ORDER BY normalized_question").fetchall()
@@ -302,7 +315,7 @@ class QuestionFormImportTests(unittest.TestCase):
             "question": "Do you like puppies?", "match_level": "exact",
             "verified_by_user": True, "recorded_in": ["invented-fixture"]})
         with self.assertRaises(ValueError):
-            ANSWERS.import_question_forms(self.db, grown, APPROVAL, FIXTURE_ROOT)
+            ANSWERS.import_question_forms(self.db, grown, APPROVAL, CORPUS_ROOT, PERMITTED)
         after = self.db.execute(
             "SELECT normalized_question, canonical_id, match_level FROM question_forms "
             "ORDER BY normalized_question").fetchall()
@@ -315,7 +328,7 @@ class QuestionFormImportTests(unittest.TestCase):
                                      (MANIFEST, {**APPROVAL, "entries": []})):
             with self.subTest():
                 with self.assertRaises(ValueError) as caught:
-                    ANSWERS.import_question_forms(self.db, manifest, provenance, FIXTURE_ROOT)
+                    ANSWERS.import_question_forms(self.db, manifest, provenance, CORPUS_ROOT, PERMITTED)
                 message = str(caught.exception)
                 for form in MANIFEST["forms"]:
                     self.assertNotIn(form["question"], message)
@@ -333,7 +346,7 @@ class QuestionFormImportTests(unittest.TestCase):
             fresh.execute("SELECT COUNT(*) FROM question_forms").fetchone()[0], 0)
 
     def test_the_result_names_meanings_and_counts_but_never_wording(self):
-        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        result = ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         rendered = json.dumps(result, ensure_ascii=False)
         self.assertEqual(set(result), {"imported", "already_present", "canonical_ids"})
         for form in MANIFEST["forms"]:
@@ -343,7 +356,7 @@ class QuestionFormImportTests(unittest.TestCase):
 
     def test_the_audit_log_hashes_the_question_rather_than_keeping_it(self):
         """An audit log is not a place to accumulate a second copy of the vocabulary."""
-        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, FIXTURE_ROOT)
+        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
         logged = "\n".join(
             row["metadata_json"] for row in
             self.db.execute("SELECT metadata_json FROM audit_events"))
@@ -372,13 +385,15 @@ class ProvenanceIntegrityTests(unittest.TestCase):
     # test, and a default that swallowed it would have quietly imported the real manifest.
     UNSET = object()
 
-    def refuse(self, manifest=UNSET, provenance=UNSET, fixture_root=UNSET, pattern=""):
+    def refuse(self, manifest=UNSET, provenance=UNSET, corpus_root=UNSET,
+               permitted=UNSET, pattern=""):
         with self.assertRaisesRegex(ValueError, pattern):
             ANSWERS.import_question_forms(
                 self.db,
                 MANIFEST if manifest is self.UNSET else manifest,
                 APPROVAL if provenance is self.UNSET else provenance,
-                FIXTURE_ROOT if fixture_root is self.UNSET else fixture_root)
+                CORPUS_ROOT if corpus_root is self.UNSET else corpus_root,
+                PERMITTED if permitted is self.UNSET else permitted)
         self.assertEqual(self.forms(), 0)
 
     def test_the_reviewed_disposition_vocabulary_has_not_drifted(self):
@@ -407,13 +422,17 @@ class ProvenanceIntegrityTests(unittest.TestCase):
                     "question": entry["recorded_label"], "match_level": "exact",
                     "verified_by_user": True,
                     "recorded_in": [entry["source_fixture"]]})
-                self.refuse(manifest=manifest, pattern="not recorded employer wording")
+                # Permitted on purpose, so the allowlist cannot shadow the check under
+                # test: what must refuse this is the disposition, not the permission.
+                self.refuse(manifest=manifest,
+                            permitted=PERMITTED | {entry["expected_target"]},
+                            pattern="not recorded employer wording")
 
     def test_an_approval_that_describes_other_bytes_is_refused(self):
         """The digest is a claim about a recording, so it is checked against the recording."""
         tampered = copy.deepcopy(APPROVAL)
         tampered["entries"][0]["source_fixture_sha256"] = "0" * 64
-        self.refuse(provenance=tampered, pattern="different bytes")
+        self.refuse(provenance=tampered, pattern="not match the recorded control")
 
     def test_a_digest_that_is_not_a_digest_is_refused(self):
         for bad in ("", "not-a-digest", "A" * 64, "0" * 63, "0" * 65, "g" * 64):
@@ -430,12 +449,12 @@ class ProvenanceIntegrityTests(unittest.TestCase):
     def test_an_approval_naming_a_fixture_that_is_not_there_is_refused(self):
         tampered = copy.deepcopy(APPROVAL)
         tampered["entries"][0]["source_fixture"] = "a-corpus-nobody-shipped"
-        self.refuse(provenance=tampered, pattern="not present")
+        self.refuse(provenance=tampered, pattern="does not record|not match the recorded")
 
     def test_fixtures_that_cannot_be_read_stop_the_import(self):
         """Not an optional check that quietly turns itself off when the corpus is missing."""
-        self.refuse(fixture_root=FIXTURE_ROOT / "nowhere", pattern="not readable")
-        self.refuse(fixture_root="a string, not a path", pattern="not readable")
+        self.refuse(corpus_root=CORPUS_ROOT / "nowhere", pattern="not readable")
+        self.refuse(corpus_root="a string, not a path", pattern="not readable")
 
     def test_recorded_in_must_be_the_exact_set_that_recorded_the_wording(self):
         """One fewer, one more, or one wrong — each is a different lie about provenance."""
@@ -465,3 +484,192 @@ class ProvenanceIntegrityTests(unittest.TestCase):
         for provenance in (None, [], "", 17, {"entries": None}):
             with self.subTest(provenance=type(provenance).__name__):
                 self.refuse(provenance=provenance, pattern="unexpected shape|no reviewed")
+
+
+class CorpusIdentityTests(unittest.TestCase):
+    """The approval has to describe the controls the pinned corpus actually records.
+
+    A digest says a file exists and has not changed. It says nothing about whether the
+    approval describes what is inside it — so with every hash correct, an approval could
+    rename a control's wording and its role, a manifest could use the renamed wording, and
+    the two files would agree with each other about a form no employer ships. Every test
+    here keeps the digests honest and moves something else.
+    """
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        ANSWERS.initialize(self.db)
+        self.addCleanup(self.db.close)
+        # A library that already holds the forms, so "unchanged" means what it should.
+        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL, CORPUS_ROOT, PERMITTED)
+        self.before = self.snapshot()
+
+    def snapshot(self):
+        return (
+            [tuple(row) for row in self.db.execute(
+                "SELECT normalized_question, canonical_id, match_level FROM question_forms "
+                "ORDER BY normalized_question")],
+            [tuple(row) for row in self.db.execute(
+                "SELECT event_type, entity_id, metadata_json FROM audit_events "
+                "ORDER BY event_id")],
+        )
+
+    def refuse(self, provenance=None, manifest=None, corpus_root=None, permitted=None):
+        with self.assertRaises(ValueError) as caught:
+            ANSWERS.import_question_forms(
+                self.db, MANIFEST if manifest is None else manifest,
+                APPROVAL if provenance is None else provenance,
+                CORPUS_ROOT if corpus_root is None else corpus_root,
+                PERMITTED if permitted is None else permitted)
+        # Nothing moved: not the forms, and not the audit log either.
+        self.assertEqual(self.snapshot(), self.before)
+        message = str(caught.exception)
+        for form in MANIFEST["forms"]:
+            self.assertNotIn(form["question"], message)
+        return message
+
+    def entry_for(self, target):
+        return next(item for item in APPROVAL["entries"]
+                    if item["expected_target"] == target)
+
+    def test_a_rewritten_label_is_refused_though_every_digest_is_correct(self):
+        """The hole this class exists for. Nothing else had to change for it to work."""
+        provenance = copy.deepcopy(APPROVAL)
+        entry = next(item for item in provenance["entries"]
+                     if item["expected_target"] == "contact.email")
+        entry["recorded_label"] = "Your electronic mail"
+        manifest = copy.deepcopy(MANIFEST)
+        form = next(item for item in manifest["forms"]
+                    if item["canonical_id"] == "contact.email")
+        form["question"] = "Your electronic mail"
+        form["recorded_in"] = [entry["source_fixture"]]
+        self.assertIn("recorded control",
+                      self.refuse(provenance=provenance, manifest=manifest))
+
+    def test_a_rewritten_role_is_refused(self):
+        provenance = copy.deepcopy(APPROVAL)
+        entry = provenance["entries"][0]
+        entry["role"] = "combobox" if entry["role"] != "combobox" else "textbox"
+        self.assertIn("recorded control", self.refuse(provenance=provenance))
+
+    def test_a_rewritten_kind_is_refused(self):
+        provenance = copy.deepcopy(APPROVAL)
+        provenance["entries"][0]["kind"] = "contact.invented"
+        self.assertIn("does not record", self.refuse(provenance=provenance))
+
+    def test_an_approval_missing_a_recorded_control_is_refused(self):
+        """Walking the approval can never notice a control nobody reviewed.
+
+        The same hole the disposition approval itself once had, closed the same way: the
+        comparison runs corpus → approval as well as approval → corpus.
+        """
+        provenance = copy.deepcopy(APPROVAL)
+        provenance["entries"].pop()
+        self.assertIn("never reviewed", self.refuse(provenance=provenance))
+
+    def test_an_approval_reviewing_a_control_nobody_recorded_is_refused(self):
+        provenance = copy.deepcopy(APPROVAL)
+        invented = copy.deepcopy(provenance["entries"][0])
+        invented["kind"] = "contact.invented"
+        provenance["entries"].append(invented)
+        self.assertIn("does not record", self.refuse(provenance=provenance))
+
+    def test_one_changed_byte_in_a_recorded_fixture_is_refused(self):
+        """The digest still has to match, and now it is compared per control."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "upstream"
+            shutil.copytree(CORPUS_ROOT, root)
+            victim = next(root.iterdir()) / "fixture.json"
+            # A byte inside a recorded label: the document stays valid JSON, so nothing but
+            # the comparison against the approval can notice.
+            raw = victim.read_bytes()
+            victim.write_bytes(raw.replace(b'"Resume"', b'"Resum3"', 1))
+            self.assertNotEqual(raw, victim.read_bytes(), "the corpus was not modified")
+            self.assertIn("recorded control", self.refuse(corpus_root=root))
+
+    def test_a_fact_nobody_permitted_cannot_become_a_question_form(self):
+        """A disposition is a floor, not a permission.
+
+        `answer` and `fact` between them cover every contact fact, every profile URL and
+        every employment fact in the corpus. Gating on disposition alone let all of these in
+        beside the three contact meanings that were actually reviewed for this task.
+        """
+        for target in ("contact.full_name", "profile.website", "profile.github",
+                       "profile.portfolio", "employment.current_company",
+                       "contact.location"):
+            with self.subTest(target=target):
+                entry = self.entry_for(target)
+                manifest = copy.deepcopy(MANIFEST)
+                manifest["forms"].append({
+                    "canonical_id": target, "canonical_meaning": "m",
+                    "question": entry["recorded_label"], "match_level": "exact",
+                    "verified_by_user": True,
+                    "recorded_in": sorted({
+                        item["source_fixture"] for item in APPROVAL["entries"]
+                        if item["recorded_label"] == entry["recorded_label"]})})
+                self.assertIn("nobody permitted", self.refuse(manifest=manifest))
+
+    def test_the_permitted_set_is_exactly_the_reviewed_intake_plan(self):
+        self.assertEqual(PERMITTED, {form["canonical_id"] for form in MANIFEST["forms"]})
+        self.assertEqual(len(PERMITTED), 10)
+        for absent in ("profile.website", "profile.github", "profile.portfolio",
+                       "contact.full_name", "employment.current_company"):
+            self.assertNotIn(absent, PERMITTED)
+
+    def test_an_empty_permission_imports_nothing(self):
+        self.refuse(permitted=set())
+
+    def test_a_missing_domain_family_or_review_reason_is_refused(self):
+        cases = {
+            "no domain key": ("expected_domain", None, "pop"),
+            "no family key": ("expected_family", None, "pop"),
+            "domain without family": ("expected_family", None, "set"),
+            "blank domain": ("expected_domain", "  ", "set"),
+        }
+        for label, (field, value, how) in cases.items():
+            with self.subTest(case=label):
+                provenance = copy.deepcopy(APPROVAL)
+                entry = next(item for item in provenance["entries"]
+                             if item["expected_domain"] is not None)
+                if how == "pop":
+                    entry.pop(field)
+                else:
+                    entry[field] = value
+                self.refuse(provenance=provenance)
+
+    def test_review_reason_belongs_to_exactly_the_entries_that_pause(self):
+        dropped = copy.deepcopy(APPROVAL)
+        manual = next(item for item in dropped["entries"]
+                      if item["expected_disposition"] == "always_manual")
+        manual.pop("review_reason")
+        self.refuse(provenance=dropped)
+
+        blank = copy.deepcopy(APPROVAL)
+        next(item for item in blank["entries"]
+             if item["expected_disposition"] == "always_manual")["review_reason"] = "  "
+        self.refuse(provenance=blank)
+
+        spurious = copy.deepcopy(APPROVAL)
+        next(item for item in spurious["entries"]
+             if item["expected_disposition"] != "always_manual")["review_reason"] = "why"
+        self.refuse(provenance=spurious)
+
+    def test_an_unrecorded_role_is_refused(self):
+        provenance = copy.deepcopy(APPROVAL)
+        provenance["entries"][0]["role"] = "slider"
+        self.assertIn("unrecorded control role", self.refuse(provenance=provenance))
+
+    def test_blank_top_level_metadata_is_refused(self):
+        for field in ("reviewed_at", "reviewed_by", "note"):
+            with self.subTest(field=field):
+                provenance = copy.deepcopy(APPROVAL)
+                provenance[field] = "   "
+                self.refuse(provenance=provenance)
+
+    def test_the_recorded_role_vocabulary_has_not_drifted(self):
+        replay = importlib.util.spec_from_file_location(
+            "import_semantic_replay", SCRIPTS / "semantic_replay.py")
+        module = importlib.util.module_from_spec(replay)
+        replay.loader.exec_module(module)
+        self.assertEqual(ANSWERS.RECORDED_ROLES, set(module.ROLE_CONTROLS))
