@@ -47,12 +47,14 @@ MANIFEST = json.loads(
     .read_text(encoding="utf-8"))
 ARTIFACT = ROOT / "docs" / "answer-library-coverage-2026-09-02.md"
 
-# The scope the one live application carries. Identifiers, not values: measuring under a
-# synthetic context would measure a situation nobody is in. The authorization is
-# reconstructed from these in `library()` so `auto_fill_ready` is measured under a standing
-# authorization rather than under none.
-REAL_CONTEXT = {"country": "US", "application_id": "app-mgb-rq4077023"}
-REAL_AUTHORIZATION = "auth-mgb-rq4077023"
+# A test context rebuilt in the shape of the current authorization. Nothing here reads the
+# private library or the authorization living in it: `library()` constructs a fresh
+# in-memory one carrying the same id and the same scope, so `auto_fill_ready` is measured
+# with a standing authorization present rather than with none. Calling that "measured under
+# the live authorization" would claim a reading of state this never touches. The identifiers
+# are identifiers, not values.
+CONTEXT_SHAPE = {"country": "US", "application_id": "app-mgb-rq4077023"}
+AUTHORIZATION_SHAPE = "auth-mgb-rq4077023"
 AT = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
 
 MAPPED = {
@@ -83,13 +85,14 @@ def reviewed_questions():
 
 
 def library():
-    """A temporary library holding the live authorization and nothing else."""
+    """A fresh in-memory library holding an authorization of the current shape, and nothing
+    else. Not the private one, and not a copy of it."""
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     ANSWERS.initialize(connection)
     ANSWERS.add_authorization(connection, {
-        "authorization_id": REAL_AUTHORIZATION, "confirmed_at": AT.isoformat(),
-        "expires_at": (AT + timedelta(days=9)).isoformat(), "scope": dict(REAL_CONTEXT)})
+        "authorization_id": AUTHORIZATION_SHAPE, "confirmed_at": AT.isoformat(),
+        "expires_at": (AT + timedelta(days=9)).isoformat(), "scope": dict(CONTEXT_SHAPE)})
     return connection
 
 
@@ -103,8 +106,8 @@ def measure_controls(connection):
     rows = []
     for entry in sorted(APPROVAL["entries"],
                         key=lambda item: (item["source_fixture"], item["kind"])):
-        match = ANSWERS.match_answer(connection, entry["recorded_label"], REAL_CONTEXT,
-                                     REAL_AUTHORIZATION, AT)
+        match = ANSWERS.match_answer(connection, entry["recorded_label"], CONTEXT_SHAPE,
+                                     AUTHORIZATION_SHAPE, AT)
         rows.append({
             "source_fixture": entry["source_fixture"],
             "kind": entry["kind"],
@@ -148,15 +151,16 @@ def render_artifact(baseline, after, answers_written):
         "with the reviewed question forms applied and still no answers written. Rendered and",
         "compared whole by `tests/test_answer_library_coverage.py`, so it cannot drift.",
         "",
-        "Measured under the scope the one live application carries —",
-        f"`{{country: {REAL_CONTEXT['country']}, application_id: {REAL_CONTEXT['application_id']}}}`,",
-        f"authorization `{REAL_AUTHORIZATION}` — because a synthetic context would measure a",
-        "situation nobody is in.",
+        "**This measures a fresh in-memory library, not the private one.** Nothing here reads",
+        "`.jobloom/` or the authorization living in it. The context is rebuilt in the shape of",
+        f"the current one — `{{country: {CONTEXT_SHAPE['country']}, application_id:",
+        f"{CONTEXT_SHAPE['application_id']}}}`, authorization `{AUTHORIZATION_SHAPE}` — so",
+        "`auto_fill_ready` is measured with a standing authorization present rather than with",
+        "none. It is not a reading of live state.",
         "",
-        "**This measures a temporary library, not the private one.** It says what the forms do",
-        "when applied. Applying them to `.jobloom/` is `answer_library.py",
-        "import-question-forms`, a command a person runs, and the count that matters afterwards",
-        "is the one that command reports.",
+        "Applying the forms to the private library is `answer_library.py",
+        "import-question-forms`, a command a person runs, and what that library holds",
+        "afterwards is a separate value-free check against the library itself.",
         "",
         "**Value-free by construction.** Each row carries source fixture, kind, recorded",
         "employer wording, reviewed disposition, canonical meaning, reason code and",
@@ -292,35 +296,48 @@ class ArtifactTests(unittest.TestCase):
             ARTIFACT.read_text(encoding="utf-8"), expected,
             "the artifact is stale; regenerate with JOBLOOM_REGENERATE=1")
 
-    def test_every_wording_appears_once_with_the_reasons_it_was_measured_with(self):
-        """Parsed back per row, keyed by wording, so a misaligned row cannot hide.
+    def test_all_forty_five_rows_parse_back_to_the_measurement_whole(self):
+        """Every row, every field, keyed by the control rather than by the wording.
 
-        Byte equality already catches this. Reading the table back and comparing tuples
-        catches the other direction: a document that was regenerated correctly from a
-        measurement that had itself gone wrong.
+        Byte equality already catches a stale file. This catches the other direction — a file
+        rendered faithfully from a measurement that had itself gone wrong — and it does it at
+        the granularity that matters. Keying by wording would collapse the forty-five
+        controls into thirty-five, which is exactly the collapse this measurement exists to
+        avoid: the same question reaches the library from three vendors and each arrival is a
+        row. `(source_fixture, kind)` is unique across all forty-five, so a misaligned,
+        duplicated or dropped row has nowhere to hide.
+
+        The source fixture is a section heading rather than a cell, so parsing has to follow
+        the document's structure to recover it. That is deliberate: a parser that ignored the
+        headings could not tell Lever's `contact.email` row from Greenhouse's.
         """
         baseline, after, _ = both_measurements()
-        expected = {}
-        for before, now in zip(baseline, after):
-            key = before["recorded_label"]
-            value = (now["canonical_id"], before["reason"], now["reason"])
-            if key in expected:
-                self.assertEqual(expected[key], value, key)
-            expected[key] = value
-        parsed = {}
+        expected = {
+            (before["source_fixture"], before["kind"]): (
+                before["recorded_label"], before["expected_disposition"],
+                now["canonical_id"], before["reason"], now["reason"],
+                now["auto_fill_ready"])
+            for before, now in zip(baseline, after)
+        }
+        self.assertEqual(len(expected), 45)
+
+        parsed, fixture = {}, None
         for line in ARTIFACT.read_text(encoding="utf-8").splitlines():
-            if not line.startswith("| `") or line.startswith("| --- "):
+            if line.startswith("### `"):
+                fixture = line[len("### `"):].rstrip("`")
+                continue
+            if not line.startswith("| `"):
                 continue
             cells = [cell.strip() for cell in line.strip("|").split("|")]
-            _, label, _, canonical, before_reason, after_reason, _ = cells
-            key = label
-            value = ("" if canonical == "—" else canonical.strip("`"),
-                     before_reason.strip("`"), after_reason.strip("`"))
-            if key in parsed:
-                self.assertEqual(parsed[key], value, key)
-            parsed[key] = value
+            kind, label, disposition, canonical, before_reason, after_reason, ready = cells
+            key = (fixture, kind.strip("`"))
+            self.assertNotIn(key, parsed, f"the document repeats a control: {key}")
+            parsed[key] = (
+                label, disposition.strip("`"),
+                "" if canonical == "—" else canonical.strip("`"),
+                before_reason.strip("`"), after_reason.strip("`"), ready == "true")
+        self.assertEqual(len(parsed), 45)
         self.assertEqual(parsed, expected)
-        self.assertEqual(len(parsed), 35)
 
     def test_the_artifact_records_no_answer_value(self):
         text = ARTIFACT.read_text(encoding="utf-8").lower()

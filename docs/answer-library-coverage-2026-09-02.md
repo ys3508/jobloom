@@ -4,15 +4,16 @@ What the answer library can answer, measured twice: against an empty library, an
 with the reviewed question forms applied and still no answers written. Rendered and
 compared whole by `tests/test_answer_library_coverage.py`, so it cannot drift.
 
-Measured under the scope the one live application carries —
-`{country: US, application_id: app-mgb-rq4077023}`,
-authorization `auth-mgb-rq4077023` — because a synthetic context would measure a
-situation nobody is in.
+**This measures a fresh in-memory library, not the private one.** Nothing here reads
+`.jobloom/` or the authorization living in it. The context is rebuilt in the shape of
+the current one — `{country: US, application_id:
+app-mgb-rq4077023}`, authorization `auth-mgb-rq4077023` — so
+`auto_fill_ready` is measured with a standing authorization present rather than with
+none. It is not a reading of live state.
 
-**This measures a temporary library, not the private one.** It says what the forms do
-when applied. Applying them to `.jobloom/` is `answer_library.py
-import-question-forms`, a command a person runs, and the count that matters afterwards
-is the one that command reports.
+Applying the forms to the private library is `answer_library.py
+import-question-forms`, a command a person runs, and what that library holds
+afterwards is a separate value-free check against the library itself.
 
 **Value-free by construction.** Each row carries source fixture, kind, recorded
 employer wording, reviewed disposition, canonical meaning, reason code and
