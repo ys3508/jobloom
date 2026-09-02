@@ -256,54 +256,95 @@ RECORDED_ROLES = {"textbox", "combobox", "radiogroup", "file"}
 # the caller passes, which is why it has no default.
 FORMABLE_DISPOSITIONS = {"answer", "fact"}
 
-# The meanings Task 14 reviewed, pinned in code because a permission an input file can widen
-# is not a permission. The intake plan was that file for one commit: copying it, adding
+# What Task 14 reviewed, pinned in code because a permission an input file can widen is not
+# a permission. The intake plan was that file for one commit: copying it, adding
 # `profile.website`, and adding the matching reviewed form to the manifest imported eleven
 # forms past the corpus check, the provenance check and the disposition floor — every one of
-# which passed, because every one of them was true. Widening this set is an edit to this
+# which passed, because every one of them was true. Widening any of this is an edit to this
 # file, under review, and never an argument.
-TASK14_QUESTION_FORM_TARGETS = frozenset({
-    "work_authorized_now", "citizenship_status", "permanent_residence_status",
-    "current_country_of_residence", "prior_employment_at_this_company",
-    "prior_employment_at_an_affiliate", "discovery_source",
-    "contact.email", "contact.phone", "profile.linkedin",
-})
+#
+# Written as the whole expected shape rather than as a list of rules, because the rules were
+# patched one at a time and the gaps between them were the holes: a plan self-consistently
+# moved to another application passed, and so did one that changed an answer type, loosened a
+# contact scope, or added a scope key nobody reviewed. A shape has no gaps between its fields.
+TASK14_APPLICATION = "app-mgb-rq4077023"
+TASK14_INTAKE_SCHEMA_VERSION = "0.1.0"
+_TASK14_APPLICATION_SCOPE = {"country": "US", "application_id": TASK14_APPLICATION}
+
+
+def _reviewed_entry(answer_types: set[str], validity: str, scope: dict[str, str],
+                    recheck: bool = False) -> dict[str, Any]:
+    return {"answer": None, "answer_type": frozenset(answer_types),
+            "source_type": "user_confirmed", "validity_class": validity,
+            "scope": dict(scope), "auto_fill_allowed": True, "auto_submit_allowed": False,
+            "engine_enforced_recheck": recheck}
+
+
+TASK14_INTAKE_SHAPE: dict[str, dict[str, Any]] = {
+    # The four legal-status meanings the corpus keeps separate and never merges. All four are
+    # bound to the reviewed application; only `work_authorized_now` is force-rechecked by
+    # `match_answer`, and the plan has to say which is which rather than claim it of all.
+    "work_authorized_now": _reviewed_entry(
+        {"time_sensitive_fact"}, "per_application", _TASK14_APPLICATION_SCOPE, recheck=True),
+    "citizenship_status": _reviewed_entry(
+        {"time_sensitive_fact"}, "per_application", _TASK14_APPLICATION_SCOPE),
+    "permanent_residence_status": _reviewed_entry(
+        {"time_sensitive_fact"}, "per_application", _TASK14_APPLICATION_SCOPE),
+    "current_country_of_residence": _reviewed_entry(
+        {"time_sensitive_fact"}, "per_application", _TASK14_APPLICATION_SCOPE),
+    # Two separate answers, scoped so neither can carry to another employer.
+    "prior_employment_at_this_company": _reviewed_entry(
+        {"company_specific"}, "per_application", _TASK14_APPLICATION_SCOPE),
+    "prior_employment_at_an_affiliate": _reviewed_entry(
+        {"company_specific"}, "per_application", _TASK14_APPLICATION_SCOPE),
+    # Stated by the user, never derived from a URL, a host or a collector.
+    "discovery_source": _reviewed_entry(
+        {"application_specific", "conditional_preference"}, "per_application",
+        _TASK14_APPLICATION_SCOPE),
+    # Global by nature: an email address does not change with the application. An empty scope
+    # exactly — a contact meaning that acquired an application scope would stop applying to
+    # the next one, silently.
+    "contact.email": _reviewed_entry({"stable_fact"}, "stable", {}),
+    "contact.phone": _reviewed_entry({"stable_fact"}, "stable", {}),
+    "profile.linkedin": _reviewed_entry({"stable_fact"}, "stable", {}),
+}
+TASK14_QUESTION_FORM_TARGETS = frozenset(TASK14_INTAKE_SHAPE)
 # Of those, the three whose values exist only inside one composite contact fact. They are the
 # only `fact` meanings this task may speak for; everything else the corpus reviews as a fact
 # stays out.
 TASK14_CONTACT_TARGETS = frozenset({"contact.email", "contact.phone", "profile.linkedin"})
-# The four legal-status meanings, and the two prior-employment ones, that must not travel
-# between applications.
-TASK14_PER_APPLICATION_TARGETS = frozenset({
-    "work_authorized_now", "citizenship_status", "permanent_residence_status",
-    "current_country_of_residence", "prior_employment_at_this_company",
-    "prior_employment_at_an_affiliate", "discovery_source",
-})
-DISCOVERY_ANSWER_TYPES = {"application_specific", "conditional_preference"}
 INTAKE_PLAN_FIELDS = {"schema_version", "reviewed_at", "reviewed_by", "note",
                       "application_id", "entries"}
 INTAKE_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "answer", "answer_type",
                        "source_type", "validity_class", "scope", "auto_fill_allowed",
                        "auto_submit_allowed", "engine_enforced_recheck", "confirmation"}
+# The two fields a person writes for a person. Checked for presence and not for content:
+# pinning prose would make every wording improvement a code change.
+INTAKE_PROSE_FIELDS = ("canonical_meaning", "confirmation")
 
 
 def intake_plan_targets(plan: Any) -> frozenset[str]:
     """Read a reviewed intake plan, and return the targets only if it is the reviewed one.
 
-    The plan is checked, never trusted: it says which meanings are to be confirmed and under
-    what terms, and this reads it to confirm it still describes the reviewed arrangement. It
-    is not where the permission comes from. `TASK14_QUESTION_FORM_TARGETS` is, and a plan
-    that names anything else is refused rather than obeyed.
+    The plan is checked, never trusted. It says which meanings are to be confirmed and under
+    what terms, and this reads it to confirm it still describes the reviewed arrangement — as
+    a whole shape, field by field, rather than as a list of properties that happened to be
+    worth checking. Self-consistency is not the test: a plan that moved its application id and
+    every scope to match passed while it said nothing about the application anybody reviewed.
     """
     if not isinstance(plan, dict) or set(plan) != INTAKE_PLAN_FIELDS:
         raise ValueError("intake plan has an unexpected shape")
-    for field in ("schema_version", "reviewed_at", "reviewed_by", "note", "application_id"):
+    if plan["schema_version"] != TASK14_INTAKE_SCHEMA_VERSION:
+        raise ValueError("intake plan is not a version this understands")
+    if plan["application_id"] != TASK14_APPLICATION:
+        raise ValueError("intake plan does not name the reviewed application")
+    for field in ("reviewed_at", "reviewed_by", "note"):
         if not isinstance(plan[field], str) or not plan[field].strip():
             raise ValueError(f"intake plan metadata must be a non-empty string: {field}")
     entries = plan["entries"]
     if not isinstance(entries, list):
         raise ValueError("intake plan entries have an unexpected shape")
-    application = plan["application_id"]
+
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != INTAKE_ENTRY_FIELDS:
@@ -312,26 +353,23 @@ def intake_plan_targets(plan: Any) -> frozenset[str]:
         if not isinstance(target, str) or target in seen:
             raise ValueError("intake plan repeats or mis-types a meaning")
         seen.add(target)
-        if entry["answer"] is not None:
-            # The one field this file may never hold. A plan carrying an answer is a private
-            # value in the repository.
-            raise ValueError("an intake plan may not carry an answer")
-        if entry["source_type"] != "user_confirmed":
-            raise ValueError("an intake entry must be the user's own confirmation")
-        if entry["auto_fill_allowed"] is not True or entry["auto_submit_allowed"] is not False:
-            raise ValueError("an intake entry may fill automatically and never submit")
-        scope = entry["scope"]
-        if not isinstance(scope, dict):
-            raise ValueError("intake plan scope has an unexpected shape")
-        if target in TASK14_PER_APPLICATION_TARGETS:
-            if entry["validity_class"] != "per_application":
-                raise ValueError("this meaning must be confirmed per application")
-            if scope.get("country") != "US" or scope.get("application_id") != application:
-                raise ValueError("this meaning must be bound to the reviewed application")
-        if target == "discovery_source" and entry["answer_type"] not in DISCOVERY_ANSWER_TYPES:
-            raise ValueError("how an opening was heard about is stated, not derived")
-        if target in TASK14_CONTACT_TARGETS and entry["validity_class"] != "stable":
-            raise ValueError("a contact meaning does not change with the application")
+        expected = TASK14_INTAKE_SHAPE.get(target)
+        if expected is None:
+            raise ValueError("intake plan names a meaning nobody reviewed")
+        for field in INTAKE_PROSE_FIELDS:
+            if not isinstance(entry[field], str) or not entry[field].strip():
+                raise ValueError(f"intake entry field must be a non-empty string: {field}")
+        if entry["answer_type"] not in expected["answer_type"]:
+            raise ValueError("intake entry does not carry the reviewed answer type")
+        # Compared as a whole, so an extra scope key is a difference rather than an extra.
+        if entry["scope"] != expected["scope"]:
+            raise ValueError("intake entry does not carry the reviewed scope")
+        for field in ("answer", "source_type", "validity_class", "auto_fill_allowed",
+                      "auto_submit_allowed", "engine_enforced_recheck"):
+            if entry[field] is not expected[field] and entry[field] != expected[field]:
+                raise ValueError(f"intake entry does not match the reviewed plan: {field}")
+        if not isinstance(entry["engine_enforced_recheck"], bool):
+            raise ValueError("intake entry must say plainly which recheck the engine enforces")
     if seen != set(TASK14_QUESTION_FORM_TARGETS):
         # Both directions: a plan that added a meaning, and a plan that dropped one so the
         # remaining nine would import quietly.

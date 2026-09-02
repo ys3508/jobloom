@@ -680,8 +680,8 @@ class CorpusIdentityTests(unittest.TestCase):
         self.assertEqual(ANSWERS.RECORDED_ROLES, set(module.ROLE_CONTROLS))
 
 
-class ProductionCliTests(unittest.TestCase):
-    """The command as it is actually run: real argument parsing, real files on disk.
+class _ImportCli:
+    """Harness for running the command as it is actually run: real parsing, real files.
 
     The permission lived in the intake plan for one commit, and the tests of that commit
     checked the committed plan — which of course named the reviewed ten. What they never did
@@ -779,7 +779,8 @@ class ProductionCliTests(unittest.TestCase):
                 manifest["forms"].append(self.reviewed_form(target))
                 self.write(self.plan_path, plan)
                 self.write(self.manifest_path, manifest)
-                self.assertIn("reviewed meanings", self.assert_refused(before))
+                self.assertRegex(self.assert_refused(before),
+                                 "reviewed meanings|meaning nobody reviewed")
 
     def test_a_plan_that_drops_a_meaning_does_not_quietly_import_the_rest(self):
         before = self.seed()
@@ -790,7 +791,8 @@ class ProductionCliTests(unittest.TestCase):
                              if form["canonical_id"] != dropped["canonical_id"]]
         self.write(self.plan_path, plan)
         self.write(self.manifest_path, manifest)
-        self.assertIn("reviewed meanings", self.assert_refused(before))
+        self.assertRegex(self.assert_refused(before),
+                                 "reviewed meanings|meaning nobody reviewed")
 
     def test_a_plan_carrying_an_answer_or_enabling_submission_is_refused(self):
         cases = {
@@ -895,3 +897,150 @@ class PinnedTargetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be a set"):
                     ANSWERS.import_question_forms(connection, MANIFEST, APPROVAL,
                                                   CORPUS_ROOT, permitted)
+
+
+class ProductionCliTests(_ImportCli, unittest.TestCase):
+    """Whether the command can be talked into permitting a meaning nobody reviewed."""
+
+
+class IntakeShapeCliTests(_ImportCli, unittest.TestCase):
+    """The reviewed arrangement, checked through the command that reads it.
+
+    The rules were patched one at a time and the gaps between them were the holes. A plan
+    self-consistently moved to another application passed every one of them: the entries
+    agreed with the top-level id, which was the only thing anything compared them to. Nothing
+    said which application had been reviewed.
+    """
+
+    def entry(self, plan, target):
+        return next(item for item in plan["entries"]
+                    if item["canonical_id"] == target)
+
+    def refuse_plan(self, mutate, expected=""):
+        before = self.seed()
+        plan = copy.deepcopy(PLAN)
+        mutate(plan)
+        self.write(self.plan_path, plan)
+        rendered = self.assert_refused(before)
+        if expected:
+            self.assertIn(expected, rendered)
+
+    def test_a_plan_moved_wholesale_to_another_application_is_refused(self):
+        """The one that passed. Self-consistency is not the test."""
+        def move(plan):
+            plan["application_id"] = "app-other"
+            for item in plan["entries"]:
+                if item["scope"].get("application_id"):
+                    item["scope"]["application_id"] = "app-other"
+        self.refuse_plan(move, "reviewed application")
+
+    def test_moving_only_the_top_level_application_is_refused(self):
+        self.refuse_plan(lambda plan: plan.update({"application_id": "app-other"}),
+                         "reviewed application")
+
+    def test_moving_only_one_entry_scope_is_refused(self):
+        self.refuse_plan(
+            lambda plan: self.entry(plan, "work_authorized_now")["scope"].update(
+                {"application_id": "app-other"}),
+            "reviewed scope")
+
+    def test_a_scope_carrying_a_key_nobody_reviewed_is_refused(self):
+        """Compared as a whole, so an extra key is a difference and not an extra."""
+        for target, extra in (("work_authorized_now", {"queue_id": "anything"}),
+                              ("contact.email", {"application_id": ANSWERS.TASK14_APPLICATION}),
+                              ("discovery_source", {"company": "Example Corp"})):
+            with self.subTest(target=target):
+                self.setUp()
+                self.refuse_plan(
+                    lambda plan, t=target, e=extra: self.entry(plan, t)["scope"].update(e),
+                    "reviewed scope")
+
+    def test_a_changed_answer_type_is_refused(self):
+        cases = {
+            "work_authorized_now": "open_text_template",
+            "prior_employment_at_this_company": "stable_fact",
+            "prior_employment_at_an_affiliate": "stable_fact",
+            "contact.phone": "derived_answer",
+            "profile.linkedin": "company_specific",
+            "discovery_source": "stable_fact",
+        }
+        for target, answer_type in cases.items():
+            with self.subTest(target=target):
+                self.setUp()
+                self.refuse_plan(
+                    lambda plan, t=target, a=answer_type: self.entry(plan, t).update(
+                        {"answer_type": a}),
+                    "reviewed answer type")
+
+    def test_a_discovery_source_may_be_either_reviewed_type_and_nothing_else(self):
+        """The one field with more than one right answer, and still not any answer."""
+        before = self.seed()
+        for answer_type in ("application_specific", "conditional_preference"):
+            with self.subTest(answer_type=answer_type):
+                plan = copy.deepcopy(PLAN)
+                self.entry(plan, "discovery_source")["answer_type"] = answer_type
+                self.write(self.plan_path, plan)
+                finished = self.run_import()
+                self.assertEqual(finished.returncode, 0, finished.stderr[-400:])
+                self.assertEqual(self.library(), before)
+
+    def test_a_loosened_validity_class_is_refused(self):
+        for target in ("work_authorized_now", "prior_employment_at_an_affiliate",
+                       "discovery_source"):
+            with self.subTest(target=target):
+                self.setUp()
+                self.refuse_plan(
+                    lambda plan, t=target: self.entry(plan, t).update(
+                        {"validity_class": "stable"}),
+                    "reviewed plan: validity_class")
+        self.setUp()
+        self.refuse_plan(
+            lambda plan: self.entry(plan, "contact.email").update(
+                {"validity_class": "per_application"}),
+            "reviewed plan: validity_class")
+
+    def test_the_recheck_the_engine_enforces_must_be_stated_plainly(self):
+        """Only `work_authorized_now` is force-rechecked, and the plan has to say so.
+
+        Claiming it of all ten would read as a stronger guarantee than the engine gives, and
+        claiming it of none would lose the one place it is real.
+        """
+        self.refuse_plan(
+            lambda plan: [item.update({"engine_enforced_recheck": True})
+                          for item in plan["entries"]],
+            "engine_enforced_recheck")
+        self.setUp()
+        self.refuse_plan(
+            lambda plan: self.entry(plan, "work_authorized_now").update(
+                {"engine_enforced_recheck": False}),
+            "engine_enforced_recheck")
+        self.setUp()
+        self.refuse_plan(
+            lambda plan: self.entry(plan, "citizenship_status").update(
+                {"engine_enforced_recheck": 1}))
+
+    def test_blank_prose_is_refused(self):
+        for field in ("canonical_meaning", "confirmation"):
+            with self.subTest(field=field):
+                self.setUp()
+                self.refuse_plan(
+                    lambda plan, name=field: plan["entries"][0].update({name: "   "}),
+                    f"non-empty string: {field}")
+
+    def test_an_unknown_schema_version_is_refused(self):
+        self.refuse_plan(lambda plan: plan.update({"schema_version": "9.9.9"}),
+                         "version this understands")
+
+    def test_the_committed_plan_is_exactly_the_reviewed_shape(self):
+        """If this fails, the plan changed and nobody reviewed the change."""
+        self.assertEqual({entry["canonical_id"] for entry in PLAN["entries"]},
+                         set(ANSWERS.TASK14_INTAKE_SHAPE))
+        for entry in PLAN["entries"]:
+            expected = ANSWERS.TASK14_INTAKE_SHAPE[entry["canonical_id"]]
+            with self.subTest(target=entry["canonical_id"]):
+                self.assertIn(entry["answer_type"], expected["answer_type"])
+                self.assertEqual(entry["scope"], expected["scope"])
+                for field in ("answer", "source_type", "validity_class",
+                              "auto_fill_allowed", "auto_submit_allowed",
+                              "engine_enforced_recheck"):
+                    self.assertEqual(entry[field], expected[field], field)
