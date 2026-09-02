@@ -1,69 +1,103 @@
 # Answer-library coverage, measured 2026-09-02
 
-What the answer library can answer, measured before anything was confirmed into it and
-again with the reviewed question forms applied and still no answers written. Regenerated
-and checked by `tests/test_answer_library_coverage.py`, so it cannot drift into a story.
+What the answer library can answer, measured twice: against an empty library, and with the
+reviewed question forms applied and still no answers written. Regenerated and checked by
+`tests/test_answer_library_coverage.py`, so it cannot drift into a story.
 
-**Value-free by construction.** Canonical ID, recorded employer wording, reviewed
-disposition and reason code. No answer, no candidate value, no private path.
+Measured under the authorization that is actually live — `auth-mgb-rq4077023`, scoped to
+`{country: US, application_id: app-mgb-rq4077023}` — because a synthetic context would
+measure a situation nobody is in.
+
+**Value-free by construction.** Each row carries source fixture, kind, recorded employer
+wording, reviewed disposition, canonical meaning, reason code and `auto_fill_ready`. No
+answer, no candidate value, no local path, no token, no database row.
 
 ## What was measured
 
-- 35 distinct employer questions, taken from the 45 reviewed controls in the vendored corpus.
-- 10 question forms in `skills/jobloom/assets/question-forms.json`, covering 10 canonical meanings.
-- Answers written at any point in this measurement: **0**.
+- 45 recorded controls (not 35 distinct wordings: the same question reaches the library from three vendors, and measuring by wording would drop that).
+- 10 reviewed question forms covering 10 canonical meanings.
+- Answers written at any point: **0**.
+- Controls reaching `auto_fill_ready: true`: **0**, before and after. Forms are a
+  vocabulary, not an answer.
 
 ## Result
 
-`new_question` means nothing has ever mapped this wording to a meaning.
-`no_applicable_answer` means the meaning is understood and the user has not answered it yet.
-That second state is the whole of what this phase can reach without a private value.
+`new_question` — nothing has ever mapped this wording to a meaning; the planner pauses.
+`no_applicable_answer` — the meaning is understood and the user has not answered it yet.
+The second state is the whole of what this phase can reach without a private value.
 
-| Canonical meaning | Recorded employer wording | Before | After forms |
-| --- | --- | --- | --- |
-| `citizenship_status` | United States citizen? | `new_question` | `no_applicable_answer` |
-| `contact.email` | Email address | `new_question` | `no_applicable_answer` |
-| `contact.phone` | Phone number | `new_question` | `no_applicable_answer` |
-| `current_country_of_residence` | Live in the United States? | `new_question` | `no_applicable_answer` |
-| `discovery_source` | How did you hear about this opportunity? | `new_question` | `no_applicable_answer` |
-| `permanent_residence_status` | Permanent resident? | `new_question` | `no_applicable_answer` |
-| `prior_employment_at_an_affiliate` | Have you previously worked for this company or an affiliate? | `new_question` | `no_applicable_answer` |
-| `prior_employment_at_this_company` | Previously worked for this company? | `new_question` | `no_applicable_answer` |
-| `profile.linkedin` | LinkedIn profile | `new_question` | `no_applicable_answer` |
-| `work_authorized_now` | Authorized to work in the United States? | `new_question` | `no_applicable_answer` |
-| — | City | `new_question` | `new_question` |
-| — | City and state | `new_question` | `new_question` |
-| — | Cover letter | `new_question` | `new_question` |
-| — | Current company | `new_question` | `new_question` |
-| — | Current location | `new_question` | `new_question` |
-| — | Current location profile | `new_question` | `new_question` |
-| — | Disability status | `new_question` | `new_question` |
-| — | Employee referral contact | `new_question` | `new_question` |
-| — | Expected total compensation | `new_question` | `new_question` |
-| — | First name | `new_question` | `new_question` |
-| — | Full name | `new_question` | `new_question` |
-| — | Gender | `new_question` | `new_question` |
-| — | GitHub profile | `new_question` | `new_question` |
-| — | Last name | `new_question` | `new_question` |
-| — | Phone country | `new_question` | `new_question` |
-| — | Portfolio | `new_question` | `new_question` |
-| — | Preferred first name | `new_question` | `new_question` |
-| — | Race or ethnicity | `new_question` | `new_question` |
-| — | Related to someone at this company? | `new_question` | `new_question` |
-| — | Resume | `new_question` | `new_question` |
-| — | Target salary | `new_question` | `new_question` |
-| — | Veteran status | `new_question` | `new_question` |
-| — | Website | `new_question` | `new_question` |
-| — | Will you require employment visa sponsorship? | `new_question` | `new_question` |
-| — | Worked for a customer, partner, or reseller? | `new_question` | `new_question` |
+### `ashby-application-2026-08-v1`
+
+| kind | recorded wording | disposition | canonical | baseline | after forms | auto_fill_ready |
+| --- | --- | --- | --- | --- | --- | --- |
+| `contact.email` | Email address | `fact` | `contact.email` | `new_question` | `no_applicable_answer` | false |
+| `contact.full_name` | Full name | `fact` | — | `new_question` | `new_question` | false |
+| `resume.file` | Resume | `material` | — | `new_question` | `new_question` | false |
+
+### `greenhouse-single-page-2026-08-v1`
+
+| kind | recorded wording | disposition | canonical | baseline | after forms | auto_fill_ready |
+| --- | --- | --- | --- | --- | --- | --- |
+| `authorization.sponsorship_select` | Will you require employment visa sponsorship? | `always_manual` | — | `new_question` | `new_question` | false |
+| `contact.email` | Email address | `fact` | `contact.email` | `new_question` | `no_applicable_answer` | false |
+| `contact.first_name` | First name | `fact` | — | `new_question` | `new_question` | false |
+| `contact.last_name` | Last name | `fact` | — | `new_question` | `new_question` | false |
+| `contact.location_city` | City | `fact` | — | `new_question` | `new_question` | false |
+| `contact.phone` | Phone number | `fact` | `contact.phone` | `new_question` | `no_applicable_answer` | false |
+| `contact.phone_country` | Phone country | `fact` | — | `new_question` | `new_question` | false |
+| `contact.preferred_name` | Preferred first name | `fact` | — | `new_question` | `new_question` | false |
+| `cover_letter.file` | Cover letter | `material` | — | `new_question` | `new_question` | false |
+| `employment.prior_affiliate` | Have you previously worked for this company or an affiliate? | `answer` | `prior_employment_at_an_affiliate` | `new_question` | `no_applicable_answer` | false |
+| `profile.linkedin` | LinkedIn profile | `fact` | `profile.linkedin` | `new_question` | `no_applicable_answer` | false |
+| `profile.website` | Website | `fact` | — | `new_question` | `new_question` | false |
+| `referral.contact` | Employee referral contact | `always_manual` | — | `new_question` | `new_question` | false |
+| `resume.file` | Resume | `material` | — | `new_question` | `new_question` | false |
+| `source.discovery` | How did you hear about this opportunity? | `answer` | `discovery_source` | `new_question` | `no_applicable_answer` | false |
+
+### `lever-application-2026-08-v1`
+
+| kind | recorded wording | disposition | canonical | baseline | after forms | auto_fill_ready |
+| --- | --- | --- | --- | --- | --- | --- |
+| `authorization.green_card` | Permanent resident? | `answer` | `permanent_residence_status` | `new_question` | `no_applicable_answer` | false |
+| `authorization.sponsorship_status` | Will you require employment visa sponsorship? | `always_manual` | — | `new_question` | `new_question` | false |
+| `authorization.us_citizen` | United States citizen? | `answer` | `citizenship_status` | `new_question` | `no_applicable_answer` | false |
+| `authorization.work_authorized` | Authorized to work in the United States? | `answer` | `work_authorized_now` | `new_question` | `no_applicable_answer` | false |
+| `compensation.target_salary` | Target salary | `always_manual` | — | `new_question` | `new_question` | false |
+| `compensation.total_range` | Expected total compensation | `always_manual` | — | `new_question` | `new_question` | false |
+| `conflict.customer_partner_reseller` | Worked for a customer, partner, or reseller? | `always_manual` | — | `new_question` | `new_question` | false |
+| `conflict.related_person` | Related to someone at this company? | `always_manual` | — | `new_question` | `new_question` | false |
+| `contact.email` | Email address | `fact` | `contact.email` | `new_question` | `no_applicable_answer` | false |
+| `contact.full_name` | Full name | `fact` | — | `new_question` | `new_question` | false |
+| `contact.location` | Current location | `fact` | — | `new_question` | `new_question` | false |
+| `contact.phone` | Phone number | `fact` | `contact.phone` | `new_question` | `no_applicable_answer` | false |
+| `eeo.disability` | Disability status | `always_manual` | — | `new_question` | `new_question` | false |
+| `eeo.gender` | Gender | `always_manual` | — | `new_question` | `new_question` | false |
+| `eeo.race` | Race or ethnicity | `always_manual` | — | `new_question` | `new_question` | false |
+| `eeo.veteran` | Veteran status | `always_manual` | — | `new_question` | `new_question` | false |
+| `employment.current_company` | Current company | `fact` | — | `new_question` | `new_question` | false |
+| `employment.prior_company` | Previously worked for this company? | `answer` | `prior_employment_at_this_company` | `new_question` | `no_applicable_answer` | false |
+| `location.city_state` | City and state | `fact` | — | `new_question` | `new_question` | false |
+| `location.us_resident` | Live in the United States? | `answer` | `current_country_of_residence` | `new_question` | `no_applicable_answer` | false |
+| `profile.github` | GitHub profile | `fact` | — | `new_question` | `new_question` | false |
+| `profile.linkedin` | LinkedIn profile | `fact` | `profile.linkedin` | `new_question` | `no_applicable_answer` | false |
+| `profile.location_url` | Current location profile | `fact` | — | `new_question` | `new_question` | false |
+| `profile.portfolio` | Portfolio | `fact` | — | `new_question` | `new_question` | false |
+| `profile.website` | Website | `fact` | — | `new_question` | `new_question` | false |
+| `resume.file` | Resume | `material` | — | `new_question` | `new_question` | false |
+| `source.discovery_radio` | How did you hear about this opportunity? | `answer` | `discovery_source` | `new_question` | `no_applicable_answer` | false |
+
+## What changed, and what did not
+
+- 15 of 45 controls moved from `new_question` to `no_applicable_answer`.
+- 30 still read `new_question`. That is not a backlog: most are reviewed as
+  `always_manual` or as facts, and pausing on them is the correct outcome.
+- Nothing became fillable. No answer exists.
 
 ## What this does not show
 
-- It does not show that any question can be **answered**: that needs values the user
+- It does not show that any question can be **answered**. That needs values the user
   confirms one at a time, and those live only in `.jobloom/`.
 - It does not show that a real ATS page presents this wording. The corpus is a reviewed
   semantic model of real recordings, not current employer DOM.
 - It does not show that a production observer can find these fields. There is none.
-- The 25 rows still reading `new_question` are not a backlog. Most are reviewed as
-  `always_manual` or as facts, and pausing on them is the correct outcome.
 

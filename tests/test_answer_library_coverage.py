@@ -52,12 +52,43 @@ MAPPED = {
 }
 
 
+# The context the one live application actually carries. Identifiers, not values: the
+# authorization is `auth-mgb-rq4077023`, scoped to this country and this application, and
+# measuring under a synthetic context would measure a situation nobody is in.
+REAL_CONTEXT = {"country": "US", "application_id": "app-mgb-rq4077023"}
+REAL_AUTHORIZATION = "auth-mgb-rq4077023"
+
+
 def reviewed_questions():
     """Every distinct employer wording in the corpus, with what it was reviewed to mean."""
     seen = {}
     for entry in APPROVAL["entries"]:
         seen.setdefault(entry["recorded_label"], entry["expected_target"])
     return dict(sorted(seen.items()))
+
+
+def measure_controls(connection, at):
+    """One row per recorded control, not per distinct wording.
+
+    Forty-five controls share thirty-five wordings, and the duplicates are the interesting
+    ones: the same question reaches the library from three different vendors. Measuring by
+    wording would quietly drop that.
+    """
+    rows = []
+    for entry in sorted(APPROVAL["entries"],
+                        key=lambda item: (item["source_fixture"], item["kind"])):
+        match = ANSWERS.match_answer(connection, entry["recorded_label"], REAL_CONTEXT,
+                                     REAL_AUTHORIZATION, at)
+        rows.append({
+            "source_fixture": entry["source_fixture"],
+            "kind": entry["kind"],
+            "recorded_label": entry["recorded_label"],
+            "expected_disposition": entry["expected_disposition"],
+            "canonical_id": match.get("canonical_id") or "",
+            "reason": match["reason"],
+            "auto_fill_ready": bool(match["auto_fill_ready"]),
+        })
+    return rows
 
 
 class CoverageMeasurement(unittest.TestCase):
@@ -187,3 +218,88 @@ class ManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlLevelMeasurement(unittest.TestCase):
+    """All forty-five recorded controls, under the authorization that is actually live.
+
+    The row schema is fixed by what a measurement of this kind may hold: which fixture
+    recorded the control, its kind, the employer's own wording, the reviewed disposition, the
+    canonical meaning if one is known, the reason code, and whether the field could be filled
+    automatically. No answer, no candidate value, no local path, no token, no database row.
+    """
+
+    AT = None
+
+    def setUp(self):
+        from datetime import datetime, timedelta, timezone
+        self.at = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        ANSWERS.initialize(self.db)
+        # The live authorization, reconstructed from its identifiers so `auto_fill_ready` is
+        # measured under a standing authorization rather than under none.
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": REAL_AUTHORIZATION,
+            "confirmed_at": self.at.isoformat(),
+            "expires_at": (self.at + timedelta(days=9)).isoformat(),
+            "scope": dict(REAL_CONTEXT),
+        })
+        self.addCleanup(self.db.close)
+
+    def apply_manifest(self):
+        for form in MANIFEST["forms"]:
+            ANSWERS.add_question_form(self.db, form["canonical_id"], form["question"],
+                                      form["match_level"], form["verified_by_user"])
+
+    def test_all_forty_five_controls_are_measured_not_thirty_five_wordings(self):
+        rows = measure_controls(self.db, self.at)
+        self.assertEqual(len(rows), len(APPROVAL["entries"]))
+        self.assertEqual(len(rows), 45)
+        self.assertEqual(len({row["recorded_label"] for row in rows}), 35)
+
+    def test_nothing_is_auto_fill_ready_before_or_after_the_forms(self):
+        """The forms are a vocabulary, not an answer.
+
+        This is the assertion that would fail if a value slipped in early: mapping wording to
+        meaning cannot make a field fillable, and the measurement says so on all forty-five
+        rows both before and after.
+        """
+        for stage in ("baseline", "after forms"):
+            if stage == "after forms":
+                self.apply_manifest()
+            with self.subTest(stage=stage):
+                rows = measure_controls(self.db, self.at)
+                self.assertEqual([row for row in rows if row["auto_fill_ready"]], [])
+                self.assertEqual(
+                    self.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+
+    def test_the_forms_understand_exactly_the_controls_they_were_written_for(self):
+        self.apply_manifest()
+        rows = measure_controls(self.db, self.at)
+        understood = {row["recorded_label"] for row in rows
+                      if row["reason"] != "new_question"}
+        self.assertEqual(understood, {form["question"] for form in MANIFEST["forms"]})
+        for row in rows:
+            if row["recorded_label"] in understood:
+                self.assertEqual(row["reason"], "no_applicable_answer", row["recorded_label"])
+                self.assertTrue(row["canonical_id"])
+            else:
+                self.assertEqual(row["canonical_id"], "")
+
+    def test_the_recorded_control_measurement_matches_the_library(self):
+        self.apply_manifest()
+        text = ARTIFACT.read_text(encoding="utf-8")
+        for row in measure_controls(self.db, self.at):
+            with self.subTest(kind=row["kind"], fixture=row["source_fixture"]):
+                self.assertIn(f"| `{row['kind']}` |", text)
+                self.assertIn(row["recorded_label"], text)
+                self.assertIn(f"| `{row['reason']}` |", text)
+
+    def test_the_measurement_rows_carry_only_the_seven_allowed_fields(self):
+        allowed = {"source_fixture", "kind", "recorded_label", "expected_disposition",
+                   "canonical_id", "reason", "auto_fill_ready"}
+        for row in measure_controls(self.db, self.at):
+            with self.subTest(kind=row["kind"]):
+                self.assertEqual(set(row), allowed)
+                self.assertIsInstance(row["auto_fill_ready"], bool)
