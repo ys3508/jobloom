@@ -30,6 +30,8 @@ Use these canonical IDs for the four immigration meanings:
 
 Exact matching uses normalized text only. Semantic matching is not an open-ended similarity search: store a paraphrase as a verified question form only after the user confirms equivalence. A question form mapped to multiple meanings is a conflict.
 
+Reviewed question forms may be applied in bulk from a manifest — `skills/jobloom/assets/question-forms.json` — with `answer_library.py import-question-forms`. This is safe to automate because a form is a question and a meaning and never an answer, which is also why such a manifest can live in the repository while every answer stays in the private root. The import is deliberately a command and not a side effect of connecting: a file appearing in a checkout is not a person deciding to trust it. It applies wholly or not at all, is idempotent so a manifest that grew by one form can be re-applied, refuses a paraphrase in bulk, refuses wording that no reviewed recording contains, and refuses a question this library already maps elsewhere — a half-applied vocabulary pauses on some questions and not others, which is worse than none. What it returns and what it writes to the audit log name meanings and counts and hash the wording.
+
 Resolve multiple applicable answers by scope specificity. A more specific applicable scope overrides a global answer. Two equally specific active answers with different values are a conflict and must pause.
 
 ## Two-channel freshness

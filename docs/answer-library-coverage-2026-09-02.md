@@ -1,24 +1,31 @@
 # Answer-library coverage, measured 2026-09-02
 
-What the answer library can answer, measured twice: against an empty library, and with the
-reviewed question forms applied and still no answers written. Regenerated and checked by
-`tests/test_answer_library_coverage.py`, so it cannot drift into a story.
+What the answer library can answer, measured twice: against an empty library, and
+with the reviewed question forms applied and still no answers written. Rendered and
+compared whole by `tests/test_answer_library_coverage.py`, so it cannot drift.
 
-Measured under the authorization that is actually live — `auth-mgb-rq4077023`, scoped to
-`{country: US, application_id: app-mgb-rq4077023}` — because a synthetic context would
-measure a situation nobody is in.
+Measured under the scope the one live application carries —
+`{country: US, application_id: app-mgb-rq4077023}`,
+authorization `auth-mgb-rq4077023` — because a synthetic context would measure a
+situation nobody is in.
 
-**Value-free by construction.** Each row carries source fixture, kind, recorded employer
-wording, reviewed disposition, canonical meaning, reason code and `auto_fill_ready`. No
-answer, no candidate value, no local path, no token, no database row.
+**This measures a temporary library, not the private one.** It says what the forms do
+when applied. Applying them to `.jobloom/` is `answer_library.py
+import-question-forms`, a command a person runs, and the count that matters afterwards
+is the one that command reports.
+
+**Value-free by construction.** Each row carries source fixture, kind, recorded
+employer wording, reviewed disposition, canonical meaning, reason code and
+`auto_fill_ready`. No answer, no candidate value, no local path, no token, no database
+row.
 
 ## What was measured
 
-- 45 recorded controls (not 35 distinct wordings: the same question reaches the library from three vendors, and measuring by wording would drop that).
+- 45 recorded controls, sharing 35 distinct wordings. The same
+  question reaches the library from three vendors, and measuring by wording would drop
+  that.
 - 10 reviewed question forms covering 10 canonical meanings.
 - Answers written at any point: **0**.
-- Controls reaching `auto_fill_ready: true`: **0**, before and after. Forms are a
-  vocabulary, not an answer.
 
 ## Result
 
@@ -95,6 +102,8 @@ The second state is the whole of what this phase can reach without a private val
 
 ## What this does not show
 
+- It does not show that anything has been applied to the private library. That is a
+  separate, explicit command.
 - It does not show that any question can be **answered**. That needs values the user
   confirms one at a time, and those live only in `.jobloom/`.
 - It does not show that a real ATS page presents this wording. The corpus is a reviewed

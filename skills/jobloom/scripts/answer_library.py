@@ -218,6 +218,125 @@ def add_question_form(
     connection.commit()
 
 
+# A reviewed question-form manifest is a vocabulary, never an answer: a question and the
+# meaning it was reviewed to have. That is why one can live in the repository while every
+# answer stays in the private root, and why importing one is safe to automate while
+# confirming an answer never is.
+QUESTION_FORM_MANIFEST_FIELDS = {"schema_version", "reviewed_at", "reviewed_by", "note",
+                                 "forms"}
+QUESTION_FORM_FIELDS = {"canonical_id", "canonical_meaning", "question", "match_level",
+                        "verified_by_user", "recorded_in"}
+
+
+def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
+    """Read a manifest strictly, or refuse it whole."""
+    if not isinstance(manifest, dict) or set(manifest) != QUESTION_FORM_MANIFEST_FIELDS:
+        raise ValueError("question-form manifest has an unexpected shape")
+    forms = manifest["forms"]
+    if not isinstance(forms, list) or not forms:
+        raise ValueError("question-form manifest carries no forms")
+    seen: dict[str, str] = {}
+    for form in forms:
+        if not isinstance(form, dict) or set(form) != QUESTION_FORM_FIELDS:
+            raise ValueError("question form has an unexpected shape")
+        for field in ("canonical_id", "canonical_meaning", "question"):
+            if not isinstance(form[field], str) or not form[field].strip():
+                raise ValueError(f"question form field must be a non-empty string: {field}")
+        if form["match_level"] != "exact":
+            # A semantic equivalent is a claim about meaning that a person makes one at a
+            # time. Importing a file full of them would make that claim in bulk.
+            raise ValueError("only exact question forms may be imported from a manifest")
+        if form["verified_by_user"] is not True:
+            raise ValueError("an imported question form must be user-verified")
+        recorded = form["recorded_in"]
+        if (not isinstance(recorded, list) or not recorded
+                or not all(isinstance(name, str) and name.strip() for name in recorded)):
+            raise ValueError("a question form must name where its wording was recorded")
+        normalized = normalize_question(form["question"])
+        if not normalized:
+            raise ValueError("a question form normalizes to nothing")
+        previous = seen.get(normalized)
+        if previous is not None and previous != form["canonical_id"]:
+            # Exactly what `match_answer` reports as `question_mapping_conflict`, caught
+            # before it is written rather than after it starts pausing pages.
+            raise ValueError(f"one question mapped to two meanings: {normalized}")
+        if previous == form["canonical_id"]:
+            raise ValueError(f"question form repeated in the manifest: {normalized}")
+        seen[normalized] = form["canonical_id"]
+    return forms
+
+
+def import_question_forms(connection: sqlite3.Connection, manifest: Any,
+                          provenance: Any = None) -> dict[str, Any]:
+    """Apply a reviewed manifest to this library, wholly or not at all.
+
+    Deliberately not called by `initialize`. A file appearing in a checkout is not a person
+    deciding to trust it, and a library that silently gained a vocabulary on first connect
+    would be one nobody chose. This runs when someone runs it.
+
+    Idempotent: a row already present exactly as the manifest describes is counted and left
+    alone, so re-importing after adding one form does not fail on the other nine. A row
+    present *differently* — a different meaning for the same wording, or a match level that
+    was widened — is a conflict and stops the whole import, because a half-applied vocabulary
+    is worse than none.
+
+    `provenance`, when given, is the reviewed disposition approval. Each question must appear
+    in it verbatim as a recorded label under the fixtures the manifest names. Wording that
+    cannot be traced to a recording is wording somebody imagined, and a form no employer
+    ships matches nothing.
+    """
+    forms = _manifest_forms(manifest)
+    if provenance is not None:
+        recorded: dict[str, set[str]] = {}
+        for entry in provenance.get("entries", []):
+            recorded.setdefault(entry["recorded_label"], set()).add(entry["source_fixture"])
+        for form in forms:
+            if form["question"] not in recorded:
+                raise ValueError("question form is not recorded employer wording")
+            if set(form["recorded_in"]) != recorded[form["question"]]:
+                raise ValueError("question form names the wrong recording provenance")
+
+    planned, already = [], []
+    for form in forms:
+        normalized = normalize_question(form["question"])
+        rows = connection.execute(
+            "SELECT canonical_id, match_level, verified_by_user FROM question_forms "
+            "WHERE normalized_question=?", (normalized,)).fetchall()
+        matching = [row for row in rows if row["canonical_id"] == form["canonical_id"]]
+        if any(row["canonical_id"] != form["canonical_id"] for row in rows):
+            raise ValueError(f"this library already maps that question elsewhere: {normalized}")
+        if matching:
+            row = matching[0]
+            if row["match_level"] != form["match_level"] or not row["verified_by_user"]:
+                raise ValueError(f"this library holds a different form for: {normalized}")
+            already.append(form["canonical_id"])
+            continue
+        planned.append((normalized, form))
+
+    timestamp = now_utc().isoformat()
+    try:
+        for normalized, form in planned:
+            connection.execute(
+                "INSERT INTO question_forms VALUES (?, ?, ?, ?, ?)",
+                (normalized, form["canonical_id"], form["match_level"],
+                 int(form["verified_by_user"]), timestamp))
+            audit(connection, "question_form_imported", form["canonical_id"], {
+                "match_level": form["match_level"],
+                # The question is hashed, exactly as `add_question_form` hashes it: an audit
+                # log is not a place to accumulate a second copy of the vocabulary.
+                "question_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            })
+    except Exception:
+        connection.rollback()
+        raise
+    connection.commit()
+    return {
+        "imported": len(planned),
+        "already_present": len(already),
+        "canonical_ids": sorted({form["canonical_id"] for form in forms}),
+    }
+
+
 def authorization_current(
     connection: sqlite3.Connection,
     authorization_id: str | None,
@@ -374,6 +493,11 @@ def main() -> None:
     authorization.add_argument("--entry", required=True, type=Path)
     revoke = subparsers.add_parser("revoke-authorization")
     revoke.add_argument("--authorization-id", required=True)
+    forms_import = subparsers.add_parser("import-question-forms")
+    forms_import.add_argument("--manifest", required=True, type=Path)
+    forms_import.add_argument("--provenance", type=Path,
+                              help="the reviewed disposition approval every question must "
+                                   "be traceable to")
     invalidate = subparsers.add_parser("invalidate")
     invalidate.add_argument("--trigger", required=True)
     match = subparsers.add_parser("match")
@@ -400,6 +524,11 @@ def main() -> None:
     elif args.command == "revoke-authorization":
         revoke_authorization(connection, args.authorization_id)
         result = {"status": "revoked", "authorization_id": args.authorization_id}
+    elif args.command == "import-question-forms":
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        provenance = (json.loads(args.provenance.read_text(encoding="utf-8"))
+                      if args.provenance else None)
+        result = import_question_forms(connection, manifest, provenance)
     elif args.command == "invalidate":
         result = {"status": "invalidated", "answer_ids": invalidate_by_trigger(connection, args.trigger)}
     elif args.command == "match":
