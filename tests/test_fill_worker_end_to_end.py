@@ -651,6 +651,38 @@ class WorkflowInvariants(LocalFillOnlyWorkflow):
                 / "FIELD-DISPOSITION-APPROVAL.json")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def corpus_controls(self):
+        """Every control the vendored fixtures actually record, read from the fixtures."""
+        upstream = ROOT / "tests" / "fixtures" / "ats-semantic" / "upstream"
+        found = []
+        for directory in sorted(path for path in upstream.iterdir() if path.is_dir()):
+            fixture = json.loads(
+                (directory / "fixture.json").read_text(encoding="utf-8"))
+            for step in fixture["steps"]:
+                for control in step["controls"]:
+                    found.append((directory.name, control["kind"], control["label"],
+                                  control["role"]))
+        return found
+
+    def test_the_approval_describes_the_corpus_exactly(self):
+        """Walking the approval cannot notice a control that was never reviewed.
+
+        Every other check here iterates `approval["entries"]`, so a control missing from the
+        file is simply never asked about and the suite stays green. Eight were: Greenhouse's
+        email and resume, and six of Lever's — 37 entries standing in for 45 controls. The
+        direction that catches that is corpus → approval, so this compares the two sets both
+        ways and counts duplicates out.
+        """
+        corpus = self.corpus_controls()
+        approved = [(entry["source_fixture"], entry["kind"], entry["recorded_label"],
+                     entry["role"]) for entry in self.approval()["entries"]]
+        self.assertEqual(len(corpus), len(set(corpus)), "the corpus repeats a control")
+        self.assertEqual(len(approved), len(set(approved)),
+                         "the approval reviews the same control twice")
+        self.assertEqual(sorted(set(corpus) - set(approved)), [], "unreviewed controls")
+        self.assertEqual(sorted(set(approved) - set(corpus)), [], "reviewed but not recorded")
+        self.assertEqual(len(approved), len(corpus))
+
     def test_every_recorded_label_matches_its_reviewed_disposition(self):
         """The oracle is a reviewed file, not a second Jobloom table.
 

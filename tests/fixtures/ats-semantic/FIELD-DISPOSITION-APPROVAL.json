@@ -1,7 +1,7 @@
 {
   "reviewed_at": "2026-09-01",
   "reviewed_by": "product owner review, recorded during Task 6",
-  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why.",
+  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why. It must describe the corpus exactly — one entry per recorded control, none missing and none extra — because a test that walks only this file cannot notice a control that was never reviewed.",
   "entries": [
     {
       "kind": "contact.email",
@@ -38,6 +38,15 @@
       "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
       "expected_disposition": "always_manual",
       "review_reason": "One broad control cannot stand in for four canonical meanings."
+    },
+    {
+      "kind": "contact.email",
+      "recorded_label": "Email address",
+      "role": "textbox",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "fact",
+      "expected_target": "contact.email"
     },
     {
       "kind": "contact.first_name",
@@ -139,6 +148,15 @@
       "review_reason": "Naming a colleague is a claim about another person."
     },
     {
+      "kind": "resume.file",
+      "recorded_label": "Resume",
+      "role": "file",
+      "source_fixture": "greenhouse-single-page-2026-08-v1",
+      "source_fixture_sha256": "8e1801d5bc7423a52ebd68c44760cfcba5612a34e29fb7dad7b89e348f337eb5",
+      "expected_disposition": "material",
+      "expected_target": "resume"
+    },
+    {
       "kind": "source.discovery",
       "recorded_label": "How did you hear about this opportunity?",
       "role": "combobox",
@@ -220,6 +238,24 @@
       "review_reason": "A per-employer disclosure; a registry miss is unknown, never No."
     },
     {
+      "kind": "contact.email",
+      "recorded_label": "Email address",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "contact.email"
+    },
+    {
+      "kind": "contact.full_name",
+      "recorded_label": "Full name",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "contact.full_name"
+    },
+    {
       "kind": "contact.location",
       "recorded_label": "Current location",
       "role": "combobox",
@@ -227,6 +263,15 @@
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
       "expected_target": "contact.location"
+    },
+    {
+      "kind": "contact.phone",
+      "recorded_label": "Phone number",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "contact.phone"
     },
     {
       "kind": "eeo.disability",
@@ -310,6 +355,15 @@
       "expected_target": "profile.github"
     },
     {
+      "kind": "profile.linkedin",
+      "recorded_label": "LinkedIn profile",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "profile.linkedin"
+    },
+    {
       "kind": "profile.location_url",
       "recorded_label": "Current location profile",
       "role": "textbox",
@@ -326,6 +380,24 @@
       "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
       "expected_disposition": "fact",
       "expected_target": "profile.portfolio"
+    },
+    {
+      "kind": "profile.website",
+      "recorded_label": "Website",
+      "role": "textbox",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "fact",
+      "expected_target": "profile.website"
+    },
+    {
+      "kind": "resume.file",
+      "recorded_label": "Resume",
+      "role": "file",
+      "source_fixture": "lever-application-2026-08-v1",
+      "source_fixture_sha256": "db9621d69311852cdf789875485a14274073dc2b87cd5db644750b885b99a02e",
+      "expected_disposition": "material",
+      "expected_target": "resume"
     },
     {
       "kind": "source.discovery_radio",
