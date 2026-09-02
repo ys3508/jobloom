@@ -1423,13 +1423,139 @@ class FillControlTests(unittest.TestCase):
             self.assertEqual(len(self.live_grants()), 1)
             self.assertEqual(self.oracle(server), 0)
 
-    def test_the_live_grant_index_exists_and_says_what_it_constrains(self):
+    def test_the_authority_index_exists_and_ignores_whether_a_grant_was_spent(self):
+        """The predicate must not mention `consumed_at`, and that is the whole point.
+
+        Excluding consumed grants looks tighter and is much weaker: the grant is spent
+        before a browser exists, so the slot would come free while the run was still
+        starting.
+        """
         with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
             self.observed_session(server)
             self.post("/fill/prepare", {"application_id": "app-1"})
         row = self.db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
-            "AND name='execution_grant_one_live_per_page'").fetchone()
+            "AND name='execution_grant_one_authority_per_page'").fetchone()
         self.assertIsNotNone(row, "the invariant is not in the database")
-        self.assertIn("consumed_at IS NULL", row["sql"])
         self.assertIn("revoked_at IS NULL", row["sql"])
+        self.assertNotIn("consumed_at", row["sql"])
+
+    # ---- the window between spending a grant and touching a page -------------
+
+    def test_a_second_bridge_is_refused_while_the_first_run_is_still_starting(self):
+        """The grant is spent before Chromium exists, and the slot must not come free.
+
+        `fill_worker` consumes the grant and only then launches a browser. With a predicate
+        that excluded consumed grants, a second bridge asking in that window found nothing
+        live, was issued its own grant, and filled the same page again — and the `running`
+        flag that would have stopped it is process-local, so it belonged to the first bridge
+        and the second one could not see it.
+
+        This blocks inside `consume_execution_grant`, which puts the second bridge's request
+        exactly in that window rather than near it.
+        """
+        import fill_core
+
+        spent = threading.Event()
+        release = threading.Event()
+        real_consume = fill_core.consume_execution_grant
+
+        def blocking_consume(*args, **kwargs):
+            outcome = real_consume(*args, **kwargs)
+            spent.set()
+            # Held here, after the grant is consumed and before the browser opens.
+            self.assertTrue(release.wait(timeout=60), "the test never released the worker")
+            return outcome
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            other = self.second_bridge()
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            first: dict = {}
+            def run_first():
+                first["result"] = self.post(
+                    "/fill/execute", {"execution_id": prepared["execution_id"]})
+            with unittest.mock.patch.object(fill_core, "consume_execution_grant",
+                                            blocking_consume):
+                worker = threading.Thread(target=run_first, daemon=True)
+                worker.start()
+                try:
+                    self.assertTrue(spent.wait(timeout=60), "the grant was never consumed")
+                    self.assertEqual(self.db.execute(
+                        "SELECT COUNT(*) FROM execution_grants "
+                        "WHERE consumed_at IS NOT NULL").fetchone()[0], 1)
+                    # The window. Nothing has been typed into anything yet.
+                    status, body = self.post_to(other, "/fill/prepare",
+                                                {"application_id": "app-1"})
+                    self.assertEqual(status, 409)
+                    self.assertEqual(body["error"], "fill_page_already_authorised")
+                    self.assertEqual(set(body), {"error"})
+                finally:
+                    release.set()
+                worker.join(timeout=120)
+            self.assertEqual(first["result"][0], 200, first["result"])
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_spent_grant_whose_run_failed_cannot_be_reminted(self):
+        """Steps still pending is not a licence to authorise them again.
+
+        The import is what marks a step done, so a run that spends its grant and then fails
+        to import leaves the page looking exactly as it did before — pending steps, ready to
+        prepare. Under the old predicate that page could be authorised again, which is a
+        consumed package coming back through a new grant. Retrying belongs to a new reviewed
+        page or session.
+        """
+        import fill_core
+
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            _, prepared = self.post("/fill/prepare", {"application_id": "app-1"})
+            with unittest.mock.patch.object(fill_core, "import_result",
+                                            side_effect=ValueError("import refused")):
+                status, _ = self.post("/fill/execute",
+                                      {"execution_id": prepared["execution_id"]})
+            self.assertEqual(status, 409)
+            # The grant is spent and the steps never moved: the shape the window leaves.
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM fill_steps WHERE status='pending'").fetchone()[0], 3)
+            status, body = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_page_already_authorised")
+            other = self.second_bridge()
+            status, body = self.post_to(other, "/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_page_already_authorised")
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM execution_grants WHERE consumed_at IS NOT NULL"
+            ).fetchone()[0], 1)
+            self.assertEqual(self.oracle(server), 0)
+
+    def test_a_database_that_already_breaks_the_rule_refuses_to_prepare(self):
+        """History does not disappear because the rule arrived.
+
+        A database written before this constraint can hold two unrevoked grants for one
+        page — that is the bug, recorded. Creating the index then fails, and the honest
+        answer is to stop rather than to carry on with the guarantee quietly absent, or to
+        revoke rows until the past fits.
+        """
+        with ReplayServer(connection=self.db, clock=lambda: self.now) as server:
+            self.observed_session(server)
+            for suffix in ("a", "b"):
+                self.db.execute(
+                    "INSERT INTO execution_grants (grant_id, session_id, page_id, "
+                    "package_sha256, secret, issued_at, expires_at, consumed_at, revoked_at) "
+                    "VALUES (?, 'session-1', 'page-1', 'd', '', ?, ?, ?, NULL)",
+                    (f"legacy-{suffix}", self.now.isoformat(), self.now.isoformat(),
+                     self.now.isoformat()))
+            self.db.commit()
+            status, body = self.post("/fill/prepare", {"application_id": "app-1"})
+            self.assertEqual(status, 409)
+            self.assertEqual(body["error"], "fill_authority_index_unavailable")
+            self.assertEqual(set(body), {"error"})
+            self.assertEqual(self.oracle(server), 0)

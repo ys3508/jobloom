@@ -431,20 +431,29 @@ FILL_ID_LIMIT = 128
 # boundary that matters; this only stops the panel offering a button that cannot work.
 FILL_PREPARED_TTL_SECONDS = 900
 
-# One live authority per page, as a property of the database rather than of a process.
+# One authority per page, ever, as a property of the database rather than of a process.
 #
 # `FillControl`'s lock is per-process, and the CLI takes `--port`, so two bridges on one
 # database each hold their own lock and their own idea of what is prepared. Both could read
-# "no live grants" and both could then issue one, and the page would carry two authorities
-# that were each single-use and each perfectly valid. A partial unique index states the
-# invariant where both processes can see it: at most one row per `(session_id, page_id)` that
-# is neither consumed nor revoked. It is created here rather than in `fill_core.initialize`
-# because that file belongs to a released task; the natural long-term home is beside the
-# table it constrains.
+# "nothing live" and both could then issue, and the page would carry two authorities that
+# were each single-use and each perfectly valid. A partial unique index states the invariant
+# where both processes can see it.
+#
+# The predicate is `revoked_at IS NULL` and deliberately says nothing about `consumed_at`.
+# An earlier version excluded consumed grants too, which looks tighter and is much weaker:
+# `fill_worker` spends the grant *before* it opens a browser, so the slot came free while the
+# run was still starting. A second bridge asking during that window found no live grant, was
+# issued one of its own, and filled the same page again — and the process-local `running`
+# flag that would have stopped it belonged to the first bridge, which the second one cannot
+# see. A consumed grant therefore keeps the page's one slot for good: a spent package must
+# not come back through a freshly minted grant. A run that failed is retried through a new
+# reviewed page or session, not by re-authorising the same pending steps.
+#
+# Created here rather than in `fill_core.initialize` because that file belongs to a released
+# task; beside the table it constrains is where it should eventually live.
 LIVE_GRANT_INDEX = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS execution_grant_one_live_per_page "
-    "ON execution_grants(session_id, page_id) "
-    "WHERE consumed_at IS NULL AND revoked_at IS NULL")
+    "CREATE UNIQUE INDEX IF NOT EXISTS execution_grant_one_authority_per_page "
+    "ON execution_grants(session_id, page_id) WHERE revoked_at IS NULL")
 FILL_PREPARE_LOCK = ".prepare.lock"
 
 try:  # POSIX only; the index above is the guarantee, this only orders the queue.
@@ -830,6 +839,22 @@ class Handler(BaseHTTPRequestHandler):
         for row in live:
             fill_core.revoke_execution_grant(connection, row["grant_id"], now)
 
+    def _ensure_authority_index(self, connection) -> None:
+        """Put the invariant in the database, or refuse to prepare without it.
+
+        A database written before this constraint existed can already hold two unrevoked
+        grants for one page — that is the bug, and its traces do not disappear because the
+        rule arrived. Creating the index then fails, and the honest answer is to stop rather
+        than to carry on with the guarantee quietly absent or to revoke history until it
+        fits. The refusal names a code and leaves the rows for a person to look at.
+        """
+        try:
+            connection.execute(LIVE_GRANT_INDEX)
+            connection.commit()
+        except sqlite3.IntegrityError as error:
+            connection.rollback()
+            raise BridgeError("fill_authority_index_unavailable", 409) from error
+
     @contextlib.contextmanager
     def _across_processes(self):
         """Hold the preparation critical section against another bridge on this database.
@@ -861,8 +886,7 @@ class Handler(BaseHTTPRequestHandler):
             session, page, steps = self._fill_state(
                 connection, request["application_id"], now)
 
-            connection.execute(LIVE_GRANT_INDEX)
-            connection.commit()
+            self._ensure_authority_index(connection)
 
             def build() -> _PreparedRun:
                 # Under `FillControl`'s lock, the file lock, and the unique index — in that

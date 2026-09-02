@@ -90,9 +90,21 @@ Consuming a grant once is not the same as there being one grant, and the differe
 a second bridge lives. `--port` starts another instance on the same database, with its own
 lock and its own memory of what is prepared, so both could read "nothing live" and both could
 issue. The invariant is therefore written where both can see it: a partial unique index on
-`execution_grants(session_id, page_id)` over the rows that are neither consumed nor revoked.
-A file lock orders the queue and the process lock orders one bridge, but neither is the
-guarantee — with both removed, the index alone still leaves a page with one authority.
+`execution_grants(session_id, page_id)` over every row that has not been revoked. A file lock
+orders the queue and the process lock orders one bridge, but neither is the guarantee — with
+both removed, the index alone still leaves a page with one authority.
+
+The predicate says nothing about `consumed_at`, and that is the load-bearing part. The worker
+spends its grant *before* it opens a browser, so a rule that excluded consumed grants would
+free the page's slot while the run was still starting: a second bridge asking in that window
+would find nothing live, be issued its own grant, and fill the page again — and the `running`
+flag that would have stopped it is process-local, so it belongs to the first bridge and the
+second cannot see it. A consumed grant therefore keeps the slot for good. A run that spends
+its grant and then fails leaves its steps pending and its page unauthorisable, which is
+deliberate: retrying goes through a new reviewed page or session, never through a second
+grant over the same pending steps. A database written before this rule can already hold two
+unrevoked grants for one page; the index then refuses to be created and the bridge refuses to
+prepare rather than continuing without the guarantee.
 
 **Permissions did not change for this.** The manifest is the same five permissions, the same
 single host permission for the bridge, and the same two optional job-site hosts, and a test
