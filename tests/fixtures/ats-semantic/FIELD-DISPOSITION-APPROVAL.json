@@ -1,7 +1,7 @@
 {
   "reviewed_at": "2026-09-01",
   "reviewed_by": "product owner review, recorded during Task 6",
-  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why. It must describe the corpus exactly — one entry per recorded control, none missing and none extra — because a test that walks only this file cannot notice a control that was never reviewed. Each entry pins the whole reviewed answer and not just its first half: `expected_target` names which authority may answer the field, or which reason the pause carries, and `expected_domain`/`expected_family` name what `field_policy.classify` must make of the recorded wording — null where no domain rule may fire at all. A disposition on its own is not a review: `contact.email` mapped to `contact.phone` is still a `fact`.",
+  "note": "The approved disposition for every control label in the vendored corpus. This file is the oracle: a test reads it and never derives what it expects from `semantic_replay.KIND_DISPOSITIONS`, because comparing one Jobloom table to another proves they agree and not that either is right. Every `always_manual` entry states why. It must describe the corpus exactly — one entry per recorded control, none missing and none extra — because a test that walks only this file cannot notice a control that was never reviewed. Each entry pins the whole reviewed answer and not just its first half: a disposition on its own is not a review, since `contact.email` mapped to `contact.phone` is still a `fact`. `expected_domain`/`expected_family` name what `field_policy.classify` must make of the recorded wording, null where no domain rule may fire at all. `expected_target` means one of two things by design. For a field with no automatic path it is the stable reason the pause carries — `employer_defined_compensation_manual`, `referral_contact_requires_user`, `sponsorship_meaning_ambiguous`. For the `eeo.*` kinds it is the protected policy domain, `voluntary_eeo`, because entering that domain hands the field to the non-disclosure policy rather than to a fixed code: the outcome there depends on what the user registered and on what the control is, and may be a planned step and no pause at all.",
   "entries": [
     {
       "kind": "contact.email",
@@ -509,6 +509,5 @@
       "expected_domain": "discovery_source",
       "expected_family": "discovery_source"
     }
-  ],
-  "known_inconsistency": "The four `eeo.*` kinds carry `voluntary_eeo` as their target, which is a domain name, while every other always_manual kind carries a reason code from `field_policy.MANUAL_REASONS` — where the code for this domain is `voluntary_disclosure_manual`. Recorded as it stands rather than quietly normalised, because the target is what the pause would carry and changing it is a product decision, not a test fix. `MANUAL_REASONS` currently has no reader at all."
+  ]
 }

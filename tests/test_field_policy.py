@@ -328,6 +328,43 @@ class FirstFormFieldPolicyTests(unittest.TestCase):
             source_kind="answer")])
         self.assertEqual(self.pause_reasons(result), {"sponsorship_meaning_ambiguous"})
 
+    def test_a_voluntary_eeo_field_is_resolved_by_policy_not_by_a_fixed_reason(self):
+        """`voluntary_eeo` names a protected domain, not a pause reason.
+
+        The other always-manual domains really do map to one stable code — compensation to
+        `employer_defined_compensation_manual`, a referral to
+        `referral_contact_requires_user` — because nothing can ever answer them. This domain
+        is different in kind: entering it hands the field to the non-disclosure policy, and
+        the answer depends on what the user registered and on what the control is. The three
+        outcomes below share no code, and one of them is not a pause at all, which is why the
+        deleted `MANUAL_REASONS` could not have described this domain correctly.
+        """
+        eeo = dict(field_id="eeo_race", question="Race / Ethnicity")
+        # Nothing registered: the reason names the absence, not the domain.
+        self.assertEqual(
+            self.pause_reasons(self.observe([self.field(
+                **eeo, control="select", options=self.race_options())], locale="en-US")),
+            {"nondisclosure_policy_absent"})
+        # Registered, but on a control that cannot carry the reviewed option.
+        self.setUp()
+        self.add_decline_policy()
+        self.assertEqual(
+            self.pause_reasons(self.observe([self.field(
+                **eeo, control="radio", options=self.race_options())], locale="en-US")),
+            {"nondisclosure_control_unsupported"})
+        # Registered, on a control that can: planned, and no pause of any kind.
+        self.setUp()
+        self.add_decline_policy()
+        result = self.observe([self.field(
+            **eeo, control="select", options=self.race_options())], locale="en-US")
+        self.assertNotEqual(result["status"], "paused")
+        self.assertEqual(self.pause_reasons(result), set())
+        self.assertEqual(self.db.execute(
+            "SELECT source_kind FROM fill_steps WHERE field_id='eeo_race'"
+        ).fetchone()["source_kind"], "nondisclosure_policy")
+        # And no static map may come back to stand in front of that rule.
+        self.assertFalse(hasattr(POLICY, "MANUAL_REASONS"))
+
     def test_a_radiogroup_nondisclosure_control_is_named_unsupported_not_mis_filled(self):
         # A radiogroup's identity is the group; the reviewed option lives on one of its
         # inputs, and nothing addresses that yet. Naming it beats filling the wrong node.

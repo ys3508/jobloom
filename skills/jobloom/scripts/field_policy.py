@@ -41,15 +41,16 @@ from _common import context_matches, parse_time  # noqa: E402
 DISPOSITIONS = {"fact", "answer", "material", "always_manual", "unsupported"}
 
 # Domains whose fields are never answered from a Jobloom source, whatever the page declares.
+#
+# There is deliberately no domain-to-reason map beside this set. One existed, was read by
+# nothing, and was wrong in the way an unused table is free to be: it gave `voluntary_eeo` a
+# single code, when entering that domain hands the field to the non-disclosure policy and the
+# outcome depends on what the user registered and on what the control is — a dynamic reason,
+# `nondisclosure_control_unsupported` on a radiogroup, or a planned step and no pause at all.
+# The reasons the other domains raise are written where the rule is applied, in
+# `fill_core._apply_domain_rule`, so a static map cannot drift away from them.
 ALWAYS_MANUAL_DOMAINS = {"voluntary_eeo", "compensation", "employer_conflict", "sponsorship",
                          "referral_contact"}
-MANUAL_REASONS = {
-    "voluntary_eeo": "voluntary_disclosure_manual",
-    "compensation": "employer_defined_compensation_manual",
-    "employer_conflict": "employer_entity_not_approved",
-    "sponsorship": "sponsorship_meaning_ambiguous",
-    "referral_contact": "referral_contact_requires_user",
-}
 
 LOCALE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Z]{2})?$")
 LOOPBACK_HOST = re.compile(r"^127\.0\.0\.1$")
