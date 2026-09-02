@@ -226,6 +226,13 @@ QUESTION_FORM_MANIFEST_FIELDS = {"schema_version", "reviewed_at", "reviewed_by",
                                  "forms"}
 QUESTION_FORM_FIELDS = {"canonical_id", "canonical_meaning", "question", "match_level",
                         "verified_by_user", "recorded_in"}
+# The reviewed disposition approval, read as strictly as the manifest it vouches for. An
+# oracle skimmed with `.get` is an oracle that can be replaced by an empty object.
+PROVENANCE_FIELDS = {"reviewed_at", "reviewed_by", "note", "entries"}
+PROVENANCE_ENTRY_FIELDS = {"kind", "recorded_label", "role", "source_fixture",
+                           "source_fixture_sha256", "expected_disposition",
+                           "expected_target"}
+PROVENANCE_ENTRY_OPTIONAL = {"expected_domain", "expected_family", "review_reason"}
 
 
 def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
@@ -266,8 +273,47 @@ def _manifest_forms(manifest: Any) -> list[dict[str, Any]]:
     return forms
 
 
+def _provenance_index(provenance: Any) -> dict[str, set[tuple[str, str]]]:
+    """Which `(fixture, meaning)` pairs actually recorded each wording.
+
+    The index keeps the meaning, not just the fixture. Checking a question against the set
+    of fixtures that recorded it proves the wording is real and proves nothing about what it
+    means, so `Email address` could be imported as `work_authorized_now` and every check
+    would pass — the label exists, the fixtures match, and the mapping is nonsense.
+    """
+    if not isinstance(provenance, dict) or set(provenance) != PROVENANCE_FIELDS:
+        raise ValueError("provenance has an unexpected shape")
+    entries = provenance["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("provenance carries no reviewed entries")
+    index: dict[str, set[tuple[str, str]]] = {}
+    controls: set[tuple[str, str]] = set()
+    meanings: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("provenance entry has an unexpected shape")
+        keys = set(entry)
+        if not PROVENANCE_ENTRY_FIELDS <= keys or keys - PROVENANCE_ENTRY_FIELDS - PROVENANCE_ENTRY_OPTIONAL:
+            raise ValueError("provenance entry has an unexpected shape")
+        for field in ("kind", "recorded_label", "source_fixture", "expected_target",
+                      "expected_disposition"):
+            if not isinstance(entry[field], str) or not entry[field].strip():
+                raise ValueError(f"provenance entry field must be a non-empty string: {field}")
+        control = (entry["source_fixture"], entry["kind"])
+        if control in controls:
+            raise ValueError(f"provenance reviews one control twice: {control[1]}")
+        controls.add(control)
+        label, target = entry["recorded_label"], entry["expected_target"]
+        if meanings.setdefault(label, target) != target:
+            # The same thing `match_answer` reports as `question_mapping_conflict`, in the
+            # file that is supposed to be settling it.
+            raise ValueError("provenance reviews one wording as two meanings")
+        index.setdefault(label, set()).add((entry["source_fixture"], target))
+    return index
+
+
 def import_question_forms(connection: sqlite3.Connection, manifest: Any,
-                          provenance: Any = None) -> dict[str, Any]:
+                          provenance: Any) -> dict[str, Any]:
     """Apply a reviewed manifest to this library, wholly or not at all.
 
     Deliberately not called by `initialize`. A file appearing in a checkout is not a person
@@ -280,21 +326,26 @@ def import_question_forms(connection: sqlite3.Connection, manifest: Any,
     was widened — is a conflict and stops the whole import, because a half-applied vocabulary
     is worse than none.
 
-    `provenance`, when given, is the reviewed disposition approval. Each question must appear
-    in it verbatim as a recorded label under the fixtures the manifest names. Wording that
-    cannot be traced to a recording is wording somebody imagined, and a form no employer
-    ships matches nothing.
+    `provenance` is the reviewed disposition approval and is required. It was briefly
+    optional, which made the whole check decorative: any file in a checkout that called
+    itself `exact` and `verified_by_user` could write arbitrary mappings in bulk, and a
+    manifest saying so is not a person confirming it. Each question must appear in the
+    approval verbatim, under the fixtures the manifest names, **and reviewed as the meaning
+    the manifest gives it** — the last of those was missing too, so `Email address` mapped to
+    `work_authorized_now` passed every check: the label existed, the fixtures matched, and
+    the mapping was nonsense.
     """
     forms = _manifest_forms(manifest)
-    if provenance is not None:
-        recorded: dict[str, set[str]] = {}
-        for entry in provenance.get("entries", []):
-            recorded.setdefault(entry["recorded_label"], set()).add(entry["source_fixture"])
-        for form in forms:
-            if form["question"] not in recorded:
-                raise ValueError("question form is not recorded employer wording")
-            if set(form["recorded_in"]) != recorded[form["question"]]:
-                raise ValueError("question form names the wrong recording provenance")
+    recorded = _provenance_index(provenance)
+    for form in forms:
+        question = form["question"]
+        if question not in recorded:
+            raise ValueError("question form is not recorded employer wording")
+        claimed = {(fixture, form["canonical_id"]) for fixture in form["recorded_in"]}
+        if claimed != recorded[question]:
+            # One comparison covers both halves: a fixture that did not record this wording,
+            # and a meaning nobody reviewed this wording as.
+            raise ValueError("question form does not match its reviewed provenance")
 
     planned, already = [], []
     for form in forms:
@@ -495,9 +546,9 @@ def main() -> None:
     revoke.add_argument("--authorization-id", required=True)
     forms_import = subparsers.add_parser("import-question-forms")
     forms_import.add_argument("--manifest", required=True, type=Path)
-    forms_import.add_argument("--provenance", type=Path,
+    forms_import.add_argument("--provenance", required=True, type=Path,
                               help="the reviewed disposition approval every question must "
-                                   "be traceable to")
+                                   "be traceable to, wording and meaning both")
     invalidate = subparsers.add_parser("invalidate")
     invalidate.add_argument("--trigger", required=True)
     match = subparsers.add_parser("match")
@@ -526,8 +577,7 @@ def main() -> None:
         result = {"status": "revoked", "authorization_id": args.authorization_id}
     elif args.command == "import-question-forms":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        provenance = (json.loads(args.provenance.read_text(encoding="utf-8"))
-                      if args.provenance else None)
+        provenance = json.loads(args.provenance.read_text(encoding="utf-8"))
         result = import_question_forms(connection, manifest, provenance)
     elif args.command == "invalidate":
         result = {"status": "invalidated", "answer_ids": invalidate_by_trigger(connection, args.trigger)}

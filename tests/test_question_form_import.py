@@ -138,16 +138,17 @@ class QuestionFormImportTests(unittest.TestCase):
         for label, manifest in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ValueError):
-                    ANSWERS.import_question_forms(self.db, manifest)
+                    ANSWERS.import_question_forms(self.db, manifest, APPROVAL)
                 self.assertEqual(self.forms(), 0)
 
     def test_a_semantic_equivalent_cannot_arrive_in_bulk(self):
         """That claim is one a person makes about one paraphrase at a time."""
         with self.assertRaisesRegex(ValueError, "only exact"):
             ANSWERS.import_question_forms(
-                self.db, self.broken_form(match_level="semantic_equivalent"))
+                self.db, self.broken_form(match_level="semantic_equivalent"), APPROVAL)
         with self.assertRaisesRegex(ValueError, "user-verified"):
-            ANSWERS.import_question_forms(self.db, self.broken_form(verified_by_user=False))
+            ANSWERS.import_question_forms(
+                self.db, self.broken_form(verified_by_user=False), APPROVAL)
         self.assertEqual(self.forms(), 0)
 
     # ---- conflicts ------------------------------------------------------------
@@ -158,14 +159,14 @@ class QuestionFormImportTests(unittest.TestCase):
         clash["canonical_id"] = "something_else"
         manifest["forms"].append(clash)
         with self.assertRaisesRegex(ValueError, "two meanings"):
-            ANSWERS.import_question_forms(self.db, manifest)
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL)
         self.assertEqual(self.forms(), 0)
 
     def test_the_same_form_twice_in_one_manifest_is_refused(self):
         manifest = copy.deepcopy(MANIFEST)
         manifest["forms"].append(copy.deepcopy(manifest["forms"][0]))
         with self.assertRaisesRegex(ValueError, "repeated"):
-            ANSWERS.import_question_forms(self.db, manifest)
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL)
         self.assertEqual(self.forms(), 0)
 
     def test_a_library_that_already_maps_the_question_elsewhere_is_not_overwritten(self):
@@ -193,15 +194,129 @@ class QuestionFormImportTests(unittest.TestCase):
         self.assertEqual(self.forms(), 0)
 
     def test_naming_the_wrong_recording_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "wrong recording provenance"):
+        with self.assertRaisesRegex(ValueError, "reviewed provenance"):
             ANSWERS.import_question_forms(
                 self.db, self.broken_form(recorded_in=["a-fixture-that-did-not-record-it"]),
                 APPROVAL)
         self.assertEqual(self.forms(), 0)
 
-    def test_provenance_is_optional_so_a_library_can_be_seeded_without_the_corpus(self):
-        result = ANSWERS.import_question_forms(self.db, MANIFEST)
-        self.assertEqual(result["imported"], len(MANIFEST["forms"]))
+    def test_provenance_cannot_be_omitted(self):
+        """It was optional, which made the whole check decorative.
+
+        Any file in a checkout that called itself `exact` and `verified_by_user` could write
+        arbitrary mappings in bulk, and a manifest saying so is not a person confirming it.
+        Omitting it is now a `TypeError` at the call rather than a quiet permission.
+        """
+        with self.assertRaises(TypeError):
+            ANSWERS.import_question_forms(self.db, MANIFEST)
+        self.assertEqual(self.forms(), 0)
+
+    def test_the_right_wording_under_the_wrong_meaning_is_refused(self):
+        """The check that was missing entirely.
+
+        Provenance compared the label and the set of fixtures that recorded it, which proves
+        the wording is real and proves nothing about what it means. `Email address` mapped to
+        `work_authorized_now` passed every check: the label existed, the fixtures matched,
+        and the mapping was nonsense — and the library would have gone on to answer an
+        employer's email field with a work-authorization answer.
+        """
+        manifest = copy.deepcopy(MANIFEST)
+        stolen = next(form for form in manifest["forms"]
+                      if form["canonical_id"] == "contact.email")
+        stolen["canonical_id"] = "work_authorized_now"
+        manifest["forms"] = [
+            form for form in manifest["forms"]
+            if not (form["canonical_id"] == "work_authorized_now"
+                    and form["question"] == "Authorized to work in the United States?")]
+        with self.assertRaisesRegex(ValueError, "reviewed provenance"):
+            ANSWERS.import_question_forms(self.db, manifest, APPROVAL)
+        self.assertEqual(self.forms(), 0)
+
+    def test_provenance_of_an_unexpected_shape_is_refused_whole(self):
+        """Read as strictly as the manifest it vouches for.
+
+        An oracle skimmed with `.get("entries", [])` is an oracle that can be replaced by an
+        empty object, at which point every question is unrecorded and nothing notices.
+        """
+        def broken_entry(**changes):
+            provenance = copy.deepcopy(APPROVAL)
+            provenance["entries"][0].update(changes)
+            return provenance
+
+        cases = {
+            "not a mapping": [],
+            "an empty object": {},
+            "no entries key": {k: v for k, v in APPROVAL.items() if k != "entries"},
+            "an extra top-level key": {**APPROVAL, "extra": "x"},
+            "no entries at all": {**APPROVAL, "entries": []},
+            "entries not a list": {**APPROVAL, "entries": {}},
+            "an entry that is not a mapping": {**APPROVAL, "entries": ["x"]},
+            "an entry missing a field": {
+                **APPROVAL,
+                "entries": [{k: v for k, v in APPROVAL["entries"][0].items()
+                             if k != "expected_target"}]},
+            "an entry with an unknown field": broken_entry(invented="x"),
+            "a blank recorded label": broken_entry(recorded_label="  "),
+            "a non-string target": broken_entry(expected_target=17),
+        }
+        for label, provenance in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    ANSWERS.import_question_forms(self.db, MANIFEST, provenance)
+                self.assertEqual(self.forms(), 0)
+
+    def test_provenance_that_contradicts_itself_is_refused(self):
+        """A file settling what wording means may not review one wording as two meanings."""
+        provenance = copy.deepcopy(APPROVAL)
+        clash = copy.deepcopy(provenance["entries"][0])
+        clash["kind"] = "invented.kind"
+        clash["expected_target"] = "something_else_entirely"
+        provenance["entries"].append(clash)
+        with self.assertRaisesRegex(ValueError, "two meanings"):
+            ANSWERS.import_question_forms(self.db, MANIFEST, provenance)
+        self.assertEqual(self.forms(), 0)
+
+    def test_provenance_that_reviews_one_control_twice_is_refused(self):
+        provenance = copy.deepcopy(APPROVAL)
+        provenance["entries"].append(copy.deepcopy(provenance["entries"][0]))
+        with self.assertRaisesRegex(ValueError, "one control twice"):
+            ANSWERS.import_question_forms(self.db, MANIFEST, provenance)
+        self.assertEqual(self.forms(), 0)
+
+    def test_every_rejection_leaves_the_library_exactly_as_it_was(self):
+        """Transactional in the sense that matters: a refused import is a no-op.
+
+        Checked from a library that already holds forms, because "nothing was written" is
+        easy to satisfy from empty and is not what a real refusal has to preserve.
+        """
+        ANSWERS.import_question_forms(self.db, MANIFEST, APPROVAL)
+        before = self.db.execute(
+            "SELECT normalized_question, canonical_id, match_level FROM question_forms "
+            "ORDER BY normalized_question").fetchall()
+        grown = copy.deepcopy(MANIFEST)
+        grown["forms"].append({
+            "canonical_id": "work_authorized_now", "canonical_meaning": "m",
+            "question": "Do you like puppies?", "match_level": "exact",
+            "verified_by_user": True, "recorded_in": ["invented-fixture"]})
+        with self.assertRaises(ValueError):
+            ANSWERS.import_question_forms(self.db, grown, APPROVAL)
+        after = self.db.execute(
+            "SELECT normalized_question, canonical_id, match_level FROM question_forms "
+            "ORDER BY normalized_question").fetchall()
+        self.assertEqual([tuple(row) for row in before], [tuple(row) for row in after])
+
+    def test_a_rejection_names_no_wording_and_no_value(self):
+        """A refusal is part of the API too."""
+        for manifest, provenance in ((self.broken_form(question="Are you a self-starter?"),
+                                      APPROVAL),
+                                     (MANIFEST, {**APPROVAL, "entries": []})):
+            with self.subTest():
+                with self.assertRaises(ValueError) as caught:
+                    ANSWERS.import_question_forms(self.db, manifest, provenance)
+                message = str(caught.exception)
+                for form in MANIFEST["forms"]:
+                    self.assertNotIn(form["question"], message)
+                self.assertNotIn("self-starter", message)
 
     # ---- nothing is written by accident, and nothing is echoed ----------------
 
