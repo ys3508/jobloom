@@ -100,6 +100,11 @@ def initialize(connection: sqlite3.Connection) -> None:
         ("keywords_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("confirmed_at", "TEXT"),
         ("invalidation_triggers_json", "TEXT NOT NULL DEFAULT '[]'"),
+        # What this fact means, so a form field can reach it by meaning rather than by an
+        # internal id no employer page has ever heard of. Nullable: facts written before the
+        # Candidate Profile existed carry no canonical meaning, and inventing one for them
+        # would be guessing which is which.
+        ("canonical_id", "TEXT"),
     ):
         if name not in fact_columns:
             connection.execute(f"ALTER TABLE candidate_facts ADD COLUMN {name} {definition}")
@@ -249,13 +254,14 @@ def register_snapshot(
                 INSERT INTO candidate_facts (
                     content_sha256, fact_id, fact_type, value_json, status, locked,
                     evidence_strength, expires_at, source_json, keywords_json, confirmed_at,
-                    invalidation_triggers_json, fact_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    invalidation_triggers_json, canonical_id, fact_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (content_hash, fact["id"], str(fact.get("type", "unknown")),
                   canonical_json(fact["value"]), fact["status"], int(fact["locked"]),
                   fact["evidence_strength"], fact.get("expires_at"),
                   canonical_json(fact.get("source") or {}), canonical_json(fact.get("keywords") or []),
                   fact.get("confirmed_at"), canonical_json(fact.get("invalidation_triggers") or []),
+                  fact.get("canonical_id"),
                   resume_core.canonical_hash(fact)))
         require_table(connection, "material_locks")
         if active:

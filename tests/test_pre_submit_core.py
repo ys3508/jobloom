@@ -69,7 +69,13 @@ class PreSubmitCoreTests(unittest.TestCase):
         ):
             value_json = json.dumps(value, sort_keys=True, separators=(",", ":"))
             self.db.execute(
-                "INSERT INTO candidate_facts VALUES (?, ?, ?, ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
+                # Columns named rather than positional: an additive migration to
+                # `candidate_facts` should not break a fixture that does not care about the
+                # new column.
+                "INSERT INTO candidate_facts (content_sha256, fact_id, fact_type, "
+                "value_json, status, locked, evidence_strength, expires_at, source_json, "
+                "keywords_json, confirmed_at, invalidation_triggers_json, fact_sha256) "
+                "VALUES (?, ?, ?, ?, 'locked', 1, 'direct', NULL, '{}', '[]', ?, '[]', ?)",
                 (candidate["content_sha256"], fact_id, fact_type, value_json, AT.isoformat(),
                  RESUMES.canonical_hash({"id": fact_id, "value": value})),
             )
