@@ -143,6 +143,17 @@ def _json(value: Any) -> str:
 
 
 def add_answer(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:
+    """Validate and write one answer, committing it.
+
+    The commit is why this cannot be the thing a batch calls. `_insert_answer` does the same
+    work and leaves the transaction open, so a caller writing several can roll all of them
+    back; this wrapper keeps the single-answer behaviour every existing caller relies on.
+    """
+    _insert_answer(connection, entry)
+    connection.commit()
+
+
+def _insert_answer(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:
     required = {
         "answer_id", "canonical_id", "canonical_meaning", "answer", "answer_type", "source_type",
         "confirmation_status", "confirmed_at", "validity_class", "auto_fill_allowed", "auto_submit_allowed",
@@ -205,7 +216,6 @@ def add_answer(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:
     if entry.get("supersedes_id"):
         connection.execute("UPDATE answers SET status='superseded' WHERE answer_id=?", (entry["supersedes_id"],))
     audit(connection, "answer_added", entry["answer_id"], {"canonical_id": entry["canonical_id"]})
-    connection.commit()
 
 
 def add_question_form(
@@ -360,7 +370,7 @@ INTAKE_PROSE_FIELDS = ("canonical_meaning", "confirmation")
 
 
 def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
-                    at: datetime | None = None) -> dict[str, Any]:
+                    at: datetime | None = None, sink=None) -> dict[str, Any]:
     """Prepare a private worksheet of what the user is being asked to confirm.
 
     Half of the loop the library has never had. Everything downstream of a confirmed answer
@@ -416,17 +426,9 @@ def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
         })
 
     proposal_id = f"proposal-{secrets.token_hex(8)}"
-    digest = _shape_digest(entries)
     timestamp = (at or now_utc()).isoformat()
-    connection.execute(
-        "INSERT INTO answer_proposals (proposal_id, created_at, snapshot_sha256, "
-        "shape_sha256, targets_json, status, confirmed_at) VALUES (?, ?, ?, ?, ?, 'open', NULL)",
-        (proposal_id, timestamp, snapshot["content_sha256"], digest, _json(in_round)))
-    audit(connection, "answers_proposed", proposal_id,
-          {"round": round_name, "canonical_ids": in_round})
-    connection.commit()
     worksheet = {
-        "proposal_id": proposal_id, "shape_sha256": digest,
+        "proposal_id": proposal_id, "shape_sha256": "",
         "snapshot_sha256": snapshot["content_sha256"], "round": round_name,
         "note": ("Private. Check each answer, then set `confirmed_by_user` to true on the "
                  "ones you want filled automatically. Anything left false is left out "
@@ -434,6 +436,27 @@ def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
                  "half-finished one. Nothing here may ever be submitted automatically."),
         "application_id": TASK14_APPLICATION, "entries": entries,
     }
+    worksheet["shape_sha256"] = _shape_digest(worksheet)
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            "INSERT INTO answer_proposals (proposal_id, created_at, snapshot_sha256, "
+            "shape_sha256, targets_json, status, confirmed_at) "
+            "VALUES (?, ?, ?, ?, ?, 'open', NULL)",
+            (proposal_id, timestamp, snapshot["content_sha256"],
+             worksheet["shape_sha256"], _json(in_round)))
+        audit(connection, "answers_proposed", proposal_id,
+              {"round": round_name, "canonical_ids": in_round})
+        if sink is not None:
+            # Inside the transaction on purpose: a worksheet the caller could not write must
+            # not leave an open proposal behind, and a proposal that could not be recorded
+            # must not leave a worksheet that looks usable.
+            sink(worksheet)
+    except Exception:
+        connection.rollback()
+        raise
+    connection.commit()
     return {"worksheet": worksheet,
             "summary": {"proposal_id": proposal_id, "round": round_name,
                         "canonical_ids": in_round,
@@ -512,9 +535,12 @@ TASK14_PROPOSAL_ROUNDS = {"contact": TASK14_CONTACT_TARGETS}
 # The parts of a proposed entry that the user may not edit. The answer itself is deliberately
 # absent: filling it in is the whole point of the worksheet, and a hash over it would make
 # every confirmation fail.
-PROPOSAL_SHAPE_FIELDS = ("canonical_id", "answer_type", "validity_class", "scope",
-                         "auto_fill_allowed", "auto_submit_allowed",
-                         "dependent_fact_ids", "invalidation_triggers")
+# The two fields the user is being asked to fill in. Everything else in the worksheet — every
+# entry field and every heading above it — is covered by the digest, because a worksheet whose
+# explanation could be edited is a worksheet that can be made to ask a different question than
+# the one it records. `canonical_meaning` mattered most: it was written straight to the
+# database, so editing it relabelled a meaning.
+WORKSHEET_EDITABLE_FIELDS = ("answer", "confirmed_by_user")
 WORKSHEET_FIELDS = {"proposal_id", "shape_sha256", "snapshot_sha256", "round", "note",
                     "application_id", "entries"}
 WORKSHEET_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "how_to_answer", "answer",
@@ -559,7 +585,7 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != WORKSHEET_ENTRY_FIELDS:
             raise ValueError("worksheet entry has an unexpected shape")
-    if _shape_digest(entries) != proposal["shape_sha256"]:
+    if _shape_digest(worksheet) != proposal["shape_sha256"]:
         # The answers may be edited. Nothing else may.
         raise ValueError("worksheet no longer matches the proposal it came from")
     if {entry["canonical_id"] for entry in entries} != set(json.loads(proposal["targets_json"])):
@@ -570,6 +596,8 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
         # no longer says that. Propose again rather than confirm a stale reading.
         raise ValueError("the candidate profile changed since this was proposed")
 
+    meanings = {entry["canonical_id"]: entry["canonical_meaning"]
+                for entry in plan["entries"]}
     planned, skipped = [], []
     for entry in entries:
         target = entry["canonical_id"]
@@ -596,7 +624,19 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
 
     timestamp = (at or now_utc()).isoformat()
     written, unchanged = [], []
+    # One transaction, taken before anything is read that will be written. `add_answer`
+    # commits per row, so a batch built on it could not be rolled back: an interruption on the
+    # third answer left the first two on file and the proposal open. Nothing inside this block
+    # may call something that commits.
+    connection.execute("BEGIN IMMEDIATE")
     try:
+        # Claimed first, and inside the transaction, so two callers racing on one proposal
+        # cannot both pass the status check above and both write.
+        claimed = connection.execute(
+            "UPDATE answer_proposals SET status='confirmed', confirmed_at=? "
+            "WHERE proposal_id=? AND status='open'", (timestamp, proposal["proposal_id"]))
+        if claimed.rowcount != 1:
+            raise ValueError("this proposal has already been confirmed")
         for target, entry, shape in planned:
             current = connection.execute(
                 "SELECT answer_id, answer_json FROM answers "
@@ -611,9 +651,11 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
                     unchanged.append(target)
                     continue
                 supersedes = current[0]["answer_id"]
-            add_answer(connection, {
+            _insert_answer(connection, {
                 "answer_id": f"answer-{target}-{secrets.token_hex(4)}",
-                "canonical_id": target, "canonical_meaning": entry["canonical_meaning"],
+                # From the validated plan, never from the worksheet: this string is written to
+                # the database, so a worksheet that could set it could relabel a meaning.
+                "canonical_id": target, "canonical_meaning": meanings[target],
                 "answer": entry["answer"], "answer_type": entry["answer_type"],
                 "source_type": shape["source_type"], "confirmation_status": "confirmed",
                 "confirmed_at": timestamp, "validity_class": shape["validity_class"],
@@ -625,9 +667,6 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
                 "supersedes_id": supersedes,
             })
             written.append(target)
-        connection.execute(
-            "UPDATE answer_proposals SET status='confirmed', confirmed_at=? WHERE proposal_id=?",
-            (timestamp, proposal["proposal_id"]))
         audit(connection, "answers_confirmed", proposal["proposal_id"],
               {"written": sorted(written), "unchanged": sorted(unchanged),
                "skipped": sorted(skipped)})
@@ -639,17 +678,62 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
             "unchanged": sorted(unchanged), "skipped": sorted(skipped)}
 
 
-def _shape_digest(entries: list[dict[str, Any]]) -> str:
-    """A hash of what the worksheet is, never of what it says.
+def _shape_digest(worksheet: dict[str, Any]) -> str:
+    """A hash of everything the user is not being asked to change.
 
-    Covers the reviewed arrangement — meaning, answer type, scope, dependency — so a worksheet
-    edited into a different shape stops matching the proposal that produced it. It does not
-    cover `answer`, because writing an answer there is what the user is being asked to do.
+    Written as "the whole thing minus two fields" rather than as a list of fields to cover,
+    because the list was the bug: it named the arrangement and left the wording beside it
+    free, so a worksheet could be edited to explain itself differently — or, worse, to carry a
+    `canonical_meaning` that went straight into the database under another name. Adding a
+    field to the worksheet now covers it by default instead of forgetting it by default.
     """
-    shape = [{field: entry[field] for field in PROPOSAL_SHAPE_FIELDS} for entry in entries]
+    covered = {key: value for key, value in worksheet.items()
+               if key not in {"entries", "proposal_id", "shape_sha256"}}
+    covered["entries"] = [
+        {field: value for field, value in entry.items()
+         if field not in WORKSHEET_EDITABLE_FIELDS}
+        for entry in worksheet["entries"]]
     return hashlib.sha256(
-        json.dumps(shape, sort_keys=True, separators=(",", ":"),
+        json.dumps(covered, sort_keys=True, separators=(",", ":"),
                    ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def write_private_worksheet(path: Path, private_root: Path, worksheet: dict[str, Any]) -> None:
+    """Create a worksheet where private things belong, exclusively, already unreadable.
+
+    A worksheet carries proposed answers, so where it lands and how it is created are part of
+    the boundary rather than a convenience. `write_text` then `chmod` creates the file with the
+    default mode first, which is a window in which anyone on the machine can read it; it also
+    follows a symlink and overwrites whatever was there. `O_CREAT | O_EXCL` with the mode given
+    at creation has neither problem, and refuses rather than replacing.
+
+    The path must be inside the private root — the directory the library itself lives in — so
+    a caller cannot ask for a copy of their own contact details in the repository.
+    """
+    root = private_root.resolve()
+    parent = path.parent
+    if path.is_symlink() or parent.is_symlink():
+        raise ValueError("a worksheet path may not be a symlink")
+    # Resolved whether or not it exists yet: `resolve` handles a missing tail and still
+    # follows the symlinks above it, which `absolute` does not — on a machine where /tmp is
+    # itself a link, comparing one against the other says a path is outside a root it is in.
+    resolved_parent = parent.resolve()
+    if resolved_parent != root and root not in resolved_parent.parents:
+        raise ValueError("a worksheet belongs in the private root and nowhere else")
+    if path.exists():
+        # Refused rather than replaced: the file it would overwrite may be a worksheet
+        # somebody is part-way through.
+        raise ValueError("that worksheet already exists")
+    resolved_parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent.chmod(0o700)
+    body = json.dumps(worksheet, indent=2, ensure_ascii=False) + "\n"
+    handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(body)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _active_snapshot(connection: sqlite3.Connection) -> sqlite3.Row:
@@ -1194,15 +1278,15 @@ def main() -> None:
         result = {"status": "revoked", "authorization_id": args.authorization_id}
     elif args.command == "propose-answers":
         plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
-        proposed = propose_answers(connection, plan, args.round)
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(
-            json.dumps(proposed["worksheet"], indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8")
-        args.out.chmod(0o600)
-        # The summary names meanings and counts. The worksheet holds the answers, and only
-        # the worksheet.
-        result = {**proposed["summary"], "worksheet": str(args.out)}
+        # The file is written inside the proposal's transaction, so neither can outlive the
+        # other: no worksheet without a proposal, and no proposal without a worksheet.
+        proposed = propose_answers(
+            connection, plan, args.round,
+            sink=lambda sheet: write_private_worksheet(
+                args.out, args.db.resolve().parent, sheet))
+        # Meanings and counts. The caller passed `--out`, so the path is theirs already and
+        # printing it back only puts a private location somewhere it need not be.
+        result = proposed["summary"]
     elif args.command == "confirm-answers":
         plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
         worksheet = json.loads(args.worksheet.read_text(encoding="utf-8"))

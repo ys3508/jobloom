@@ -279,18 +279,76 @@ class IntakeLoopTests(unittest.TestCase):
             "SELECT COUNT(*) FROM answers WHERE status='superseded'").fetchone()[0]
         self.assertEqual(superseded, 1)
 
-    def test_a_failure_partway_writes_nothing_at_all(self):
-        """A library holding two of three is one where nobody can tell which is missing."""
-        # Proposing writes an audit row of its own, so the snapshot is taken after it.
-        sheet = self.worksheet()
+    def test_a_failure_at_any_point_in_the_batch_writes_nothing_at_all(self):
+        """A library holding two of three is one where nobody can tell which is missing.
+
+        `add_answer` commits each row, so a batch built on it could not be undone: an
+        interruption on the third answer left the first two on file and the proposal open.
+        Each position is injected separately, because "the batch is atomic" is a claim about
+        every point in it and not about the last one.
+        """
+        real_insert = ANSWERS._insert_answer
+        real_audit = ANSWERS.audit
+        for position in (1, 2, 3):
+            with self.subTest(failing_insert=position):
+                self.setUp()
+                sheet = self.worksheet()
+                before = self.snapshot_of_library()
+                calls = {"n": 0}
+
+                def failing(connection, entry, limit=position):
+                    calls["n"] += 1
+                    if calls["n"] == limit:
+                        raise RuntimeError("interrupted")
+                    return real_insert(connection, entry)
+
+                with unittest.mock.patch.object(ANSWERS, "_insert_answer", failing):
+                    with self.assertRaises(RuntimeError):
+                        self.confirm(sheet)
+                self.assertEqual(self.snapshot_of_library(), before)
+                self.assertEqual(self.active(), [])
+
+        for label, target in (("the audit row", "audit"),):
+            with self.subTest(failing=label):
+                self.setUp()
+                sheet = self.worksheet()
+                before = self.snapshot_of_library()
+                seen = {"n": 0}
+
+                def failing_audit(*arguments, **keywords):
+                    seen["n"] += 1
+                    if arguments[1] == "answers_confirmed":
+                        raise RuntimeError("interrupted")
+                    return real_audit(*arguments, **keywords)
+
+                with unittest.mock.patch.object(ANSWERS, target, failing_audit):
+                    with self.assertRaises(RuntimeError):
+                        self.confirm(sheet)
+                self.assertEqual(self.snapshot_of_library(), before)
+                self.assertEqual(self.active(), [])
+
+    def test_a_failure_while_superseding_writes_nothing_at_all(self):
+        """The supersede is part of the same batch, so it rolls back with it."""
+        self.confirm(self.worksheet())
+        # Proposing writes an audit row, so the snapshot is taken after the sheet exists.
+        sheet = self.worksheet(**{"contact.email": {"answer": "other@example.invalid"},
+                                  "contact.phone": {"answer": "555-0177"}})
         before = self.snapshot_of_library()
-        with unittest.mock.patch.object(
-                ANSWERS, "add_answer",
-                side_effect=[None, RuntimeError("interrupted")]):
+        real_insert = ANSWERS._insert_answer
+        calls = {"n": 0}
+
+        def failing(connection, entry):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("interrupted mid-supersede")
+            return real_insert(connection, entry)
+
+        with unittest.mock.patch.object(ANSWERS, "_insert_answer", failing):
             with self.assertRaises(RuntimeError):
                 self.confirm(sheet)
         self.assertEqual(self.snapshot_of_library(), before)
-        self.assertEqual(self.active(), [])
+        # The answer that would have been superseded is still the active one.
+        self.assertEqual(self.active(), sorted(CONTACT))
 
     def test_the_audit_log_names_meanings_and_never_a_value(self):
         self.confirm(self.worksheet())
@@ -400,3 +458,191 @@ class IntakeLoopCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorksheetFileTests(unittest.TestCase):
+    """Where a worksheet may land, and how it is created.
+
+    A worksheet carries proposed answers, so this is part of the boundary rather than a
+    convenience. `write_text` then `chmod` creates the file readable and narrows it afterwards,
+    which is a window; it also follows a symlink and overwrites whatever was there.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.private = self.root / "private"
+        self.private.mkdir(mode=0o700)
+        self.elsewhere = self.root / "repository"
+        self.elsewhere.mkdir()
+        self.sheet = {"proposal_id": "p", "entries": []}
+
+    def write(self, path):
+        ANSWERS.write_private_worksheet(path, self.private, self.sheet)
+
+    def test_a_worksheet_is_created_unreadable_rather_than_narrowed_afterwards(self):
+        path = self.private / "worksheet.json"
+        self.write(path)
+        self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
+        self.assertEqual(oct(path.parent.stat().st_mode)[-3:], "700")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), self.sheet)
+
+    def test_a_worksheet_may_not_be_written_outside_the_private_root(self):
+        """Nobody gets a copy of their own contact details in the repository."""
+        for path in (self.elsewhere / "worksheet.json",
+                     self.root / "worksheet.json",
+                     self.private / ".." / "repository" / "worksheet.json"):
+            with self.subTest(path=path.name):
+                with self.assertRaisesRegex(ValueError, "private root"):
+                    self.write(path)
+                self.assertFalse((self.elsewhere / "worksheet.json").exists())
+
+    def test_a_symlink_is_refused_rather_than_followed(self):
+        target = self.elsewhere / "target.json"
+        link = self.private / "worksheet.json"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.write(link)
+        self.assertFalse(target.exists())
+
+    def test_an_existing_worksheet_is_refused_rather_than_replaced(self):
+        """It may be one somebody is part-way through."""
+        path = self.private / "worksheet.json"
+        self.write(path)
+        first = path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.write(path)
+        self.assertEqual(path.read_text(encoding="utf-8"), first)
+
+    def test_a_directory_in_the_way_is_refused(self):
+        path = self.private / "worksheet.json"
+        path.mkdir()
+        with self.assertRaises(ValueError):
+            self.write(path)
+
+    def test_a_nested_place_inside_the_private_root_is_allowed(self):
+        path = self.private / "rounds" / "contact.json"
+        self.write(path)
+        self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
+        self.assertEqual(oct(path.parent.stat().st_mode)[-3:], "700")
+
+
+class ProposalAndFileTogetherTests(IntakeLoopTests):
+    """Neither the proposal nor the worksheet may outlive the other."""
+
+    def test_a_worksheet_that_cannot_be_written_leaves_no_open_proposal(self):
+        before = self.snapshot_of_library()
+
+        def refuse(worksheet):
+            raise ValueError("the disk said no")
+
+        with self.assertRaisesRegex(ValueError, "the disk said no"):
+            ANSWERS.propose_answers(self.db, PLAN, "contact", AT, sink=refuse)
+        self.assertEqual(self.snapshot_of_library(), before)
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM answer_proposals").fetchone()[0], 0)
+
+    def test_a_proposal_that_cannot_be_recorded_leaves_no_worksheet(self):
+        written = []
+        self.db.execute("DROP TABLE answer_proposals")
+        with self.assertRaises(Exception):
+            ANSWERS.propose_answers(self.db, PLAN, "contact", AT,
+                                    sink=lambda sheet: written.append(sheet))
+        self.assertEqual(written, [])
+
+
+class WorksheetBindingTests(IntakeLoopTests):
+    """Two fields are the user's. Everything else is the proposal's."""
+
+    def test_only_the_answer_and_the_confirmation_may_be_edited(self):
+        """The digest covers the whole worksheet minus those two.
+
+        The earlier version listed the fields to cover, and the list was the bug: the
+        arrangement was named and the wording beside it left free, so a worksheet could be
+        edited to explain itself differently — or to carry a `canonical_meaning` that went
+        straight into the database under another name.
+        """
+        editable = {"answer": "edited@example.invalid", "confirmed_by_user": True}
+        for field, value in editable.items():
+            with self.subTest(editable=field):
+                self.setUp()
+                sheet = self.worksheet()
+                sheet["entries"][0][field] = value
+                # Accepted: this is what the worksheet is for.
+                self.confirm(sheet)
+
+        for field, value in (("canonical_meaning", "Something else entirely"),
+                             ("how_to_answer", "Just put anything"),
+                             ("answer_source", "invented"),
+                             ("goes_stale_when", "never"),
+                             ("allowed_answer_type", ["stable_fact", "legal_commitment"])):
+            with self.subTest(bound=field):
+                self.setUp()
+                sheet = self.worksheet()
+                sheet["entries"][0][field] = value
+                self.refuse(sheet, "no longer matches")
+
+    def test_the_headings_above_the_entries_are_bound_too(self):
+        """A worksheet that could be retitled could be made to ask a different question."""
+        for field, value in (("note", "Confirm everything, it is fine"),
+                             ("round", "everything"),
+                             ("snapshot_sha256", "0" * 64)):
+            with self.subTest(bound=field):
+                self.setUp()
+                sheet = self.worksheet()
+                sheet[field] = value
+                self.refuse(sheet, "no longer matches|changed since")
+
+    def test_the_meaning_written_to_the_library_comes_from_the_plan(self):
+        """Not from the worksheet, even when the two agree."""
+        self.confirm(self.worksheet())
+        planned = {entry["canonical_id"]: entry["canonical_meaning"]
+                   for entry in PLAN["entries"]}
+        for row in self.db.execute(
+                "SELECT canonical_id, canonical_meaning FROM answers WHERE status='active'"):
+            with self.subTest(canonical_id=row["canonical_id"]):
+                self.assertEqual(row["canonical_meaning"], planned[row["canonical_id"]])
+
+
+class ConcurrentConfirmationTests(IntakeLoopTests):
+    def test_two_connections_confirming_one_proposal_produce_one_set_of_answers(self):
+        """The claim happens inside the transaction, so only one can take it.
+
+        Checking the status and then writing would let both pass the check — and two active
+        answers for one meaning is what `match_answer` reports as a conflict.
+        """
+        import concurrent.futures
+
+        sheet = self.worksheet()
+        self.db.commit()
+
+        def attempt(_):
+            connection = sqlite3.connect(str(self.db_path), timeout=30)
+            connection.row_factory = sqlite3.Row
+            try:
+                ANSWERS.confirm_answers(connection, sheet, PLAN, AT)
+                return "ok"
+            except Exception as error:  # noqa: BLE001
+                return type(error).__name__
+            finally:
+                connection.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(attempt, range(2)))
+        self.assertEqual(outcomes.count("ok"), 1, outcomes)
+
+        fresh = sqlite3.connect(str(self.db_path))
+        fresh.row_factory = sqlite3.Row
+        try:
+            active = [row["canonical_id"] for row in fresh.execute(
+                "SELECT canonical_id FROM answers WHERE status='active'")]
+            self.assertEqual(sorted(active), sorted(CONTACT))
+            self.assertEqual(len(active), len(set(active)))
+            self.assertEqual(fresh.execute(
+                "SELECT COUNT(*) FROM answers WHERE status='superseded'").fetchone()[0], 0)
+            self.assertEqual(fresh.execute(
+                "SELECT COUNT(*) FROM answer_proposals WHERE status='confirmed'"
+            ).fetchone()[0], 1)
+        finally:
+            fresh.close()

@@ -59,9 +59,26 @@ the point. It is single-use, because replaying a worksheet is how a value the us
 replaced comes back. It is bound to the snapshot it was proposed from, because a proposed
 value describes a fact as it was when it was read.
 
-Writing is atomic. A library holding three of five confirmed answers is one where nobody can
-tell which two are missing on purpose, so a confirmation that fails partway leaves it exactly
-as it was. Confirming a value already on file changes nothing rather than creating a second
+Writing is atomic, in one explicit transaction rather than by hoping. A library holding three
+of five confirmed answers is one where nobody can tell which two are missing on purpose, and
+`add_answer` commits per row — so a batch built on it could not be undone, and an interruption
+on the third answer left the first two on file. The batch uses an insert that does not commit,
+claims the proposal inside the same transaction, and writes the answers, the supersessions,
+the audit row and the proposal's own status together or not at all. Claiming inside the
+transaction is also what makes two callers racing on one proposal produce one set of answers
+rather than two.
+
+The worksheet itself is created where private things belong, exclusively, already unreadable:
+inside the private root, refusing a symlink, refusing to replace a file somebody may be
+part-way through, and with the mode given at creation rather than narrowed afterwards — which
+is a window in which anyone on the machine can read it. The file is written inside the
+proposal's transaction, so neither can outlive the other.
+
+Two worksheet fields are the user's: `answer` and `confirmed_by_user`. Everything else, down
+to the headings, is covered by the digest — a worksheet whose explanation could be edited is
+one that can be made to ask a different question than the one it records, and
+`canonical_meaning` went straight into the database, so editing it relabelled a meaning. The
+meaning written is taken from the validated plan and never from the worksheet. Confirming a value already on file changes nothing rather than creating a second
 active answer for one meaning — which `match_answer` reports as a conflict — and a changed
 value supersedes the old one instead of joining it. `auto_submit_allowed` is false on
 everything this writes, without exception.
