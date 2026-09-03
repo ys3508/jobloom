@@ -2,7 +2,7 @@
   "schema_version": "0.1.0",
   "reviewed_at": "2026-09-02",
   "reviewed_by": "product owner review, recorded during Task 14",
-  "note": "The reviewed shape of the first ten answers, with every value left null. Phase 2 fills copies of these in `.jobloom/` after the user confirms each one; nothing here may ever hold an answer, which is why this file can live in the repository at all. `auto_submit_allowed` is false on every entry and there is no case in which Task 14 may set it true.",
+  "note": "The reviewed shape of the first ten answers, with every value left null. Phase 2 fills copies of these in `.jobloom/` after the user confirms each one; nothing here may ever hold an answer, which is why this file can live in the repository at all. `auto_submit_allowed` is false on every entry and there is no case in which Task 14 may set it true. The three contact meanings depend on `fact-0002`, the composite contact fact: `candidate_core` marks an answer stale when a fact it depends on changes, is renamed or disappears, so replacing an email address stops the old one being filled. Because that fact is composite, changing any one of the three marks all three stale together — conservative on purpose, since over-invalidating costs a re-confirmation and under-invalidating fills a form with a value the user has replaced. `invalidation_triggers` is empty everywhere: `invalidate_by_trigger` has no production caller, so a trigger named here would be a declaration nobody raises.",
   "application_id": "app-mgb-rq4077023",
   "entries": [
     {
@@ -19,7 +19,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": true,
-      "confirmation": "user must state this directly; never copied from a snapshot"
+      "confirmation": "user must state this directly; never copied from a snapshot",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "citizenship_status",
@@ -35,7 +37,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "user must state this directly; never copied from a snapshot"
+      "confirmation": "user must state this directly; never copied from a snapshot",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "permanent_residence_status",
@@ -51,7 +55,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "user must state this directly; never copied from a snapshot"
+      "confirmation": "user must state this directly; never copied from a snapshot",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "current_country_of_residence",
@@ -67,7 +73,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "user must state this directly; never copied from a snapshot"
+      "confirmation": "user must state this directly; never copied from a snapshot",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "prior_employment_at_this_company",
@@ -83,7 +91,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "confirmed separately from the affiliate question"
+      "confirmation": "confirmed separately from the affiliate question",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "prior_employment_at_an_affiliate",
@@ -99,7 +109,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "confirmed separately from the this-company question"
+      "confirmation": "confirmed separately from the this-company question",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "discovery_source",
@@ -115,7 +127,9 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "stated by the user; never inferred from a URL, host or collector"
+      "confirmation": "stated by the user; never inferred from a URL, host or collector",
+      "dependent_fact_ids": [],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "contact.email",
@@ -128,7 +142,11 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "shown to the user from the composite fact and confirmed item by item"
+      "confirmation": "shown to the user from the composite fact and confirmed item by item",
+      "dependent_fact_ids": [
+        "fact-0002"
+      ],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "contact.phone",
@@ -141,7 +159,11 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "shown to the user from the composite fact and confirmed item by item"
+      "confirmation": "shown to the user from the composite fact and confirmed item by item",
+      "dependent_fact_ids": [
+        "fact-0002"
+      ],
+      "invalidation_triggers": []
     },
     {
       "canonical_id": "profile.linkedin",
@@ -154,7 +176,11 @@
       "auto_fill_allowed": true,
       "auto_submit_allowed": false,
       "engine_enforced_recheck": false,
-      "confirmation": "shown to the user from the composite fact and confirmed item by item"
+      "confirmation": "shown to the user from the composite fact and confirmed item by item",
+      "dependent_fact_ids": [
+        "fact-0002"
+      ],
+      "invalidation_triggers": []
     }
   ]
 }

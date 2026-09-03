@@ -36,6 +36,31 @@ What may be imported is pinned in code — `answer_library.TASK14_QUESTION_FORM_
 
 Resolve multiple applicable answers by scope specificity. A more specific applicable scope overrides a global answer. Two equally specific active answers with different values are a conflict and must pause.
 
+## What makes a stored answer go stale
+
+`candidate_core.register_snapshot` compares the old and new snapshots fact by fact and marks
+any active answer stale when a fact it named in `dependent_fact_ids` has changed. The
+comparison walks the **union** of the old and new fact ids, so a fact that was deleted or
+renamed counts as changed too — the dependency cannot be left dangling while the old value
+keeps filling forms. It is per-fact: editing an unrelated fact leaves the answer alone.
+
+Naming the dependency is what connects an answer to that chain. An answer with an empty
+`dependent_fact_ids` is never invalidated by a profile edit, whatever else it declares, and an
+answer naming a fact the active snapshot does not hold can never be invalidated at all,
+because the intersection is empty forever — so that is refused when the answer is written.
+
+`invalidation_triggers` is the other half of the schema and currently has no production
+emitter: `invalidate_by_trigger` is reached only from an operator CLI. Answers written today
+therefore leave it empty rather than declaring a trigger nobody raises. A dependency that
+looks handled and is not is worse than one that plainly is not, and one chain that runs beats
+two that look complete.
+
+**Recorded conservative behaviour.** The candidate's email, phone and LinkedIn URL live in one
+composite `contact` fact, so changing any one of them marks all three answers stale together.
+Splitting that fact would need a new CandidateSnapshot and the re-approval of every resume
+version bound behind it. Over-invalidating costs a re-confirmation; under-invalidating fills
+an employer's form with a value the user has replaced.
+
 ## Two-channel freshness
 
 Both channels must pass:

@@ -18,7 +18,7 @@ from typing import Any
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-from _common import answer_issue, context_matches, parse_time  # noqa: E402
+from _common import answer_issue, context_matches, parse_time, require_table  # noqa: E402
 
 
 IMMIGRATION_CANONICAL_IDS = {
@@ -272,12 +272,33 @@ TASK14_INTAKE_SCHEMA_VERSION = "0.1.0"
 _TASK14_APPLICATION_SCOPE = {"country": "US", "application_id": TASK14_APPLICATION}
 
 
+# The one composite fact the contact meanings are derived from. `candidate_core` marks an
+# answer stale when a fact it depends on changes, is renamed, or disappears — `_changed_fact_ids`
+# compares the union of the old and new fact ids, so an absence counts as a change and the
+# chain fails closed in all three directions. It is per-fact, so editing an unrelated fact
+# leaves these alone.
+#
+# Because the fact is composite, changing any one of the email, the phone or the LinkedIn URL
+# marks all three answers stale together. That is deliberate and conservative: splitting it
+# would need a new CandidateSnapshot and the re-approval of every resume version behind it,
+# and over-invalidating costs a re-confirmation while under-invalidating fills a form with a
+# value the user has replaced.
+TASK14_CONTACT_FACT = "fact-0002"
+# Left empty on purpose. `invalidate_by_trigger` has no production caller — only an operator
+# CLI — so a trigger named here would be a declaration nobody ever raises: a dependency that
+# looks handled and is not, which is worse than one that plainly is not. The wired channel is
+# `dependent_fact_ids`, and one chain that runs beats two that look complete.
+TASK14_INVALIDATION_TRIGGERS: list[str] = []
+
+
 def _reviewed_entry(answer_types: set[str], validity: str, scope: dict[str, str],
-                    recheck: bool = False) -> dict[str, Any]:
+                    recheck: bool = False, depends_on: list[str] | None = None) -> dict[str, Any]:
     return {"answer": None, "answer_type": frozenset(answer_types),
             "source_type": "user_confirmed", "validity_class": validity,
             "scope": dict(scope), "auto_fill_allowed": True, "auto_submit_allowed": False,
-            "engine_enforced_recheck": recheck}
+            "engine_enforced_recheck": recheck,
+            "dependent_fact_ids": list(depends_on or []),
+            "invalidation_triggers": list(TASK14_INVALIDATION_TRIGGERS)}
 
 
 TASK14_INTAKE_SHAPE: dict[str, dict[str, Any]] = {
@@ -304,9 +325,12 @@ TASK14_INTAKE_SHAPE: dict[str, dict[str, Any]] = {
     # Global by nature: an email address does not change with the application. An empty scope
     # exactly — a contact meaning that acquired an application scope would stop applying to
     # the next one, silently.
-    "contact.email": _reviewed_entry({"stable_fact"}, "stable", {}),
-    "contact.phone": _reviewed_entry({"stable_fact"}, "stable", {}),
-    "profile.linkedin": _reviewed_entry({"stable_fact"}, "stable", {}),
+    "contact.email": _reviewed_entry({"stable_fact"}, "stable", {},
+                                     depends_on=[TASK14_CONTACT_FACT]),
+    "contact.phone": _reviewed_entry({"stable_fact"}, "stable", {},
+                                     depends_on=[TASK14_CONTACT_FACT]),
+    "profile.linkedin": _reviewed_entry({"stable_fact"}, "stable", {},
+                                        depends_on=[TASK14_CONTACT_FACT]),
 }
 TASK14_QUESTION_FORM_TARGETS = frozenset(TASK14_INTAKE_SHAPE)
 # Of those, the three whose values exist only inside one composite contact fact. They are the
@@ -317,10 +341,37 @@ INTAKE_PLAN_FIELDS = {"schema_version", "reviewed_at", "reviewed_by", "note",
                       "application_id", "entries"}
 INTAKE_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "answer", "answer_type",
                        "source_type", "validity_class", "scope", "auto_fill_allowed",
-                       "auto_submit_allowed", "engine_enforced_recheck", "confirmation"}
+                       "auto_submit_allowed", "engine_enforced_recheck", "confirmation",
+                       "dependent_fact_ids", "invalidation_triggers"}
 # The two fields a person writes for a person. Checked for presence and not for content:
 # pinning prose would make every wording improvement a code change.
 INTAKE_PROSE_FIELDS = ("canonical_meaning", "confirmation")
+
+
+def require_dependent_facts(connection: sqlite3.Connection, dependent_fact_ids: list[str]) -> None:
+    """Refuse a dependency on a fact the active snapshot does not hold.
+
+    An answer that names a fact nobody has is an answer whose invalidation chain can never
+    fire: the snapshot walk intersects changed ids with this list, and a list naming nothing
+    real intersects nothing forever. Checked when the answer is written, because that is the
+    moment at which the dependency is a claim; after that, deletion and renaming are caught by
+    the walk itself, which compares the union of the old and new fact ids.
+    """
+    if not isinstance(dependent_fact_ids, list):
+        raise ValueError("dependent fact ids must be a list")
+    if not dependent_fact_ids:
+        return
+    require_table(connection, "candidate_snapshots")
+    active = connection.execute(
+        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active'").fetchone()
+    if not active:
+        raise ValueError("no active candidate snapshot to depend on")
+    held = {row["fact_id"] for row in connection.execute(
+        "SELECT fact_id FROM candidate_facts WHERE content_sha256=?",
+        (active["content_sha256"],))}
+    missing = sorted(set(dependent_fact_ids) - held)
+    if missing:
+        raise ValueError(f"answer depends on facts the snapshot does not hold: {len(missing)}")
 
 
 def intake_plan_targets(plan: Any) -> frozenset[str]:
@@ -365,7 +416,8 @@ def intake_plan_targets(plan: Any) -> frozenset[str]:
         if entry["scope"] != expected["scope"]:
             raise ValueError("intake entry does not carry the reviewed scope")
         for field in ("answer", "source_type", "validity_class", "auto_fill_allowed",
-                      "auto_submit_allowed", "engine_enforced_recheck"):
+                      "auto_submit_allowed", "engine_enforced_recheck",
+                      "dependent_fact_ids", "invalidation_triggers"):
             want = expected[field]
             if isinstance(want, bool) and not isinstance(entry[field], bool):
                 # `1 == True` and `0 == False` in Python, so comparing by value alone let a
