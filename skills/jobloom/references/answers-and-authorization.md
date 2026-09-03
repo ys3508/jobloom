@@ -68,11 +68,30 @@ the audit row and the proposal's own status together or not at all. Claiming ins
 transaction is also what makes two callers racing on one proposal produce one set of answers
 rather than two.
 
+Every read the decision rests on happens inside that transaction, not only the writes.
+Reading the active snapshot before it began left a window in which another connection could
+register a new profile after the check passed, so a worksheet proposed against the old one
+would be confirmed against the new; re-checking afterwards would not have closed it either,
+as long as any authorising judgement had already been made.
+
+A worksheet belongs to one proposal. The digest covers its `proposal_id`, and that alone was
+not enough: two proposals of the same round over the same snapshot are otherwise identical
+documents, so a swap changes the id and the recomputed digest together and lands exactly on
+the other's stored hash. Each proposal therefore carries a nonce, recorded in the database and
+not derivable from anything in the worksheet.
+
 The worksheet itself is created where private things belong, exclusively, already unreadable:
-inside the private root, refusing a symlink, refusing to replace a file somebody may be
-part-way through, and with the mode given at creation rather than narrowed afterwards — which
-is a window in which anyone on the machine can read it. The file is written inside the
-proposal's transaction, so neither can outlive the other.
+inside the private root, with `O_NOFOLLOW` so a path replaced between the check and the open
+is refused rather than followed, with every component between the root and the file walked as
+given rather than as resolved — resolving is exactly what removes the links one is looking
+for, and a link pointing elsewhere inside the root resolves to a contained path — refusing to
+replace a file somebody may be part-way through, and with the mode given at creation rather
+than narrowed afterwards, which is a window in which anyone on the machine can read it.
+
+The file is written inside the proposal's transaction and the commit is inside it too, so
+neither can outlive the other: a commit that failed after the file was written used to leave a
+worksheet that can never be confirmed and looks exactly like one that can. On that failure the
+file is removed — the exact file that call created by exclusive open, and nothing else.
 
 Two worksheet fields are the user's: `answer` and `confirmed_by_user`. Everything else, down
 to the headings, is covered by the digest — a worksheet whose explanation could be edited is

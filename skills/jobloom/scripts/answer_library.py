@@ -98,6 +98,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             snapshot_sha256 TEXT NOT NULL,
             shape_sha256 TEXT NOT NULL,
             targets_json TEXT NOT NULL,
+            nonce TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             confirmed_at TEXT
         );
@@ -427,8 +428,14 @@ def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
 
     proposal_id = f"proposal-{secrets.token_hex(8)}"
     timestamp = (at or now_utc()).isoformat()
+    # Two proposals of the same round over the same snapshot are otherwise identical
+    # documents, so swapping one's id for the other's produced a worksheet indistinguishable
+    # from the second one's own — the digest covering `proposal_id` did not help, because a
+    # swap changes the id and the digest together. The nonce is the part a swapper does not
+    # have: it is recorded here and never derivable from the worksheet's contents.
+    nonce = secrets.token_hex(16)
     worksheet = {
-        "proposal_id": proposal_id, "shape_sha256": "",
+        "proposal_id": proposal_id, "proposal_nonce": nonce, "shape_sha256": "",
         "snapshot_sha256": snapshot["content_sha256"], "round": round_name,
         "note": ("Private. Check each answer, then set `confirmed_by_user` to true on the "
                  "ones you want filled automatically. Anything left false is left out "
@@ -438,25 +445,33 @@ def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
     }
     worksheet["shape_sha256"] = _shape_digest(worksheet)
 
+    undo = None
     connection.execute("BEGIN IMMEDIATE")
     try:
         connection.execute(
             "INSERT INTO answer_proposals (proposal_id, created_at, snapshot_sha256, "
-            "shape_sha256, targets_json, status, confirmed_at) "
-            "VALUES (?, ?, ?, ?, ?, 'open', NULL)",
+            "shape_sha256, targets_json, nonce, status, confirmed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'open', NULL)",
             (proposal_id, timestamp, snapshot["content_sha256"],
-             worksheet["shape_sha256"], _json(in_round)))
+             worksheet["shape_sha256"], _json(in_round), nonce))
         audit(connection, "answers_proposed", proposal_id,
               {"round": round_name, "canonical_ids": in_round})
         if sink is not None:
             # Inside the transaction on purpose: a worksheet the caller could not write must
             # not leave an open proposal behind, and a proposal that could not be recorded
             # must not leave a worksheet that looks usable.
-            sink(worksheet)
+            undo = sink(worksheet)
+        # Inside the `try` as well. With the commit outside it, a worksheet written and then
+        # a commit that failed left the file on disk with no proposal behind it — a worksheet
+        # that can never be confirmed and looks exactly like one that can.
+        connection.commit()
     except Exception:
         connection.rollback()
+        if undo is not None:
+            # Only the file this call created, by exclusive open. Anything else on that path
+            # belongs to somebody else.
+            undo()
         raise
-    connection.commit()
     return {"worksheet": worksheet,
             "summary": {"proposal_id": proposal_id, "round": round_name,
                         "canonical_ids": in_round,
@@ -541,8 +556,8 @@ TASK14_PROPOSAL_ROUNDS = {"contact": TASK14_CONTACT_TARGETS}
 # the one it records. `canonical_meaning` mattered most: it was written straight to the
 # database, so editing it relabelled a meaning.
 WORKSHEET_EDITABLE_FIELDS = ("answer", "confirmed_by_user")
-WORKSHEET_FIELDS = {"proposal_id", "shape_sha256", "snapshot_sha256", "round", "note",
-                    "application_id", "entries"}
+WORKSHEET_FIELDS = {"proposal_id", "proposal_nonce", "shape_sha256", "snapshot_sha256",
+                    "round", "note", "application_id", "entries"}
 WORKSHEET_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "how_to_answer", "answer",
                           "answer_source", "confirmed_by_user", "goes_stale_when",
                           "answer_type", "allowed_answer_type", "validity_class", "scope",
@@ -566,12 +581,32 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
     targets = intake_plan_targets(plan)
     if not isinstance(worksheet, dict) or set(worksheet) != WORKSHEET_FIELDS:
         raise ValueError("worksheet has an unexpected shape")
+    # Every read that the decision rests on happens inside this transaction, not only the
+    # writes. Reading the active snapshot before it began left a window in which another
+    # connection could register a new one after the check passed, and a worksheet proposed
+    # against the old profile would then be confirmed against the new one. A re-check after
+    # `BEGIN` would not fix that either, as long as any authorising judgement was made before.
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        return _confirm_within_transaction(connection, worksheet, plan, targets, at)
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _confirm_within_transaction(connection: sqlite3.Connection, worksheet: dict[str, Any],
+                                plan: Any, targets: frozenset[str],
+                                at: datetime | None) -> dict[str, Any]:
     require_table(connection, "answer_proposals")
     proposal = connection.execute(
         "SELECT * FROM answer_proposals WHERE proposal_id=?",
         (worksheet["proposal_id"],)).fetchone()
     if not proposal:
         raise ValueError("no such proposal")
+    if not secrets.compare_digest(str(worksheet["proposal_nonce"]),
+                                  str(proposal["nonce"])):
+        # A worksheet filled in against one proposal and relabelled with another's id.
+        raise ValueError("worksheet does not belong to that proposal")
     if proposal["status"] != "open":
         # Single-use. Replaying a worksheet is how a value the user has since replaced comes
         # back, and how one confirmation becomes two answers.
@@ -624,14 +659,12 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
 
     timestamp = (at or now_utc()).isoformat()
     written, unchanged = [], []
-    # One transaction, taken before anything is read that will be written. `add_answer`
-    # commits per row, so a batch built on it could not be rolled back: an interruption on the
-    # third answer left the first two on file and the proposal open. Nothing inside this block
-    # may call something that commits.
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        # Claimed first, and inside the transaction, so two callers racing on one proposal
-        # cannot both pass the status check above and both write.
+    # Nothing from here on may call something that commits: `add_answer` commits per row, so a
+    # batch built on it could not be rolled back, and an interruption on the third answer left
+    # the first two on file.
+    if True:
+        # Claimed with a conditional update, so two callers racing on one proposal cannot both
+        # pass the status check above and both write.
         claimed = connection.execute(
             "UPDATE answer_proposals SET status='confirmed', confirmed_at=? "
             "WHERE proposal_id=? AND status='open'", (timestamp, proposal["proposal_id"]))
@@ -670,9 +703,6 @@ def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
         audit(connection, "answers_confirmed", proposal["proposal_id"],
               {"written": sorted(written), "unchanged": sorted(unchanged),
                "skipped": sorted(skipped)})
-    except Exception:
-        connection.rollback()
-        raise
     connection.commit()
     return {"proposal_id": proposal["proposal_id"], "written": sorted(written),
             "unchanged": sorted(unchanged), "skipped": sorted(skipped)}
@@ -687,8 +717,13 @@ def _shape_digest(worksheet: dict[str, Any]) -> str:
     `canonical_meaning` that went straight into the database under another name. Adding a
     field to the worksheet now covers it by default instead of forgetting it by default.
     """
+    # `proposal_id` is covered. Leaving it out made two proposals of the same round and
+    # snapshot share a digest, so a worksheet filled in against one could have its id swapped
+    # for the other's and be accepted — which is the single-use rule and the no-swapping rule
+    # failing together. Only the digest field itself is excluded, because it cannot cover
+    # itself.
     covered = {key: value for key, value in worksheet.items()
-               if key not in {"entries", "proposal_id", "shape_sha256"}}
+               if key not in {"entries", "shape_sha256"}}
     covered["entries"] = [
         {field: value for field, value in entry.items()
          if field not in WORKSHEET_EDITABLE_FIELDS}
@@ -698,7 +733,8 @@ def _shape_digest(worksheet: dict[str, Any]) -> str:
                    ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def write_private_worksheet(path: Path, private_root: Path, worksheet: dict[str, Any]) -> None:
+def write_private_worksheet(path: Path, private_root: Path,
+                            worksheet: dict[str, Any]):
     """Create a worksheet where private things belong, exclusively, already unreadable.
 
     A worksheet carries proposed answers, so where it lands and how it is created are part of
@@ -712,14 +748,33 @@ def write_private_worksheet(path: Path, private_root: Path, worksheet: dict[str,
     """
     root = private_root.resolve()
     parent = path.parent
-    if path.is_symlink() or parent.is_symlink():
-        raise ValueError("a worksheet path may not be a symlink")
     # Resolved whether or not it exists yet: `resolve` handles a missing tail and still
     # follows the symlinks above it, which `absolute` does not — on a machine where /tmp is
     # itself a link, comparing one against the other says a path is outside a root it is in.
     resolved_parent = parent.resolve()
     if resolved_parent != root and root not in resolved_parent.parents:
         raise ValueError("a worksheet belongs in the private root and nowhere else")
+    # Every component between the root and the file, walked on the path **as given** rather
+    # than as resolved. Walking the resolved path can never see a link, because resolving is
+    # exactly what removes them — and a link pointing somewhere else inside the private root
+    # resolves to a contained path, so the check above passes and nothing else notices that a
+    # link was followed at all.
+    walker = Path(os.path.abspath(parent))
+    between = []
+    while True:
+        if walker.exists() and walker.resolve() == root:
+            break
+        if walker == walker.parent:
+            break
+        between.append(walker)
+        walker = walker.parent
+    for candidate in between:
+        if candidate.is_symlink():
+            raise ValueError("a worksheet path may not pass through a symlink")
+    if path.is_symlink():
+        # Named apart from the case below: following it would write a private answer wherever
+        # it points, which is a different mistake from overwriting something.
+        raise ValueError("a worksheet path may not pass through a symlink")
     if path.exists():
         # Refused rather than replaced: the file it would overwrite may be a worksheet
         # somebody is part-way through.
@@ -727,13 +782,25 @@ def write_private_worksheet(path: Path, private_root: Path, worksheet: dict[str,
     resolved_parent.mkdir(parents=True, exist_ok=True)
     resolved_parent.chmod(0o700)
     body = json.dumps(worksheet, indent=2, ensure_ascii=False) + "\n"
-    handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    # `O_NOFOLLOW` closes the gap between the check above and this call: the check is a
+    # courtesy that gives a clear message, and the flag is what actually holds if the path is
+    # replaced with a link in between. `O_EXCL` refuses an existing file, and the mode is
+    # given at creation rather than narrowed afterwards, which would leave the file readable
+    # for as long as it took to chmod it.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    handle = os.open(path, flags, 0o600)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(body)
     except Exception:
         path.unlink(missing_ok=True)
         raise
+
+    def undo() -> None:
+        """Remove exactly the file this call created, and nothing else."""
+        path.unlink(missing_ok=True)
+
+    return undo
 
 
 def _active_snapshot(connection: sqlite3.Connection) -> sqlite3.Row:

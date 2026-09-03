@@ -646,3 +646,221 @@ class ConcurrentConfirmationTests(IntakeLoopTests):
             ).fetchone()[0], 1)
         finally:
             fresh.close()
+
+
+class WorksheetIdentityTests(IntakeLoopTests):
+    """A worksheet belongs to one proposal, and cannot be relabelled into another's."""
+
+    def test_two_proposals_of_the_same_round_are_not_interchangeable(self):
+        """Covering `proposal_id` in the digest was not enough on its own.
+
+        Two proposals over the same snapshot and round are otherwise identical documents, so a
+        swap changes the id and the recomputed digest together and lands exactly on the other
+        proposal's stored hash. The nonce is the part a swapper does not have.
+        """
+        first = self.propose()["worksheet"]
+        second = self.propose()["worksheet"]
+        self.assertNotEqual(first["shape_sha256"], second["shape_sha256"])
+        self.assertNotEqual(first["proposal_nonce"], second["proposal_nonce"])
+
+        for label, rebuild in (("id only", False), ("id and digest", True)):
+            with self.subTest(swap=label):
+                sheet = copy.deepcopy(first)
+                for entry in sheet["entries"]:
+                    entry["confirmed_by_user"] = True
+                sheet["proposal_id"] = second["proposal_id"]
+                if rebuild:
+                    sheet["shape_sha256"] = ANSWERS._shape_digest(sheet)
+                self.refuse(sheet, "does not belong to that proposal")
+
+    def test_a_confirmed_worksheet_cannot_be_relabelled_onto_a_fresh_proposal(self):
+        first = self.propose()["worksheet"]
+        second = self.propose()["worksheet"]
+        sheet = copy.deepcopy(first)
+        for entry in sheet["entries"]:
+            entry["confirmed_by_user"] = True
+        self.confirm(sheet)
+        relabelled = copy.deepcopy(sheet)
+        relabelled["proposal_id"] = second["proposal_id"]
+        relabelled["shape_sha256"] = ANSWERS._shape_digest(relabelled)
+        self.refuse(relabelled, "does not belong to that proposal")
+
+    def test_the_nonce_is_bound_by_the_digest_too(self):
+        sheet = self.worksheet()
+        sheet["proposal_nonce"] = "0" * 32
+        self.refuse(sheet, "no longer matches|does not belong")
+
+
+class SnapshotRaceTests(IntakeLoopTests):
+    """Every read the decision rests on happens inside the transaction.
+
+    Reading the active snapshot before `BEGIN IMMEDIATE` left a window: another connection
+    could register a new profile after the check passed, and a worksheet proposed against the
+    old one would be confirmed against the new. Re-checking after `BEGIN` would not have fixed
+    it either, as long as any authorising judgement had already been made.
+    """
+
+    def test_a_snapshot_registered_during_confirmation_is_not_confirmed_against(self):
+        import threading
+
+        sheet = self.worksheet()
+        self.db.commit()
+        reached = threading.Event()
+        released = threading.Event()
+        outcome = {}
+
+        def confirm_slowly():
+            connection = sqlite3.connect(str(self.db_path), timeout=30)
+            connection.row_factory = sqlite3.Row
+            real = ANSWERS._active_snapshot
+
+            def watched(conn):
+                # Exactly the window: the snapshot has been read inside the transaction, and
+                # the other thread is about to move it.
+                row = real(conn)
+                reached.set()
+                released.wait(timeout=10)
+                return row
+
+            try:
+                with unittest.mock.patch.object(ANSWERS, "_active_snapshot", watched):
+                    ANSWERS.confirm_answers(connection, sheet, PLAN, AT)
+                outcome["result"] = "confirmed"
+            except Exception as error:  # noqa: BLE001
+                outcome["result"] = type(error).__name__
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=confirm_slowly, daemon=True)
+        worker.start()
+        self.assertTrue(reached.wait(timeout=10), "the confirmation never reached the window")
+        # The other connection tries to move the profile underneath it. `BEGIN IMMEDIATE`
+        # holds the write lock, so this either waits or fails — either way it cannot land
+        # between the check and the write.
+        moved = {}
+        def move_profile():
+            try:
+                self.register(REPLACEMENT)
+                moved["result"] = "registered"
+            except Exception as error:  # noqa: BLE001
+                moved["result"] = type(error).__name__
+        mover = threading.Thread(target=move_profile, daemon=True)
+        mover.start()
+        mover.join(timeout=5)
+        released.set()
+        worker.join(timeout=30)
+
+        # Whatever the ordering, the answers on file were never confirmed against a profile
+        # that had already moved.
+        fresh = sqlite3.connect(str(self.db_path))
+        fresh.row_factory = sqlite3.Row
+        try:
+            active = sorted(row["canonical_id"] for row in fresh.execute(
+                "SELECT canonical_id FROM answers WHERE status='active'"))
+            proposals = fresh.execute(
+                "SELECT status FROM answer_proposals").fetchall()
+            if outcome.get("result") == "confirmed":
+                self.assertEqual(active, sorted(CONTACT))
+                self.assertEqual([row["status"] for row in proposals], ["confirmed"])
+            else:
+                self.assertEqual(active, [])
+                self.assertEqual([row["status"] for row in proposals], ["open"])
+        finally:
+            fresh.close()
+
+
+class ProposalCommitFailureTests(IntakeLoopTests):
+    """A worksheet that outlives its proposal can never be confirmed and looks like one that can."""
+
+    def test_a_commit_that_fails_after_the_file_was_written_removes_the_file(self):
+        """The exact ordering the earlier version left open.
+
+        `sqlite3.Connection.commit` cannot be patched, so the connection is wrapped: the
+        failure lands at the commit, after the row and after the file, which is the only
+        arrangement in which a worksheet could outlive its proposal.
+        """
+        class FailingAtCommit:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def commit(self):
+                raise RuntimeError("the disk said no at commit")
+
+            def rollback(self):
+                self._connection.rollback()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            private = Path(temporary) / "private"
+            private.mkdir(mode=0o700)
+            path = private / "worksheet.json"
+            wrapped = FailingAtCommit(self.db)
+            with self.assertRaisesRegex(RuntimeError, "at commit"):
+                ANSWERS.propose_answers(
+                    wrapped, PLAN, "contact", AT,
+                    sink=lambda sheet: ANSWERS.write_private_worksheet(
+                        path, private, sheet))
+            # No proposal, no audit row, and no worksheet left looking usable.
+            self.assertFalse(path.exists(), "the worksheet outlived its proposal")
+            self.assertEqual(
+                self.db.execute("SELECT COUNT(*) FROM answer_proposals").fetchone()[0], 0)
+            self.assertEqual(self.db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type='answers_proposed'"
+            ).fetchone()[0], 0)
+
+    def test_the_undo_removes_only_the_file_this_call_created(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            private = Path(temporary) / "private"
+            private.mkdir(mode=0o700)
+            bystander = private / "someone-elses.json"
+            bystander.write_text("{}", encoding="utf-8")
+            path = private / "worksheet.json"
+            undo = ANSWERS.write_private_worksheet(path, private, {"a": 1})
+            self.assertTrue(path.exists())
+            undo()
+            self.assertFalse(path.exists())
+            self.assertTrue(bystander.exists())
+
+
+class SymlinkPathTests(WorksheetFileTests):
+    def test_a_symlink_leading_out_of_the_root_is_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.private / "rounds").symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "symlink|private root"):
+            self.write(self.private / "rounds" / "worksheet.json")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_symlink_that_stays_inside_the_root_is_still_refused(self):
+        """The case containment cannot see.
+
+        A link pointing somewhere else inside the private root resolves to a path that is
+        still contained, so the root check passes and only walking the components notices
+        that a link was traversed at all. Somebody who can create links inside the root can
+        move where a worksheet lands without ever leaving it.
+        """
+        real = self.private / "real"
+        real.mkdir()
+        (self.private / "rounds").symlink_to(real)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.write(self.private / "rounds" / "worksheet.json")
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_the_open_refuses_a_symlink_even_if_it_appears_after_the_check(self):
+        """`O_NOFOLLOW` is what holds; the check above only gives a clearer message."""
+        target = self.elsewhere / "target.json"
+        path = self.private / "worksheet.json"
+        path.symlink_to(target)
+        with self.assertRaises(ValueError):
+            self.write(path)
+        self.assertFalse(target.exists())
+        # And directly, with the courtesy check removed from the picture.
+        path.unlink()
+        path.symlink_to(target)
+        import os as _os
+        with self.assertRaises(OSError):
+            _os.open(path, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY
+                     | getattr(_os, "O_NOFOLLOW", 0), 0o600)
+        self.assertFalse(target.exists())
