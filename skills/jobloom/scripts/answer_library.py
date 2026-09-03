@@ -366,10 +366,16 @@ def intake_plan_targets(plan: Any) -> frozenset[str]:
             raise ValueError("intake entry does not carry the reviewed scope")
         for field in ("answer", "source_type", "validity_class", "auto_fill_allowed",
                       "auto_submit_allowed", "engine_enforced_recheck"):
-            if entry[field] is not expected[field] and entry[field] != expected[field]:
+            want = expected[field]
+            if isinstance(want, bool) and not isinstance(entry[field], bool):
+                # `1 == True` and `0 == False` in Python, so comparing by value alone let a
+                # JSON number stand in for a permission. It widened nothing — `add_answer`
+                # type-checks these before any answer is written — but a shape that accepts
+                # `0` where it means `false` is not the exact shape it claims to be, and the
+                # next field compared this way might be one that does widen something.
+                raise ValueError(f"intake entry must state a boolean plainly: {field}")
+            if entry[field] is not want and entry[field] != want:
                 raise ValueError(f"intake entry does not match the reviewed plan: {field}")
-        if not isinstance(entry["engine_enforced_recheck"], bool):
-            raise ValueError("intake entry must say plainly which recheck the engine enforces")
     if seen != set(TASK14_QUESTION_FORM_TARGETS):
         # Both directions: a plan that added a meaning, and a plan that dropped one so the
         # remaining nine would import quietly.

@@ -1044,3 +1044,31 @@ class IntakeShapeCliTests(_ImportCli, unittest.TestCase):
                               "auto_fill_allowed", "auto_submit_allowed",
                               "engine_enforced_recheck"):
                     self.assertEqual(entry[field], expected[field], field)
+
+    def test_a_number_cannot_stand_in_for_a_permission(self):
+        """`1 == True` in Python, so a JSON number satisfied a boolean by value.
+
+        It widened nothing — `add_answer` type-checks these before any answer is written —
+        but a shape that accepts `0` where it means `false` is not the exact shape it claims
+        to be, and the next field compared that way might be one that does widen something.
+        """
+        cases = {
+            "filling as one": {"auto_fill_allowed": 1},
+            "submission as zero": {"auto_submit_allowed": 0},
+            "both as numbers": {"auto_fill_allowed": 1, "auto_submit_allowed": 0},
+            "filling as a float": {"auto_fill_allowed": 1.0},
+            "recheck as one": {"engine_enforced_recheck": 1},
+            "filling as a string": {"auto_fill_allowed": "true"},
+        }
+        for label, change in cases.items():
+            with self.subTest(case=label):
+                self.setUp()
+                self.refuse_plan(
+                    lambda plan, c=change: plan["entries"][0].update(c),
+                    "state a boolean plainly")
+
+    def test_a_number_cannot_stand_in_for_the_recheck_of_the_one_that_has_one(self):
+        self.refuse_plan(
+            lambda plan: self.entry(plan, "work_authorized_now").update(
+                {"engine_enforced_recheck": 1}),
+            "state a boolean plainly")
