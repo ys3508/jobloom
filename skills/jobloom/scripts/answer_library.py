@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import unicodedata
@@ -90,6 +91,16 @@ def initialize(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (supersedes_id) REFERENCES answers(answer_id)
         );
         CREATE INDEX IF NOT EXISTS answers_canonical_idx ON answers(canonical_id, status);
+
+        CREATE TABLE IF NOT EXISTS answer_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            snapshot_sha256 TEXT NOT NULL,
+            shape_sha256 TEXT NOT NULL,
+            targets_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confirmed_at TEXT
+        );
 
         CREATE TABLE IF NOT EXISTS question_forms (
             normalized_question TEXT NOT NULL,
@@ -348,6 +359,126 @@ INTAKE_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "answer", "answer_ty
 INTAKE_PROSE_FIELDS = ("canonical_meaning", "confirmation")
 
 
+def propose_answers(connection: sqlite3.Connection, plan: Any, round_name: str,
+                    at: datetime | None = None) -> dict[str, Any]:
+    """Prepare a private worksheet of what the user is being asked to confirm.
+
+    Half of the loop the library has never had. Everything downstream of a confirmed answer
+    was built and tested; the step where a person is asked the question and says yes was a
+    hand-written JSON file, so the library held nothing. This is that step, with the same
+    discipline as the rest: the shape comes from the pinned plan and not from the worksheet,
+    the round is a named set and not an argument, and the proposal is recorded here so the
+    worksheet cannot be swapped for another one.
+
+    Contact meanings arrive with a value already proposed, read out of the composite fact they
+    depend on — that is what makes this a proposal rather than a blank form. The user's job is
+    to check it, not to retype it. Nothing is written to the library; nothing is returned that
+    carries a value.
+    """
+    targets = intake_plan_targets(plan)
+    if round_name not in TASK14_PROPOSAL_ROUNDS:
+        raise ValueError("no such reviewed round")
+    in_round = sorted(TASK14_PROPOSAL_ROUNDS[round_name] & set(targets))
+    if not in_round:
+        raise ValueError("the reviewed round names no meanings")
+    require_table(connection, "answer_proposals")
+    snapshot = _active_snapshot(connection)
+    held = {row["fact_id"]: json.loads(row["value_json"]) for row in connection.execute(
+        "SELECT fact_id, value_json FROM candidate_facts WHERE content_sha256=?",
+        (snapshot["content_sha256"],))}
+
+    by_target = {entry["canonical_id"]: entry for entry in plan["entries"]}
+    entries = []
+    for target in in_round:
+        shape = TASK14_INTAKE_SHAPE[target]
+        planned = by_target[target]
+        require_dependent_facts(connection, shape["dependent_fact_ids"])
+        entries.append({
+            "canonical_id": target,
+            "canonical_meaning": planned["canonical_meaning"],
+            "how_to_answer": planned["confirmation"],
+            "answer": _propose_value(target, shape["dependent_fact_ids"], held),
+            "answer_source": ("proposed from the fact it depends on — check it"
+                              if shape["dependent_fact_ids"] else "state it yourself"),
+            "confirmed_by_user": False,
+            "goes_stale_when": (
+                "the fact it depends on changes, is renamed or is deleted; that fact is "
+                "composite, so these move together"
+                if shape["dependent_fact_ids"] else "re-confirmed per application"),
+            "answer_type": planned["answer_type"],
+            "allowed_answer_type": sorted(shape["answer_type"]),
+            "validity_class": shape["validity_class"],
+            "scope": dict(shape["scope"]),
+            "auto_fill_allowed": shape["auto_fill_allowed"],
+            "auto_submit_allowed": shape["auto_submit_allowed"],
+            "dependent_fact_ids": list(shape["dependent_fact_ids"]),
+            "invalidation_triggers": list(shape["invalidation_triggers"]),
+        })
+
+    proposal_id = f"proposal-{secrets.token_hex(8)}"
+    digest = _shape_digest(entries)
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "INSERT INTO answer_proposals (proposal_id, created_at, snapshot_sha256, "
+        "shape_sha256, targets_json, status, confirmed_at) VALUES (?, ?, ?, ?, ?, 'open', NULL)",
+        (proposal_id, timestamp, snapshot["content_sha256"], digest, _json(in_round)))
+    audit(connection, "answers_proposed", proposal_id,
+          {"round": round_name, "canonical_ids": in_round})
+    connection.commit()
+    worksheet = {
+        "proposal_id": proposal_id, "shape_sha256": digest,
+        "snapshot_sha256": snapshot["content_sha256"], "round": round_name,
+        "note": ("Private. Check each answer, then set `confirmed_by_user` to true on the "
+                 "ones you want filled automatically. Anything left false is left out "
+                 "entirely rather than guessed at, which is a valid choice and not a "
+                 "half-finished one. Nothing here may ever be submitted automatically."),
+        "application_id": TASK14_APPLICATION, "entries": entries,
+    }
+    return {"worksheet": worksheet,
+            "summary": {"proposal_id": proposal_id, "round": round_name,
+                        "canonical_ids": in_round,
+                        "proposed": sum(1 for e in entries if e["answer"] is not None)}}
+
+
+def _classify_contact(source: str) -> dict[str, str]:
+    """Split a composite contact fact into the meanings it holds.
+
+    Classified once, in order of how distinctive each shape is, rather than scanned once per
+    meaning: an earlier version asked "does this piece contain linkedin.com?" and so missed a
+    profile URL on any other host, which is a property of the host and not of the fact. What
+    identifies the pieces is that one is labelled, one holds an address, and one is mostly
+    digits.
+    """
+    found: dict[str, str] = {}
+    for piece in [part.strip() for part in re.split(r"[\u01c1|]", source) if part.strip()]:
+        labelled = re.match(r"^\s*linkedin\s*:\s*(.+)$", piece, flags=re.IGNORECASE)
+        if labelled or "linkedin." in piece.lower():
+            found.setdefault("profile.linkedin",
+                             labelled.group(1).strip() if labelled else piece)
+        elif "@" in piece and " " not in piece:
+            found.setdefault("contact.email", piece)
+        elif sum(character.isdigit() for character in piece) >= 7:
+            found.setdefault("contact.phone", piece)
+    return found
+
+
+def _propose_value(target: str, dependent_fact_ids: list[str],
+                   held: dict[str, Any]) -> str | None:
+    """The part of the fact this meaning is about, for the user to check.
+
+    The values live in one string because splitting the fact would need a new
+    CandidateSnapshot and the re-approval of every resume version behind it. Reading a part out
+    of it costs nothing and changes nothing; a part this cannot identify is left absent rather
+    than guessed, and the user states it.
+    """
+    if not dependent_fact_ids:
+        return None
+    source = held.get(dependent_fact_ids[0])
+    if not isinstance(source, str):
+        return None
+    return _classify_contact(source).get(target)
+
+
 def require_dependent_facts(connection: sqlite3.Connection, dependent_fact_ids: list[str]) -> None:
     """Refuse a dependency on a fact the active snapshot does not hold.
 
@@ -372,6 +503,162 @@ def require_dependent_facts(connection: sqlite3.Connection, dependent_fact_ids: 
     missing = sorted(set(dependent_fact_ids) - held)
     if missing:
         raise ValueError(f"answer depends on facts the snapshot does not hold: {len(missing)}")
+
+
+# Which meanings a round of proposing may cover. Pinned, like everything else here: a caller
+# who could name an arbitrary set could propose the seven business answers with no employer
+# form in front of them, which is the thing their wording has to come from.
+TASK14_PROPOSAL_ROUNDS = {"contact": TASK14_CONTACT_TARGETS}
+# The parts of a proposed entry that the user may not edit. The answer itself is deliberately
+# absent: filling it in is the whole point of the worksheet, and a hash over it would make
+# every confirmation fail.
+PROPOSAL_SHAPE_FIELDS = ("canonical_id", "answer_type", "validity_class", "scope",
+                         "auto_fill_allowed", "auto_submit_allowed",
+                         "dependent_fact_ids", "invalidation_triggers")
+WORKSHEET_FIELDS = {"proposal_id", "shape_sha256", "snapshot_sha256", "round", "note",
+                    "application_id", "entries"}
+WORKSHEET_ENTRY_FIELDS = {"canonical_id", "canonical_meaning", "how_to_answer", "answer",
+                          "answer_source", "confirmed_by_user", "goes_stale_when",
+                          "answer_type", "allowed_answer_type", "validity_class", "scope",
+                          "auto_fill_allowed", "auto_submit_allowed", "dependent_fact_ids",
+                          "invalidation_triggers"}
+
+
+def confirm_answers(connection: sqlite3.Connection, worksheet: Any, plan: Any,
+                    at: datetime | None = None) -> dict[str, Any]:
+    """Write the answers the user confirmed, wholly or not at all.
+
+    Every check happens before anything is written. A library holding three of five confirmed
+    answers is one where nobody can tell which two are missing on purpose, so a worksheet that
+    fails halfway leaves it exactly as it was.
+
+    Confirmation is per entry and never inferred: `confirmed_by_user` false means the entry is
+    left out, which is a decision the user is allowed to make and not a half-finished
+    worksheet. The proposal is single-use and bound to the snapshot it was proposed from, so an
+    old worksheet cannot be replayed and one from another profile cannot be borrowed.
+    """
+    targets = intake_plan_targets(plan)
+    if not isinstance(worksheet, dict) or set(worksheet) != WORKSHEET_FIELDS:
+        raise ValueError("worksheet has an unexpected shape")
+    require_table(connection, "answer_proposals")
+    proposal = connection.execute(
+        "SELECT * FROM answer_proposals WHERE proposal_id=?",
+        (worksheet["proposal_id"],)).fetchone()
+    if not proposal:
+        raise ValueError("no such proposal")
+    if proposal["status"] != "open":
+        # Single-use. Replaying a worksheet is how a value the user has since replaced comes
+        # back, and how one confirmation becomes two answers.
+        raise ValueError("this proposal has already been confirmed")
+    if worksheet["application_id"] != TASK14_APPLICATION:
+        raise ValueError("worksheet does not name the reviewed application")
+
+    entries = worksheet["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("worksheet carries no entries")
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != WORKSHEET_ENTRY_FIELDS:
+            raise ValueError("worksheet entry has an unexpected shape")
+    if _shape_digest(entries) != proposal["shape_sha256"]:
+        # The answers may be edited. Nothing else may.
+        raise ValueError("worksheet no longer matches the proposal it came from")
+    if {entry["canonical_id"] for entry in entries} != set(json.loads(proposal["targets_json"])):
+        raise ValueError("worksheet does not cover the proposed meanings")
+    snapshot = _active_snapshot(connection)
+    if snapshot["content_sha256"] != proposal["snapshot_sha256"]:
+        # The profile moved under the worksheet, so a proposed value may describe a fact that
+        # no longer says that. Propose again rather than confirm a stale reading.
+        raise ValueError("the candidate profile changed since this was proposed")
+
+    planned, skipped = [], []
+    for entry in entries:
+        target = entry["canonical_id"]
+        if target not in targets or target not in TASK14_INTAKE_SHAPE:
+            raise ValueError("worksheet names a meaning nobody reviewed")
+        confirmed = entry["confirmed_by_user"]
+        if not isinstance(confirmed, bool):
+            raise ValueError("confirmation must be stated as a boolean")
+        if not confirmed:
+            skipped.append(target)
+            continue
+        shape = TASK14_INTAKE_SHAPE[target]
+        answer = entry["answer"]
+        if not isinstance(answer, str) or not answer.strip():
+            # Confirming an entry with nothing in it would file a blank as the user's word.
+            raise ValueError("a confirmed entry must carry an answer")
+        if entry["answer_type"] not in shape["answer_type"]:
+            raise ValueError("confirmed entry does not carry the reviewed answer type")
+        require_dependent_facts(connection, shape["dependent_fact_ids"])
+        planned.append((target, entry, shape))
+
+    if not planned:
+        raise ValueError("nothing was confirmed")
+
+    timestamp = (at or now_utc()).isoformat()
+    written, unchanged = [], []
+    try:
+        for target, entry, shape in planned:
+            current = connection.execute(
+                "SELECT answer_id, answer_json FROM answers "
+                "WHERE canonical_id=? AND status='active'", (target,)).fetchall()
+            if len(current) > 1:
+                raise ValueError("this meaning already has more than one active answer")
+            supersedes = None
+            if current:
+                if json.loads(current[0]["answer_json"]) == entry["answer"]:
+                    # Already on file, unchanged. Writing it again would make two active
+                    # answers for one meaning, which `match_answer` reports as a conflict.
+                    unchanged.append(target)
+                    continue
+                supersedes = current[0]["answer_id"]
+            add_answer(connection, {
+                "answer_id": f"answer-{target}-{secrets.token_hex(4)}",
+                "canonical_id": target, "canonical_meaning": entry["canonical_meaning"],
+                "answer": entry["answer"], "answer_type": entry["answer_type"],
+                "source_type": shape["source_type"], "confirmation_status": "confirmed",
+                "confirmed_at": timestamp, "validity_class": shape["validity_class"],
+                "scope": dict(shape["scope"]),
+                "auto_fill_allowed": shape["auto_fill_allowed"],
+                "auto_submit_allowed": shape["auto_submit_allowed"],
+                "dependent_fact_ids": list(shape["dependent_fact_ids"]),
+                "invalidation_triggers": list(shape["invalidation_triggers"]),
+                "supersedes_id": supersedes,
+            })
+            written.append(target)
+        connection.execute(
+            "UPDATE answer_proposals SET status='confirmed', confirmed_at=? WHERE proposal_id=?",
+            (timestamp, proposal["proposal_id"]))
+        audit(connection, "answers_confirmed", proposal["proposal_id"],
+              {"written": sorted(written), "unchanged": sorted(unchanged),
+               "skipped": sorted(skipped)})
+    except Exception:
+        connection.rollback()
+        raise
+    connection.commit()
+    return {"proposal_id": proposal["proposal_id"], "written": sorted(written),
+            "unchanged": sorted(unchanged), "skipped": sorted(skipped)}
+
+
+def _shape_digest(entries: list[dict[str, Any]]) -> str:
+    """A hash of what the worksheet is, never of what it says.
+
+    Covers the reviewed arrangement — meaning, answer type, scope, dependency — so a worksheet
+    edited into a different shape stops matching the proposal that produced it. It does not
+    cover `answer`, because writing an answer there is what the user is being asked to do.
+    """
+    shape = [{field: entry[field] for field in PROPOSAL_SHAPE_FIELDS} for entry in entries]
+    return hashlib.sha256(
+        json.dumps(shape, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _active_snapshot(connection: sqlite3.Connection) -> sqlite3.Row:
+    require_table(connection, "candidate_snapshots")
+    row = connection.execute(
+        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active'").fetchone()
+    if not row:
+        raise ValueError("no active candidate snapshot")
+    return row
 
 
 def intake_plan_targets(plan: Any) -> frozenset[str]:
@@ -860,6 +1147,16 @@ def main() -> None:
     authorization.add_argument("--entry", required=True, type=Path)
     revoke = subparsers.add_parser("revoke-authorization")
     revoke.add_argument("--authorization-id", required=True)
+    propose = subparsers.add_parser("propose-answers")
+    propose.add_argument("--intake-plan", required=True, type=Path)
+    propose.add_argument("--round", required=True,
+                         help="a reviewed round of meanings, not an arbitrary set")
+    propose.add_argument("--out", required=True, type=Path,
+                         help="where the private worksheet is written; it carries proposed "
+                              "answers, so it is created 0600 and belongs in the private root")
+    confirm = subparsers.add_parser("confirm-answers")
+    confirm.add_argument("--intake-plan", required=True, type=Path)
+    confirm.add_argument("--worksheet", required=True, type=Path)
     forms_import = subparsers.add_parser("import-question-forms")
     forms_import.add_argument("--manifest", required=True, type=Path)
     forms_import.add_argument("--provenance", required=True, type=Path,
@@ -895,6 +1192,21 @@ def main() -> None:
     elif args.command == "revoke-authorization":
         revoke_authorization(connection, args.authorization_id)
         result = {"status": "revoked", "authorization_id": args.authorization_id}
+    elif args.command == "propose-answers":
+        plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
+        proposed = propose_answers(connection, plan, args.round)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(proposed["worksheet"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        args.out.chmod(0o600)
+        # The summary names meanings and counts. The worksheet holds the answers, and only
+        # the worksheet.
+        result = {**proposed["summary"], "worksheet": str(args.out)}
+    elif args.command == "confirm-answers":
+        plan = json.loads(args.intake_plan.read_text(encoding="utf-8"))
+        worksheet = json.loads(args.worksheet.read_text(encoding="utf-8"))
+        result = confirm_answers(connection, worksheet, plan)
     elif args.command == "import-question-forms":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         provenance = json.loads(args.provenance.read_text(encoding="utf-8"))

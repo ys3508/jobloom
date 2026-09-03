@@ -36,6 +36,39 @@ What may be imported is pinned in code — `answer_library.TASK14_QUESTION_FORM_
 
 Resolve multiple applicable answers by scope specificity. A more specific applicable scope overrides a global answer. Two equally specific active answers with different values are a conflict and must pause.
 
+## How an answer gets into the library
+
+`answer_library.py propose-answers` and `confirm-answers`. Everything downstream of a
+confirmed answer was built and tested long before this existed; the step where a person is
+asked the question and says yes was a hand-written JSON file, so the library held nothing and
+an application sat unfilled.
+
+A round is a **named set** of meanings, not an argument. Proposing reads the pinned intake
+shape, reads the facts a meaning depends on, and writes a worksheet at 0600 in the private
+root carrying a proposed answer for the user to check — a proposal rather than a blank form.
+Nothing is written to the library, and the terminal gets meanings and counts.
+
+Confirmation is **per entry and never inferred**: `confirmed_by_user` false leaves that entry
+out entirely, which is a choice the user is allowed to make and not a half-finished worksheet.
+Confirming an entry with nothing in it is refused rather than filed as the user's word.
+
+The worksheet cannot be swapped, edited into another shape, or replayed. The proposal is
+recorded in the database with a hash over the reviewed arrangement — meaning, answer type,
+scope, dependency — and deliberately **not** over the answer, since writing an answer there is
+the point. It is single-use, because replaying a worksheet is how a value the user has since
+replaced comes back. It is bound to the snapshot it was proposed from, because a proposed
+value describes a fact as it was when it was read.
+
+Writing is atomic. A library holding three of five confirmed answers is one where nobody can
+tell which two are missing on purpose, so a confirmation that fails partway leaves it exactly
+as it was. Confirming a value already on file changes nothing rather than creating a second
+active answer for one meaning — which `match_answer` reports as a conflict — and a changed
+value supersedes the old one instead of joining it. `auto_submit_allowed` is false on
+everything this writes, without exception.
+
+Answers live only in the private root. The command's output, the audit log and every refusal
+name meanings and counts; none of them carries a value.
+
 ## What makes a stored answer go stale
 
 `candidate_core.register_snapshot` compares the old and new snapshots fact by fact and marks
