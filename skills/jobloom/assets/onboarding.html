@@ -44,7 +44,9 @@
   .progress { display: flex; gap: 4px; margin-bottom: 22px; }
   .progress i { flex: 1; height: 3px; border-radius: 2px; background: var(--line); }
   .progress i.done { background: var(--accent); }
-  label.field { display: block; font-weight: 600; margin: 22px 0 4px; }
+  label.field { display: block; font-weight: 600; margin: 0 0 4px; }
+  .row { margin: 18px 0; }
+  .row .origin:first-of-type { margin: -2px 0 6px; }
   input[type=text] {
     width: 100%; font: inherit; color: inherit; padding: 10px 12px; border-radius: 8px;
     border: 1px solid var(--line); background: var(--bg);
@@ -94,6 +96,7 @@
   </header>
   <div class="progress" id="progress"></div>
   <section class="card" id="screen"></section>
+  <datalist id="countries"></datalist>
 </main>
 
 <script>
@@ -114,14 +117,23 @@ const COPY = {
     welcomeNothingDerived: "没有任何一项是推算出来的。全名不由姓和名拼出来，国家区号也不从电话号码里解析——你说什么就是什么。",
     start: "开始",
     resume: "继续上次",
-    fieldTitle: "完善你的基本资料",
+    screen_name: "你的姓名",
+    screenHint_name: "按你会写在申请表上的样子填。法定全名单独确认一次，不由姓和名拼出来。",
+    screen_address: "你的地址",
+    screenHint_address: "带 * 的是必填。国家可以下拉选，也可以直接打前几个字母。",
+    screen_reach: "怎么联系你",
+    screenHint_reach: "邮箱和电话。国家区号是表单单独问的那一格。",
+    screen_links: "你的主页",
+    screenHint_links: "全部可选。不填的就留空。",
+    screenLeftOut: "这一屏这轮不填",
+    requiredMissing: "这一项是必填",
     proposedFrom: "从你已确认的联系方式里读出来的，请核对",
     statedByYou: "这一项没有现成的值，请你填写",
     ambiguous: "有不止一条资料可能是这个意思，所以没有提议值，请你填写",
     required: "每一份录制过的申请表都把这项列为必填",
     optional: "出现的地方都是选填",
-    gateOne: "这个值正确吗？",
-    gateTwo: "允许 Jobloom 用它填写申请吗？",
+    gateOne: "这些值都正确吗？",
+    gateTwo: "允许 Jobloom 用它们填写申请吗？",
     yes: "是", no: "否",
     allow: "允许", ask: "每次问我",
     didYouMean: "是不是想写 {v}？",
@@ -163,8 +175,8 @@ const COPY = {
     carry: "带过来",
     resumeCarry: "继续",
     skipMigrations: "以后再说",
-    reviewTitle: "看一眼这份简历",
-    reviewBody: "字节和你批准过的那一份完全一致（系统已经核对过哈希）。但字节相同不等于你现在还愿意用它，所以请你自己看。",
+    carryReviewTitle: "看一眼这份简历",
+    carryReviewBody: "字节和你批准过的那一份完全一致（系统已经核对过哈希）。但字节相同不等于你现在还愿意用它，所以请你自己看。",
     reviewClaims: "这份简历声称的内容，已经对新的资料快照重新校验通过：",
     reviewOpening: "正在取文件…",
     reviewFailed: "文件打不开：",
@@ -188,14 +200,23 @@ const COPY = {
     welcomeNothingDerived: "Nothing here is worked out from anything else. A full name is not your first plus your last, and a country code is not read off your phone number — each is what you say it is.",
     start: "Start",
     resume: "Pick up where you left off",
-    fieldTitle: "Your basics",
+    screen_name: "Your name",
+    screenHint_name: "As you would write it on an application. The full legal name is confirmed on its own — it is never joined from the parts.",
+    screen_address: "Your address",
+    screenHint_address: "Starred fields are required. The country can be picked from the list or typed.",
+    screen_reach: "How to reach you",
+    screenHint_reach: "Email and phone. The country code is the separate box some forms have.",
+    screen_links: "Your profiles",
+    screenHint_links: "All optional. Leave blank what you do not have.",
+    screenLeftOut: "Leaving this screen out of this round",
+    requiredMissing: "this one is required",
     proposedFrom: "read out of contact details you already confirmed — check it",
     statedByYou: "nothing on file proposes this one; you state it",
     ambiguous: "more than one detail could mean this, so nothing is proposed; you state it",
     required: "every recorded application form marks this required",
     optional: "optional everywhere it appears",
-    gateOne: "Is this correct?",
-    gateTwo: "May Jobloom use it to fill in applications?",
+    gateOne: "Are these correct?",
+    gateTwo: "May Jobloom use them to fill in applications?",
     yes: "Yes", no: "No",
     allow: "Allow", ask: "Ask me each time",
     didYouMean: "Did you mean {v}?",
@@ -237,8 +258,8 @@ const COPY = {
     carry: "Carry it across",
     resumeCarry: "Pick it up",
     skipMigrations: "Not now",
-    reviewTitle: "Take a look at this resume",
-    reviewBody: "It is byte-for-byte the file you approved before — the hashes were checked. But the same bytes are not the same decision, so this is yours to look at.",
+    carryReviewTitle: "Take a look at this resume",
+    carryReviewBody: "It is byte-for-byte the file you approved before — the hashes were checked. But the same bytes are not the same decision, so this is yours to look at.",
     reviewClaims: "What it claims, revalidated against the new profile:",
     reviewOpening: "Fetching the file…",
     reviewFailed: "The file could not be opened: ",
@@ -257,31 +278,53 @@ const COPY = {
 
 const FIELD_COPY = {
   zh: {
-    "contact.first_name": ["名字", "你写在申请表上的名"],
-    "contact.last_name": ["姓氏", "你写在申请表上的姓"],
-    "contact.full_name": ["法定全名", "单独确认一次，不由姓和名拼出来"],
+    "contact.first_name": ["法定名字", ""],
+    "contact.last_name": ["法定姓氏", ""],
+    "contact.full_name": ["法定全名", "有些平台只要一个完整姓名字段"],
     "contact.email": ["邮箱", "招聘表单里最常见的一项"],
     "contact.phone": ["电话", "保持你写的样子，不做格式转换"],
     "contact.phone_country": ["国家区号", "表单单独问的那一格，例如 +1"],
     "contact.location_city": ["所在城市", "只填城市"],
     "contact.location": ["所在地（完整）", "有些平台只有一个“现居地”字段"],
     "profile.linkedin": ["LinkedIn", "完整链接"],
+    "contact.address.line1": ["地址第一行", "街道地址"],
+    "contact.address.line2": ["地址第二行", "公寓、单元号等，可留空"],
+    "contact.location_region": ["州 / 省", ""],
+    "contact.postal_code": ["邮编", ""],
+    "contact.country": ["国家", "下拉选，或者打前几个字母"],
+    "contact.preferred_name": ["常用名", "希望别人怎么称呼你，可留空"],
+    "contact.phone_extension": ["分机", "可留空"],
+    "profile.github": ["GitHub", "可留空"],
+    "profile.portfolio": ["作品集", "可留空"],
+    "profile.website": ["个人网站", "可留空"],
+    "employment.current_company": ["现任公司", "可留空"],
   },
   en: {
-    "contact.first_name": ["First name", "your given name as you write it"],
-    "contact.last_name": ["Last name", "your family name as you write it"],
-    "contact.full_name": ["Full legal name", "confirmed on its own, never joined from the parts"],
+    "contact.first_name": ["Legal first name", ""],
+    "contact.last_name": ["Legal last name", ""],
+    "contact.full_name": ["Full legal name", "some sites ask for one whole-name field"],
     "contact.email": ["Email", "the one thing nearly every form asks for"],
     "contact.phone": ["Phone", "kept exactly as you write it"],
     "contact.phone_country": ["Country code", "the separate box some forms have, e.g. +1"],
     "contact.location_city": ["City", "just the city"],
     "contact.location": ["Location (full)", "some sites have one 'current location' box"],
     "profile.linkedin": ["LinkedIn", "the full link"],
+    "contact.address.line1": ["Address line 1", "street address"],
+    "contact.address.line2": ["Address line 2", "apartment, unit — optional"],
+    "contact.location_region": ["State / province", ""],
+    "contact.postal_code": ["Postal code", ""],
+    "contact.country": ["Country", "pick from the list, or type the first letters"],
+    "contact.preferred_name": ["Preferred name", "what to call you — optional"],
+    "contact.phone_extension": ["Extension", "optional"],
+    "profile.github": ["GitHub", "optional"],
+    "profile.portfolio": ["Portfolio", "optional"],
+    "profile.website": ["Website", "optional"],
+    "employment.current_company": ["Current company", "optional"],
   },
 };
 
 let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
-let app = { fields: [], answers: {}, index: 0, screen: "welcome", state: null,
+let app = { fields: [], answers: {}, screenGates: {}, index: 0, screen: "welcome", state: null,
             draft: null, done: null, error: "", stranded: [], carry: null,
             pdfUrl: "", reviewed: false, busy: false, restored: null };
 
@@ -336,71 +379,88 @@ function welcome() {
                      onclick: () => go("field", 0) })));
 }
 
-function fieldScreen() {
-  const field = app.fields[app.index];
+function screenFields() {
+  const group = (app.state.screens || [])[app.index] || { fields: [] };
+  return group.fields
+    .map((id) => app.fields.find((field) => field.canonical_id === id))
+    .filter(Boolean);
+}
+
+function fieldRow(field) {
   const answer = app.answers[field.canonical_id];
   const [label, hint] = fieldCopy(field.canonical_id);
-  const box = el("div", {});
-
-  const input = el("input", { type: "text", value: answer.value || "", id: "value",
-                              autocomplete: "off", spellcheck: "false" });
+  const inputId = `v-${field.canonical_id.replace(/\./g, "-")}`;
+  const attrs = { type: "text", value: answer.value || "", id: inputId, autocomplete: "off",
+                  spellcheck: "false" };
+  if (field.canonical_id === "contact.country") attrs.list = "countries";
+  const input = el("input", attrs);
+  // Deliberately not re-rendering: this used to call render() on every keystroke, which
+  // replaced the input the person was typing into and threw the caret away after each
+  // letter. The model is updated in place, and the screen is only rebuilt when something
+  // structural changes - a gate answered, a complaint raised, a rewrite offered.
   input.addEventListener("input", () => {
     answer.value = input.value;
-    answer.complaint = "";
-    answer.suggestion = "";
-    render();
+    if (answer.complaint || answer.suggestion) {
+      answer.complaint = "";
+      answer.suggestion = "";
+      rerender(inputId);
+    }
   });
-
-  box.append(
-    el("h2", { text: t("fieldTitle") }),
-    el("p", { class: "muted", text: hint }),
-    el("label", { class: "field", for: "value", text: label }),
+  const parts = [
+    el("label", { class: "field", for: inputId,
+                  text: label + (field.required ? " *" : "") }),
+    hint ? el("p", { class: "origin", text: hint }) : null,
     input,
-    el("p", { class: "origin",
-              text: field.proposed ? t("proposedFrom")
-                    : (field.value_source || "").indexOf("more than one") >= 0
-                      ? t("ambiguous") : t("statedByYou") }),
-    el("p", { class: "origin", text: field.required ? t("required") : t("optional") }));
-
-  if (answer.complaint) box.append(el("p", { class: "complaint", text: answer.complaint }));
+  ];
+  if (field.proposed) parts.push(el("p", { class: "origin", text: t("proposedFrom") }));
+  if (answer.complaint) parts.push(el("p", { class: "complaint", text: answer.complaint }));
   if (answer.suggestion) {
-    box.append(el("div", { class: "offer" },
+    parts.push(el("div", { class: "offer" },
       el("span", { text: t("didYouMean", { v: answer.suggestion }) + "  " }),
       el("button", { class: "link", text: t("useIt"), onclick: () => {
         answer.value = answer.suggestion;
         answer.suggestion = ""; answer.complaint = "";
-        render();
+        rerender(inputId);
       } }),
       el("span", { text: "  ·  " }),
       el("button", { class: "link", text: t("keepMine"),
-                     onclick: () => { answer.suggestion = ""; render(); } })));
+                     onclick: () => { answer.suggestion = ""; rerender(inputId); } })));
   }
+  return el("div", { class: "row" }, ...parts.filter(Boolean));
+}
 
-  const gateOne = el("div", { class: "gate" },
+function fieldScreen() {
+  const group = (app.state.screens || [])[app.index] || { name: "", fields: [] };
+  const fields = screenFields();
+  const answers = fields.map((field) => app.answers[field.canonical_id]);
+  const anyValue = answers.some((answer) => (answer.value || "").trim());
+  const gate = app.screenGates[group.name] || { confirmed: null, autofill: null };
+  const box = el("div", {},
+    el("h2", { text: t(`screen_${group.name}`) }),
+    el("p", { class: "muted", text: t(`screenHint_${group.name}`) }),
+    ...fields.map(fieldRow));
+
+  box.append(el("div", { class: "gate" },
     el("p", { text: t("gateOne") }),
     el("div", { class: "choices" },
-      el("button", { text: t("yes"), "aria-pressed": String(answer.confirmed === true),
-                     onclick: () => { answer.confirmed = true; render(); } }),
-      el("button", { text: t("no"), "aria-pressed": String(answer.confirmed === false),
-                     onclick: () => {
-                       answer.confirmed = false; answer.autofill = false; render();
-                     } })));
-  box.append(gateOne);
-
-  if (answer.confirmed === true) {
+      el("button", { text: t("yes"), "aria-pressed": String(gate.confirmed === true),
+                     onclick: () => setGate(group.name, true, gate.autofill) }),
+      el("button", { text: t("no"), "aria-pressed": String(gate.confirmed === false),
+                     onclick: () => setGate(group.name, false, false) }))));
+  if (gate.confirmed === true) {
     box.append(el("div", { class: "gate" },
       el("p", { text: t("gateTwo") }),
       el("div", { class: "choices" },
-        el("button", { text: t("allow"), "aria-pressed": String(answer.autofill === true),
-                       onclick: () => { answer.autofill = true; render(); } }),
-        el("button", { text: t("ask"), "aria-pressed": String(answer.autofill === false),
-                       onclick: () => { answer.autofill = false; render(); } }))));
-  } else if (answer.confirmed === false) {
-    box.append(el("p", { class: "muted", text: t("leftOut") }));
+        el("button", { text: t("allow"), "aria-pressed": String(gate.autofill === true),
+                       onclick: () => setGate(group.name, true, true) }),
+        el("button", { text: t("ask"), "aria-pressed": String(gate.autofill === false),
+                       onclick: () => setGate(group.name, true, false) }))));
+  } else if (gate.confirmed === false) {
+    box.append(el("p", { class: "muted", text: t("screenLeftOut") }));
   }
 
-  const ready = answer.confirmed === false
-    || (answer.confirmed === true && !!(answer.value || "").trim() && answer.autofill !== null);
+  const ready = gate.confirmed === false
+    || (gate.confirmed === true && gate.autofill !== null && anyValue);
   box.append(el("footer", { class: "nav" },
     app.index > 0 ? el("button", { text: t("back"), onclick: () => go("field", app.index - 1) })
                   : null,
@@ -410,37 +470,66 @@ function fieldScreen() {
   return box;
 }
 
+function setGate(name, confirmed, autofill) {
+  app.screenGates[name] = { confirmed, autofill: confirmed ? autofill : false };
+  render();
+}
+
 async function advance() {
-  const field = app.fields[app.index];
-  const answer = app.answers[field.canonical_id];
-  if (answer.confirmed) {
-    // Checked by the service, with the same rule the terminal path uses. The page never
-    // decides what a valid value is, it only shows what came back.
-    const checked = await api("/api/check", { canonical_id: field.canonical_id,
-                                              value: answer.value });
-    answer.value = checked.value;
-    answer.complaint = checked.complaint || "";
-    answer.suggestion = checked.suggestion || "";
-    if (answer.complaint || answer.suggestion) return render();
+  const group = (app.state.screens || [])[app.index];
+  const gate = app.screenGates[group.name];
+  if (gate.confirmed) {
+    // Checked by the service, field by field, with the same rule the terminal path uses.
+    let complained = false;
+    for (const field of screenFields()) {
+      const answer = app.answers[field.canonical_id];
+      if (!(answer.value || "").trim()) {
+        answer.complaint = field.required ? t("requiredMissing") : "";
+        complained = complained || field.required;
+        continue;
+      }
+      const checked = await api("/api/check", { canonical_id: field.canonical_id,
+                                                value: answer.value });
+      answer.value = checked.value;
+      answer.complaint = checked.complaint || "";
+      answer.suggestion = checked.suggestion || "";
+      complained = complained || !!(answer.complaint || answer.suggestion);
+    }
+    if (complained) return render();
   }
-  if (app.index + 1 < app.fields.length) return go("field", app.index + 1);
+  if (app.index + 1 < (app.state.screens || []).length) return go("field", app.index + 1);
   return go("review");
 }
 
+function decided(canonicalId) {
+  const screens = app.state.screens || [];
+  const index = screens.findIndex((group) => group.fields.includes(canonicalId));
+  const gate = app.screenGates[(screens[index] || {}).name] || {};
+  const value = (app.answers[canonicalId] || {}).value || "";
+  const confirmed = gate.confirmed === true && !!value.trim();
+  return { index, confirmed, autofill: confirmed && gate.autofill === true, value };
+}
+
+function inScreenOrder() {
+  const order = (app.state.screens || []).flatMap((group) => group.fields);
+  return [...app.fields].sort(
+    (a, b) => order.indexOf(a.canonical_id) - order.indexOf(b.canonical_id));
+}
+
 function reviewScreen() {
-  const rows = app.fields.map((field) => {
-    const answer = app.answers[field.canonical_id];
+  const rows = inScreenOrder().map((field) => {
+    const state = decided(field.canonical_id);
     const [label] = fieldCopy(field.canonical_id);
-    const state = !answer.confirmed ? t("stLeftOut")
-                  : answer.autofill ? t("stLocked") : t("stRecorded");
-    const index = app.fields.indexOf(field);
+    const shown = !state.confirmed ? t("stLeftOut")
+                  : state.autofill ? t("stLocked") : t("stRecorded");
     return el("tr", {},
       el("th", { text: label }),
-      el("td", { text: answer.confirmed ? answer.value : "—" }),
-      el("td", { class: "state" }, el("span", { text: state + "  " }),
-        el("button", { class: "link", text: t("edit"), onclick: () => go("field", index) })));
+      el("td", { text: state.confirmed ? state.value : "—" }),
+      el("td", { class: "state" }, el("span", { text: shown + "  " }),
+        el("button", { class: "link", text: t("edit"),
+                       onclick: () => go("field", state.index) })));
   });
-  const anyConfirmed = app.fields.some((f) => app.answers[f.canonical_id].confirmed);
+  const anyConfirmed = app.fields.some((f) => decided(f.canonical_id).confirmed);
   return el("div", {},
     el("h2", { text: t("reviewTitle") }),
     el("p", { class: "muted", text: t("reviewBody") }),
@@ -458,9 +547,9 @@ async function prepare() {
   try {
     const answers = {};
     for (const field of app.fields) {
-      const answer = app.answers[field.canonical_id];
-      answers[field.canonical_id] = { value: answer.value, confirmed: !!answer.confirmed,
-                                      autofill: !!answer.autofill };
+      const state = decided(field.canonical_id);
+      answers[field.canonical_id] = { value: state.value, confirmed: state.confirmed,
+                                      autofill: state.autofill };
     }
     await api("/api/answers", { answers });
     app.draft = await api("/api/draft", {});
@@ -625,10 +714,10 @@ function carryReviewScreen() {
   const claims = (app.carry.claims || []).map((claim) =>
     el("li", { text: `${claim.claim_text} — ${claim.evidence_strength}` }));
   return el("div", {},
-    el("h2", { text: t("reviewTitle") }),
-    el("p", { text: t("reviewBody") }),
+    el("h2", { text: t("carryReviewTitle") }),
+    el("p", { text: t("carryReviewBody") }),
     app.pdfUrl
-      ? el("iframe", { class: "paper", src: app.pdfUrl, title: t("reviewTitle") })
+      ? el("iframe", { class: "paper", src: app.pdfUrl, title: t("carryReviewTitle") })
       : el("p", { class: "muted", text: t("reviewOpening") }),
     claims.length ? el("p", { text: t("reviewClaims") }) : null,
     claims.length ? el("ul", { class: "plain" }, ...claims) : null,
@@ -718,12 +807,25 @@ function go(screen, index) {
   render();
 }
 
+function rerender(focusId) {
+  // Rebuilding the screen throws the caret away, so whatever was being typed into is given
+  // back its focus and its caret. Only called where a rebuild is unavoidable.
+  render();
+  const field = document.getElementById(focusId);
+  if (field) {
+    const at = field.value.length;
+    field.focus();
+    field.setSelectionRange(at, at);
+  }
+}
+
 function render() {
-  const total = app.fields.length + 3;
+  const steps = (app.state && app.state.screens ? app.state.screens.length : 4);
+  const total = steps + 3;
   const at = app.screen === "welcome" ? 0
            : app.screen === "field" ? app.index + 1
-           : app.screen === "review" ? app.fields.length + 1
-           : app.screen === "impact" ? app.fields.length + 2 : total;
+           : app.screen === "review" ? steps + 1
+           : app.screen === "impact" ? steps + 2 : total;
   const progress = document.getElementById("progress");
   progress.replaceChildren(...Array.from({ length: total }, (_, i) =>
     el("i", { class: i <= at ? "done" : "" })));
@@ -755,15 +857,14 @@ document.getElementById("lang").addEventListener("change", (event) => {
       return;
     }
     app.fields = round.fields;
+    document.getElementById("countries").replaceChildren(
+      ...(round.countries || []).map((name) => el("option", { value: name })));
     for (const field of app.fields) {
-      app.answers[field.canonical_id] = {
-        value: field.value || "",
-        // Null, not false: nobody has answered yet, and a default of "no" would be an answer
-        // the user did not give.
-        confirmed: field.confirmed ? true : null,
-        autofill: field.confirmed ? field.autofill : null,
-        complaint: "", suggestion: "",
-      };
+      // Null gates, not false: nobody has answered yet, and a default of "no" would be an
+      // answer the user did not give. They live per screen, because that is where they are
+      // asked.
+      app.answers[field.canonical_id] = { value: field.value || "", complaint: "",
+                                          suggestion: "" };
     }
     render();
   } catch (error) {

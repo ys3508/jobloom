@@ -231,11 +231,38 @@ def resolve_canonical_fact(connection: sqlite3.Connection, canonical_id: str,
 # move quietly. Optional and user-demand fields are deliberately absent from every round in
 # this version: a profile round costs a new CandidateSnapshot, and a field that no recorded
 # form requires does not earn one.
+# What the window asks, and in what order. A screen per group of fields a person thinks about
+# at once, because asking twenty things one at a time - each with its own two confirmations -
+# is a form nobody finishes. The shape follows the employer forms these fields come from: a
+# legal name together, an address together, a way to be reached together.
+#
+# The address is here because the user asked for it, not because the corpus did; `demand`
+# records which, and `contact.address.line1` and its neighbours are all `user`. That is the
+# label doing its job rather than being overruled - a field set may grow on a person's own
+# requirement, it may not grow on looking reasonable.
+PROFILE_SCREENS = (
+    ("name", ("contact.first_name", "contact.last_name", "contact.full_name",
+              "contact.preferred_name")),
+    ("address", ("contact.address.line1", "contact.address.line2", "contact.location_city",
+                 "contact.location_region", "contact.postal_code", "contact.country",
+                 "contact.location")),
+    ("reach", ("contact.email", "contact.phone_country", "contact.phone",
+               "contact.phone_extension")),
+    ("links", ("profile.linkedin", "profile.github", "profile.portfolio", "profile.website",
+               "employment.current_company")),
+)
+
 PROFILE_ROUNDS = {
-    "required-v1": frozenset(
-        field.canonical_id for field in PROFILE_V1.values()
-        if field.demand == DEMAND_CORPUS and field.required_where_present),
+    "onboarding-v1": frozenset(
+        canonical_id for _, fields in PROFILE_SCREENS for canonical_id in fields),
 }
+
+# The measured floor the round has to clear: every meaning the corpus asks for and marks
+# required wherever it appears. Derived, so it tracks the measurement; asserted against the
+# round in the tests, so a screen cannot quietly drop one.
+CORPUS_REQUIRED = frozenset(
+    field.canonical_id for field in PROFILE_V1.values()
+    if field.demand == DEMAND_CORPUS and field.required_where_present)
 
 # The `fact_type` a profile fact carries into the snapshot. Pinned per group, not per field:
 # the type is how the rest of the system talks about a fact's kind, and a type per field would
@@ -832,7 +859,7 @@ def status(connection: sqlite3.Connection) -> dict[str, Any]:
         else:
             unresolved[canonical_id] = reason
     return {"active_snapshot": active["content_sha256"],
-            "round": sorted(PROFILE_ROUNDS["required-v1"]),
+            "round": sorted(set().union(*PROFILE_ROUNDS.values())),
             "resolvable": resolvable, "unresolved": unresolved}
 
 
@@ -948,7 +975,27 @@ def _offer_scheme(value: str) -> str | None:
 
 # Per meaning, because a rule that applied to a group would have to be right for the whole
 # group. Anything not named here is text: refused only when it is empty.
+COUNTRY_NAMES = tuple(json.loads(
+    (Path(__file__).resolve().parent.parent / "assets" / "countries.json")
+    .read_text(encoding="utf-8"))["names"])
+_COUNTRY_INDEX = {name.casefold(): name for name in COUNTRY_NAMES}
+
+
+def _check_country(value: str) -> str | None:
+    if value.casefold() not in _COUNTRY_INDEX:
+        return "pick a country from the list"
+    return None
+
+
+def _offer_country(value: str) -> str | None:
+    """The same country under a different capitalisation is the same country, and is offered
+    in the list's own spelling rather than accepted as typed - so two profiles that mean the
+    United States do not hold two different strings."""
+    return _COUNTRY_INDEX.get(value.casefold())
+
+
 FIELD_RULES = {
+    "contact.country": (_check_country, _offer_country),
     "contact.email": (_check_email, None),
     "contact.phone": (_check_phone, None),
     "contact.phone_country": (_check_phone_country, _offer_country_code),

@@ -46,10 +46,10 @@ AT = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 COMPOSITE = ("probe@example.invalid ǁ 555-0100 ǁ "
              "LinkedIn: https://example.invalid/in/probe")
 PIECES = ("probe@example.invalid", "555-0100", "example.invalid/in/probe")
-ROUND = "required-v1"
-NINE = ("contact.email", "contact.first_name", "contact.full_name", "contact.last_name",
-        "contact.location", "contact.location_city", "contact.phone", "contact.phone_country",
-        "profile.linkedin")
+ROUND = "onboarding-v1"
+# The whole round, in the order the resolver sorts it. Named for what it is rather than for
+# its size, because the size is now a property of the reviewed screens.
+NINE = tuple(sorted(PROFILE.PROFILE_ROUNDS[ROUND]))
 # What the user types for the six nothing can propose. Visibly synthetic, and never a value
 # any code under test could have derived from the composite.
 STATED = {
@@ -59,9 +59,20 @@ STATED = {
     "contact.first_name": "Probe",
     "contact.last_name": "Example",
     "contact.full_name": "Probe Q. Example",
+    "contact.preferred_name": "Probe",
     "contact.phone_country": "+1",
+    "contact.phone_extension": "101",
     "contact.location_city": "Testville",
     "contact.location": "Testville, Nowhere",
+    "contact.location_region": "Nowhere",
+    "contact.address.line1": "1 Probe Lane",
+    "contact.address.line2": "Unit 2",
+    "contact.postal_code": "00000",
+    "contact.country": "United States of America",
+    "profile.github": "https://example.invalid/probe",
+    "profile.portfolio": "https://example.invalid/portfolio",
+    "profile.website": "https://example.invalid/site",
+    "employment.current_company": "Probe Corp",
 }
 
 
@@ -179,23 +190,28 @@ class ProfileIntakeTests(unittest.TestCase):
 
 
 class RoundTests(ProfileIntakeTests):
-    def test_the_round_holds_the_nine_measured_required_fields(self):
-        """Pinned here so a flag flipped on a field cannot quietly widen a round.
+    def test_the_round_clears_the_measured_floor(self):
+        """A screen may add a field the corpus never asked for. It may not drop one it did.
 
-        The round is derived - corpus demand and required wherever recorded - and the point of
-        deriving it is that it tracks the measurement. The point of pinning it in a test is
-        that the measurement changing is a thing a person should have to look at.
+        The floor is derived - corpus demand, required wherever recorded - so it tracks the
+        measurement; the round is the reviewed screens, so it can carry what the user needs as
+        well. This is the join: every measured requirement is on some screen.
         """
-        self.assertEqual(sorted(PROFILE.PROFILE_ROUNDS[ROUND]), sorted(NINE))
+        self.assertTrue(PROFILE.CORPUS_REQUIRED <= PROFILE.PROFILE_ROUNDS[ROUND])
+        self.assertEqual(len(PROFILE.CORPUS_REQUIRED), 9)
 
-    def test_no_optional_deferred_or_user_demand_field_is_in_a_round(self):
+    def test_every_field_a_screen_asks_for_is_a_real_profile_field(self):
         every = set().union(*PROFILE.PROFILE_ROUNDS.values())
         for canonical_id in every:
-            field = PROFILE.PROFILE_V1[canonical_id]
-            self.assertEqual(field.demand, PROFILE.DEMAND_CORPUS, canonical_id)
-            self.assertTrue(field.required_where_present, canonical_id)
+            self.assertIn(canonical_id, PROFILE.PROFILE_V1, canonical_id)
         self.assertFalse(every & set(PROFILE.PROFILE_V1_DEFERRED))
         self.assertFalse(every & PROFILE.FORBIDDEN_MEANINGS)
+
+    def test_no_screen_names_a_field_twice_and_none_is_left_off_one(self):
+        seen = [canonical_id for _, fields in PROFILE.PROFILE_SCREENS
+                for canonical_id in fields]
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(set(seen), PROFILE.PROFILE_ROUNDS[ROUND])
 
     def test_forbidden_deferred_and_unknown_meanings_are_refused(self):
         for canonical_id, pattern in (
@@ -309,7 +325,7 @@ class ConfirmingTests(ProfileIntakeTests):
                              ("what_it_is", "anything at all"),
                              ("group", "links"),
                              ("source_fact_ids", ["fact-9999"]),
-                             ("required_where_present", False)):
+                             ("required_where_present", True)):
             sheet = self.worksheet()
             sheet["entries"][0][field] = value
             self.refuse(lambda sheet=sheet: self.confirm(sheet),

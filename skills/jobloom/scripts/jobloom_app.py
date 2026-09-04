@@ -56,7 +56,7 @@ from _common import require_table  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 LOOPBACK = "127.0.0.1"
-ROUND = "required-v1"
+ROUND = "onboarding-v1"
 # One worksheet per round, named for the round rather than for the moment it was made, so
 # reopening the app finds the round in progress instead of starting a second one beside it.
 WORKSHEET_NAME = f"profile-{ROUND}.json"
@@ -88,6 +88,12 @@ def state(connection: sqlite3.Connection, private_root: Path) -> dict[str, Any]:
     return {
         "has_profile": report["active_snapshot"] is not None,
         "round": ROUND,
+        # The grouping is the service's, not the page's: which fields belong on one screen is
+        # part of what was reviewed, and a page that decided it could put a country code on
+        # its own or bury a required field behind an optional one.
+        "screens": [{"name": name, "fields": [f for f in fields
+                                              if f in candidate_profile.PROFILE_ROUNDS[ROUND]]}
+                    for name, fields in candidate_profile.PROFILE_SCREENS],
         "fields_in_round": sorted(candidate_profile.PROFILE_ROUNDS[ROUND]),
         "resolvable": report.get("resolvable", []),
         "unresolved": report.get("unresolved", {}),
@@ -117,7 +123,8 @@ def start_round(connection: sqlite3.Connection, private_root: Path) -> dict[str,
     """
     path = _worksheet_path(private_root)
     try:
-        return {"fields": _fields(_read_worksheet(connection, private_root)), "resumed": True}
+        return {"fields": _fields(_read_worksheet(connection, private_root)), "resumed": True,
+                "countries": list(candidate_profile.COUNTRY_NAMES)}
     except AppError:
         pass
     except ValueError:
@@ -127,7 +134,8 @@ def start_round(connection: sqlite3.Connection, private_root: Path) -> dict[str,
     candidate_profile.propose_profile(
         connection, ROUND,
         sink=lambda sheet: candidate_profile.write_private_document(path, private_root, sheet))
-    return {"fields": _fields(_read_worksheet(connection, private_root)), "resumed": False}
+    return {"fields": _fields(_read_worksheet(connection, private_root)), "resumed": False,
+            "countries": list(candidate_profile.COUNTRY_NAMES)}
 
 
 def _fields(worksheet: dict[str, Any]) -> list[dict[str, Any]]:

@@ -54,16 +54,26 @@ AT = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 COMPOSITE = ("probe@example.invalid ǁ 555-0100 ǁ "
              "LinkedIn: https://example.invalid/in/probe")
 PIECES = ("probe@example.invalid", "555-0100", "example.invalid/in/probe")
-NINE = ("contact.email", "contact.first_name", "contact.full_name", "contact.last_name",
-        "contact.location", "contact.location_city", "contact.phone", "contact.phone_country",
-        "profile.linkedin")
+ROUND = "onboarding-v1"
+NINE = tuple(sorted(PROFILE.PROFILE_ROUNDS[ROUND]))
 TYPED = {
     "contact.first_name": "Probe",
     "contact.last_name": "Example",
     "contact.full_name": "Probe Q. Example",
+    "contact.preferred_name": "Probe",
     "contact.phone_country": "+1",
+    "contact.phone_extension": "101",
     "contact.location_city": "Testville",
     "contact.location": "Testville, Nowhere",
+    "contact.location_region": "Nowhere",
+    "contact.address.line1": "1 Probe Lane",
+    "contact.address.line2": "Unit 2",
+    "contact.postal_code": "00000",
+    "contact.country": "United States of America",
+    "profile.github": "https://example.invalid/probe",
+    "profile.portfolio": "https://example.invalid/portfolio",
+    "profile.website": "https://example.invalid/site",
+    "employment.current_company": "Probe Corp",
 }
 
 
@@ -192,7 +202,7 @@ class AppTests(AppFixture):
         """A site the user has open must not reach this, even knowing the port."""
         status, payload = self.refused("/api/state", None, origin="https://example.invalid")
         self.assertEqual((status, payload["error"]), (403, "bad_token"))
-        self.assertEqual(self.call("/api/state", origin=self.origin)["round"], "required-v1")
+        self.assertEqual(self.call("/api/state", origin=self.origin)["round"], ROUND)
 
     def test_an_unknown_endpoint_is_a_404(self):
         self.assertEqual(self.refused("/api/everything", {})[0], 404)
@@ -203,6 +213,11 @@ class AppTests(AppFixture):
         state = self.call("/api/state")
         self.assertTrue(state["has_profile"])
         self.assertEqual(state["fields_in_round"], sorted(NINE))
+        # The grouping comes from the service, so the page cannot decide it.
+        self.assertEqual([group["name"] for group in state["screens"]],
+                         ["name", "address", "reach", "links"])
+        self.assertEqual(sorted(f for g in state["screens"] for f in g["fields"]),
+                         sorted(NINE))
         self.assertEqual(state["resolvable"], [])
         self.assertEqual(state["unresolved"]["contact.email"], "profile_fact_missing")
         self.assertIsNone(state["open_round"])
@@ -211,7 +226,7 @@ class AppTests(AppFixture):
         """Reopening the window is not a decision to start over."""
         first = self.call("/api/round", {})
         self.assertFalse(first["resumed"])
-        self.assertEqual(len(first["fields"]), 9)
+        self.assertEqual(len(first["fields"]), len(NINE))
         self.assertEqual(sum(1 for f in first["fields"] if f["proposed"]), 3)
         second = self.call("/api/round", {})
         self.assertTrue(second["resumed"])
