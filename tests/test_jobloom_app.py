@@ -381,6 +381,20 @@ class MigrationSurfaceTests(AppFixture):
 
     # ---- listing ---------------------------------------------------------------
 
+    def test_the_window_creates_every_table_it_can_reach(self):
+        """Registering used to be followed by a bare failure code.
+
+        `serve` initialised the profile's tables and stopped, so the screen after registering
+        was the first thing to touch `resume_migrations` and found no such table.
+        """
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            for table in ("resume_migrations", "profile_proposals", "profile_drafts"):
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone(), table)
+        finally:
+            connection.close()
+
     def test_the_listing_names_the_stranded_resume_and_migrates_none(self):
         listed = self.call("/api/resume-migrations")
         self.assertEqual([row["version_id"] for row in listed["stranded"]], ["resume-a"])

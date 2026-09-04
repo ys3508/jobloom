@@ -105,6 +105,22 @@ def _active_snapshot(connection: sqlite3.Connection) -> str:
     return row[0]
 
 
+def _blocked_reason(version: sqlite3.Row, carried: sqlite3.Row | None) -> str | None:
+    """Why this one cannot be carried, or nothing if it can.
+
+    Every case says something. A row that is neither carryable nor explained shows a person
+    an empty cell where an answer belongs, which is how `kind` being unaccounted for stayed
+    invisible: a `user_provided` master source was not migratable and gave no reason.
+    """
+    if carried:
+        return "already carried forward"
+    if version["source_mode"] != MIGRATABLE_SOURCE_MODE:
+        return "source mode carries a plan and needs its own migration"
+    if version["kind"] != "direction":
+        return "only a direction resume is used for an application"
+    return None
+
+
 def stranded(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     """Approved resumes the active snapshot has left behind, and whether this path can carry them.
 
@@ -116,7 +132,10 @@ def stranded(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     require_table(connection, "material_locks")
     rows = []
     for version in connection.execute(
-            "SELECT * FROM resume_versions WHERE status='approved' "
+            # `master_source` is deliberately absent: it is refused for an application by
+            # kind whatever snapshot it was approved against, so it is not something an
+            # application is waiting on and listing it here would read as a job to do.
+            "SELECT * FROM resume_versions WHERE status='approved' AND kind!='master_source' "
             "AND candidate_profile_sha256 IS NOT ? ORDER BY version_id", (active,)):
         live_lock = connection.execute(
             "SELECT application_id FROM material_locks WHERE resume_version_id=? "
@@ -147,9 +166,7 @@ def stranded(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             "source_mode": version["source_mode"],
             "migratable": migratable,
             "carried_by": carried["successor_version_id"] if carried else None,
-            "blocked_reason": ("already carried forward" if carried
-                               else None if version["source_mode"] == MIGRATABLE_SOURCE_MODE
-                               else "source mode carries a plan and needs its own migration"),
+            "blocked_reason": _blocked_reason(version, carried),
             # Which application went quiet when the profile moved. This is the urgency, and it
             # is why the list is ordered by the user's attention rather than by id.
             "application_id": (live_lock or held or {"application_id": None})["application_id"],

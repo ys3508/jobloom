@@ -470,6 +470,10 @@ def _open_window(url: str) -> str:
 def serve(db_path: Path, private_root: Path, store: Path, port: int = 0,
           open_browser: bool = True) -> ThreadingHTTPServer:
     connection = candidate_profile.connect(db_path)
+    # Every component the window can reach, not only the first one it needs. Initialising
+    # lazily meant the screen after registering was the first thing to touch
+    # `resume_migrations`, and it found no such table.
+    resume_migration.initialize(connection)
     connection.close()
     Path(private_root).mkdir(parents=True, exist_ok=True)
     os.chmod(private_root, 0o700)

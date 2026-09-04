@@ -155,6 +155,33 @@ class MigrationTests(unittest.TestCase):
             RESUMES.approve_version(self.db, "resume-a", self.candidate_path(self.second),
                                     self.manifest, "user", LATER)
 
+    def test_a_master_source_is_not_something_an_application_waits_on(self):
+        """It is refused for an application by kind, whatever snapshot approved it.
+
+        Listing it among the resumes an application is waiting on read as a job to do, and
+        it also had no `blocked_reason` — an empty cell where an answer belongs, because the
+        reason only looked at `source_mode` and this one is `user_provided` too.
+        """
+        self.db.execute(
+            "INSERT INTO resume_versions (version_id, kind, direction, status, snapshot_path, "
+            "file_sha256, file_size, file_format, candidate_profile_sha256, created_at, "
+            "source_mode) VALUES ('master-1', 'master_source', 'unassigned', 'approved', ?, "
+            "'m', 1, 'docx', ?, ?, 'user_provided')",
+            (str(self.root / "master.docx"), self.first, AT.isoformat()))
+        self.db.commit()
+        self.move_the_profile()
+        listed = MIGRATION.stranded(self.db)
+        self.assertEqual([row["version_id"] for row in listed], ["resume-a"])
+
+    def test_every_row_that_cannot_be_carried_says_why(self):
+        self.move_the_profile()
+        self.db.execute("UPDATE resume_versions SET source_mode='generated' "
+                        "WHERE version_id='resume-a'")
+        self.db.commit()
+        row = MIGRATION.stranded(self.db)[0]
+        self.assertFalse(row["migratable"])
+        self.assertTrue(row["blocked_reason"])
+
     def test_stranded_names_them_and_migrates_none(self):
         self.move_the_profile()
         rows = MIGRATION.stranded(self.db)
