@@ -186,6 +186,13 @@ them.
   are not ready; running the migration again continues from there; and the move back to
   `ready_to_fill` re-runs `require_active_material_lock` on its own.
 
+- **A bound cover letter is not left behind.** If the application binds one that was approved
+  against the old snapshot, the carry stops by name — before the application moves — rather
+  than failing later inside `lock_materials` with an error about a document nobody was
+  thinking about. Carrying a cover letter across is the same successor dance for a second
+  document and is deliberately not done as a side effect of the resume's, which would approve
+  something the user was never shown.
+
 **What the revalidation does not promise.** A manifest pins the exact value only of a fact
 that is *locked*. A confirmed fact whose wording changed still satisfies the check, so the
 guarantee is "every cited fact still exists at the strength claimed", not "every cited fact

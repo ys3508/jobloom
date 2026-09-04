@@ -39,6 +39,7 @@ RESUMES = load("resume_core")
 APPLICATIONS = load("application_core")
 CANDIDATES = load("candidate_core")
 ANSWERS = load("answer_library")
+COVERS = load("cover_letter_core")
 PRE_SUBMIT = load("pre_submit_core")
 from tests.pdf_fixture import synthetic_pdf  # noqa: E402
 
@@ -60,7 +61,8 @@ class MigrationTests(unittest.TestCase):
         self.db = sqlite3.connect(":memory:")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
-        for module in (RESUMES, APPLICATIONS, CANDIDATES, ANSWERS, PRE_SUBMIT, MIGRATION):
+        for module in (RESUMES, APPLICATIONS, CANDIDATES, ANSWERS, COVERS, PRE_SUBMIT,
+                       MIGRATION):
             module.initialize(self.db)
         self.addCleanup(self.db.close)
 
@@ -354,6 +356,33 @@ class MigrationTests(unittest.TestCase):
         MIGRATION.bind_for_application(self.db, "app-1", "resume-a-next", "user", LATER)
         bound = self.version(self.live_lock()["resume_version_id"])
         self.assertEqual(bound["candidate_profile_sha256"], self.second)
+
+    def test_a_cover_letter_left_behind_stops_before_anything_moves(self):
+        """`lock_materials` would refuse it too, but only after the application had moved.
+
+        Checked first and by name, so the answer is about the cover letter rather than an
+        error deep in a migration that has already rebound the resume. Carrying one across is
+        the same successor dance for a second document, and doing it as a side effect here
+        would approve something the user was never shown.
+        """
+        self.db.execute(
+            "INSERT INTO cover_letter_versions (version_id, kind, status, snapshot_path, "
+            "file_sha256, file_size, file_format, candidate_profile_sha256, created_at) "
+            "VALUES ('cover-1', 'direction', 'approved', ?, 'f', 1, 'pdf', ?, ?)",
+            (str(self.root / "cover.pdf"), self.first, AT.isoformat()))
+        self.db.execute("UPDATE applications SET cover_letter_version_id='cover-1' "
+                        "WHERE application_id='app-1'")
+        self.db.commit()
+        self.move_the_profile()
+        self.prepare()
+        self.approve()
+        with self.assertRaisesRegex(ValueError, "cover letter needs its own migration"):
+            MIGRATION.bind_for_application(self.db, "app-1", "resume-a-next", "user", LATER)
+        self.assertEqual(self.state(), "ready_to_fill")
+        self.assertIsNone(self.live_lock())
+        self.assertEqual(
+            self.db.execute("SELECT resume_version_id FROM applications "
+                            "WHERE application_id='app-1'").fetchone()[0], "resume-a")
 
     def test_a_failure_part_way_leaves_preparation_in_progress_not_readiness(self):
         """The stopping point has to be a true statement about the application."""

@@ -26,6 +26,8 @@ ROOT = Path(__file__).parents[1]
 SCRIPTS = ROOT / "skills" / "jobloom" / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def load(name):
@@ -43,6 +45,10 @@ RESUMES = load("resume_core")
 APPLICATIONS = load("application_core")
 PRE_SUBMIT = load("pre_submit_core")
 ANSWERS = load("answer_library")
+COVERS = load("cover_letter_core")
+MIGRATION = load("resume_migration")
+
+from tests.pdf_fixture import synthetic_pdf  # noqa: E402
 
 AT = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 COMPOSITE = ("probe@example.invalid ǁ 555-0100 ǁ "
@@ -61,7 +67,9 @@ TYPED = {
 }
 
 
-class AppTests(unittest.TestCase):
+class AppFixture(unittest.TestCase):
+    """The window, its service and a profile waiting to be filled in. No tests of its own."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -72,7 +80,8 @@ class AppTests(unittest.TestCase):
         self.db_path = self.root / "app.db"
         self.db = sqlite3.connect(str(self.db_path))
         self.db.row_factory = sqlite3.Row
-        for module in (RESUMES, APPLICATIONS, PRE_SUBMIT, ANSWERS, PROFILE):
+        for module in (RESUMES, APPLICATIONS, PRE_SUBMIT, ANSWERS, COVERS,
+                       PROFILE, MIGRATION):
             module.initialize(self.db)
         self.base = self.register_snapshot()
         self.bind_a_resume(self.base)
@@ -156,7 +165,9 @@ class AppTests(unittest.TestCase):
         self.call("/api/answers", {"answers": answers})
         return self.call("/api/draft", {})
 
-    # ---- the surface -----------------------------------------------------------
+
+class AppTests(AppFixture):
+    """The surface itself: what it serves, what it refuses, and what the wizard reaches."""
 
     def test_the_page_is_served_without_a_token_and_forbids_outside_resources(self):
         """The HTML holds nothing. The token guards the data, not the markup."""
@@ -284,6 +295,273 @@ class AppTests(unittest.TestCase):
         fresh = self.call("/api/round", {})
         self.assertFalse(fresh["resumed"])
         self.assertEqual(len(list(self.private.glob("*.superseded-*.json"))), 1)
+
+
+class MigrationSurfaceTests(AppFixture):
+    """Carrying a stranded resume, driven the way the window drives it.
+
+    The page shows and asks; it cannot say a version is migratable, and it cannot name a file.
+    These hold that line: no path crosses the boundary in either direction, opening the
+    document is not approving it, and nothing advances on a GET.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pdf = self.root / "resume-a.pdf"
+        self.pdf.write_bytes(synthetic_pdf(["Probe analysis, as approved"]))
+        self.approve_a_resume()
+        draft = self.walk_the_wizard()
+        self.call("/api/register", {"draft_sha256": draft["draft_sha256"]})
+
+    def approve_a_resume(self):
+        """A real approved user-provided resume, so the successor path has something to carry.
+
+        The fixture in `AppTests` inserts a row; this one goes through `resume_core`, because
+        what is under test here is a migration of a genuinely approved version.
+        """
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        connection.execute("DELETE FROM material_locks")
+        connection.execute("DELETE FROM resume_versions")
+        connection.commit()
+        RESUMES.register_version(connection, self.root / "resumes", self.pdf, "resume-a",
+                                 "direction", "probe-direction", actor="user", at=AT,
+                                 source_mode="user_provided")
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps({"schema_version": "0.1.0", "claims": [{
+            "claim_id": "claim-1", "claim_text": "Probe analysis", "fact_ids": ["fact-0002"],
+            "evidence_strength": "direct", "exact_locked_value_preserved": False,
+        }]}), encoding="utf-8")
+        active = connection.execute(
+            "SELECT snapshot_path FROM candidate_snapshots WHERE status='active'").fetchone()[0]
+        RESUMES.approve_version(connection, "resume-a", Path(active), manifest, "user", AT)
+        APPLICATIONS.ingest_job(connection, {
+            "job_id": "job-1", "canonical_url": "https://example.invalid/jobs/1",
+            "employer": "Probe Corp", "title": "Analyst", "location": "Testville",
+            "country": "US", "employment_type": "full_time", "status": "open"}, at=AT)
+        APPLICATIONS.create_application(connection, "app-1", "job-1", "precision",
+                                        "approved_queue", AT)
+        for state, reason in (("pending_analysis", "analysis"),
+                              ("precision_recommended", "match"), ("approved", "approved"),
+                              ("materials_in_progress", "materials")):
+            APPLICATIONS.transition(connection, "app-1", state,
+                                    "user" if state == "approved" else "system", reason, at=AT)
+        RESUMES.bind_version(connection, "app-1", "resume-a", at=AT)
+        RESUMES.lock_materials(connection, "app-1", lock_id="lock-1", at=AT)
+        APPLICATIONS.transition(connection, "app-1", "ready_to_fill", "system", "ready", at=AT)
+        connection.commit()
+        connection.close()
+
+    def prepared(self):
+        return self.call("/api/resume-migrations/prepare",
+                         {"predecessor_version_id": "resume-a"})
+
+    def app_state(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            return connection.execute(
+                "SELECT state FROM applications WHERE application_id='app-1'").fetchone()[0]
+        finally:
+            connection.close()
+
+    # ---- listing ---------------------------------------------------------------
+
+    def test_the_listing_names_the_stranded_resume_and_migrates_none(self):
+        listed = self.call("/api/resume-migrations")
+        self.assertEqual([row["version_id"] for row in listed["stranded"]], ["resume-a"])
+        self.assertTrue(listed["stranded"][0]["migratable"])
+        self.assertTrue(listed["stranded"][0]["lock_lost"])
+        self.assertEqual(listed["stranded"][0]["application_id"], "app-1")
+        self.assertEqual(listed["carryable"], 1)
+        self.assertEqual(self.app_state(), "ready_to_fill")
+
+    def test_no_local_path_crosses_the_boundary(self):
+        rendered = json.dumps([self.call("/api/resume-migrations"), self.prepared()],
+                              ensure_ascii=False)
+        for shape in (str(self.root), "/private/", ".pdf", "manifest.json"):
+            self.assertNotIn(shape, rendered)
+
+    # ---- preparing --------------------------------------------------------------
+
+    def test_preparing_returns_the_claims_to_read_and_no_manifest_path(self):
+        result = self.prepared()
+        self.assertEqual(result["status"], "prepared")
+        self.assertTrue(result["same_bytes"])
+        self.assertFalse(result["approved"])
+        self.assertNotIn("claims_manifest_path", result)
+        self.assertEqual([claim["claim_text"] for claim in result["claims"]],
+                         ["Probe analysis"])
+
+    def test_preparing_needs_a_predecessor(self):
+        self.assertEqual(self.refused("/api/resume-migrations/prepare", {})[1]["error"],
+                         "predecessor_required")
+
+    # ---- looking at the document -------------------------------------------------
+
+    def test_the_document_under_review_can_be_read_and_matches_the_original(self):
+        prepared = self.prepared()
+        request = urllib.request.Request(
+            f"{self.origin}/api/resume-file?version_id={prepared['successor_version_id']}")
+        request.add_header("X-Jobloom-Token", self.token)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+            headers = dict(response.headers)
+        self.assertEqual(body, self.pdf.read_bytes())
+        self.assertEqual(headers["Content-Type"], "application/pdf")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Content-Disposition"], "inline")
+
+    def test_reading_the_document_advances_nothing(self):
+        """A GET that approved something would make opening a file into approving it."""
+        prepared = self.prepared()
+        request = urllib.request.Request(
+            f"{self.origin}/api/resume-file?version_id={prepared['successor_version_id']}")
+        request.add_header("X-Jobloom-Token", self.token)
+        urllib.request.urlopen(request, timeout=10).read()
+        connection = sqlite3.connect(str(self.db_path))
+        self.assertEqual(connection.execute(
+            "SELECT status FROM resume_migrations").fetchone()[0], "prepared")
+        connection.close()
+
+    def test_only_a_document_under_review_can_be_read(self):
+        """Not a way to read the resume store, and not a way to name a file."""
+        self.assertEqual(
+            self.refused("/api/resume-file?version_id=resume-a")[1]["error"],
+            "version_not_under_review")
+        self.prepared()
+        self.assertEqual(
+            self.refused("/api/resume-file?version_id=nothing-like-it")[1]["error"],
+            "version_not_under_review")
+
+    def test_the_document_must_still_be_the_file_that_was_registered(self):
+        prepared = self.prepared()
+        connection = sqlite3.connect(str(self.db_path))
+        stored = Path(connection.execute(
+            "SELECT snapshot_path FROM resume_versions WHERE version_id=?",
+            (prepared["successor_version_id"],)).fetchone()[0])
+        connection.close()
+        stored.chmod(0o600)
+        stored.write_bytes(synthetic_pdf(["Swapped underneath"]))
+        self.assertEqual(
+            self.refused(f"/api/resume-file?version_id={prepared['successor_version_id']}")[1]
+            ["error"], "version_changed")
+
+    # ---- the two approvals --------------------------------------------------------
+
+    def test_approving_requires_saying_the_materials_were_reviewed(self):
+        prepared = self.prepared()
+        status, payload = self.refused("/api/resume-migrations/approve", {
+            "successor_version_id": prepared["successor_version_id"]})
+        self.assertEqual((status, payload["error"]), (409, "materials_not_reviewed"))
+        connection = sqlite3.connect(str(self.db_path))
+        self.assertEqual(connection.execute(
+            "SELECT status FROM resume_versions WHERE version_id=?",
+            (prepared["successor_version_id"],)).fetchone()[0], "draft")
+        connection.close()
+
+    def test_approving_is_not_binding(self):
+        """Two presses, because approving a document and using it are two decisions."""
+        prepared = self.prepared()
+        approved = self.call("/api/resume-migrations/approve", {
+            "successor_version_id": prepared["successor_version_id"],
+            "materials_reviewed": True})
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(self.app_state(), "ready_to_fill")
+        connection = sqlite3.connect(str(self.db_path))
+        self.assertIsNone(connection.execute(
+            "SELECT lock_id FROM material_locks WHERE invalidated_at IS NULL").fetchone())
+        connection.close()
+
+    def test_the_page_cannot_name_the_candidate_document(self):
+        """It is read from the active snapshot's row, so there is nowhere to put a path."""
+        prepared = self.prepared()
+        self.call("/api/resume-migrations/approve", {
+            "successor_version_id": prepared["successor_version_id"],
+            "materials_reviewed": True, "candidate_path": "/somewhere/else.json"})
+        connection = sqlite3.connect(str(self.db_path))
+        approved_against = connection.execute(
+            "SELECT successor_snapshot_sha256 FROM resume_migrations").fetchone()[0]
+        active = connection.execute(
+            "SELECT content_sha256 FROM candidate_snapshots WHERE status='active'").fetchone()[0]
+        connection.close()
+        self.assertEqual(approved_against, active)
+
+    # ---- binding -------------------------------------------------------------------
+
+    def test_the_whole_carry_restores_the_application(self):
+        prepared = self.prepared()
+        self.call("/api/resume-migrations/approve", {
+            "successor_version_id": prepared["successor_version_id"],
+            "materials_reviewed": True})
+        bound = self.call("/api/resume-migrations/bind", {
+            "successor_version_id": prepared["successor_version_id"],
+            "application_id": "app-1"})
+        self.assertEqual(bound["status"], "bound")
+        self.assertEqual(self.app_state(), "ready_to_fill")
+        # The predecessor is still approved against a superseded snapshot, so it is still
+        # listed — with nothing left to do about it, and pointing at what carried it.
+        listed = self.call("/api/resume-migrations")
+        self.assertEqual(listed["carryable"], 0)
+        self.assertEqual(listed["stranded"][0]["carried_by"],
+                         prepared["successor_version_id"])
+        self.assertFalse(listed["stranded"][0]["migratable"])
+
+    def test_binding_before_approval_is_refused_and_moves_nothing(self):
+        prepared = self.prepared()
+        status, payload = self.refused("/api/resume-migrations/bind", {
+            "successor_version_id": prepared["successor_version_id"],
+            "application_id": "app-1"})
+        self.assertEqual(status, 409)
+        self.assertIn("has not been approved", payload["detail"])
+        self.assertEqual(self.app_state(), "ready_to_fill")
+
+    def test_binding_names_both_the_successor_and_the_application(self):
+        self.prepared()
+        self.assertEqual(self.refused("/api/resume-migrations/bind", {})[1]["error"],
+                         "successor_required")
+        self.assertEqual(self.refused("/api/resume-migrations/bind",
+                                      {"successor_version_id": "x"})[1]["error"],
+                         "application_required")
+
+    # ---- the surface itself ----------------------------------------------------------
+
+    def test_every_migration_route_needs_the_token_and_this_origin(self):
+        for path, body in (("/api/resume-migrations", None),
+                           ("/api/resume-file?version_id=resume-a", None),
+                           ("/api/resume-migrations/prepare", {"predecessor_version_id": "x"}),
+                           ("/api/resume-migrations/approve", {"successor_version_id": "x"}),
+                           ("/api/resume-migrations/bind", {"successor_version_id": "x"})):
+            with self.subTest(path=path):
+                self.assertEqual(self.refused(path, body, token="wrong")[1]["error"],
+                                 "bad_token")
+                self.assertEqual(
+                    self.refused(path, body, origin="https://example.invalid")[1]["error"],
+                    "bad_token")
+
+    def test_a_cover_letter_left_behind_stops_the_carry_by_name(self):
+        connection = sqlite3.connect(str(self.db_path))
+        old = connection.execute(
+            "SELECT content_sha256 FROM candidate_snapshots WHERE status='superseded'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO cover_letter_versions (version_id, kind, status, snapshot_path, "
+            "file_sha256, file_size, file_format, candidate_profile_sha256, created_at) "
+            "VALUES ('cover-1', 'direction', 'approved', ?, 'f', 1, 'pdf', ?, ?)",
+            (str(self.root / "cover.pdf"), old, AT.isoformat()))
+        connection.execute("UPDATE applications SET cover_letter_version_id='cover-1' "
+                           "WHERE application_id='app-1'")
+        connection.commit()
+        connection.close()
+        prepared = self.prepared()
+        self.call("/api/resume-migrations/approve", {
+            "successor_version_id": prepared["successor_version_id"],
+            "materials_reviewed": True})
+        status, payload = self.refused("/api/resume-migrations/bind", {
+            "successor_version_id": prepared["successor_version_id"],
+            "application_id": "app-1"})
+        self.assertEqual(status, 409)
+        self.assertIn("cover letter needs its own migration", payload["detail"])
+        self.assertEqual(self.app_state(), "ready_to_fill")
 
 
 if __name__ == "__main__":

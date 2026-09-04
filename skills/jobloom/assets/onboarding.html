@@ -76,6 +76,10 @@
   td.state { text-align: right; white-space: nowrap; color: var(--muted); font-size: 13px; }
   ul.plain { margin: 0 0 14px; padding-left: 20px; }
   .error { color: var(--warn); margin-top: 14px; }
+  iframe.paper { width: 100%; height: 420px; border: 1px solid var(--line);
+                 border-radius: 8px; background: var(--bg); margin: 4px 0 18px; }
+  label.check { display: flex; align-items: flex-start; gap: 4px; font-weight: 600; }
+  label.check input { margin-top: 4px; }
   .good { color: var(--good); }
 </style>
 
@@ -151,6 +155,29 @@ const COPY = {
     doneNext: "下一步是把受影响的简历对新快照重新审批并绑定。",
     close: "可以关掉这个窗口了",
     failed: "没能完成：",
+    migrationsTitle: "还有申请材料要恢复",
+    migrationsBody: "换了资料快照之后，对旧快照批准过的简历不能再用于申请——这不是简历有问题，是它的批准记录指向了旧的你。把它带过来需要你重新看一眼并批准。",
+    migrationsNone: "没有需要恢复的申请材料。",
+    migrationsUrgent: "这份卡着一份申请",
+    migrationsBlocked: "这份不能走这条路：",
+    carry: "带过来",
+    resumeCarry: "继续",
+    skipMigrations: "以后再说",
+    reviewTitle: "看一眼这份简历",
+    reviewBody: "字节和你批准过的那一份完全一致（系统已经核对过哈希）。但字节相同不等于你现在还愿意用它，所以请你自己看。",
+    reviewClaims: "这份简历声称的内容，已经对新的资料快照重新校验通过：",
+    reviewOpening: "正在取文件…",
+    reviewFailed: "文件打不开：",
+    materialsGate: "我已经看过这份 PDF，批准它用于新的资料快照",
+    approveMaterials: "批准这份简历",
+    bindTitle: "把它绑回申请",
+    bindBody: "批准之后还要把它绑到申请上并重新锁定材料。锁定会把当时的字节固定下来，这是提交前的最后一道材料校验。",
+    bindApplication: "申请",
+    bindNow: "绑定并重新锁定",
+    restoredTitle: "材料恢复了",
+    restoredBody: "这份申请重新回到「可以填写」。",
+    restoredMore: "还有其他材料要恢复。",
+    working: "处理中…",
   },
   en: {
     welcomeTitle: "Let's get your basics down",
@@ -202,6 +229,29 @@ const COPY = {
     doneNext: "Next is re-approving the affected resume against the new snapshot and binding it.",
     close: "You can close this window",
     failed: "Could not finish: ",
+    migrationsTitle: "Some application materials need restoring",
+    migrationsBody: "A resume approved against your old profile cannot be used for an application any more. Nothing is wrong with the resume — its approval points at the older you. Carrying it across needs you to look at it again and approve it.",
+    migrationsNone: "No application materials need restoring.",
+    migrationsUrgent: "an application is waiting on this one",
+    migrationsBlocked: "This one cannot take this path: ",
+    carry: "Carry it across",
+    resumeCarry: "Pick it up",
+    skipMigrations: "Not now",
+    reviewTitle: "Take a look at this resume",
+    reviewBody: "It is byte-for-byte the file you approved before — the hashes were checked. But the same bytes are not the same decision, so this is yours to look at.",
+    reviewClaims: "What it claims, revalidated against the new profile:",
+    reviewOpening: "Fetching the file…",
+    reviewFailed: "The file could not be opened: ",
+    materialsGate: "I have looked at this PDF and approve it for the new profile",
+    approveMaterials: "Approve this resume",
+    bindTitle: "Bind it back to the application",
+    bindBody: "Approving it is not using it. Binding attaches it to the application and re-locks the materials, which pins the exact bytes — the last material check before anything is sent.",
+    bindApplication: "Application",
+    bindNow: "Bind and re-lock",
+    restoredTitle: "Materials restored",
+    restoredBody: "This application is ready to fill again.",
+    restoredMore: "There are other materials still to restore.",
+    working: "Working…",
   },
 };
 
@@ -232,7 +282,8 @@ const FIELD_COPY = {
 
 let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
 let app = { fields: [], answers: {}, index: 0, screen: "welcome", state: null,
-            draft: null, done: null, error: "" };
+            draft: null, done: null, error: "", stranded: [], carry: null,
+            pdfUrl: "", reviewed: false, busy: false, restored: null };
 
 const t = (key, vars) => {
   let out = COPY[lang][key] || key;
@@ -477,7 +528,185 @@ function doneScreen() {
       ...recorded.map((id) => el("li", { text: fieldCopy(id)[0] }))) : null,
     el("p", { class: "muted", text: t("doneNotWired") }),
     el("p", { class: "muted", text: t("doneNext") }),
-    el("p", { class: "muted", text: t("close") }));
+    el("footer", { class: "nav" },
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: t("next"), onclick: openMigrations })));
+}
+
+// ---- carrying the resumes the new profile left behind ---------------------------
+
+async function openMigrations() {
+  app.error = "";
+  try {
+    app.stranded = (await api("/api/resume-migrations")).stranded;
+    go("migrations");
+  } catch (error) {
+    app.error = error.message;
+    render();
+  }
+}
+
+function migrationsScreen() {
+  const rows = app.stranded.map((row) => {
+    const detail = [row.direction];
+    if (row.lock_lost && row.application_id) detail.push(t("migrationsUrgent"));
+    return el("tr", {},
+      el("th", { text: row.version_id }),
+      el("td", { class: "muted", text: detail.join(" · ") }),
+      el("td", { class: "state" },
+        row.migratable
+          ? el("button", { text: row.in_progress ? t("resumeCarry") : t("carry"),
+                           disabled: app.busy || null,
+                           onclick: () => prepareCarry(row) })
+          : el("span", { text: t("migrationsBlocked") + row.blocked_reason })));
+  });
+  return el("div", {},
+    el("h2", { text: app.stranded.length ? t("migrationsTitle") : t("restoredTitle") }),
+    el("p", { text: app.stranded.length ? t("migrationsBody") : t("migrationsNone") }),
+    app.stranded.length ? el("table", {}, ...rows) : null,
+    app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
+    el("footer", { class: "nav" },
+      el("span", { class: "spacer" }),
+      el("button", { text: t("skipMigrations"), onclick: () => go("done") })));
+}
+
+async function prepareCarry(row) {
+  app.error = "";
+  app.busy = true;
+  render();
+  try {
+    if (row.in_progress) {
+      // Closing the window mid-carry must not strand the carry as well. A second prepare
+      // would be refused, so the one already open is picked up where it was left.
+      app.carry = { successor_version_id: row.in_progress.successor_version_id,
+                    application_id: row.application_id, claims: [] };
+      app.reviewed = false;
+      app.pdfUrl = "";
+      if (row.in_progress.status === "approved") {
+        go("carryBind");
+      } else {
+        go("carryReview");
+        loadPdf();
+      }
+      return;
+    }
+    app.carry = await api("/api/resume-migrations/prepare",
+                          { predecessor_version_id: row.version_id });
+    app.carry.application_id = row.application_id;
+    app.reviewed = false;
+    app.pdfUrl = "";
+    go("carryReview");
+    loadPdf();
+  } catch (error) {
+    app.error = error.message;
+  } finally {
+    app.busy = false;
+    render();
+  }
+}
+
+async function loadPdf() {
+  // Fetched with the session token, then shown from a blob inside this window. An
+  // `<iframe src="/api/resume-file">` could not carry the token, and a new tab would need it
+  // in a URL, where it would stay in history.
+  try {
+    const response = await fetch(
+      `/api/resume-file?version_id=${encodeURIComponent(app.carry.successor_version_id)}`,
+      { headers: { "X-Jobloom-Token": TOKEN } });
+    if (!response.ok) throw new Error((await response.json()).error || "failed");
+    app.pdfUrl = URL.createObjectURL(await response.blob());
+  } catch (error) {
+    app.error = t("reviewFailed") + error.message;
+  }
+  render();
+}
+
+function carryReviewScreen() {
+  const claims = (app.carry.claims || []).map((claim) =>
+    el("li", { text: `${claim.claim_text} — ${claim.evidence_strength}` }));
+  return el("div", {},
+    el("h2", { text: t("reviewTitle") }),
+    el("p", { text: t("reviewBody") }),
+    app.pdfUrl
+      ? el("iframe", { class: "paper", src: app.pdfUrl, title: t("reviewTitle") })
+      : el("p", { class: "muted", text: t("reviewOpening") }),
+    claims.length ? el("p", { text: t("reviewClaims") }) : null,
+    claims.length ? el("ul", { class: "plain" }, ...claims) : null,
+    el("div", { class: "gate" },
+      el("label", { class: "check" },
+        el("input", { type: "checkbox", id: "reviewed",
+                      checked: app.reviewed ? "checked" : false,
+                      onchange: (event) => { app.reviewed = event.target.checked; render(); } }),
+        el("span", { text: "  " + t("materialsGate") }))),
+    app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
+    el("footer", { class: "nav" },
+      el("button", { text: t("back"), onclick: () => go("migrations") }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: app.busy ? t("working") : t("approveMaterials"),
+                     disabled: (!app.reviewed || !app.pdfUrl || app.busy) || null,
+                     onclick: approveCarry })));
+}
+
+async function approveCarry() {
+  app.error = "";
+  app.busy = true;
+  render();
+  try {
+    await api("/api/resume-migrations/approve", {
+      successor_version_id: app.carry.successor_version_id, materials_reviewed: true });
+    go("carryBind");
+  } catch (error) {
+    app.error = error.message;
+  } finally {
+    app.busy = false;
+    render();
+  }
+}
+
+function carryBindScreen() {
+  return el("div", {},
+    el("h2", { text: t("bindTitle") }),
+    el("p", { text: t("bindBody") }),
+    el("p", { class: "muted",
+              text: `${t("bindApplication")}: ${app.carry.application_id || "—"}` }),
+    app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
+    el("footer", { class: "nav" },
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: app.busy ? t("working") : t("bindNow"),
+                     disabled: (!app.carry.application_id || app.busy) || null,
+                     onclick: bindCarry })));
+}
+
+async function bindCarry() {
+  app.error = "";
+  app.busy = true;
+  render();
+  try {
+    app.restored = await api("/api/resume-migrations/bind", {
+      successor_version_id: app.carry.successor_version_id,
+      application_id: app.carry.application_id });
+    app.stranded = (await api("/api/resume-migrations")).stranded;
+    go("restored");
+  } catch (error) {
+    app.error = error.message;
+  } finally {
+    app.busy = false;
+    render();
+  }
+}
+
+function restoredScreen() {
+  const left = app.stranded.filter((row) => row.migratable).length;
+  return el("div", {},
+    el("h2", { class: "good", text: t("restoredTitle") }),
+    el("p", { text: t("restoredBody") }),
+    el("p", { class: "muted", text: app.restored.application_id }),
+    left ? el("p", { text: t("restoredMore") }) : null,
+    el("footer", { class: "nav" },
+      el("span", { class: "spacer" }),
+      left
+        ? el("button", { class: "primary", text: t("next"), onclick: () => go("migrations") })
+        : null));
 }
 
 // ---- shell ---------------------------------------------------------------------
@@ -499,7 +728,9 @@ function render() {
   progress.replaceChildren(...Array.from({ length: total }, (_, i) =>
     el("i", { class: i <= at ? "done" : "" })));
   const screen = { welcome, field: fieldScreen, review: reviewScreen,
-                   impact: impactScreen, done: doneScreen }[app.screen];
+                   impact: impactScreen, done: doneScreen,
+                   migrations: migrationsScreen, carryReview: carryReviewScreen,
+                   carryBind: carryBindScreen, restored: restoredScreen }[app.screen];
   document.getElementById("screen").replaceChildren(screen());
 }
 
@@ -514,7 +745,15 @@ document.getElementById("lang").addEventListener("change", (event) => {
   document.documentElement.lang = lang;
   try {
     app.state = await api("/api/state");
-    const round = await api("/api/round", {});
+    const round = app.state.fields_in_round.every((id) => app.state.resolvable.includes(id))
+      ? null : await api("/api/round", {});
+    if (round === null) {
+      // The round is answered and registered. Coming back is for what is left over.
+      app.stranded = (await api("/api/resume-migrations")).stranded;
+      app.fields = [];
+      go("migrations");
+      return;
+    }
     app.fields = round.fields;
     for (const field of app.fields) {
       app.answers[field.canonical_id] = {

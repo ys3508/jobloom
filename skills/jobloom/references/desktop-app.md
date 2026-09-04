@@ -17,6 +17,26 @@ tests, and is no longer the way in.
 welcome, nine questions, review, impact preview, registration, done. Bilingual, no external
 resources, nothing stored in the browser.
 
+Then the second half of the same sitting: **carrying the resumes the new profile left
+behind.** Registering a profile invalidates the material locks bound to the old snapshot, so
+the window goes on to list what was stranded, prepares a successor for the one the user picks,
+shows the actual PDF, shows the claims revalidated against the new profile, takes the two
+approvals separately, and binds and re-locks. Closing the window mid-carry loses nothing: an
+in-flight migration is picked up where it was left, and a round already answered is not asked
+again.
+
+**Two approvals, two presses.** *I have looked at this PDF and approve it for the new profile*
+is not *bind it to the application and re-lock*. Opening the document is neither: reading it is
+a GET that advances nothing, and `materials_reviewed` is a field the approval refuses without.
+A hash proves two files are the same file; it cannot prove the file is the one a person wants
+sent to an employer.
+
+**No path crosses the boundary, in either direction.** The page cannot say a version is
+migratable, cannot name a candidate document, a resume or a manifest, and never receives one:
+the service resolves all three from rows it has already verified, and the PDF is served from
+the registry's own path after re-checking its hash. That endpoint serves only a document under
+an open migration — it is not a way to read the resume store.
+
 **Does not exist yet, and is not pretended to:**
 
 - **Packaging.** The page opens in a window of the user's own browser (Chrome's app mode where
@@ -44,6 +64,8 @@ Kept in the service, not trusted to the page:
 | The page cannot fetch anything | `Content-Security-Policy: default-src 'none'; connect-src 'self'` |
 | No value is logged | The request log is off; unexpected errors return a bare code, because a message may carry a path or a value |
 | The page holds nothing | No storage of any kind; values live in the window while it is open and go to the private worksheet |
+| A document under review can be read and nothing else | `frame-src blob:` only, the PDF fetched with the token and shown from a blob; served `inline`, `no-store`, and only for a version an open migration is carrying |
+| A cover letter is not left behind | A bound cover letter approved against the old snapshot stops the carry by name, before the application moves |
 
 The token is in the URL the process opens, and the page removes it from the address bar on
 load, so it stays out of history and out of anything a user might copy to somebody.

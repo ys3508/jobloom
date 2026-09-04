@@ -129,15 +129,27 @@ def stranded(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             "SELECT successor_version_id, status FROM resume_migrations "
             "WHERE predecessor_version_id=? AND status IN (?, ?)",
             (version["version_id"], PREPARED, APPROVED)).fetchone()
+        # A predecessor whose successor is bound is still approved against a superseded
+        # snapshot, so it is still stranded and is still listed - it would still be refused if
+        # anything tried to use it. What has changed is that there is nothing left to do about
+        # it, and a list that dropped the row would lose the reason its successor exists.
+        carried = connection.execute(
+            "SELECT successor_version_id FROM resume_migrations "
+            "WHERE predecessor_version_id=? AND status=?",
+            (version["version_id"], BOUND)).fetchone()
+        migratable = (version["kind"] == "direction"
+                      and version["source_mode"] == MIGRATABLE_SOURCE_MODE
+                      and carried is None)
         rows.append({
             "version_id": version["version_id"],
             "kind": version["kind"],
             "direction": version["direction"],
             "source_mode": version["source_mode"],
-            "migratable": (version["kind"] == "direction"
-                           and version["source_mode"] == MIGRATABLE_SOURCE_MODE),
-            "blocked_reason": None if version["source_mode"] == MIGRATABLE_SOURCE_MODE
-                              else "source mode carries a plan and needs its own migration",
+            "migratable": migratable,
+            "carried_by": carried["successor_version_id"] if carried else None,
+            "blocked_reason": ("already carried forward" if carried
+                               else None if version["source_mode"] == MIGRATABLE_SOURCE_MODE
+                               else "source mode carries a plan and needs its own migration"),
             # Which application went quiet when the profile moved. This is the urgency, and it
             # is why the list is ordered by the user's attention rather than by id.
             "application_id": (live_lock or held or {"application_id": None})["application_id"],
@@ -268,11 +280,13 @@ def bind_for_application(connection: sqlite3.Connection, application_id: str, su
     if migration["status"] != APPROVED:
         raise ValueError("that successor has not been approved")
     application = connection.execute(
-        "SELECT state FROM applications WHERE application_id=?", (application_id,)).fetchone()
+        "SELECT state, cover_letter_version_id FROM applications WHERE application_id=?",
+        (application_id,)).fetchone()
     if not application:
         raise ValueError("application not found")
     if application["state"] not in {"ready_to_fill", "materials_in_progress"}:
         raise ValueError("this application is not waiting on its materials")
+    _require_cover_letter_carried(connection, application["cover_letter_version_id"])
 
     if application["state"] == "ready_to_fill":
         application_core.transition(connection, application_id, "materials_in_progress",
@@ -290,6 +304,34 @@ def bind_for_application(connection: sqlite3.Connection, application_id: str, su
     return {"migration_id": migration["migration_id"], "application_id": application_id,
             "successor_version_id": successor_id, "lock_id": lock["lock_id"],
             "status": BOUND, "state": "ready_to_fill"}
+
+
+def _require_cover_letter_carried(connection: sqlite3.Connection,
+                                  cover_letter_version_id: str | None) -> None:
+    """A cover letter the application already binds is not left behind quietly.
+
+    `lock_materials` would refuse it anyway, and that is the point: it would refuse *after* the
+    application had been moved into preparation and the resume rebound, leaving the migration
+    stopped on an error about a document nobody was thinking about. Checked first, by name, so
+    the answer is "your cover letter needs its own migration" before anything moves.
+
+    Carrying one is not implemented here on purpose. A cover letter records the snapshot it was
+    approved against exactly as a resume does, so carrying it across means the same successor
+    dance for a second document, and doing that as a side effect of the resume's migration
+    would approve a document the user was never shown.
+    """
+    if not cover_letter_version_id:
+        return
+    require_table(connection, "cover_letter_versions")
+    cover = connection.execute(
+        "SELECT candidate_profile_sha256, status FROM cover_letter_versions WHERE version_id=?",
+        (cover_letter_version_id,)).fetchone()
+    if not cover:
+        raise ValueError("the bound cover letter is missing")
+    if cover["status"] != "approved":
+        raise ValueError("the bound cover letter is not approved")
+    if cover["candidate_profile_sha256"] != _active_snapshot(connection):
+        raise ValueError("the bound cover letter needs its own migration")
 
 
 def main() -> None:

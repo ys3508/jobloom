@@ -44,11 +44,15 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import candidate_profile  # noqa: E402
+import resume_core  # noqa: E402
+import resume_migration  # noqa: E402
+from _common import require_table  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 LOOPBACK = "127.0.0.1"
@@ -182,6 +186,101 @@ def register(connection: sqlite3.Connection, private_root: Path, store: Path,
         connection, draft_sha256, Path(store), "user")
 
 
+# ---- carrying the resumes the new profile left behind --------------------------
+#
+# The page shows and asks; every judgement stays here. It cannot say a version is migratable,
+# and it cannot name a file: no candidate path, no resume path, no manifest path crosses the
+# boundary in either direction. The service resolves all three from database rows it has
+# already verified.
+
+def migrations(connection: sqlite3.Connection) -> dict[str, Any]:
+    """Which approved resumes the active profile left behind, and where each one has got to."""
+    try:
+        rows = resume_migration.stranded(connection)
+    except ValueError:
+        # No active snapshot yet, which is simply "nothing to carry" from the window's side.
+        return {"stranded": [], "carryable": 0}
+    return {"stranded": rows, "carryable": sum(1 for row in rows if row["migratable"])}
+
+
+def prepare_migration(connection: sqlite3.Connection, store: Path,
+                      payload: dict[str, Any]) -> dict[str, Any]:
+    predecessor = payload.get("predecessor_version_id")
+    if not isinstance(predecessor, str) or not predecessor:
+        raise AppError("predecessor_required")
+    result = resume_migration.prepare_successor(connection, Path(store), predecessor)
+    # The manifest's location is the service's business. What the user needs is that the
+    # claims were the ones already approved, and how many of them there are to look at.
+    manifest = json.loads(Path(result.pop("claims_manifest_path")).read_text(encoding="utf-8"))
+    result["claims"] = [{"claim_id": claim["claim_id"], "claim_text": claim["claim_text"],
+                         "evidence_strength": claim["evidence_strength"]}
+                        for claim in manifest.get("claims", [])]
+    return result
+
+
+def approve_migration(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    """Approve the successor for the profile that is active now.
+
+    The candidate document is the active snapshot's own registered file, read from the row
+    rather than accepted from the page. A page that could name a candidate path could approve
+    a resume against a profile nobody registered.
+    """
+    successor = payload.get("successor_version_id")
+    if not isinstance(successor, str) or not successor:
+        raise AppError("successor_required")
+    if not payload.get("materials_reviewed") is True:
+        # The first of the two approvals, and the one a page is most likely to skip. Opening
+        # the file is not approving it, so the press that says so is its own field.
+        raise AppError("materials_not_reviewed", 409)
+    require_table(connection, "candidate_snapshots")
+    snapshot = connection.execute(
+        "SELECT snapshot_path FROM candidate_snapshots WHERE status='active' "
+        "AND registered_by='user'").fetchone()
+    if not snapshot:
+        raise AppError("no_active_profile", 409)
+    return resume_migration.approve_successor(
+        connection, successor, Path(snapshot["snapshot_path"]), "user")
+
+
+def bind_migration(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    successor = payload.get("successor_version_id")
+    application_id = payload.get("application_id")
+    if not isinstance(successor, str) or not successor:
+        raise AppError("successor_required")
+    if not isinstance(application_id, str) or not application_id:
+        raise AppError("application_required")
+    return resume_migration.bind_for_application(connection, application_id, successor, "user")
+
+
+def resume_bytes(connection: sqlite3.Connection, version_id: str) -> tuple[bytes, str]:
+    """The actual PDF, for the user to look at before approving it.
+
+    A hash proves two files are the same file; it does not prove the file is the one a person
+    wants sent to an employer, and only they can answer that. So the bytes are served - from
+    the path the registry holds, verified against the hash the registry holds, never from
+    anything the page said. A version outside a live migration is not viewable here: this
+    endpoint exists for the document under review and is not a way to read the resume store.
+    """
+    if not isinstance(version_id, str) or not version_id:
+        raise AppError("version_required")
+    require_table(connection, "resume_migrations")
+    carried = connection.execute(
+        "SELECT 1 FROM resume_migrations WHERE (successor_version_id=? OR "
+        "predecessor_version_id=?) AND status IN (?, ?)",
+        (version_id, version_id, resume_migration.PREPARED, resume_migration.APPROVED)).fetchone()
+    if not carried:
+        raise AppError("version_not_under_review", 403)
+    version = connection.execute(
+        "SELECT snapshot_path, file_sha256, file_format FROM resume_versions WHERE version_id=?",
+        (version_id,)).fetchone()
+    if not version or version["file_format"] != "pdf":
+        raise AppError("version_not_viewable", 403)
+    path = Path(version["snapshot_path"])
+    if not path.is_file() or resume_core.file_sha256(path) != version["file_sha256"]:
+        raise AppError("version_changed", 409)
+    return path.read_bytes(), version["file_sha256"]
+
+
 # ---- the local service ---------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
@@ -211,9 +310,47 @@ class Handler(BaseHTTPRequestHandler):
         # The page talks to this origin and loads nothing from anywhere else. Spelled out so a
         # future edit that reaches for a font or a CDN fails here rather than silently sending
         # a request from a window holding somebody's contact details.
+        # `blob:` for frames and objects and nothing else: the resume under review is fetched
+        # with the session token, turned into a blob and shown inside this window. An
+        # `<iframe src="/api/resume-file">` could not carry the token, and a new tab would
+        # need it in a URL, where it would land in history.
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; script-src 'unsafe-inline'; "
-                         "style-src 'unsafe-inline'; connect-src 'self'")
+                         "style-src 'unsafe-inline'; connect-src 'self'; "
+                         "frame-src blob:; object-src blob:")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_resume(self, raw_path: str) -> None:
+        """The PDF itself, inline, from this origin only and never cached.
+
+        A read, so it is a GET - but a GET that does nothing except hand back bytes the
+        registry has just re-verified. No migration advances here: opening a document is not
+        approving it, and the two are separate presses precisely so that one cannot be
+        mistaken for the other.
+        """
+        query = parse_qs(urlsplit(raw_path).query)
+        version_id = (query.get("version_id") or [""])[0]
+        connection = self._connection()
+        try:
+            body, digest = resume_bytes(connection, version_id)
+        except AppError as error:
+            self._send(error.status, {"error": error.code})
+            return
+        except Exception:
+            self._send(500, {"error": "app_failure"})
+            return
+        finally:
+            connection.close()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Length", str(len(body)))
+        # Shown, not saved: the viewer is the window the user already has open, and a copy in
+        # a downloads folder is a second place this document lives.
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Jobloom-File-Sha256", digest)
         self.end_headers()
         self.wfile.write(body)
 
@@ -237,13 +374,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_page()
             return
-        if path == "/api/state":
-            if not self._authorised():
-                self._send(403, {"error": "bad_token"})
-                return
-            self._run(lambda connection: state(connection, self.private_root))
+        if not self._authorised():
+            self._send(403, {"error": "bad_token"})
             return
-        self._send(404, {"error": "unknown_endpoint"})
+        if path == "/api/state":
+            self._run(lambda connection: state(connection, self.private_root))
+        elif path == "/api/resume-migrations":
+            self._run(migrations)
+        elif path == "/api/resume-file":
+            self._send_resume(self.path)
+        else:
+            self._send(404, {"error": "unknown_endpoint"})
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorised():
@@ -267,6 +408,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/register":
             self._run(lambda connection: register(connection, self.private_root, self.store,
                                                   payload))
+        elif path == "/api/resume-migrations/prepare":
+            self._run(lambda connection: prepare_migration(connection, self.store, payload))
+        elif path == "/api/resume-migrations/approve":
+            self._run(lambda connection: approve_migration(connection, payload))
+        elif path == "/api/resume-migrations/bind":
+            self._run(lambda connection: bind_migration(connection, payload))
         else:
             self._send(404, {"error": "unknown_endpoint"})
 
