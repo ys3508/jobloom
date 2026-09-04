@@ -958,35 +958,99 @@ FIELD_RULES = {
     "profile.website": (_check_url, _offer_scheme),
 }
 
+def check_value(canonical_id: str, value: str) -> dict[str, Any]:
+    """One field's value, checked once, for whoever is asking.
+
+    The prompt loop and the desktop wizard both call this rather than each carrying its own
+    idea of what an email address is. It reports three things and changes none of them: the
+    value with its surrounding whitespace gone, a complaint if it cannot be what it claims to
+    be, and a rewrite worth offering. The rewrite is never applied here — a caller shows it,
+    the user accepts it, and the accepted value comes back through this function again.
+    """
+    require_proposable(canonical_id)
+    if not isinstance(value, str):
+        raise ValueError("a value is text")
+    check, offer = FIELD_RULES.get(canonical_id, (_check_text, None))
+    # Stripped, not reformatted: removing the whitespace around a value is the absence of a
+    # change. Everything past that is offered rather than done.
+    stripped = value.strip()
+    if not stripped:
+        return {"value": "", "empty": True, "complaint": None, "suggestion": None}
+    suggestion = offer(stripped) if offer is not None else None
+    return {"value": stripped, "empty": False, "complaint": check(stripped),
+            "suggestion": suggestion if suggestion and suggestion != stripped else None}
+
+
+def apply_answers(worksheet_path: Path, private_root: Path, connection: sqlite3.Connection,
+                  answers: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Write the user's answers into the worksheet their proposal bound, or write nothing.
+
+    The one writer, so a terminal prompt and a desktop form cannot disagree about what a
+    filled worksheet looks like. Only the three fields the digest leaves editable are touched,
+    every confirmed value goes back through `check_value`, and a worksheet that fails anywhere
+    is left exactly as it was rather than half updated.
+    """
+    worksheet = json.loads(Path(worksheet_path).read_text(encoding="utf-8"))
+    check_worksheet(connection, worksheet)
+    known = {entry["canonical_id"] for entry in worksheet["entries"]}
+    unknown = sorted(set(answers) - known)
+    if unknown:
+        raise ValueError("answers name fields this worksheet does not carry")
+
+    prepared, locked, recorded, left_out = [], [], [], []
+    for entry in worksheet["entries"]:
+        canonical_id = entry["canonical_id"]
+        given = answers.get(canonical_id) or {}
+        confirmed = given.get("confirmed", False)
+        autofill = given.get("autofill", False)
+        # Raises on the one illegal combination: authorised for filling, never confirmed.
+        gate_status(confirmed, autofill)
+        if not confirmed:
+            prepared.append((entry, entry["value"], False, False))
+            left_out.append(canonical_id)
+            continue
+        checked = check_value(canonical_id, given.get("value") or "")
+        if checked["empty"]:
+            raise ValueError("a confirmed field must carry a value")
+        if checked["complaint"]:
+            raise ValueError(f"{canonical_id}: {checked['complaint']}")
+        prepared.append((entry, checked["value"], True, autofill))
+        (locked if autofill else recorded).append(canonical_id)
+    if not locked and not recorded:
+        raise ValueError("nothing was confirmed")
+
+    for entry, value, confirmed, autofill in prepared:
+        entry["value"] = value
+        entry["confirmed_by_user"] = confirmed
+        entry["autofill_allowed_by_user"] = autofill
+    update_private_document(Path(worksheet_path), Path(private_root), worksheet)
+    return {"written": True, "worksheet": str(worksheet_path), "locked": sorted(locked),
+            "recorded_only": sorted(recorded), "left_out": sorted(left_out)}
+
+
 def _yes(answer: str) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
 def _ask_value(entry: dict[str, Any], ask, say) -> str | None:
-    """One field's value, checked, with any rewrite offered rather than applied."""
+    """One field's value at the prompt, with any rewrite offered rather than applied."""
     canonical_id = entry["canonical_id"]
-    check, offer = FIELD_RULES.get(canonical_id, (_check_text, None))
     if entry["value"]:
         say(f"    proposed: {entry['value']}")
         say(f"    ({entry['value_source']})")
         if _yes(ask("    keep this value? [y/n] ")):
             return entry["value"]
     while True:
-        # Stripped, not reformatted: removing the whitespace around a value is the absence of
-        # a change, and everything past that is offered below.
-        typed = ask("    value (blank line leaves this field out): ").strip()
-        if not typed:
+        checked = check_value(canonical_id, ask("    value (blank line leaves this field out): "))
+        if checked["empty"]:
             return None
-        if offer is not None:
-            suggestion = offer(typed)
-            if suggestion and suggestion != typed:
-                say(f"    did you mean: {suggestion}")
-                if _yes(ask("    use that instead? [y/n] ")):
-                    typed = suggestion
-        complaint = check(typed)
-        if complaint is None:
-            return typed
-        say(f"    that cannot be right: {complaint}")
+        if checked["suggestion"]:
+            say(f"    did you mean: {checked['suggestion']}")
+            if _yes(ask("    use that instead? [y/n] ")):
+                checked = check_value(canonical_id, checked["suggestion"])
+        if checked["complaint"] is None:
+            return checked["value"]
+        say(f"    that cannot be right: {checked['complaint']}")
 
 
 def fill_profile(worksheet_path: Path, private_root: Path, connection: sqlite3.Connection,
@@ -1044,14 +1108,12 @@ def fill_profile(worksheet_path: Path, private_root: Path, connection: sqlite3.C
         say("Nothing written. The worksheet is as it was.")
         return {"written": False, "locked": [], "recorded_only": [], "left_out": left_out}
 
-    for entry, value, confirmed, autofill in answered:
-        entry["value"] = value if confirmed else entry["value"]
-        entry["confirmed_by_user"] = confirmed
-        entry["autofill_allowed_by_user"] = autofill
-    update_private_document(Path(worksheet_path), Path(private_root), worksheet)
+    written = apply_answers(
+        worksheet_path, private_root, connection,
+        {entry["canonical_id"]: {"value": value, "confirmed": confirmed, "autofill": autofill}
+         for entry, value, confirmed, autofill in answered})
     say(f"Written to {worksheet_path}.")
-    return {"written": True, "worksheet": str(worksheet_path), "locked": sorted(locked),
-            "recorded_only": sorted(recorded), "left_out": sorted(left_out)}
+    return written
 
 
 if __name__ == "__main__":

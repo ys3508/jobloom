@@ -10,6 +10,7 @@ Optimize for qualified interviews while minimizing user time and model usage. Re
 ## Choose the workflow
 
 - For candidate onboarding, read `references/facts-and-evidence.md`.
+- For the app a person actually uses — the local service, the onboarding window, what it refuses, and what packaging still does not exist — read `references/desktop-app.md`.
 - For the Candidate Profile — what a form field's canonical meaning resolves to, the two confirmations behind a locked profile fact, and the snapshot switch that activates them — read `references/candidate-profile.md`, `references/facts-and-evidence.md`, and `references/answers-and-authorization.md`.
 - For private backend initialization, component status, MVP readiness, or remaining user steps, read `references/mvp-readiness.md` and `references/schemas.md`.
 - For automatic career-direction proposals after material upload, read `references/career-direction-engine.md`, `references/facts-and-evidence.md`, `references/search-directions.md`, and `references/schemas.md`.

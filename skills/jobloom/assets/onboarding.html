@@ -1,0 +1,532 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Jobloom</title>
+<!--
+  The onboarding window. It renders what the local service gives it and decides nothing: every
+  rule it appears to apply - which fields are asked, what a valid email is, what the two
+  confirmations mean, what registering costs - is enforced in `candidate_profile` and re-checked
+  there. A page that could be edited into skipping a gate would be a page holding the gate.
+
+  Values live here only while the window is open. Nothing is stored in the browser, nothing is
+  sent anywhere but the loopback service that opened this page, and the page loads no font,
+  script or image from outside itself.
+-->
+<style>
+  :root {
+    --ink: #1a1c1f; --muted: #6b7280; --line: #e3e6ea; --bg: #f6f7f9;
+    --card: #ffffff; --accent: #1f6feb; --accent-ink: #ffffff;
+    --warn: #8a5a00; --warn-bg: #fff8e6; --good: #146c2e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e9ecef; --muted: #9aa4b2; --line: #2b3038; --bg: #14161a;
+      --card: #1c1f24; --accent: #4c8dff; --accent-ink: #0b0d10;
+      --warn: #f0c674; --warn-bg: #2a2418; --good: #6fcf8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 620px; margin: 0 auto; padding: 32px 24px 80px; }
+  header.bar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 28px; }
+  header.bar h1 { font-size: 17px; margin: 0; letter-spacing: .01em; }
+  header.bar .spacer { flex: 1; }
+  select { font: inherit; color: inherit; background: transparent; border: 1px solid var(--line);
+           border-radius: 6px; padding: 3px 6px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 28px; }
+  h2 { font-size: 22px; margin: 0 0 6px; }
+  p { margin: 0 0 14px; }
+  .muted { color: var(--muted); font-size: 13.5px; }
+  .progress { display: flex; gap: 4px; margin-bottom: 22px; }
+  .progress i { flex: 1; height: 3px; border-radius: 2px; background: var(--line); }
+  .progress i.done { background: var(--accent); }
+  label.field { display: block; font-weight: 600; margin: 22px 0 4px; }
+  input[type=text] {
+    width: 100%; font: inherit; color: inherit; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg);
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .origin { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  .complaint { color: var(--warn); font-size: 13.5px; margin-top: 8px; }
+  .offer { background: var(--warn-bg); border: 1px solid var(--line); border-radius: 8px;
+           padding: 10px 12px; margin-top: 10px; font-size: 13.5px; }
+  .gate { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 22px; }
+  .gate p { margin: 0 0 8px; font-weight: 600; }
+  .choices { display: flex; gap: 8px; }
+  button {
+    font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button[aria-pressed=true] { background: var(--accent); color: var(--accent-ink);
+                              border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.primary[disabled] { opacity: .45; cursor: not-allowed; }
+  button.link { border: none; background: none; color: var(--accent); padding: 0; }
+  footer.nav { display: flex; gap: 10px; align-items: center; margin-top: 28px; }
+  footer.nav .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td, th { text-align: left; padding: 8px 0; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { font-weight: 600; }
+  td.state { text-align: right; white-space: nowrap; color: var(--muted); font-size: 13px; }
+  ul.plain { margin: 0 0 14px; padding-left: 20px; }
+  .error { color: var(--warn); margin-top: 14px; }
+  .good { color: var(--good); }
+</style>
+
+<main>
+  <header class="bar">
+    <h1>Jobloom</h1>
+    <span class="spacer"></span>
+    <select id="lang" aria-label="Language">
+      <option value="zh">中文</option>
+      <option value="en">English</option>
+    </select>
+  </header>
+  <div class="progress" id="progress"></div>
+  <section class="card" id="screen"></section>
+</main>
+
+<script>
+"use strict";
+
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+// The token is in the URL this process opened. Removing it from the address keeps it out of
+// the window's history and out of anything the user might copy and paste to somebody.
+history.replaceState(null, "", location.pathname);
+
+const COPY = {
+  zh: {
+    welcomeTitle: "先把你的基本资料填好",
+    welcomeBody: "这些是招聘网站每次都会问的资料。填一次，以后每份申请都能直接用。",
+    welcomeAsk: "这一轮会问 {n} 项。",
+    welcomeKnown: "其中 {n} 项 Jobloom 已经从你确认过的资料里读出来了，你只需要核对。",
+    welcomeNone: "还没有可以直接用的资料，所以每一项都要你确认一次。",
+    welcomeNothingDerived: "没有任何一项是推算出来的。全名不由姓和名拼出来，国家区号也不从电话号码里解析——你说什么就是什么。",
+    start: "开始",
+    resume: "继续上次",
+    fieldTitle: "完善你的基本资料",
+    proposedFrom: "从你已确认的联系方式里读出来的，请核对",
+    statedByYou: "这一项没有现成的值，请你填写",
+    ambiguous: "有不止一条资料可能是这个意思，所以没有提议值，请你填写",
+    required: "每一份录制过的申请表都把这项列为必填",
+    optional: "出现的地方都是选填",
+    gateOne: "这个值正确吗？",
+    gateTwo: "允许 Jobloom 用它填写申请吗？",
+    yes: "是", no: "否",
+    allow: "允许", ask: "每次问我",
+    didYouMean: "是不是想写 {v}？",
+    useIt: "用这个",
+    keepMine: "保持我写的",
+    leftOut: "这一项这轮不填",
+    back: "上一步", next: "继续",
+    reviewTitle: "核对一遍",
+    reviewBody: "这些就是要写进你资料里的内容。任何一项都可以点回去改。",
+    stLocked: "确认，允许自动填写",
+    stRecorded: "确认，仅记录",
+    stLeftOut: "这轮不填",
+    edit: "修改",
+    prepare: "生成并查看影响",
+    impactTitle: "注册前，先看看会影响什么",
+    impactBody: "确认资料会生成一份新的资料快照。旧快照上的东西会随之失效——这不是错误，是设计如此，但你应该先知道。",
+    impactLocks: "{n} 份已锁定的申请材料会失效",
+    impactResumes: "{n} 份简历需要重新绑定",
+    impactApps: "{n} 份申请受影响",
+    impactReviews: "{n} 份预提交审核会失效",
+    impactAnswers: "{n} 条已保存的回答会变为待复核",
+    impactNothing: "没有任何已有的东西会受影响。",
+    willAdd: "会写入 {n} 项资料，其中 {m} 项允许自动填写。",
+    registerWarn: "注册之后旧快照不会消失，它会被标记为已取代，随时可以查。",
+    register: "确认注册",
+    registering: "正在注册…",
+    doneTitle: "资料已经就绪",
+    doneBody: "以下这些，Jobloom 现在可以直接填进申请表：",
+    doneRecorded: "这些已经记下来了，但你没有允许自动填写，所以每次会问你：",
+    doneNext: "下一步是把受影响的简历重新绑定，然后就可以开始投递了。",
+    close: "可以关掉这个窗口了",
+    failed: "没能完成：",
+  },
+  en: {
+    welcomeTitle: "Let's get your basics down",
+    welcomeBody: "These are the details every job site asks for. Fill them in once and every application can use them.",
+    welcomeAsk: "This round asks for {n} things.",
+    welcomeKnown: "Jobloom already read {n} of them out of details you confirmed before, so those just need checking.",
+    welcomeNone: "Nothing is on file yet, so every one of them needs you.",
+    welcomeNothingDerived: "Nothing here is worked out from anything else. A full name is not your first plus your last, and a country code is not read off your phone number — each is what you say it is.",
+    start: "Start",
+    resume: "Pick up where you left off",
+    fieldTitle: "Your basics",
+    proposedFrom: "read out of contact details you already confirmed — check it",
+    statedByYou: "nothing on file proposes this one; you state it",
+    ambiguous: "more than one detail could mean this, so nothing is proposed; you state it",
+    required: "every recorded application form marks this required",
+    optional: "optional everywhere it appears",
+    gateOne: "Is this correct?",
+    gateTwo: "May Jobloom use it to fill in applications?",
+    yes: "Yes", no: "No",
+    allow: "Allow", ask: "Ask me each time",
+    didYouMean: "Did you mean {v}?",
+    useIt: "Use that",
+    keepMine: "Keep mine",
+    leftOut: "Leaving this one out of this round",
+    back: "Back", next: "Continue",
+    reviewTitle: "Check it over",
+    reviewBody: "This is what goes into your profile. Anything here can be changed.",
+    stLocked: "confirmed, fillable",
+    stRecorded: "confirmed, recorded only",
+    stLeftOut: "left out",
+    edit: "Change",
+    prepare: "Prepare and show me the impact",
+    impactTitle: "Before this goes live",
+    impactBody: "Confirming makes a new snapshot of your profile. Things bound to the old one fall away with it — that is by design, but you should see it first.",
+    impactLocks: "{n} locked application material(s) will be invalidated",
+    impactResumes: "{n} resume(s) will need rebinding",
+    impactApps: "{n} application(s) affected",
+    impactReviews: "{n} pre-submission review(s) invalidated",
+    impactAnswers: "{n} saved answer(s) will need rechecking",
+    impactNothing: "Nothing already on file is affected.",
+    willAdd: "{n} details will be written, {m} of them allowed for filling.",
+    registerWarn: "The old snapshot is not deleted. It is marked superseded and stays readable.",
+    register: "Register",
+    registering: "Registering…",
+    doneTitle: "Your profile is ready",
+    doneBody: "Jobloom can now put these straight into an application form:",
+    doneRecorded: "These are on file, but you did not allow filling, so you will be asked each time:",
+    doneNext: "Next is rebinding the affected resume, and then you can start applying.",
+    close: "You can close this window",
+    failed: "Could not finish: ",
+  },
+};
+
+const FIELD_COPY = {
+  zh: {
+    "contact.first_name": ["名字", "你写在申请表上的名"],
+    "contact.last_name": ["姓氏", "你写在申请表上的姓"],
+    "contact.full_name": ["法定全名", "单独确认一次，不由姓和名拼出来"],
+    "contact.email": ["邮箱", "招聘表单里最常见的一项"],
+    "contact.phone": ["电话", "保持你写的样子，不做格式转换"],
+    "contact.phone_country": ["国家区号", "表单单独问的那一格，例如 +1"],
+    "contact.location_city": ["所在城市", "只填城市"],
+    "contact.location": ["所在地（完整）", "有些平台只有一个“现居地”字段"],
+    "profile.linkedin": ["LinkedIn", "完整链接"],
+  },
+  en: {
+    "contact.first_name": ["First name", "your given name as you write it"],
+    "contact.last_name": ["Last name", "your family name as you write it"],
+    "contact.full_name": ["Full legal name", "confirmed on its own, never joined from the parts"],
+    "contact.email": ["Email", "the one thing nearly every form asks for"],
+    "contact.phone": ["Phone", "kept exactly as you write it"],
+    "contact.phone_country": ["Country code", "the separate box some forms have, e.g. +1"],
+    "contact.location_city": ["City", "just the city"],
+    "contact.location": ["Location (full)", "some sites have one 'current location' box"],
+    "profile.linkedin": ["LinkedIn", "the full link"],
+  },
+};
+
+let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
+let app = { fields: [], answers: {}, index: 0, screen: "welcome", state: null,
+            draft: null, done: null, error: "" };
+
+const t = (key, vars) => {
+  let out = COPY[lang][key] || key;
+  for (const [name, value] of Object.entries(vars || {})) {
+    out = out.replace("{" + name + "}", value);
+  }
+  return out;
+};
+const fieldCopy = (id) => FIELD_COPY[lang][id] || [id, ""];
+const el = (tag, attrs, ...kids) => {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value !== null && value !== false) node.setAttribute(key, value);
+  }
+  for (const kid of kids) if (kid) node.append(kid);
+  return node;
+};
+
+async function api(path, body) {
+  const options = { headers: { "X-Jobloom-Token": TOKEN } };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const payload = await response.json().catch(() => ({ error: "unreadable" }));
+  if (!response.ok) throw new Error(payload.detail || payload.error || "failed");
+  return payload;
+}
+
+// ---- screens -------------------------------------------------------------------
+
+function welcome() {
+  const known = app.state.fields_in_round.filter((id) =>
+    (app.fields.find((f) => f.canonical_id === id) || {}).proposed).length;
+  const total = app.state.fields_in_round.length;
+  return el("div", {},
+    el("h2", { text: t("welcomeTitle") }),
+    el("p", { text: t("welcomeBody") }),
+    el("p", { text: t("welcomeAsk", { n: total }) }),
+    el("p", { class: "muted", text: known ? t("welcomeKnown", { n: known }) : t("welcomeNone") }),
+    el("p", { class: "muted", text: t("welcomeNothingDerived") }),
+    el("footer", { class: "nav" },
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: app.state.open_round ? t("resume") : t("start"),
+                     onclick: () => go("field", 0) })));
+}
+
+function fieldScreen() {
+  const field = app.fields[app.index];
+  const answer = app.answers[field.canonical_id];
+  const [label, hint] = fieldCopy(field.canonical_id);
+  const box = el("div", {});
+
+  const input = el("input", { type: "text", value: answer.value || "", id: "value",
+                              autocomplete: "off", spellcheck: "false" });
+  input.addEventListener("input", () => {
+    answer.value = input.value;
+    answer.complaint = "";
+    answer.suggestion = "";
+    render();
+  });
+
+  box.append(
+    el("h2", { text: t("fieldTitle") }),
+    el("p", { class: "muted", text: hint }),
+    el("label", { class: "field", for: "value", text: label }),
+    input,
+    el("p", { class: "origin",
+              text: field.proposed ? t("proposedFrom")
+                    : (field.value_source || "").indexOf("more than one") >= 0
+                      ? t("ambiguous") : t("statedByYou") }),
+    el("p", { class: "origin", text: field.required ? t("required") : t("optional") }));
+
+  if (answer.complaint) box.append(el("p", { class: "complaint", text: answer.complaint }));
+  if (answer.suggestion) {
+    box.append(el("div", { class: "offer" },
+      el("span", { text: t("didYouMean", { v: answer.suggestion }) + "  " }),
+      el("button", { class: "link", text: t("useIt"), onclick: () => {
+        answer.value = answer.suggestion;
+        answer.suggestion = ""; answer.complaint = "";
+        render();
+      } }),
+      el("span", { text: "  ·  " }),
+      el("button", { class: "link", text: t("keepMine"),
+                     onclick: () => { answer.suggestion = ""; render(); } })));
+  }
+
+  const gateOne = el("div", { class: "gate" },
+    el("p", { text: t("gateOne") }),
+    el("div", { class: "choices" },
+      el("button", { text: t("yes"), "aria-pressed": String(answer.confirmed === true),
+                     onclick: () => { answer.confirmed = true; render(); } }),
+      el("button", { text: t("no"), "aria-pressed": String(answer.confirmed === false),
+                     onclick: () => {
+                       answer.confirmed = false; answer.autofill = false; render();
+                     } })));
+  box.append(gateOne);
+
+  if (answer.confirmed === true) {
+    box.append(el("div", { class: "gate" },
+      el("p", { text: t("gateTwo") }),
+      el("div", { class: "choices" },
+        el("button", { text: t("allow"), "aria-pressed": String(answer.autofill === true),
+                       onclick: () => { answer.autofill = true; render(); } }),
+        el("button", { text: t("ask"), "aria-pressed": String(answer.autofill === false),
+                       onclick: () => { answer.autofill = false; render(); } }))));
+  } else if (answer.confirmed === false) {
+    box.append(el("p", { class: "muted", text: t("leftOut") }));
+  }
+
+  const ready = answer.confirmed === false
+    || (answer.confirmed === true && !!(answer.value || "").trim() && answer.autofill !== null);
+  box.append(el("footer", { class: "nav" },
+    app.index > 0 ? el("button", { text: t("back"), onclick: () => go("field", app.index - 1) })
+                  : null,
+    el("span", { class: "spacer" }),
+    el("button", { class: "primary", text: t("next"), disabled: !ready || null,
+                   onclick: advance })));
+  return box;
+}
+
+async function advance() {
+  const field = app.fields[app.index];
+  const answer = app.answers[field.canonical_id];
+  if (answer.confirmed) {
+    // Checked by the service, with the same rule the terminal path uses. The page never
+    // decides what a valid value is, it only shows what came back.
+    const checked = await api("/api/check", { canonical_id: field.canonical_id,
+                                              value: answer.value });
+    answer.value = checked.value;
+    answer.complaint = checked.complaint || "";
+    answer.suggestion = checked.suggestion || "";
+    if (answer.complaint || answer.suggestion) return render();
+  }
+  if (app.index + 1 < app.fields.length) return go("field", app.index + 1);
+  return go("review");
+}
+
+function reviewScreen() {
+  const rows = app.fields.map((field) => {
+    const answer = app.answers[field.canonical_id];
+    const [label] = fieldCopy(field.canonical_id);
+    const state = !answer.confirmed ? t("stLeftOut")
+                  : answer.autofill ? t("stLocked") : t("stRecorded");
+    const index = app.fields.indexOf(field);
+    return el("tr", {},
+      el("th", { text: label }),
+      el("td", { text: answer.confirmed ? answer.value : "—" }),
+      el("td", { class: "state" }, el("span", { text: state + "  " }),
+        el("button", { class: "link", text: t("edit"), onclick: () => go("field", index) })));
+  });
+  const anyConfirmed = app.fields.some((f) => app.answers[f.canonical_id].confirmed);
+  return el("div", {},
+    el("h2", { text: t("reviewTitle") }),
+    el("p", { class: "muted", text: t("reviewBody") }),
+    el("table", {}, ...rows),
+    app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
+    el("footer", { class: "nav" },
+      el("button", { text: t("back"), onclick: () => go("field", app.fields.length - 1) }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: t("prepare"), disabled: !anyConfirmed || null,
+                     onclick: prepare })));
+}
+
+async function prepare() {
+  app.error = "";
+  try {
+    const answers = {};
+    for (const field of app.fields) {
+      const answer = app.answers[field.canonical_id];
+      answers[field.canonical_id] = { value: answer.value, confirmed: !!answer.confirmed,
+                                      autofill: !!answer.autofill };
+    }
+    await api("/api/answers", { answers });
+    app.draft = await api("/api/draft", {});
+    go("impact");
+  } catch (error) {
+    app.error = error.message;
+    render();
+  }
+}
+
+function impactScreen() {
+  const impact = app.draft.impact_if_registered;
+  const lines = [];
+  if (impact.material_locks_invalidated)
+    lines.push(t("impactLocks", { n: impact.material_locks_invalidated }));
+  if (impact.resume_versions_needing_rebinding.length)
+    lines.push(t("impactResumes", { n: impact.resume_versions_needing_rebinding.length }));
+  if (impact.applications_affected.length)
+    lines.push(t("impactApps", { n: impact.applications_affected.length }));
+  if (impact.pre_submit_reviews_invalidated)
+    lines.push(t("impactReviews", { n: impact.pre_submit_reviews_invalidated }));
+  if (impact.answers_going_stale.length)
+    lines.push(t("impactAnswers", { n: impact.answers_going_stale.length }));
+
+  return el("div", {},
+    el("h2", { text: t("impactTitle") }),
+    el("p", { text: t("impactBody") }),
+    el("p", { text: t("willAdd", { n: app.draft.facts_locked.length
+                                      + app.draft.facts_recorded_only.length,
+                                   m: app.draft.facts_locked.length }) }),
+    lines.length
+      ? el("ul", { class: "plain" }, ...lines.map((line) => el("li", { text: line })))
+      : el("p", { class: "good", text: t("impactNothing") }),
+    el("p", { class: "muted", text: t("registerWarn") }),
+    app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
+    el("footer", { class: "nav" },
+      el("button", { text: t("back"), onclick: () => go("review") }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "primary", text: t("register"), onclick: registerDraft })));
+}
+
+async function registerDraft() {
+  app.error = "";
+  try {
+    // The draft's hash goes back with the press, so the approval names the one draft whose
+    // impact was on the screen. Nobody is asked to read 64 characters.
+    app.done = await api("/api/register", { draft_sha256: app.draft.draft_sha256 });
+    go("done");
+  } catch (error) {
+    app.error = error.message;
+    render();
+  }
+}
+
+function doneScreen() {
+  const fillable = app.done.observed_impact.meanings_now_resolvable || [];
+  const recorded = app.draft.facts_recorded_only || [];
+  return el("div", {},
+    el("h2", { class: "good", text: t("doneTitle") }),
+    el("p", { text: t("doneBody") }),
+    el("ul", { class: "plain" },
+      ...fillable.map((id) => el("li", { text: fieldCopy(id)[0] }))),
+    recorded.length ? el("p", { text: t("doneRecorded") }) : null,
+    recorded.length ? el("ul", { class: "plain" },
+      ...recorded.map((id) => el("li", { text: fieldCopy(id)[0] }))) : null,
+    el("p", { class: "muted", text: t("doneNext") }),
+    el("p", { class: "muted", text: t("close") }));
+}
+
+// ---- shell ---------------------------------------------------------------------
+
+function go(screen, index) {
+  app.screen = screen;
+  if (index !== undefined) app.index = index;
+  app.error = "";
+  render();
+}
+
+function render() {
+  const total = app.fields.length + 3;
+  const at = app.screen === "welcome" ? 0
+           : app.screen === "field" ? app.index + 1
+           : app.screen === "review" ? app.fields.length + 1
+           : app.screen === "impact" ? app.fields.length + 2 : total;
+  const progress = document.getElementById("progress");
+  progress.replaceChildren(...Array.from({ length: total }, (_, i) =>
+    el("i", { class: i <= at ? "done" : "" })));
+  const screen = { welcome, field: fieldScreen, review: reviewScreen,
+                   impact: impactScreen, done: doneScreen }[app.screen];
+  document.getElementById("screen").replaceChildren(screen());
+}
+
+document.getElementById("lang").addEventListener("change", (event) => {
+  lang = event.target.value;
+  document.documentElement.lang = lang;
+  render();
+});
+
+(async function start() {
+  document.getElementById("lang").value = lang;
+  document.documentElement.lang = lang;
+  try {
+    app.state = await api("/api/state");
+    const round = await api("/api/round", {});
+    app.fields = round.fields;
+    for (const field of app.fields) {
+      app.answers[field.canonical_id] = {
+        value: field.value || "",
+        // Null, not false: nobody has answered yet, and a default of "no" would be an answer
+        // the user did not give.
+        confirmed: field.confirmed ? true : null,
+        autofill: field.confirmed ? field.autofill : null,
+        complaint: "", suggestion: "",
+      };
+    }
+    render();
+  } catch (error) {
+    document.getElementById("screen").replaceChildren(
+      el("p", { class: "error", text: t("failed") + error.message }));
+  }
+})();
+</script>
