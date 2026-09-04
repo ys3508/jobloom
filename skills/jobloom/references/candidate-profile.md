@@ -113,8 +113,8 @@ confirmed against a profile the user never previewed.
 
 - It does not migrate the real profile. Running it against real data is a separate, user-owned
   step, and it is not free: the active resume versions are bound to the old snapshot hash, so
-  every material lock behind them is invalidated and they must be rebound before a fact-sourced
-  pre-submit field can verify again.
+  every material lock behind them is invalidated. Carrying one across is a successor, not a
+  rebind — see the migration section of `references/resume-versions.md`.
 - It does not cover the optional or `demand: user` fields. They are reachable only when a round
   names them, and no round does.
 - It does not connect the profile to the fill planner. Nothing in `fill_core` calls

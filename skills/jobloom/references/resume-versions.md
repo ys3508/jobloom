@@ -139,3 +139,54 @@ Do not select baseline content by keyword-matching the direction profile. Those 
 job-posting vocabulary and the fact library is the candidate's own; matching one against the
 other misses genuinely relevant experience. Selection is a judgment that belongs in a
 reviewable BaselinePlan.
+
+## Carrying a resume across a change of CandidateSnapshot
+
+Registering a new profile invalidates every material lock bound to the old snapshot, and it
+should: a lock says "these exact bytes were approved against this exact profile", and one half
+of that has moved. The other side of it had no path. An approved ResumeVersion records the
+snapshot it was approved against and `_require_resume_authorized_for_application` requires that
+snapshot to be the active one, so afterwards the resume is refused at binding, at locking and
+at selection — while `approve_version` accepts only a draft and the recorded hash is not
+editable, correctly.
+
+`resume_migration.py` is the way out, and it is a **successor**, not a rebind:
+
+```text
+prepare -> the same file registered again as its own draft, bytes hash-verified
+approve -> the predecessor's claims manifest revalidated against the new snapshot,
+           approved by the user
+bind    -> ready_to_fill -> materials_in_progress -> bind -> lock -> ready_to_fill
+```
+
+The user is being asked a real question — *these claims were checked against who you were; are
+they still true of who you are now?* — and a button that skipped it would be answering it for
+them.
+
+- **No `parent_version_id`.** That column means "derived from" in the generation chain, and
+  `_validate_parent` refuses it for a `user_provided` resume so a supplied PDF cannot claim a
+  lineage it never earned. A snapshot migration is a different relation and gets its own
+  record in `resume_migrations`.
+- **`user_provided` only.** A `generated` resume is bound to an adaptation plan and a
+  `direction_baseline` one to a baseline plan, both carrying their own snapshot hashes;
+  migrating either means deciding what a stale plan becomes, which is a separate design. The
+  other two modes are refused by name rather than half-handled.
+- **The bytes are taken from the predecessor's own stored snapshot** and checked against its
+  recorded hash, then checked again on the registered copy. No caller supplies a file.
+- **The manifest is the predecessor's stored one**, verified to be the file that was recorded
+  and then revalidated in full. A snapshot that only *added* facts passes, which is what a
+  profile round does. One that drops a cited fact, weakens its evidence, or **locks** a fact a
+  claim cited without promising to preserve its exact value does not.
+- **Nothing is migrated automatically.** `stranded` names every approved resume the active
+  snapshot has left behind, says which can take this path and which application went quiet,
+  and migrates none. Which resume is worth carrying is a question about the user's week.
+- **A failure leaves the application in `materials_in_progress`.** The sequence is not one
+  transaction — `transition` commits as it goes, by design — so it is ordered instead so that
+  every stopping point is a true statement. Stuck in preparation means the materials really
+  are not ready; running the migration again continues from there; and the move back to
+  `ready_to_fill` re-runs `require_active_material_lock` on its own.
+
+**What the revalidation does not promise.** A manifest pins the exact value only of a fact
+that is *locked*. A confirmed fact whose wording changed still satisfies the check, so the
+guarantee is "every cited fact still exists at the strength claimed", not "every cited fact
+still says the same thing". What catches the rest is the review the user is being asked for.
