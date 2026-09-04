@@ -73,8 +73,9 @@ class PageChainTests(unittest.TestCase):
 
     def make_candidate(self):
         facts = [
-            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-name", "type": "identity", "canonical_id": "contact.full_name",
+             "value": "Verified Candidate", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
             {"id": "fact-unlocked", "type": "location", "value": "New York",
              "status": "confirmed", "locked": False, "evidence_strength": "direct"},
         ]
@@ -165,7 +166,7 @@ class PageChainTests(unittest.TestCase):
         return [
             {"field_id": "candidate_name", "question": "Full name", "selector": "#name",
              "control": "text", "required": True, "sensitivity": "normal",
-             "source_kind": "fact", "source_id": "fact-name"},
+             "source_kind": "fact", "canonical_id": "contact.full_name"},
             {"field_id": "work_auth", "question": "Are you authorized to work?", "selector": "#auth",
              "control": "radio", "required": True, "sensitivity": "normal",
              "source_kind": "answer"},

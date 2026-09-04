@@ -117,11 +117,10 @@ confirmed against a profile the user never previewed.
   rebind — see the migration section of `references/resume-versions.md`.
 - It does not cover the optional or `demand: user` fields. They are reachable only when a round
   names them, and no round does.
-- It does not connect the profile to the fill planner. Nothing in `fill_core` calls
-  `resolve_canonical_fact` yet; the planner still reads a `source_id` off the observation and
-  looks that up, and the only mapping from a meaning to a fact id outside this module is a
-  three-entry constant in a test fixture. Registering a profile makes the resolution possible,
-  not wired.
+- It does not put a profile fact on a real employer's form. `fill_core` now resolves a fact
+  field by its `canonical_id` against the locked snapshot, so a registered profile is what the
+  planner reads — but the only observer that produces such a field is the local semantic
+  replay. Production ATS adapters remain unimplemented; see `references/known-liabilities.md`.
 - It does not capture anything from a web page. Nothing here reads what a user typed into an
   employer's form; every value in a profile came from a worksheet the user filled in.
 - It does not answer an employer's question. Work authorization and every sponsorship wording

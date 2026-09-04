@@ -79,6 +79,13 @@ planner could fill from.
 A profile therefore needs its own canonical-id-to-fact binding; splitting values alone would
 not make them reachable.
 
+> **Closed 2026-09-04.** `candidate_profile.resolve_canonical_fact` is that binding and
+> `fill_core` calls it: an observed fact field now names a canonical meaning, the planner
+> resolves it inside the material-locked snapshot, and an observation carrying an internal
+> `source_id` is refused. `FACT_IDS` is deleted; the replay observer reports the reviewed
+> `expected_target` from the disposition approval instead. The measurement above is left as it
+> was written — it is what was true on the day.
+
 **2. Facts a profile would serve are not locked.** `fill_core` refuses any fact that is not
 both `status = 'locked'` and `locked`, with `candidate_fact_not_locked`. The composite contact
 fact and the other contact-typed fact are `confirmed` only. So splitting the composite is

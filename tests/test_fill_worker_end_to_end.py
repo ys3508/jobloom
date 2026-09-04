@@ -138,11 +138,14 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
 
     def build_candidate(self):
         facts = [
-            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
-            {"id": "fact-city", "type": "location", "value": "New York, NY",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
-            {"id": "fact-company", "type": "employment", "value": "Example Employer",
+            {"id": "fact-name", "type": "identity", "canonical_id": "contact.full_name",
+             "value": "Verified Candidate", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
+            {"id": "fact-city", "type": "location", "canonical_id": "contact.location_city",
+             "value": "New York, NY", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
+            {"id": "fact-company", "type": "employment",
+             "canonical_id": "employment.current_company", "value": "Example Employer",
              "status": "locked", "locked": True, "evidence_strength": "direct"},
         ]
         candidate = {
@@ -302,14 +305,14 @@ class LocalFillOnlyWorkflow(unittest.TestCase):
             self.field("lever-0-0", "Resume", control="file", required=True,
                        upload_kind="resume"),
             self.field("lever-0-1", "Full name", required=True,
-                       source_kind="fact", source_id="fact-name"),
+                       source_kind="fact", canonical_id="contact.full_name"),
             self.field("lever-0-5", "Current company", source_kind="answer"),
         ]
 
     def page_two_fields(self):
         return [
             self.field("lever-0-20", "City and state", required=True,
-                       source_kind="fact", source_id="fact-city"),
+                       source_kind="fact", canonical_id="contact.location_city"),
             self.field("final-action", "Submit application", control="submit",
                        required=True),
         ]

@@ -87,19 +87,25 @@ class ArtifactPrivacyTests(unittest.TestCase):
 class ProfileReachabilityTests(unittest.TestCase):
     """The two findings that decide whether splitting values would be enough."""
 
-    def test_the_only_canonical_to_fact_mapping_lives_in_a_test_fixture(self):
-        """`fill_core` looks a fact up by an id the observation supplies.
+    def test_the_canonical_to_fact_mapping_now_lives_in_the_planner(self):
+        """It did not on 2026-09-02, and this test is the thing that noticed.
 
-        Nothing in production says which fact a canonical meaning refers to, so splitting a
-        composite value would produce facts the planner still could not reach. If a production
-        mapping is ever added, this test should be the thing that notices.
+        What it asserted then: `fill_core` looked a fact up by an id the observation supplied,
+        and the only mapping from a meaning to a fact anywhere was `FACT_IDS`, three entries
+        long, in a test fixture — so splitting a composite value would have produced facts the
+        planner still could not reach. The artifact above still says so, because it is a
+        measurement of that day. This is where the closure is asserted instead: the planner
+        resolves by meaning, and no table of internal fact ids is left in either place.
         """
         fixture = (ROOT / "tests" / "fixtures" / "replay_observer.py").read_text(
             encoding="utf-8")
-        self.assertIn("FACT_IDS", fixture)
-        production = [path for path in SCRIPTS.glob("*.py")
-                      if "FACT_IDS" in path.read_text(encoding="utf-8")]
-        self.assertEqual(production, [], "a production mapping appeared; update the artifact")
+        self.assertNotIn("FACT_IDS", fixture)
+        self.assertEqual([path for path in SCRIPTS.glob("*.py")
+                          if "FACT_IDS" in path.read_text(encoding="utf-8")], [])
+        planner = (SCRIPTS / "fill_core.py").read_text(encoding="utf-8")
+        self.assertIn("candidate_profile.resolve_canonical_fact", planner)
+        # And the door it replaced stays shut.
+        self.assertIn("never a source id", planner)
 
     def test_the_planner_refuses_a_fact_that_is_merely_confirmed(self):
         """Splitting is necessary and not sufficient: the facts have to be locked.
@@ -108,7 +114,12 @@ class ProfileReachabilityTests(unittest.TestCase):
         correctly split, correctly mapped profile would still fill nothing.
         """
         source = (SCRIPTS / "fill_core.py").read_text(encoding="utf-8")
+        # Two reasons, deliberately: the planner refuses an unlocked fact as
+        # `profile_fact_not_locked` when it resolves the meaning, and the import path still
+        # refuses one as `candidate_fact_not_locked` when it re-checks the resolved fact.
         self.assertIn("candidate_fact_not_locked", source)
+        self.assertIn("PROFILE_FACT_NOT_LOCKED", (SCRIPTS / "candidate_profile.py").read_text(
+            encoding="utf-8"))
         policy = importlib.util.spec_from_file_location("coverage_field_policy",
                                                         SCRIPTS / "field_policy.py")
         module = importlib.util.module_from_spec(policy)

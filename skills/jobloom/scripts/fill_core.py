@@ -23,6 +23,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import answer_library  # noqa: E402
 import application_core  # noqa: E402
+import candidate_profile  # noqa: E402
 import archive_core  # noqa: E402
 import field_policy  # noqa: E402
 import pre_submit_core  # noqa: E402
@@ -394,7 +395,13 @@ def _active_session(connection: sqlite3.Connection, session_id: str, worker_id: 
 
 
 def _candidate_facts(connection: sqlite3.Connection, application_id: str,
-                     candidate_path: Path) -> dict[str, dict[str, Any]]:
+                     candidate_path: Path) -> tuple[dict[str, dict[str, Any]], str]:
+    """Every fact of the snapshot this application's materials are locked to, and its hash.
+
+    The hash comes back because the planner resolves a canonical meaning inside exactly this
+    snapshot and nowhere else. Deriving it a second time at the call site would be a second
+    answer to "which profile is this application filling from".
+    """
     candidate, candidate_hash = resume_core.load_valid_candidate(candidate_path)
     require_table(connection, "candidate_snapshots")
     snapshot = connection.execute(
@@ -420,7 +427,7 @@ def _candidate_facts(connection: sqlite3.Connection, application_id: str,
         row = stored.get(fact["id"])
         if not row or row["fact_sha256"] != resume_core.canonical_hash(fact):
             raise ValueError("candidate fact registry does not match candidate.json")
-    return {fact["id"]: fact for fact in candidate["facts"]}
+    return {fact["id"]: fact for fact in candidate["facts"]}, candidate_hash
 
 
 def _require_chain_link(connection: sqlite3.Connection, session_id: str, page_index: int,
@@ -794,7 +801,8 @@ def observe_page(
     ).fetchone():
         raise ValueError("page was already observed")
     _require_chain_link(connection, session_id, observation["page_index"], predecessor)
-    facts = _candidate_facts(connection, session["application_id"], candidate_path)
+    facts, snapshot_sha256 = _candidate_facts(
+        connection, session["application_id"], candidate_path)
     current_time = at or now_utc()
     reasons: list[str] = []
     legal_items = set(observation["legal_items"])
@@ -817,7 +825,12 @@ def observe_page(
         if not isinstance(field, dict):
             raise ValueError("each observed field must be an object")
         allowed = {"field_id", "question", "selector", "control", "required", "sensitivity",
-                   "source_kind", "source_id", "upload_kind", "options"}
+                   "source_kind", "canonical_id", "upload_kind", "options"}
+        if "source_id" in field:
+            # Named apart from the generic refusal below, because this is the migration a
+            # caller is most likely to have missed. A browser has never heard of `fact-0002`
+            # and must not be the thing that decides which fact a form field reaches.
+            raise ValueError("an observed field names a canonical meaning, never a source id")
         if set(field) - allowed:
             raise ValueError("observed field has unknown properties")
         for name in ("field_id", "question", "selector", "control"):
@@ -878,8 +891,23 @@ def observe_page(
                             "value": value, "expected_sha256": expected})
             continue
         source_kind = field.get("source_kind")
+        canonical_id = field.get("canonical_id")
+        if canonical_id is not None and source_kind != "fact":
+            raise ValueError("only a fact field may name a canonical meaning")
         if source_kind == "fact":
-            fact = facts.get(field.get("source_id"))
+            if not isinstance(canonical_id, str) or not canonical_id.strip():
+                raise ValueError("an observed fact field must name a canonical meaning")
+            # The untrusted half of the exchange ends here: the page said what the field
+            # means, and the planner decides which fact that is, inside the snapshot the
+            # materials are locked to. Each way of not resolving keeps its own reason - an
+            # unreviewed meaning, one that is not profile data, none, two, one that is only
+            # confirmed and one that has expired are six different things to tell a person.
+            resolved, refusal = candidate_profile.resolve_canonical_fact(
+                connection, canonical_id, snapshot_sha256, current_time)
+            if refusal:
+                reasons.append(_field_reason(refusal, field_id, sensitivity))
+                continue
+            fact = facts.get(resolved["fact_id"])
             if not fact:
                 reasons.append(_field_reason("candidate_fact_unknown", field_id, sensitivity))
                 continue

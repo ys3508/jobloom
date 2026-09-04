@@ -833,11 +833,14 @@ class FillControlTests(unittest.TestCase):
 
     def _build_candidate(self):
         facts = [
-            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
-            {"id": "fact-city", "type": "location", "value": "New York, NY",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
-            {"id": "fact-company", "type": "employment", "value": "Example Employer",
+            {"id": "fact-name", "type": "identity", "canonical_id": "contact.full_name",
+             "value": "Verified Candidate", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
+            {"id": "fact-city", "type": "location", "canonical_id": "contact.location_city",
+             "value": "New York, NY", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
+            {"id": "fact-company", "type": "employment",
+             "canonical_id": "employment.current_company", "value": "Example Employer",
              "status": "locked", "locked": True, "evidence_strength": "direct"},
         ]
         candidate = {

@@ -61,10 +61,12 @@ class FillCoreTests(unittest.TestCase):
 
     def make_candidate(self):
         facts = [
-            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
-             "status": "locked", "locked": True, "evidence_strength": "direct"},
-            {"id": "fact-unlocked", "type": "location", "value": "New York",
-             "status": "confirmed", "locked": False, "evidence_strength": "direct"},
+            {"id": "fact-name", "type": "identity", "canonical_id": "contact.full_name",
+             "value": "Verified Candidate", "status": "locked", "locked": True,
+             "evidence_strength": "direct"},
+            {"id": "fact-unlocked", "type": "location", "canonical_id": "contact.location_city",
+             "value": "New York", "status": "confirmed", "locked": False,
+             "evidence_strength": "direct"},
         ]
         candidate = {
             "schema_version": "0.2.0", "profile_id": "candidate-1",
@@ -153,7 +155,7 @@ class FillCoreTests(unittest.TestCase):
         return [
             {"field_id": "candidate_name", "question": "Full name", "selector": "#name",
              "control": "text", "required": True, "sensitivity": "normal",
-             "source_kind": "fact", "source_id": "fact-name"},
+             "source_kind": "fact", "canonical_id": "contact.full_name"},
             {"field_id": "work_auth", "question": "Are you authorized to work?", "selector": "#auth",
              "control": "radio", "required": True, "sensitivity": "normal",
              "source_kind": "answer"},
@@ -308,7 +310,7 @@ class FillCoreTests(unittest.TestCase):
         fields = [
             {"field_id": "location", "question": "Location", "selector": "#location",
              "control": "text", "required": True, "sensitivity": "normal",
-             "source_kind": "fact", "source_id": "fact-unlocked"},
+             "source_kind": "fact", "canonical_id": "contact.location_city"},
             {"field_id": "cover", "question": "Cover letter", "selector": "#cover",
              "control": "file", "required": False, "sensitivity": "normal",
              "upload_kind": "cover_letter"},
@@ -316,7 +318,7 @@ class FillCoreTests(unittest.TestCase):
         result = FILL.observe_page(
             self.db, "session-1", "worker-1", self.candidate_path, self.page(fields=fields), AT
         )
-        self.assertIn("candidate_fact_not_locked:location", result["reasons"])
+        self.assertIn("profile_fact_not_locked:location", result["reasons"])
         self.assertIn("unapproved_upload:cover", result["reasons"])
 
     def test_cross_origin_and_captcha_pause(self):
@@ -364,3 +366,96 @@ class FillCoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalResolutionTests(FillCoreTests):
+    """An observation says what a field means; the planner decides which fact that is.
+
+    The browser side of the exchange is untrusted and has never heard of `fact-0002`, so it
+    reports a canonical meaning and nothing else. Everything downstream of the resolution -
+    the internal fact id in the action package, the exact value hash, the material-lock and
+    snapshot checks on import - is unchanged, and these tests hold that line as much as they
+    hold the new one.
+    """
+
+    def observe(self, fields):
+        # Started here rather than in `setUp`, which the inherited tests share and which
+        # already starts their own sessions.
+        if not self.db.execute("SELECT 1 FROM fill_sessions").fetchone():
+            self.start(authorization_context={"country": "US", "application_id": "app-1"})
+        return FILL.observe_page(self.db, "session-1", "worker-1", self.candidate_path,
+                                 self.page(fields=fields), AT)
+
+    def fact_field(self, **extra):
+        field = {"field_id": "candidate_name", "question": "Full name", "selector": "#name",
+                 "control": "text", "required": True, "sensitivity": "normal",
+                 "source_kind": "fact"}
+        field.update(extra)
+        return [field]
+
+    def test_a_meaning_resolves_to_the_locked_fact_behind_it(self):
+        result = self.observe(self.fact_field(canonical_id="contact.full_name"))
+        step = self.db.execute(
+            "SELECT source_kind, source_id, value_json FROM fill_steps "
+            "WHERE field_id='candidate_name'").fetchone()
+        self.assertEqual(result["step_count"], 1)
+        # The package still names the internal fact, which is what import verifies against.
+        self.assertEqual((step["source_kind"], step["source_id"]), ("fact", "fact-name"))
+        self.assertEqual(json.loads(step["value_json"]), "Verified Candidate")
+
+    def test_an_observation_cannot_name_an_internal_fact_id(self):
+        """The bypass this exists to close: the page choosing which fact it reaches."""
+        with self.assertRaisesRegex(ValueError, "never a source id"):
+            self.observe(self.fact_field(source_id="fact-name"))
+        with self.assertRaisesRegex(ValueError, "never a source id"):
+            self.observe(self.fact_field(canonical_id="contact.full_name",
+                                         source_id="fact-name"))
+
+    def test_a_fact_field_without_a_meaning_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "must name a canonical meaning"):
+            self.observe(self.fact_field())
+
+    def test_only_a_fact_field_may_name_a_meaning(self):
+        with self.assertRaisesRegex(ValueError, "only a fact field"):
+            self.observe(self.fact_field(source_kind="answer",
+                                         canonical_id="contact.full_name"))
+
+    def test_each_way_of_not_resolving_keeps_its_own_reason(self):
+        """Six different things to tell a person, not one `candidate_fact_unknown`."""
+        for canonical_id, reason in (
+                ("contact.email", "profile_fact_missing"),
+                ("contact.location_city", "profile_fact_not_locked"),
+                ("profile.location_url", "profile_field_unknown"),
+                ("contact.favourite_colour", "profile_field_unknown"),
+                ("eeo.race", "profile_meaning_not_profile_data"),
+                ("work_authorized_now", "profile_meaning_not_profile_data")):
+            with self.subTest(canonical_id=canonical_id):
+                # A refusal pauses the session, so each case gets its own.
+                self.setUp()
+                result = self.observe(self.fact_field(canonical_id=canonical_id))
+                self.assertIn(f"{reason}:candidate_name", result["reasons"])
+
+    def test_two_facts_claiming_one_meaning_fill_neither(self):
+        """Picking either would fill an employer's form from a value nobody arbitrated.
+
+        Written straight into the registry: the resolver reads the snapshot's rows, and
+        building a second snapshot to reach the case would move the material lock instead of
+        exercising the ambiguity.
+        """
+        active = self.db.execute(
+            "SELECT content_sha256 FROM candidate_snapshots WHERE status='active'").fetchone()[0]
+        self.db.execute(
+            "INSERT INTO candidate_facts (content_sha256, fact_id, fact_type, value_json, "
+            "status, locked, evidence_strength, canonical_id, fact_sha256, source_json, "
+            "keywords_json, invalidation_triggers_json) "
+            "VALUES (?, 'fact-name-2', 'identity', '\"Someone Else\"', 'locked', 1, "
+            "'direct', 'contact.full_name', 'unused', '{}', '[]', '[]')", (active,))
+        self.db.commit()
+        result = self.observe(self.fact_field(canonical_id="contact.full_name"))
+        self.assertIn("profile_fact_ambiguous:candidate_name", result["reasons"])
+
+    def test_a_sensitive_field_still_hides_its_id_in_the_reason(self):
+        result = self.observe(self.fact_field(canonical_id="contact.email",
+                                              sensitivity="sensitive_personal"))
+        reason = next(r for r in result["reasons"] if r.startswith("profile_fact_missing:"))
+        self.assertNotIn("candidate_name", reason)

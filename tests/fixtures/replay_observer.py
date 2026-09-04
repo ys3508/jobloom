@@ -27,6 +27,7 @@ refused, it was never looked at. Both are now refusals of the whole observation.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -36,14 +37,19 @@ sys.path.insert(0, str(ROOT / "skills" / "jobloom" / "scripts"))
 
 import semantic_replay  # noqa: E402
 
-# What the replay's own markup maps a control to. `_plan_upload` needs a kind, a fact needs
-# its id; anything not named here is reported as unsupported rather than filled.
-FACT_IDS = {
-    "contact.full_name": "fact-name",
-    "location.city_state": "fact-city",
-    "employment.current_company": "fact-company",
-}
+# What the replay's own markup maps a control to. Upload kinds are this observer's business;
+# which fact a control reaches is not, and used to be a three-entry table of internal fact ids
+# written here. A browser has never heard of `fact-name`. The reviewed corpus already records
+# what each recorded control *means* - `expected_target` in the disposition approval - so the
+# observer reports that and the planner resolves it against the locked snapshot.
 UPLOAD_KINDS = {"resume.file": "resume", "cover_letter.file": "cover_letter"}
+_APPROVAL = json.loads(
+    (ROOT / "tests" / "fixtures" / "ats-semantic" / "FIELD-DISPOSITION-APPROVAL.json")
+    .read_text(encoding="utf-8"))
+CANONICAL_TARGETS = {
+    entry["kind"]: entry["expected_target"] for entry in _APPROVAL["entries"]
+    if entry["expected_disposition"] == "fact"
+}
 
 
 # A nested browsing context this observer cannot read and must not ignore.
@@ -183,10 +189,10 @@ def observe(page, page_id: str, page_index: int, page_url: str, *, locale: str |
         if disposition == "material":
             field["upload_kind"] = UPLOAD_KINDS[kind]
         elif disposition == "fact":
-            if kind not in FACT_IDS:
-                raise ObservationRefused(f"no candidate fact is mapped for {kind}")
+            if kind not in CANONICAL_TARGETS:
+                raise ObservationRefused(f"no reviewed meaning is recorded for {kind}")
             field["source_kind"] = "fact"
-            field["source_id"] = FACT_IDS[kind]
+            field["canonical_id"] = CANONICAL_TARGETS[kind]
         elif disposition == "answer":
             field["source_kind"] = "answer"
         # `always_manual` and `unsupported` carry no source: the planner decides, from the
