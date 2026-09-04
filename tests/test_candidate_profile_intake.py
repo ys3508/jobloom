@@ -539,6 +539,151 @@ class StatusTests(ProfileIntakeTests):
             PROFILE.PROFILE_FACT_EXPIRED)
 
 
+class FillerTests(ProfileIntakeTests):
+    """The step where Jobloom asks and the user answers.
+
+    Driven with a scripted `ask` so the questions and their order are the thing under test.
+    Nothing here reads a terminal, and the answers are the same visibly synthetic values the
+    rest of the file uses.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.private / "round-1.json"
+        PROFILE.propose_profile(
+            self.db, ROUND, AT,
+            sink=lambda sheet: ANSWERS.write_private_document(self.path, self.private, sheet))
+        self.said = []
+
+    def fill(self, answers):
+        script = list(answers)
+        return PROFILE.fill_profile(
+            self.path, self.private, self.db,
+            ask=lambda prompt: script.pop(0), say=self.said.append)
+
+    def sheet(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def answers_for(self, value_reply="y", confirm="y", autofill="y"):
+        """One scripted run: keep each proposed value, state each blank one, both gates yes."""
+        script = []
+        for entry in self.sheet()["entries"]:
+            if entry["value"]:
+                script.append(value_reply)
+                if value_reply != "y":
+                    script.append(STATED[entry["canonical_id"]])
+            else:
+                script.append(STATED[entry["canonical_id"]])
+            script.append(confirm)
+            if confirm == "y":
+                script.append(autofill)
+        script.append("y")
+        return script
+
+    def test_a_filled_worksheet_still_confirms(self):
+        """The end of the point: what the filler writes is what confirmation accepts."""
+        result = self.fill(self.answers_for())
+        self.assertTrue(result["written"])
+        self.assertEqual(result["locked"], sorted(NINE))
+        prepared = PROFILE.confirm_profile(self.db, self.sheet(), self.private, AT)
+        self.assertEqual(prepared["facts_locked"], sorted(NINE))
+
+    def test_writing_answers_does_not_break_the_proposal_binding(self):
+        before = self.sheet()
+        self.fill(self.answers_for())
+        after = self.sheet()
+        self.assertEqual(
+            PROFILE.worksheet_shape_digest(after, PROFILE.PROFILE_WORKSHEET_EDITABLE_FIELDS),
+            PROFILE.worksheet_shape_digest(before, PROFILE.PROFILE_WORKSHEET_EDITABLE_FIELDS))
+        self.assertEqual(after["shape_sha256"], before["shape_sha256"])
+        self.assertEqual(after["proposal_nonce"], before["proposal_nonce"])
+
+    def test_the_two_gates_are_asked_separately(self):
+        self.fill(self.answers_for(confirm="y", autofill="n"))
+        for entry in self.sheet()["entries"]:
+            self.assertTrue(entry["confirmed_by_user"], entry["canonical_id"])
+            self.assertFalse(entry["autofill_allowed_by_user"], entry["canonical_id"])
+
+    def test_declining_the_first_gate_leaves_the_field_out(self):
+        result = self.fill(self.answers_for(confirm="n"))
+        self.assertEqual(result["written"], False)
+        self.assertEqual(result["left_out"], sorted(NINE))
+        for entry in self.sheet()["entries"]:
+            self.assertFalse(entry["confirmed_by_user"])
+
+    def test_a_blank_line_leaves_a_field_out(self):
+        script = []
+        for entry in self.sheet()["entries"]:
+            if entry["canonical_id"] == "contact.location":
+                script += ["n", ""] if entry["value"] else [""]
+                continue
+            script.append("y" if entry["value"] else STATED[entry["canonical_id"]])
+            script += ["y", "y"]
+        script.append("y")
+        result = self.fill(script)
+        self.assertEqual(result["left_out"], ["contact.location"])
+        self.assertEqual(result["locked"], sorted(set(NINE) - {"contact.location"}))
+
+    def test_a_value_that_cannot_be_what_it_claims_is_asked_again(self):
+        script = []
+        for entry in self.sheet()["entries"]:
+            if entry["canonical_id"] == "contact.email":
+                script += ["n", "not an address", "still-not-one@", "typed@example.invalid"]
+            elif entry["value"]:
+                script.append("y")
+            else:
+                script.append(STATED[entry["canonical_id"]])
+            script += ["y", "y"]
+        script.append("y")
+        self.fill(script)
+        complaint = ("    that cannot be right: an email address is one local part, one @, "
+                     "and one domain")
+        self.assertEqual(self.said.count(complaint), 2)
+        held = {e["canonical_id"]: e["value"] for e in self.sheet()["entries"]}
+        self.assertEqual(held["contact.email"], "typed@example.invalid")
+
+    def test_a_rewrite_is_offered_and_never_applied_unsolicited(self):
+        """`1` almost certainly means `+1`. Almost is not a licence."""
+        for reply, expected in (("y", "+1"), ("n", "1")):
+            with self.subTest(reply=reply):
+                self.setUp()
+                script = []
+                for entry in self.sheet()["entries"]:
+                    if entry["canonical_id"] == "contact.phone_country":
+                        script += ["1", reply]
+                    elif entry["value"]:
+                        script.append("y")
+                    else:
+                        script.append(STATED[entry["canonical_id"]])
+                    script += ["y", "y"]
+                script.append("y")
+                self.fill(script)
+                held = {e["canonical_id"]: e["value"] for e in self.sheet()["entries"]}
+                self.assertEqual(held["contact.phone_country"], expected)
+
+    def test_nothing_is_written_until_the_user_says_so(self):
+        script = self.answers_for()
+        script[-1] = "n"
+        before = self.sheet()
+        result = self.fill(script)
+        self.assertFalse(result["written"])
+        self.assertEqual(self.sheet(), before)
+
+    def test_a_spent_proposal_is_refused_before_the_first_question(self):
+        """Nine answers into a worksheet that cannot be confirmed are nine answers lost."""
+        PROFILE.confirm_profile(self.db, self.fill(self.answers_for()) and self.sheet(),
+                                self.private, AT)
+        with self.assertRaisesRegex(ValueError, "already been drafted"):
+            self.fill(["y"])
+
+    def test_the_summary_names_meanings_and_never_a_value(self):
+        self.fill(self.answers_for())
+        summary = "\n".join(self.said[self.said.index(
+            "Summary, by meaning. No value is repeated here."):])
+        for piece in PIECES + tuple(STATED.values()):
+            self.assertNotIn(piece, summary)
+
+
 class CommandLineTests(ProfileIntakeTests):
     """The four subcommands, driven the way a person drives them.
 

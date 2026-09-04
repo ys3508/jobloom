@@ -49,10 +49,24 @@ CandidateSnapshot, and a field no recorded form requires does not earn one.
 
 ```text
 propose-profile  -> private worksheet (0600, inside the private root)
-                 -> user edits value / confirmed_by_user / autofill_allowed_by_user
+fill-profile     -> Jobloom asks each field; the answers go into that worksheet
 confirm-profile  -> draft CandidateSnapshot + impact preview; nothing is activated
 register-profile -> the user names the draft by its exact sha256; atomic switch
 ```
+
+**Asking is the step, not editing a file.** `fill-profile` puts each field to the user in
+turn, then writes the answers back into the worksheet it was given — only the three fields the
+digest leaves editable, so a filled worksheet is still the one its proposal bound. It runs the
+binding checks before the first question rather than after the last, refuses a pipe (an intake
+reading from a script is how a scripted value gets filed as a person's own word), and writes
+nothing until every field has been asked and the user says to write it.
+
+It validates and it offers; it never rewrites. An address with no `@` is refused and asked
+again. A country code typed as `1` gets `+1` **offered** — shown, and applied only if the user
+says so — as does a profile link pasted without its scheme. Leading and trailing whitespace is
+stripped, which is the absence of a change rather than one. Nothing else is touched, and
+nothing is ever computed from another field: the no-derivation rule does not become negotiable
+because the value arrived through a prompt instead of an editor.
 
 **Proposing** reads a value out of a composite contact fact so the user checks rather than
 retypes it, and proposes nothing for anything else. A fact that already carries a

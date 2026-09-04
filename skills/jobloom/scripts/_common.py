@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,18 +147,11 @@ def classify_composite_contact(source: str) -> dict[str, str]:
     return found
 
 
-def write_private_document(path: Path, private_root: Path,
-                           document: dict[str, Any]):
-    """Create a worksheet where private things belong, exclusively, already unreadable.
+def require_private_path(path: Path, private_root: Path) -> Path:
+    """Refuse a path that leaves the private root, or reaches it through a link.
 
-    A worksheet carries proposed answers and a draft profile carries confirmed ones, so where
-    either lands and how it is created are part of the boundary rather than a convenience. `write_text` then `chmod` creates the file with the
-    default mode first, which is a window in which anyone on the machine can read it; it also
-    follows a symlink and overwrites whatever was there. `O_CREAT | O_EXCL` with the mode given
-    at creation has neither problem, and refuses rather than replacing.
-
-    The path must be inside the private root — the directory the library itself lives in — so
-    a caller cannot ask for a copy of their own contact details in the repository.
+    Shared by the two writers below so "inside the private root" means one thing. Returns the
+    resolved parent, which the callers need anyway.
     """
     root = private_root.resolve()
     parent = path.parent
@@ -185,9 +179,49 @@ def write_private_document(path: Path, private_root: Path,
         if candidate.is_symlink():
             raise ValueError("a worksheet path may not pass through a symlink")
     if path.is_symlink():
-        # Named apart from the case below: following it would write a private answer wherever
-        # it points, which is a different mistake from overwriting something.
+        # Named apart from the "already exists" case: following it would write a private
+        # answer wherever it points, which is a different mistake from overwriting something.
         raise ValueError("a worksheet path may not pass through a symlink")
+    return resolved_parent
+
+
+def update_private_document(path: Path, private_root: Path, document: dict[str, Any]) -> None:
+    """Replace a private document that already exists, atomically.
+
+    The filler writes answers back into the worksheet it was given, which the creating writer
+    below refuses to do on purpose. Written to a fresh exclusive file in the same directory and
+    then renamed, so a crash halfway leaves the original worksheet whole rather than a file
+    holding half a person's answers. The temporary carries the same 0600 from creation.
+    """
+    resolved_parent = require_private_path(path, private_root)
+    if not path.is_file():
+        raise ValueError("that worksheet does not exist")
+    temporary = resolved_parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    handle = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_private_document(path: Path, private_root: Path,
+                           document: dict[str, Any]):
+    """Create a worksheet where private things belong, exclusively, already unreadable.
+
+    A worksheet carries proposed answers and a draft profile carries confirmed ones, so where
+    either lands and how it is created are part of the boundary rather than a convenience. `write_text` then `chmod` creates the file with the
+    default mode first, which is a window in which anyone on the machine can read it; it also
+    follows a symlink and overwrites whatever was there. `O_CREAT | O_EXCL` with the mode given
+    at creation has neither problem, and refuses rather than replacing.
+
+    The path must be inside the private root — the directory the library itself lives in — so
+    a caller cannot ask for a copy of their own contact details in the repository.
+    """
+    resolved_parent = require_private_path(path, private_root)
     if path.exists():
         # Refused rather than replaced: the file it would overwrite may be a worksheet
         # somebody is part-way through.

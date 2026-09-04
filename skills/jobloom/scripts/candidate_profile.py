@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -51,7 +52,8 @@ if SCRIPT_DIR not in sys.path:
 import candidate_core  # noqa: E402
 import resume_core  # noqa: E402
 from _common import (classify_composite_contact, parse_time,  # noqa: E402
-                     require_table, worksheet_shape_digest, write_private_document)
+                     require_table, update_private_document,
+                     worksheet_shape_digest, write_private_document)
 
 
 def now_utc() -> datetime:
@@ -592,8 +594,6 @@ def confirm_profile(connection: sqlite3.Connection, worksheet: Any, private_root
     an approval referred to. Changing an answer means proposing again, which also re-reads the
     profile the worksheet is being checked against.
     """
-    if not isinstance(worksheet, dict) or set(worksheet) != PROFILE_WORKSHEET_FIELDS:
-        raise ValueError("worksheet has an unexpected shape")
     require_table(connection, "profile_proposals")
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -603,8 +603,18 @@ def confirm_profile(connection: sqlite3.Connection, worksheet: Any, private_root
         raise
 
 
-def _confirm_within_transaction(connection: sqlite3.Connection, worksheet: dict[str, Any],
-                                private_root: Path, at: datetime | None) -> dict[str, Any]:
+def check_worksheet(connection: sqlite3.Connection,
+                    worksheet: Any) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """Everything that binds a worksheet to its proposal, and nothing that acts on it.
+
+    Separate from confirmation because the interactive filler runs the same checks before it
+    asks the first question. A person who answers nine questions into a worksheet whose
+    proposal has already been drafted has spent nine answers on a file that cannot be
+    confirmed, and finding that out at the end is finding it out too late.
+    """
+    if not isinstance(worksheet, dict) or set(worksheet) != PROFILE_WORKSHEET_FIELDS:
+        raise ValueError("worksheet has an unexpected shape")
+    require_table(connection, "profile_proposals")
     proposal = connection.execute(
         "SELECT * FROM profile_proposals WHERE proposal_id=?",
         (worksheet["proposal_id"],)).fetchone()
@@ -631,6 +641,13 @@ def _confirm_within_transaction(connection: sqlite3.Connection, worksheet: dict[
         # The profile moved under the worksheet, so a proposed value may have been read out of
         # a fact that no longer says that. Propose again rather than confirm a stale reading.
         raise ValueError("the candidate profile changed since this was proposed")
+    return proposal, snapshot
+
+
+def _confirm_within_transaction(connection: sqlite3.Connection, worksheet: dict[str, Any],
+                                private_root: Path, at: datetime | None) -> dict[str, Any]:
+    proposal, snapshot = check_worksheet(connection, worksheet)
+    entries = worksheet["entries"]
 
     confirmed, recorded_only, left_out = [], [], []
     for entry in entries:
@@ -830,6 +847,8 @@ def main() -> None:
     propose = commands.add_parser("propose-profile")
     propose.add_argument("--round", required=True, dest="round_name")
     propose.add_argument("--out", required=True, type=Path)
+    fill = commands.add_parser("fill-profile")
+    fill.add_argument("--worksheet", required=True, type=Path)
     confirm = commands.add_parser("confirm-profile")
     confirm.add_argument("--worksheet", required=True, type=Path)
     register = commands.add_parser("register-profile")
@@ -850,6 +869,12 @@ def main() -> None:
             sink=lambda sheet: write_private_document(args.out, private_root, sheet),
         )["summary"]
         result["worksheet"] = str(args.out)
+    elif args.command == "fill-profile":
+        if not sys.stdin.isatty():
+            # An intake reading from a pipe is how a scripted value gets filed as the user's
+            # own word. The whole point of this command is that a person answered.
+            raise SystemExit("fill-profile asks questions, so it needs a terminal")
+        result = fill_profile(args.worksheet, private_root, connection)
     elif args.command == "confirm-profile":
         worksheet = json.loads(args.worksheet.read_text(encoding="utf-8"))
         result = confirm_profile(connection, worksheet, private_root)
@@ -857,7 +882,176 @@ def main() -> None:
         result = register_profile(connection, args.draft_sha256, store, args.actor)
     else:
         result = status(connection)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if args.command != "fill-profile":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+
+# ---- the interactive filler ----------------------------------------------------
+#
+# A worksheet a person edits in a text editor is a developer's affordance, not the step. This
+# is the step: Jobloom asks, the user answers, and the answer goes into the worksheet the user
+# was already given. It writes only the three fields the digest leaves editable, so a filled
+# worksheet is still the worksheet its proposal bound.
+#
+# What it does not do is normalise anything silently. `full_name` is not first plus last and a
+# country code is not read off a phone number; that rule does not become negotiable because
+# the value arrived through a prompt rather than through an editor. What it may do is refuse a
+# value that cannot be what it claims to be, and offer a rewrite the user accepts or declines
+# — the same relationship the proposed values have to the composite fact they came from.
+
+
+def _check_email(value: str) -> str | None:
+    if " " in value or value.count("@") != 1:
+        return "an email address is one local part, one @, and one domain"
+    local, _, domain = value.partition("@")
+    if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+        return "an email address is one local part, one @, and one domain"
+    return None
+
+
+def _check_phone(value: str) -> str | None:
+    if sum(character.isdigit() for character in value) < 7:
+        return "a phone number needs at least seven digits"
+    return None
+
+
+def _check_phone_country(value: str) -> str | None:
+    if not re.fullmatch(r"\+?\d{1,4}", value):
+        return "a dialling country code is one to four digits, optionally after a +"
+    return None
+
+
+def _check_url(value: str) -> str | None:
+    if not value.startswith(("http://", "https://")):
+        return "a link starts with http:// or https://"
+    host = value.split("://", 1)[1].split("/", 1)[0]
+    if "." not in host or " " in value:
+        return "a link needs a host"
+    return None
+
+
+def _check_text(value: str) -> str | None:
+    return None
+
+
+def _offer_country_code(value: str) -> str | None:
+    """`1` almost certainly means `+1`. Offered, because almost is not a licence to rewrite."""
+    return f"+{value}" if value.isdigit() else None
+
+
+def _offer_scheme(value: str) -> str | None:
+    """A profile pasted without its scheme. Offered rather than assumed: some forms want the
+    bare handle, and the user is the one who knows which their profile is."""
+    return f"https://{value}" if value and "://" not in value else None
+
+
+# Per meaning, because a rule that applied to a group would have to be right for the whole
+# group. Anything not named here is text: refused only when it is empty.
+FIELD_RULES = {
+    "contact.email": (_check_email, None),
+    "contact.phone": (_check_phone, None),
+    "contact.phone_country": (_check_phone_country, _offer_country_code),
+    "profile.linkedin": (_check_url, _offer_scheme),
+    "profile.github": (_check_url, _offer_scheme),
+    "profile.portfolio": (_check_url, _offer_scheme),
+    "profile.website": (_check_url, _offer_scheme),
+}
+
+def _yes(answer: str) -> bool:
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def _ask_value(entry: dict[str, Any], ask, say) -> str | None:
+    """One field's value, checked, with any rewrite offered rather than applied."""
+    canonical_id = entry["canonical_id"]
+    check, offer = FIELD_RULES.get(canonical_id, (_check_text, None))
+    if entry["value"]:
+        say(f"    proposed: {entry['value']}")
+        say(f"    ({entry['value_source']})")
+        if _yes(ask("    keep this value? [y/n] ")):
+            return entry["value"]
+    while True:
+        # Stripped, not reformatted: removing the whitespace around a value is the absence of
+        # a change, and everything past that is offered below.
+        typed = ask("    value (blank line leaves this field out): ").strip()
+        if not typed:
+            return None
+        if offer is not None:
+            suggestion = offer(typed)
+            if suggestion and suggestion != typed:
+                say(f"    did you mean: {suggestion}")
+                if _yes(ask("    use that instead? [y/n] ")):
+                    typed = suggestion
+        complaint = check(typed)
+        if complaint is None:
+            return typed
+        say(f"    that cannot be right: {complaint}")
+
+
+def fill_profile(worksheet_path: Path, private_root: Path, connection: sqlite3.Connection,
+                 ask=input, say=print) -> dict[str, Any]:
+    """Ask the user each field of a worksheet, and write down what they say.
+
+    The binding checks run before the first question rather than after the last: nine answers
+    typed into a worksheet whose proposal is already spent are nine answers thrown away.
+    Nothing is written until every field has been asked and the user says to write it, so
+    stopping halfway leaves the worksheet exactly as it was.
+    """
+    worksheet = json.loads(Path(worksheet_path).read_text(encoding="utf-8"))
+    check_worksheet(connection, worksheet)
+    entries = worksheet["entries"]
+
+    say(f"\n{len(entries)} fields in round {worksheet['round']}.")
+    say("Two questions each: whether the value is right, and whether Jobloom may type it into")
+    say("an employer's form. Answering only the first records it without granting the second.")
+    say("Nothing is derived from anything else, so a field nobody proposed is one you state.\n")
+
+    answered = []
+    for index, entry in enumerate(entries, start=1):
+        canonical_id = entry["canonical_id"]
+        say(f"[{index}/{len(entries)}] {canonical_id}")
+        say(f"    {entry['what_it_is']}")
+        value = _ask_value(entry, ask, say)
+        if value is None:
+            say("    left out of this round.\n")
+            answered.append((entry, None, False, False))
+            continue
+        confirmed = _yes(ask("    confirm this value is correct? [y/n] "))
+        if not confirmed:
+            say("    left out of this round.\n")
+            answered.append((entry, None, False, False))
+            continue
+        autofill = _yes(ask("    may Jobloom type it into an employer's form? [y/n] "))
+        say("")
+        answered.append((entry, value, True, autofill))
+
+    locked = [entry["canonical_id"] for entry, _, confirmed, auto in answered if confirmed and auto]
+    recorded = [entry["canonical_id"] for entry, _, confirmed, auto in answered
+                if confirmed and not auto]
+    left_out = [entry["canonical_id"] for entry, _, confirmed, _ in answered if not confirmed]
+    say("Summary, by meaning. No value is repeated here.")
+    for canonical_id in locked:
+        say(f"    {canonical_id:<24} confirmed, fillable")
+    for canonical_id in recorded:
+        say(f"    {canonical_id:<24} confirmed, recorded only")
+    for canonical_id in left_out:
+        say(f"    {canonical_id:<24} left out")
+    if not locked and not recorded:
+        say("\nNothing was confirmed, so there is nothing to write.")
+        return {"written": False, "locked": [], "recorded_only": [], "left_out": left_out}
+    if not _yes(ask("\nWrite these answers into the worksheet? [y/n] ")):
+        say("Nothing written. The worksheet is as it was.")
+        return {"written": False, "locked": [], "recorded_only": [], "left_out": left_out}
+
+    for entry, value, confirmed, autofill in answered:
+        entry["value"] = value if confirmed else entry["value"]
+        entry["confirmed_by_user"] = confirmed
+        entry["autofill_allowed_by_user"] = autofill
+    update_private_document(Path(worksheet_path), Path(private_root), worksheet)
+    say(f"Written to {worksheet_path}.")
+    return {"written": True, "worksheet": str(worksheet_path), "locked": sorted(locked),
+            "recorded_only": sorted(recorded), "left_out": sorted(left_out)}
 
 
 if __name__ == "__main__":
