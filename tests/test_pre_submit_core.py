@@ -234,6 +234,27 @@ class PreSubmitCoreTests(unittest.TestCase):
                 {"pre_submit_review_id": "review-1"}, AT,
             )
 
+    def test_a_fact_whose_value_changed_after_approval_blocks_the_transition(self):
+        """The review is a statement about values, so the values are what it rechecks.
+
+        Reachable only by writing to `candidate_facts` directly, because the normal way a
+        locked value changes is a new CandidateSnapshot - which invalidates the material lock,
+        and the join above would then find no row at all. That is the point of the check: it
+        holds when the row moved without the mechanism that is supposed to move it.
+        """
+        self.register_inventory()
+        self.finish_fill()
+        review = self.create_review()
+        PRE.approve_review(self.db, "review-1", "user", review["summary_sha256"], AT)
+        self.db.execute("UPDATE candidate_facts SET value_json=? WHERE fact_id='fact-name'",
+                        (json.dumps("Someone Else", sort_keys=True, separators=(",", ":")),))
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "CandidateFact value changed"):
+            APPLICATIONS.transition(
+                self.db, "app-1", "pre_submit_ready", "system", "checked",
+                {"pre_submit_review_id": "review-1"}, AT,
+            )
+
     def test_approved_review_locks_authorization_and_is_invalidated_on_return(self):
         self.register_inventory()
         self.finish_fill()

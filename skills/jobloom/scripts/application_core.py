@@ -330,8 +330,11 @@ def require_approved_pre_submit_review(
             """, (application_id, stored_field["source_id"])).fetchone()
             if not fact or fact["status"] != "locked" or not fact["locked"]:
                 raise ValueError("pre-submit review CandidateFact is no longer locked")
-                if fact["value_json"] != stored_field["value_json"]:
-                    raise ValueError("pre-submit review CandidateFact value changed")
+            if fact["value_json"] != stored_field["value_json"]:
+                # Was nested under the raise above and so never ran. The line beside it asks
+                # whether the fact is still lockable; this one asks whether it still says what
+                # the review recorded, which is the question the whole review is about.
+                raise ValueError("pre-submit review CandidateFact value changed")
         elif stored_field["source_kind"] == "answer":
             answer = connection.execute("SELECT * FROM answers WHERE answer_id=?", (stored_field["source_id"],)).fetchone()
             if not answer or answer["status"] != "active" or answer["confirmation_status"] != "confirmed":
