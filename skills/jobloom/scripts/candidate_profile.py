@@ -21,12 +21,26 @@ nothing: `fill_core` requires `status = 'locked'` and `locked`. So intake record
 per field — "this value is right" and "Jobloom may type it into forms" — and only both
 together produce a locked fact. That is intake writing down an authorization the user gave,
 not intake granting one to itself.
+
+The write path below follows from that second decision. Locking happens at snapshot approval,
+so intake cannot end at a confirmation: it proposes a round of fields, takes the two answers on
+a private worksheet, drafts one new CandidateSnapshot, shows what activating that snapshot
+would invalidate, and switches only when the user names the draft by its exact hash. One
+snapshot per round rather than one per field, because a snapshot change invalidates every
+material lock bound to the old one — a per-field switch would pay that price nine times.
+
+See `references/candidate-profile.md`.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import secrets
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +48,14 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from _common import parse_time, require_table  # noqa: E402
+import candidate_core  # noqa: E402
+import resume_core  # noqa: E402
+from _common import (classify_composite_contact, parse_time,  # noqa: E402
+                     require_table, worksheet_shape_digest, write_private_document)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # Where a field came from, which is not the same as whether it is wanted. `corpus` means the
@@ -125,7 +146,12 @@ FORBIDDEN_MEANINGS = {
     "eeo.race", "eeo.gender", "eeo.disability", "eeo.veteran",
     "compensation.target_salary", "compensation.total_range",
     "authorization.sponsorship_status", "authorization.sponsorship_select",
-    "work_authorized_now", "citizenship_status", "permanent_residence_status",
+    # All four immigration meanings, not only the one the reviewed corpus has a form for.
+    # Three of them are absent from `PROFILE_V1` too, so they were already refused - but as
+    # "no such profile field", which reads like an oversight in the shape rather than the rule
+    # it actually is. They are never interchangeable and none of them is profile data.
+    "work_authorized_now", "sponsorship_now", "sponsorship_future",
+    "employer_action_required", "citizenship_status", "permanent_residence_status",
     "current_country_of_residence", "prior_employment_at_this_company",
     "prior_employment_at_an_affiliate", "referral.contact", "discovery_source",
 }
@@ -192,3 +218,647 @@ def resolve_canonical_fact(connection: sqlite3.Connection, canonical_id: str,
     if expires and at is not None and at >= expires:
         return None, PROFILE_FACT_EXPIRED
     return fact, None
+
+
+# ---- intake: how a confirmed value becomes a fact the planner may fill ---------
+
+# Which meanings a round of proposing may cover. Derived from the two measured properties on
+# the field rather than listed by hand: the corpus asks for it, and every recorded control
+# that carried it was marked required. A hand-written set here would be a taste; this one
+# moves only when the measurement moves, and the test pins today's membership so it cannot
+# move quietly. Optional and user-demand fields are deliberately absent from every round in
+# this version: a profile round costs a new CandidateSnapshot, and a field that no recorded
+# form requires does not earn one.
+PROFILE_ROUNDS = {
+    "required-v1": frozenset(
+        field.canonical_id for field in PROFILE_V1.values()
+        if field.demand == DEMAND_CORPUS and field.required_where_present),
+}
+
+# The `fact_type` a profile fact carries into the snapshot. Pinned per group, not per field:
+# the type is how the rest of the system talks about a fact's kind, and a type per field would
+# invent twenty-one kinds nobody else knows.
+GROUP_FACT_TYPE = {
+    "name": "identity",
+    "contact": "contact",
+    "mailing_address": "location",
+    "current_location": "location",
+    "links": "profile",
+    "employment": "employment",
+}
+
+# The fact types a composite value may be read out of. The coverage measurement found the
+# profile-relevant facts in exactly these three; scanning every fact in the snapshot would let
+# an address inside an unrelated resume-derived fact arrive as a proposal, and a proposal is
+# the thing a person is most likely to wave through.
+COMPOSITE_SOURCE_TYPES = ("identity", "contact", "location")
+
+# A profile worksheet carries no `application_id`. That is the difference from the answer
+# worksheet in one field: an answer is scoped to where it may be used, and a profile fact is
+# scoped to the snapshot that holds it.
+PROFILE_WORKSHEET_EDITABLE_FIELDS = ("value", "confirmed_by_user", "autofill_allowed_by_user")
+PROFILE_WORKSHEET_FIELDS = {"proposal_id", "proposal_nonce", "shape_sha256", "snapshot_sha256",
+                            "round", "note", "entries"}
+PROFILE_WORKSHEET_ENTRY_FIELDS = {"canonical_id", "group", "demand", "required_where_present",
+                                  "what_it_is", "how_to_answer", "value", "value_source",
+                                  "source_fact_ids", "confirmed_by_user",
+                                  "autofill_allowed_by_user"}
+
+WORKSHEET_NOTE = (
+    "Private. Two separate questions per field. `confirmed_by_user` says the value is right. "
+    "`autofill_allowed_by_user` says Jobloom may type it into an employer's form. Both true "
+    "produces a fact the planner may fill from; confirmed alone records it without granting "
+    "that; neither leaves the field out entirely, which is a decision and not an unfinished "
+    "worksheet. Nothing here is derived: a full name is not first plus last, a country code is "
+    "not read out of a phone number, and a value nobody proposed is one you state. Confirming "
+    "this worksheet prepares a new CandidateSnapshot; it does not activate one."
+)
+
+HOW_TO_ANSWER = "Write it exactly as it should be typed into an employer's form."
+
+VALUE_FROM_FACT = "read out of a contact fact you already confirmed - check it"
+VALUE_FROM_USER = "you state it; nothing here proposes it"
+VALUE_AMBIGUOUS = "more than one fact could mean this, so nothing is proposed; state it"
+
+
+def connect(path: Path | str) -> sqlite3.Connection:
+    """The same terms every other component opens the database on, including the mode.
+
+    Spelled out rather than borrowed from `candidate_core.connect` because that one runs its
+    own `initialize` and not this module's; what is shared is the settings, and those are the
+    part a copy could get wrong quietly.
+    """
+    connection = sqlite3.connect(str(path), timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=10000")
+    initialize(connection)
+    if str(path) != ":memory:":
+        os.chmod(path, 0o600)
+    return connection
+
+
+def initialize(connection: sqlite3.Connection) -> None:
+    """Create the intake tables, and the candidate tables they depend on.
+
+    `candidate_core.initialize` is called rather than assumed: it carries the migration that
+    adds `candidate_facts.canonical_id`, which is the column `resolve_canonical_fact` reads. A
+    database that has the profile tables and not that column would resolve nothing and say
+    only that the fact is missing.
+    """
+    candidate_core.initialize(connection)
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS profile_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            snapshot_sha256 TEXT NOT NULL,
+            shape_sha256 TEXT NOT NULL,
+            round TEXT NOT NULL,
+            targets_json TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            status TEXT NOT NULL,
+            drafted_at TEXT,
+            registered_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS profile_drafts (
+            draft_sha256 TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            base_snapshot_sha256 TEXT NOT NULL,
+            draft_path TEXT NOT NULL,
+            file_sha256 TEXT NOT NULL,
+            added_json TEXT NOT NULL,
+            impact_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            registered_at TEXT,
+            FOREIGN KEY (proposal_id) REFERENCES profile_proposals(proposal_id)
+        );
+    """)
+    connection.commit()
+
+
+def require_proposable(canonical_id: str) -> ProfileField:
+    """The one gate every layer repeats, because each layer is reachable on its own.
+
+    Proposing, confirming and registering each check this. Two of the three would be enough
+    for an honest caller and none of them would be enough for a tampered worksheet, which is
+    the case the repetition is for: a meaning inserted into a worksheet after it was written
+    reaches confirmation without ever having been proposed.
+    """
+    if canonical_id in FORBIDDEN_MEANINGS:
+        raise ValueError("that meaning is not profile data")
+    if canonical_id in PROFILE_V1_DEFERRED:
+        raise ValueError("that meaning is recorded as unclear and has no reviewed shape")
+    field = PROFILE_V1.get(canonical_id)
+    if field is None:
+        raise ValueError("no such profile field")
+    return field
+
+
+def _active_snapshot_row(connection: sqlite3.Connection) -> sqlite3.Row:
+    require_table(connection, "candidate_snapshots")
+    row = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE status='active'").fetchone()
+    if not row:
+        raise ValueError("no active candidate snapshot")
+    return row
+
+
+def _read_composites(connection: sqlite3.Connection, snapshot_sha256: str
+                     ) -> tuple[dict[str, tuple[str, list[str]]], frozenset[str]]:
+    """Meanings a composite fact already holds, and the ones too many facts claim.
+
+    Two facts offering one meaning proposes nothing. Picking either would put a value in front
+    of the user with the authority of a proposal and no arbitration behind it, and a person
+    checking a plausible value is the weakest gate in the whole flow. Both answers come from
+    one walk, because two walks could disagree about which facts were even looked at.
+    """
+    found: dict[str, list[tuple[str, str]]] = {}
+    for row in connection.execute(
+            "SELECT fact_id, fact_type, canonical_id, value_json FROM candidate_facts "
+            "WHERE content_sha256=?", (snapshot_sha256,)):
+        if row["fact_type"] not in COMPOSITE_SOURCE_TYPES:
+            continue
+        if row["canonical_id"]:
+            # A fact that already states one meaning exactly is not a composite to read parts
+            # out of. Scanning it would make every field this intake wrote look like a second
+            # claim on its own meaning, and a later round would propose nothing at all.
+            continue
+        value = json.loads(row["value_json"])
+        if not isinstance(value, str):
+            continue
+        for meaning, piece in classify_composite_contact(value).items():
+            found.setdefault(meaning, []).append((piece, row["fact_id"]))
+    single = {meaning: (sources[0][0], [sources[0][1]])
+              for meaning, sources in found.items() if len(sources) == 1}
+    return single, frozenset(m for m, sources in found.items() if len(sources) > 1)
+
+
+def propose_profile(connection: sqlite3.Connection, round_name: str,
+                    at: datetime | None = None, sink=None) -> dict[str, Any]:
+    """Prepare a private worksheet of the profile fields the user is being asked to confirm.
+
+    Nothing is written to the profile and nothing is returned that carries a value. A value
+    already held inside a composite fact is offered so the user checks rather than retypes it;
+    everything else is blank, because the alternative to a value nobody holds is a guess.
+    """
+    if round_name not in PROFILE_ROUNDS:
+        raise ValueError("no such reviewed round")
+    targets = sorted(PROFILE_ROUNDS[round_name])
+    if not targets:
+        raise ValueError("the reviewed round names no fields")
+    require_table(connection, "profile_proposals")
+    snapshot = _active_snapshot_row(connection)
+    proposable, ambiguous = _read_composites(connection, snapshot["content_sha256"])
+
+    entries = []
+    for target in targets:
+        field = require_proposable(target)
+        value, sources = proposable.get(target, (None, []))
+        if value is not None:
+            source_prose = VALUE_FROM_FACT
+        elif target in ambiguous:
+            source_prose = VALUE_AMBIGUOUS
+        else:
+            source_prose = VALUE_FROM_USER
+        entries.append({
+            "canonical_id": target,
+            "group": field.group,
+            "demand": field.demand,
+            "required_where_present": field.required_where_present,
+            "what_it_is": field.note,
+            "how_to_answer": HOW_TO_ANSWER,
+            "value": value,
+            "value_source": source_prose,
+            "source_fact_ids": sources,
+            "confirmed_by_user": False,
+            "autofill_allowed_by_user": False,
+        })
+
+    proposal_id = f"profile-proposal-{secrets.token_hex(8)}"
+    nonce = secrets.token_hex(16)
+    timestamp = (at or now_utc()).isoformat()
+    worksheet = {
+        "proposal_id": proposal_id, "proposal_nonce": nonce, "shape_sha256": "",
+        "snapshot_sha256": snapshot["content_sha256"], "round": round_name,
+        "note": WORKSHEET_NOTE, "entries": entries,
+    }
+    worksheet["shape_sha256"] = worksheet_shape_digest(
+        worksheet, PROFILE_WORKSHEET_EDITABLE_FIELDS)
+
+    undo = None
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            "INSERT INTO profile_proposals (proposal_id, created_at, snapshot_sha256, "
+            "shape_sha256, round, targets_json, nonce, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'open')",
+            (proposal_id, timestamp, snapshot["content_sha256"], worksheet["shape_sha256"],
+             round_name, json.dumps(targets), nonce))
+        if sink is not None:
+            # Inside the transaction, as in the answer loop: a worksheet the caller could not
+            # write must not leave an open proposal behind, and a proposal that could not be
+            # recorded must not leave a worksheet that looks usable.
+            undo = sink(worksheet)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        if undo is not None:
+            undo()
+        raise
+    return {"worksheet": worksheet,
+            "summary": {"proposal_id": proposal_id, "round": round_name,
+                        "canonical_ids": targets,
+                        "proposed": sum(1 for entry in entries if entry["value"] is not None)}}
+
+
+def _new_fact_id(canonical_id: str) -> str:
+    """A fact id derived from the meaning, so the same meaning never lands twice under two ids.
+
+    Derived rather than random because the collision this prevents is the one that matters: a
+    second intake writing `contact.email` under a fresh id would give the meaning two facts,
+    and `resolve_canonical_fact` would then refuse both as ambiguous rather than fill either.
+    """
+    fact_id = "fact-profile-" + canonical_id.replace(".", "-")
+    resume_core._require_safe_id(fact_id, "fact_id")
+    return fact_id
+
+
+def _draft_candidate(connection: sqlite3.Connection, snapshot: sqlite3.Row,
+                     confirmed: list[tuple[str, dict[str, Any], str, bool]],
+                     proposal_id: str, timestamp: str) -> tuple[dict[str, Any], list[str]]:
+    """The next CandidateSnapshot: every fact the active one holds, plus the confirmed ones.
+
+    Nothing is removed and nothing is edited. The composite fact stays exactly as it is,
+    because answers already name it in their `dependent_fact_ids` and dropping it would break
+    an invalidation chain to tidy up a value; the facts split out of it record it as their
+    source instead. The copy is checked fact by fact against the hashes the database holds, so
+    "this draft only adds" is verified rather than asserted.
+    """
+    candidate_core.verify_snapshot_file(snapshot)
+    candidate, content_hash = resume_core.load_valid_candidate(Path(snapshot["snapshot_path"]))
+    if content_hash != snapshot["content_sha256"]:
+        raise ValueError("the active snapshot file does not match its recorded content hash")
+    stored = {row["fact_id"]: row["fact_sha256"] for row in connection.execute(
+        "SELECT fact_id, fact_sha256 FROM candidate_facts WHERE content_sha256=?",
+        (snapshot["content_sha256"],))}
+    facts = [dict(fact) for fact in candidate["facts"]]
+    for fact in facts:
+        if stored.get(fact["id"]) != resume_core.canonical_hash(fact):
+            raise ValueError("the active snapshot's facts do not match the recorded hashes")
+
+    held = {fact["id"] for fact in facts}
+    added = []
+    for canonical_id, entry, status, locked in confirmed:
+        field = require_proposable(canonical_id)
+        fact_id = _new_fact_id(canonical_id)
+        if fact_id in held:
+            # A meaning already carried by a fact of its own. Re-confirming it is a change to
+            # an existing fact, which is a supersession this version does not implement, not
+            # an addition it can make quietly.
+            raise ValueError("that meaning already has a profile fact in the active snapshot")
+        held.add(fact_id)
+        facts.append({
+            "id": fact_id,
+            "type": GROUP_FACT_TYPE[field.group],
+            "canonical_id": canonical_id,
+            "value": entry["value"],
+            "status": status,
+            "locked": locked,
+            # The user stating their own contact detail is the strongest evidence there is for
+            # it. It says nothing about any skill: no claim may cite a profile fact.
+            "evidence_strength": "direct",
+            "confirmed_at": timestamp,
+            "source": {"kind": "profile_intake", "proposal_id": proposal_id,
+                       "derived_from": list(entry["source_fact_ids"])},
+        })
+        added.append(canonical_id)
+
+    draft = dict(candidate)
+    draft["facts"] = facts
+    draft.pop("content_sha256", None)
+    draft["content_sha256"] = resume_core.canonical_hash(draft)
+    return draft, added
+
+
+def _impact(connection: sqlite3.Connection, snapshot: sqlite3.Row,
+            draft: dict[str, Any]) -> dict[str, Any]:
+    """What registering this draft would invalidate, counted before anything is registered.
+
+    Read-only, and value-free: ids of locks, versions and applications are not candidate data.
+    The stale-answer set is computed with the same function registration uses, so the preview
+    cannot promise one thing and the switch do another.
+    """
+    require_table(connection, "material_locks")
+    locks = connection.execute("""
+        SELECT ml.lock_id, ml.application_id, ml.resume_version_id
+        FROM material_locks ml
+        JOIN resume_versions rv ON rv.version_id=ml.resume_version_id
+        -- `!=` and not `IS NOT`, because this must predict what `register_snapshot`
+        -- does and that is the predicate it uses. A version bound to no snapshot at
+        -- all keeps its lock there, so the preview must not promise it loses one.
+        WHERE ml.invalidated_at IS NULL AND rv.candidate_profile_sha256 != ?
+    """, (draft["content_sha256"],)).fetchall()
+    applications = sorted({row["application_id"] for row in locks})
+    changed = candidate_core._changed_fact_ids(connection, snapshot["content_sha256"], draft)
+    require_table(connection, "answers")
+    stale = sorted(
+        row["canonical_id"] for row in connection.execute(
+            "SELECT canonical_id, dependent_fact_ids_json FROM answers WHERE status='active'")
+        if changed.intersection(json.loads(row["dependent_fact_ids_json"])))
+    reviews = 0
+    if applications:
+        placeholders = ",".join("?" * len(applications))
+        require_table(connection, "pre_submit_reviews")
+        reviews = connection.execute(
+            "SELECT COUNT(*) FROM pre_submit_reviews WHERE status IN ('generated','approved') "
+            f"AND application_id IN ({placeholders})", applications).fetchone()[0]
+    return {
+        "material_locks_invalidated": len(locks),
+        "resume_versions_needing_rebinding": sorted({row["resume_version_id"] for row in locks}),
+        "applications_affected": applications,
+        "pre_submit_reviews_invalidated": reviews,
+        "answers_going_stale": stale,
+    }
+
+
+def confirm_profile(connection: sqlite3.Connection, worksheet: Any, private_root: Path,
+                    at: datetime | None = None) -> dict[str, Any]:
+    """Turn a filled-in worksheet into a draft snapshot and a preview of what it would cost.
+
+    Registers nothing and activates nothing. A proposal is single-use here as it is for
+    answers: a second draft from one proposal would leave two drafts and no way to say which
+    an approval referred to. Changing an answer means proposing again, which also re-reads the
+    profile the worksheet is being checked against.
+    """
+    if not isinstance(worksheet, dict) or set(worksheet) != PROFILE_WORKSHEET_FIELDS:
+        raise ValueError("worksheet has an unexpected shape")
+    require_table(connection, "profile_proposals")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        return _confirm_within_transaction(connection, worksheet, private_root, at)
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _confirm_within_transaction(connection: sqlite3.Connection, worksheet: dict[str, Any],
+                                private_root: Path, at: datetime | None) -> dict[str, Any]:
+    proposal = connection.execute(
+        "SELECT * FROM profile_proposals WHERE proposal_id=?",
+        (worksheet["proposal_id"],)).fetchone()
+    if not proposal:
+        raise ValueError("no such proposal")
+    if not secrets.compare_digest(str(worksheet["proposal_nonce"]), str(proposal["nonce"])):
+        raise ValueError("worksheet does not belong to that proposal")
+    if proposal["status"] != "open":
+        raise ValueError("this proposal has already been drafted")
+
+    entries = worksheet["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("worksheet carries no entries")
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != PROFILE_WORKSHEET_ENTRY_FIELDS:
+            raise ValueError("worksheet entry has an unexpected shape")
+    if worksheet_shape_digest(worksheet, PROFILE_WORKSHEET_EDITABLE_FIELDS) != proposal["shape_sha256"]:
+        raise ValueError("worksheet no longer matches the proposal it came from")
+    targets = json.loads(proposal["targets_json"])
+    if [entry["canonical_id"] for entry in entries] != sorted(targets):
+        raise ValueError("worksheet does not cover the proposed fields")
+    snapshot = _active_snapshot_row(connection)
+    if snapshot["content_sha256"] != proposal["snapshot_sha256"]:
+        # The profile moved under the worksheet, so a proposed value may have been read out of
+        # a fact that no longer says that. Propose again rather than confirm a stale reading.
+        raise ValueError("the candidate profile changed since this was proposed")
+
+    confirmed, recorded_only, left_out = [], [], []
+    for entry in entries:
+        canonical_id = entry["canonical_id"]
+        require_proposable(canonical_id)
+        status, locked = gate_status(entry["confirmed_by_user"],
+                                     entry["autofill_allowed_by_user"])
+        if status == "unconfirmed":
+            left_out.append(canonical_id)
+            continue
+        value = entry["value"]
+        if not isinstance(value, str) or not value.strip():
+            # Confirming an empty field would file a blank as the user's word for it.
+            raise ValueError("a confirmed field must carry a value")
+        confirmed.append((canonical_id, entry, status, locked))
+        if not locked:
+            recorded_only.append(canonical_id)
+    if not confirmed:
+        raise ValueError("nothing was confirmed")
+
+    timestamp = (at or now_utc()).isoformat()
+    draft, added = _draft_candidate(connection, snapshot, confirmed,
+                                    proposal["proposal_id"], timestamp)
+    if draft["content_sha256"] == snapshot["content_sha256"]:
+        raise ValueError("the draft is identical to the active snapshot")
+    impact = _impact(connection, snapshot, draft)
+
+    path = Path(private_root) / "profile-drafts" / f"{draft['content_sha256'][:16]}.json"
+    undo = write_private_document(path, Path(private_root), draft)
+    try:
+        connection.execute(
+            "UPDATE profile_proposals SET status='drafted', drafted_at=? "
+            "WHERE proposal_id=? AND status='open'", (timestamp, proposal["proposal_id"]))
+        connection.execute(
+            "INSERT INTO profile_drafts (draft_sha256, proposal_id, created_at, "
+            "base_snapshot_sha256, draft_path, file_sha256, added_json, impact_json, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')",
+            (draft["content_sha256"], proposal["proposal_id"], timestamp,
+             snapshot["content_sha256"], str(path), resume_core.file_sha256(path),
+             json.dumps(sorted(added)), json.dumps(impact)))
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        undo()
+        raise
+    return {
+        "draft_sha256": draft["content_sha256"],
+        "draft_path": str(path),
+        "base_snapshot_sha256": snapshot["content_sha256"],
+        "facts_locked": sorted(set(added) - set(recorded_only)),
+        "facts_recorded_only": sorted(recorded_only),
+        "fields_left_out": sorted(left_out),
+        "impact_if_registered": impact,
+        "registered": False,
+        "next_step": ("review the impact, then approve this exact draft by its sha256; "
+                      "nothing is active until you do"),
+    }
+
+
+def register_profile(connection: sqlite3.Connection, draft_sha256: str, store: Path,
+                     actor: str, at: datetime | None = None) -> dict[str, Any]:
+    """Activate one approved draft, wholly or not at all.
+
+    The user names the draft by its exact hash, as they do for a pre-submit review, because
+    approving "the draft" is not approving a particular set of facts. Everything this writes
+    happens in the transaction `register_snapshot` commits: the proposal is claimed and the
+    draft marked before that call, so a registration that fails takes the bookkeeping with it
+    and never leaves a consumed proposal behind a snapshot that does not exist.
+    """
+    if actor != "user":
+        raise ValueError("activating a candidate profile requires the user actor")
+    require_table(connection, "profile_drafts")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        draft_row = connection.execute(
+            "SELECT * FROM profile_drafts WHERE draft_sha256=?", (draft_sha256,)).fetchone()
+        if not draft_row:
+            raise ValueError("no such draft")
+        if draft_row["status"] != "open":
+            raise ValueError("this draft has already been registered")
+        proposal = connection.execute(
+            "SELECT * FROM profile_proposals WHERE proposal_id=?",
+            (draft_row["proposal_id"],)).fetchone()
+        if not proposal or proposal["status"] != "drafted":
+            raise ValueError("this draft's proposal is not awaiting approval")
+        snapshot = _active_snapshot_row(connection)
+        if snapshot["content_sha256"] != draft_row["base_snapshot_sha256"]:
+            # Somebody registered a snapshot between the preview and the approval, so the
+            # impact the user read was computed against a profile that is no longer there.
+            raise ValueError("the candidate profile changed since this draft was prepared")
+        path = Path(draft_row["draft_path"])
+        if not path.is_file() or resume_core.file_sha256(path) != draft_row["file_sha256"]:
+            raise ValueError("the draft file has changed since it was prepared")
+        draft, content_hash = resume_core.load_valid_candidate(path)
+        if content_hash != draft_sha256:
+            raise ValueError("the draft file no longer states the approved content hash")
+        for fact in draft["facts"]:
+            # The third place the forbidden check runs, and the only one inside the switch.
+            # The two before it are checks on a file; this one is a check on what is about to
+            # become the active profile, which is the thing the rule is actually about.
+            if fact.get("canonical_id"):
+                require_proposable(fact["canonical_id"])
+
+        moment = at or now_utc()
+        timestamp = moment.isoformat()
+        claimed = connection.execute(
+            "UPDATE profile_proposals SET status='registered', registered_at=? "
+            "WHERE proposal_id=? AND status='drafted'", (timestamp, proposal["proposal_id"]))
+        if claimed.rowcount != 1:
+            raise ValueError("this draft's proposal is not awaiting approval")
+        claimed = connection.execute(
+            "UPDATE profile_drafts SET status='registered', registered_at=? "
+            "WHERE draft_sha256=? AND status='open'", (timestamp, draft_sha256))
+        if claimed.rowcount != 1:
+            raise ValueError("this draft has already been registered")
+        # Commits the whole transaction, this bookkeeping included, or rolls all of it back.
+        registered = candidate_core.register_snapshot(connection, Path(store), path, actor,
+                                                     moment)
+    except Exception:
+        connection.rollback()
+        raise
+    return {
+        "content_sha256": registered["content_sha256"],
+        "superseded": draft_row["base_snapshot_sha256"],
+        "facts_added": json.loads(draft_row["added_json"]),
+        "predicted_impact": json.loads(draft_row["impact_json"]),
+        "observed_impact": _observed_impact(connection, registered["content_sha256"],
+                                            timestamp),
+    }
+
+
+def _observed_impact(connection: sqlite3.Connection, content_sha256: str,
+                     timestamp: str) -> dict[str, Any]:
+    """What this switch actually invalidated, read back rather than restated from the preview.
+
+    Scoped to this registration's own timestamp, because an unscoped count would grow with
+    every profile change ever made and would agree with a one-change preview only on the first
+    one. The stale-answer count cannot be scoped that way - the invalidation walk records no
+    time on the row - so it is reported as the total it is and never as this switch's delta.
+    """
+    require_table(connection, "material_locks")
+    locks = connection.execute(
+        "SELECT resume_version_id, application_id FROM material_locks "
+        "WHERE invalidation_reason='candidate_snapshot_changed' AND invalidated_at=?",
+        (timestamp,)).fetchall()
+    require_table(connection, "answers")
+    stale = connection.execute("SELECT COUNT(*) FROM answers WHERE status='stale'").fetchone()[0]
+    require_table(connection, "pre_submit_reviews")
+    reviews = connection.execute(
+        "SELECT COUNT(*) FROM pre_submit_reviews WHERE status='invalidated' "
+        "AND invalidation_reason='candidate_snapshot_changed' AND invalidated_at=?",
+        (timestamp,)).fetchone()[0]
+    resolvable = sorted(
+        canonical_id for canonical_id in PROFILE_V1
+        if resolve_canonical_fact(connection, canonical_id, content_sha256)[0] is not None)
+    return {
+        "material_locks_invalidated": len(locks),
+        "resume_versions_needing_rebinding": sorted({row["resume_version_id"] for row in locks}),
+        "applications_affected": sorted({row["application_id"] for row in locks}),
+        "answers_stale_total": stale,
+        "pre_submit_reviews_invalidated": reviews,
+        "meanings_now_resolvable": resolvable,
+    }
+
+
+def status(connection: sqlite3.Connection) -> dict[str, Any]:
+    """Which meanings the active snapshot can already fill from, and which it cannot.
+
+    Names meanings and reason codes. A value never reaches this report.
+    """
+    require_table(connection, "candidate_snapshots")
+    active = connection.execute(
+        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active'").fetchone()
+    if not active:
+        return {"active_snapshot": None, "resolvable": [], "unresolved": {}}
+    resolvable, unresolved = [], {}
+    for canonical_id in sorted(PROFILE_V1):
+        fact, reason = resolve_canonical_fact(connection, canonical_id,
+                                              active["content_sha256"], now_utc())
+        if fact is not None:
+            resolvable.append(canonical_id)
+        else:
+            unresolved[canonical_id] = reason
+    return {"active_snapshot": active["content_sha256"],
+            "round": sorted(PROFILE_ROUNDS["required-v1"]),
+            "resolvable": resolvable, "unresolved": unresolved}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", required=True, type=Path)
+    parser.add_argument("--private-root", type=Path,
+                        help="where worksheets and drafts are written; defaults beside the db")
+    parser.add_argument("--store", type=Path, help="candidate snapshot store")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("init")
+    propose = commands.add_parser("propose-profile")
+    propose.add_argument("--round", required=True, dest="round_name")
+    propose.add_argument("--out", required=True, type=Path)
+    confirm = commands.add_parser("confirm-profile")
+    confirm.add_argument("--worksheet", required=True, type=Path)
+    register = commands.add_parser("register-profile")
+    register.add_argument("--draft-sha256", required=True)
+    register.add_argument("--actor", required=True)
+    commands.add_parser("status")
+    args = parser.parse_args()
+
+    private_root = args.private_root or args.db.parent
+    store = args.store or args.db.parent / "candidates"
+    connection = connect(args.db)
+    if args.command == "init":
+        initialize(connection)
+        result = {"status": "initialized", "private_root": str(private_root)}
+    elif args.command == "propose-profile":
+        result = propose_profile(
+            connection, args.round_name,
+            sink=lambda sheet: write_private_document(args.out, private_root, sheet),
+        )["summary"]
+        result["worksheet"] = str(args.out)
+    elif args.command == "confirm-profile":
+        worksheet = json.loads(args.worksheet.read_text(encoding="utf-8"))
+        result = confirm_profile(connection, worksheet, private_root)
+    elif args.command == "register-profile":
+        result = register_profile(connection, args.draft_sha256, store, args.actor)
+    else:
+        result = status(connection)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

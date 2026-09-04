@@ -479,7 +479,7 @@ class WorksheetFileTests(unittest.TestCase):
         self.sheet = {"proposal_id": "p", "entries": []}
 
     def write(self, path):
-        ANSWERS.write_private_worksheet(path, self.private, self.sheet)
+        ANSWERS.write_private_document(path, self.private, self.sheet)
 
     def test_a_worksheet_is_created_unreadable_rather_than_narrowed_afterwards(self):
         path = self.private / "worksheet.json"
@@ -800,7 +800,7 @@ class ProposalCommitFailureTests(IntakeLoopTests):
             with self.assertRaisesRegex(RuntimeError, "at commit"):
                 ANSWERS.propose_answers(
                     wrapped, PLAN, "contact", AT,
-                    sink=lambda sheet: ANSWERS.write_private_worksheet(
+                    sink=lambda sheet: ANSWERS.write_private_document(
                         path, private, sheet))
             # No proposal, no audit row, and no worksheet left looking usable.
             self.assertFalse(path.exists(), "the worksheet outlived its proposal")
@@ -817,7 +817,7 @@ class ProposalCommitFailureTests(IntakeLoopTests):
             bystander = private / "someone-elses.json"
             bystander.write_text("{}", encoding="utf-8")
             path = private / "worksheet.json"
-            undo = ANSWERS.write_private_worksheet(path, private, {"a": 1})
+            undo = ANSWERS.write_private_document(path, private, {"a": 1})
             self.assertTrue(path.exists())
             undo()
             self.assertFalse(path.exists())
