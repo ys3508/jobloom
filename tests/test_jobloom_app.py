@@ -462,6 +462,22 @@ class MigrationSurfaceTests(AppFixture):
             self.refused("/api/resume-file?version_id=nothing-like-it")[1]["error"],
             "version_not_under_review")
 
+    def test_the_successor_is_filed_with_the_resumes_not_with_the_profiles(self):
+        """Two stores, and the carry writes to the resume one.
+
+        The window was handed a single store, and the one it was handed is the candidate
+        snapshot store, so a carried resume landed inside the profile store — working, and
+        in a directory nothing else looks in for a resume.
+        """
+        prepared = self.prepared()
+        connection = sqlite3.connect(str(self.db_path))
+        stored = Path(connection.execute(
+            "SELECT snapshot_path FROM resume_versions WHERE version_id=?",
+            (prepared["successor_version_id"],)).fetchone()[0])
+        connection.close()
+        self.assertEqual(stored.parent.parent, (self.root / "resumes").resolve())
+        self.assertNotIn(self.store.resolve(), stored.parents)
+
     def test_the_document_must_still_be_the_file_that_was_registered(self):
         prepared = self.prepared()
         connection = sqlite3.connect(str(self.db_path))

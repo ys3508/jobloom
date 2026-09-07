@@ -297,6 +297,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path: Path
     private_root: Path
     store: Path
+    resume_store: Path
     origin = ""
 
     def log_message(self, *args: Any) -> None:  # noqa: D102 - a request log is a value log
@@ -417,7 +418,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(lambda connection: register(connection, self.private_root, self.store,
                                                   payload))
         elif path == "/api/resume-migrations/prepare":
-            self._run(lambda connection: prepare_migration(connection, self.store, payload))
+            self._run(lambda connection: prepare_migration(connection, self.resume_store,
+                                                           payload))
         elif path == "/api/resume-migrations/approve":
             self._run(lambda connection: approve_migration(connection, payload))
         elif path == "/api/resume-migrations/bind":
@@ -468,7 +470,7 @@ def _open_window(url: str) -> str:
 
 
 def serve(db_path: Path, private_root: Path, store: Path, port: int = 0,
-          open_browser: bool = True) -> ThreadingHTTPServer:
+          open_browser: bool = True, resume_store: Path | None = None) -> ThreadingHTTPServer:
     connection = candidate_profile.connect(db_path)
     # Every component the window can reach, not only the first one it needs. Initialising
     # lazily meant the screen after registering was the first thing to touch
@@ -481,6 +483,11 @@ def serve(db_path: Path, private_root: Path, store: Path, port: int = 0,
     Handler.db_path = Path(db_path)
     Handler.private_root = Path(private_root)
     Handler.store = Path(store)
+    # Two stores, because they hold two different things. `store` is the candidate snapshot
+    # store, where `register` writes a profile; a resume successor belongs with the other
+    # resumes. One path serving both would file resume PDFs inside the profile store, where
+    # nothing else expects to find them.
+    Handler.resume_store = Path(resume_store) if resume_store else Path(db_path).parent / "resumes"
     server = ThreadingHTTPServer((LOOPBACK, port), Handler)
     Handler.origin = f"http://{LOOPBACK}:{server.server_port}"
     url = f"{Handler.origin}/?token={Handler.token}"
@@ -498,12 +505,14 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=Path(".jobloom/jobloom.db"))
     parser.add_argument("--private-root", type=Path)
     parser.add_argument("--store", type=Path)
+    parser.add_argument("--resume-store", type=Path)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     private_root = args.private_root or args.db.parent
     store = args.store or args.db.parent / "candidates"
-    server = serve(args.db, private_root, store, args.port, not args.no_browser)
+    server = serve(args.db, private_root, store, args.port, not args.no_browser,
+                   resume_store=args.resume_store)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
