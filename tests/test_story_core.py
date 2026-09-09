@@ -387,3 +387,175 @@ class AccountingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MappingFixture(StoryFixture):
+    """Two approved stories with different capabilities, to have something to choose between."""
+
+    SECOND_ACTION = "I wrote the SAS analysis plan."
+    SECOND_RESULT = "It cut the reporting cycle."
+
+    def second_story(self, primary="cap.statistical-programming", secondary=(),
+                     evidence_class="direct", confidentiality="reusable", **kwargs):
+        content = {
+            "title": "Analysis plan",
+            "star": {"situation": "The team had no plan.", "task": "I owned it.",
+                     "action": self.SECOND_ACTION, "result": self.SECOND_RESULT},
+            "primary_capability": primary,
+            "secondary_capabilities": list(secondary),
+            "domains": ["cap.domain.statistical-analytics"],
+            "framing_spans": ["The team had no plan.", "I owned it.", self.SECOND_RESULT],
+            "claims": [{"claim_id": "d1", "text": self.SECOND_ACTION,
+                        "evidence_refs": ["@focus"], "evidence_class": evidence_class}],
+        }
+        drafted = STORIES.draft_version(self.db, self.bind(content),
+                                        confidentiality=confidentiality, at=AT, **kwargs)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"],
+                                "user", AT)
+        return drafted
+
+
+class StoryMappingTests(MappingFixture):
+
+    def test_the_capability_a_story_is_about_is_a_strong_fit(self):
+        drafted = self.approved()
+        mapped = STORIES.map_stories(self.db, ["cap.survey-design"])
+        self.assertEqual(mapped["cap.survey-design"]["fit"], "strong")
+        self.assertEqual(mapped["cap.survey-design"]["stories"][0]["version_id"],
+                         drafted["version_id"])
+        self.assertEqual(mapped["cap.survey-design"]["stories"][0]["why"], "primary_capability")
+
+    def test_a_secondary_capability_is_workable_not_strong(self):
+        self.approved(secondary_capabilities=["cap.stakeholder-reporting"])
+        mapped = STORIES.map_stories(self.db, ["cap.stakeholder-reporting"])
+        self.assertEqual(mapped["cap.stakeholder-reporting"]["fit"], "workable")
+
+    def test_a_competency_no_story_covers_is_a_gap_not_the_nearest_thing(self):
+        self.approved()
+        mapped = STORIES.map_stories(self.db, ["cap.clinical-study-operations"])
+        self.assertEqual(mapped["cap.clinical-study-operations"]["fit"], "gap")
+        self.assertEqual(mapped["cap.clinical-study-operations"]["stories"], [])
+
+    def test_transferable_evidence_stays_a_transferable_fit(self):
+        """T2 at retrieval: the band is named after the evidence, not rounded up to it."""
+        self.snapshot = self.register(self.facts(sales_strength="transferable"))
+        content = story_content()
+        content["claims"][0]["evidence_class"] = "transferable"
+        content["claims"][1]["evidence_class"] = "transferable"
+        drafted = STORIES.draft_version(self.db, self.bind(content), at=AT)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"])
+        mapped = STORIES.map_stories(self.db, ["cap.survey-design"])
+        self.assertEqual(mapped["cap.survey-design"]["fit"], "transferable")
+        self.assertEqual(mapped["cap.survey-design"]["stories"][0]["evidence_class"],
+                         "transferable")
+
+    def test_a_reviewed_mapping_is_what_reaches_beyond_the_capabilities(self):
+        drafted = self.approved()
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]["fit"],
+            "gap")
+        STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
+                               "answers_with_limitation",
+                               "the design was qualitative only", "user", AT)
+        mapped = STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]
+        self.assertEqual(mapped["fit"], "workable")
+        self.assertEqual(mapped["stories"][0]["why"], "reviewed_mapping")
+        self.assertEqual(mapped["stories"][0]["limitation"], "the design was qualitative only")
+
+    def test_a_limitation_mapping_must_say_what_the_limitation_is(self):
+        drafted = self.approved()
+        with self.assertRaises(ValueError):
+            STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
+                                   "answers_with_limitation", "  ", "user", AT)
+
+    def test_a_mapping_names_a_reviewed_capability(self):
+        drafted = self.approved()
+        with self.assertRaises(ValueError):
+            STORIES.record_mapping(self.db, drafted["version_id"], "cap.made-up", "answers",
+                                   None, "user", AT)
+
+
+class RetrievalGateTests(MappingFixture):
+
+    def test_an_unapproved_story_is_never_retrieved(self):
+        self.drafted()
+        self.assertEqual(STORIES.map_stories(self.db, ["cap.survey-design"])
+                         ["cap.survey-design"]["fit"], "gap")
+
+    def test_a_story_stranded_by_a_profile_change_is_never_retrieved(self):
+        self.approved()
+        self.register(self.facts(), "Renamed Candidate")
+        self.assertEqual(STORIES.map_stories(self.db, ["cap.survey-design"])
+                         ["cap.survey-design"]["fit"], "gap")
+
+    def test_an_employer_confidential_story_never_surfaces_for_another_employer(self):
+        """T3."""
+        self.second_story(confidentiality="employer_confidential",
+                          confidential_employer="Employer A")
+        asked = ["cap.statistical-programming"]
+        self.assertEqual(STORIES.map_stories(self.db, asked, employer="Employer A")
+                         ["cap.statistical-programming"]["fit"], "strong")
+        for employer in ("Employer B", None):
+            self.assertEqual(STORIES.map_stories(self.db, asked, employer=employer)
+                             ["cap.statistical-programming"]["fit"], "gap")
+
+    def test_an_application_confidential_story_requires_that_exact_application(self):
+        """T3."""
+        self.second_story(confidentiality="application_confidential",
+                          confidential_application_id="app-1")
+        asked = ["cap.statistical-programming"]
+        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-1")
+                         ["cap.statistical-programming"]["fit"], "strong")
+        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-2")
+                         ["cap.statistical-programming"]["fit"], "gap")
+
+
+class AdvisoryRankingTests(MappingFixture):
+    """A model may reorder what the deterministic layer returned. That is all it may do."""
+
+    def advisory(self, version_id, score):
+        return [{"version_id": version_id, "score": score, "confidence": 0.4,
+                 "provenance": {"source": "model", "model": "test-model",
+                                "at": AT.isoformat()}}]
+
+    def test_an_advisory_signal_cannot_promote_a_gap(self):
+        self.approved()
+        mapped = STORIES.map_stories(self.db, ["cap.clinical-study-operations"],
+                                     advisory=self.advisory("SV-anything", 99.0))
+        self.assertEqual(mapped["cap.clinical-study-operations"]["fit"], "gap")
+
+    def test_an_advisory_signal_cannot_change_a_fit_or_a_class(self):
+        first = self.approved()
+        self.snapshot = self.snapshot  # unchanged; the second story shares the profile
+        second = self.second_story(secondary=["cap.survey-design"])
+        plain = STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]
+        boosted = STORIES.map_stories(
+            self.db, ["cap.survey-design"],
+            advisory=self.advisory(second["version_id"], 99.0))["cap.survey-design"]
+        self.assertEqual([row["version_id"] for row in plain["stories"]],
+                         [first["version_id"], second["version_id"]])
+        # The boosted story is workable and stays below the strong one however high it scores.
+        self.assertEqual([(row["version_id"], row["fit"]) for row in boosted["stories"]],
+                         [(first["version_id"], "strong"), (second["version_id"], "workable")])
+
+    def test_an_advisory_signal_orders_within_a_band(self):
+        first = self.approved()
+        second = self.second_story(primary="cap.survey-design")
+        default = STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]
+        self.assertEqual({row["fit"] for row in default["stories"]}, {"strong"})
+        boosted = STORIES.map_stories(
+            self.db, ["cap.survey-design"],
+            advisory=self.advisory(second["version_id"], 5.0))["cap.survey-design"]
+        self.assertEqual(boosted["stories"][0]["version_id"], second["version_id"])
+        self.assertEqual({row["version_id"] for row in boosted["stories"]},
+                         {first["version_id"], second["version_id"]})
+
+    def test_an_advisory_signal_without_provenance_is_refused(self):
+        self.approved()
+        for broken in ({"version_id": "SV-1", "score": 1.0},
+                       {"version_id": "SV-1", "score": 1.0,
+                        "provenance": {"source": "model", "model": "m"}},
+                       {"version_id": "SV-1",
+                        "provenance": {"source": "model", "model": "m", "at": "now"}}):
+            with self.assertRaises(ValueError):
+                STORIES.map_stories(self.db, ["cap.survey-design"], advisory=[broken])

@@ -2,11 +2,11 @@
 
 Spec: [`docs/jobloom-story-bank-spec.md`](../../../docs/jobloom-story-bank-spec.md).
 
-**What exists today is build-order step 1 of that spec**: the registry, claim binding,
-approval, revocation, and snapshot carry. `story map`, `answer draft`, `story find-gaps`,
-retrieval drills, and interview usage reporting are **not implemented**. Nothing here can
-answer an employer's question yet; a Story reaches an application only through the
-AnswerLibrary, and that path is step 3.
+**What exists today is build-order steps 1–2 of that spec**: the registry, claim binding,
+approval, revocation, snapshot carry, reviewed competency mappings, and `story map`.
+`answer draft`, `story find-gaps`, retrieval drills, and interview usage reporting are
+**not implemented**. Nothing here can answer an employer's question yet; a Story reaches an
+application only through the AnswerLibrary, and that path is step 3.
 
 ## What a Story is
 
@@ -93,8 +93,45 @@ thresholds are presentation policy for a later step, not evidence truth.
 `reusable` | `employer_confidential` | `application_confidential`, declared when the story is
 first drafted, and a confidential story must name what it is confidential to. `selectable()`
 returns the confidentiality alongside its answer so a caller cannot read one without the
-other. **Enforcement at retrieval belongs to step 2** and does not exist yet; today this is
-recorded and surfaced, not applied.
+other, and `map_stories()` enforces it as a hard AND restriction: `employer_confidential:A`
+never surfaces for employer B, and — because absent context does not open a restriction — it
+does not surface when no employer was named either. `application_confidential` requires the
+exact application id.
+
+## Mapping a story to a competency
+
+`map_stories(competencies, employer=, application_id=, advisory=)` is read-only and produces
+nothing submittable. It runs in two layers, and the separation is the point.
+
+**The deterministic layer** decides whether a version may be used at all and on what
+evidence. A version must pass `selectable()` and the confidentiality gate; then its
+*evidence ceiling* — the strongest class among its claims, the one it would actually cite —
+places it:
+
+| Fit | When |
+|---|---|
+| `strong` | the competency is the version's `primary_capability`, on `direct` or `strongly_related` evidence |
+| `workable` | the competency is a `secondary_capability` on covering evidence, or a reviewed mapping says the version answers it |
+| `transferable` | the same coverage, but resting on evidence classed `transferable` |
+| `gap` | no story at any fit level |
+
+`mention_only` is deliberately not coverage. `transferable` is the weakest band the spec
+names, and a fact the profile merely mentions is not something to answer a question out of.
+
+A competency nothing covers comes back as `gap`, never as the nearest thing — the nearest
+thing is how a bridging claim gets invented.
+
+`record_mapping(version_id, competency, relation, limitation)` stores a reviewed mapping
+rather than inferring one per use, so what a story is retrievable under is something a person
+decided once and can be shown. `answers_with_limitation` must say what the limitation is, and
+the limitation travels with the retrieval result.
+
+**The advisory layer** may reorder what the deterministic layer returned, and may do nothing
+else. An advisory signal must carry `provenance` (`source: model`, the model, a timestamp)
+and a score, or it is refused. It sorts only after fit and evidence class have tied, so a
+model's opinion cannot lift a `workable` story above a `strong` one, cannot add or remove a
+story, and cannot change a class. Without any advisory input the order is still total: fit,
+evidence class, least-used, version id.
 
 ## What is deliberately not here
 

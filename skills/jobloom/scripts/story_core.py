@@ -163,6 +163,17 @@ def initialize(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (version_id) REFERENCES story_versions(version_id)
         );
 
+        CREATE TABLE IF NOT EXISTS story_competency_mappings (
+            version_id TEXT NOT NULL,
+            competency TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            limitation TEXT,
+            reviewed_by TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL,
+            PRIMARY KEY (version_id, competency),
+            FOREIGN KEY (version_id) REFERENCES story_versions(version_id)
+        );
+
         CREATE TABLE IF NOT EXISTS story_usage_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             story_version_id TEXT NOT NULL,
@@ -677,6 +688,182 @@ def prepare_successor(connection: sqlite3.Connection, version_id: str,
 
 
 # ---- usage --------------------------------------------------------------------------
+
+
+# ---- mapping a story to the competency a question tests -----------------------------
+#
+# Two layers, and the separation is the point. The first answers whether a version may be
+# used at all and what evidence class supports it; it is arithmetic over approved rows. The
+# second may reorder what the first returned. Nothing in the second can add a story, remove
+# one, or change a class — a ranking signal that could do any of those would be an evidence
+# decision wearing a ranking signal's clothes.
+
+ANSWERS = "answers"
+ANSWERS_WITH_LIMITATION = "answers_with_limitation"
+RELATIONS = (ANSWERS, ANSWERS_WITH_LIMITATION)
+
+STRONG = "strong"
+WORKABLE = "workable"
+TRANSFERABLE = "transferable"
+GAP = "gap"
+FIT_ORDER = {STRONG: 3, WORKABLE: 2, TRANSFERABLE: 1}
+
+# What counts as covering a competency at all. `mention_only` is deliberately absent: the
+# spec names transferable as the weakest coverage there is, and a fact the profile merely
+# mentions is not something to answer an interview question out of.
+COVERING = {"direct", "strongly_related"}
+
+
+def record_mapping(connection: sqlite3.Connection, version_id: str, competency: str,
+                   relation: str = ANSWERS, limitation: str | None = None,
+                   actor: str = "user", at: datetime | None = None) -> dict[str, Any]:
+    """Record that a reviewed version answers a competency its capabilities do not name.
+
+    Stored rather than inferred on each use, so what a story is retrieved under is something
+    a person decided once and can be shown, not something recomputed differently next time.
+    """
+    require_table(connection, "story_competency_mappings")
+    if relation not in RELATIONS:
+        raise ValueError("invalid mapping relation")
+    if relation == ANSWERS_WITH_LIMITATION and not (limitation or "").strip():
+        raise ValueError("a limitation must say what the limitation is")
+    if _capability_layer(competency) != "SKILL":
+        raise ValueError(f"{competency} is not a reviewed SKILL capability")
+    version = connection.execute(
+        "SELECT story_id FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not version:
+        raise ValueError("story version not found")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "INSERT OR REPLACE INTO story_competency_mappings (version_id, competency, relation, "
+        "limitation, reviewed_by, reviewed_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (version_id, competency, relation, limitation, actor, timestamp))
+    _event(connection, version["story_id"], version_id, actor, "story_mapping_recorded",
+           relation, {"competency": competency}, at)
+    connection.commit()
+    return {"version_id": version_id, "competency": competency, "relation": relation,
+            "limitation": limitation, "reviewed_by": actor, "reviewed_at": timestamp}
+
+
+def _evidence_ceiling(classes: dict[str, str]) -> str | None:
+    """The strongest class the version can bring to bear, which is what it would cite."""
+    if not classes:
+        return None
+    return max(classes.values(), key=lambda name: EVIDENCE_ORDER[name])
+
+
+def _confidentiality_allows(check: dict[str, Any], employer: str | None,
+                            application_id: str | None) -> bool:
+    """A hard AND restriction, not a retrieval hint. Absent context does not open it."""
+    kind = check["confidentiality"]
+    if kind == "employer_confidential":
+        return bool(employer) and employer == check["confidential_employer"]
+    if kind == "application_confidential":
+        return bool(application_id) and application_id == check["confidential_application_id"]
+    return True
+
+
+def _fit(connection: sqlite3.Connection, version: sqlite3.Row, competency: str,
+         ceiling: str | None) -> dict[str, Any] | None:
+    if ceiling is None:
+        return None
+    covering = ceiling in COVERING
+    if version["primary_capability"] == competency:
+        if covering:
+            return {"fit": STRONG, "why": "primary_capability"}
+        if ceiling == TRANSFERABLE:
+            return {"fit": TRANSFERABLE, "why": "primary_capability"}
+        return None
+    if competency in json.loads(version["secondary_capabilities_json"]):
+        if covering:
+            return {"fit": WORKABLE, "why": "secondary_capability"}
+        if ceiling == TRANSFERABLE:
+            return {"fit": TRANSFERABLE, "why": "secondary_capability"}
+        return None
+    mapping = connection.execute(
+        "SELECT * FROM story_competency_mappings WHERE version_id=? AND competency=?",
+        (version["version_id"], competency)).fetchone()
+    if mapping:
+        if ceiling == TRANSFERABLE:
+            return {"fit": TRANSFERABLE, "why": "reviewed_mapping",
+                    "limitation": mapping["limitation"]}
+        if covering:
+            return {"fit": WORKABLE, "why": "reviewed_mapping",
+                    "limitation": mapping["limitation"]}
+    return None
+
+
+def _validate_advisory(advisory: Any) -> dict[str, dict[str, Any]]:
+    """Advisory ranking is allowed to be a model's opinion. It has to say that it is."""
+    if not advisory:
+        return {}
+    ranked: dict[str, dict[str, Any]] = {}
+    for entry in advisory:
+        version_id = entry.get("version_id")
+        provenance = entry.get("provenance") or {}
+        if not isinstance(version_id, str) or not version_id:
+            raise ValueError("an advisory signal must name the version it ranks")
+        if provenance.get("source") != "model" or not provenance.get("model") \
+                or not provenance.get("at"):
+            raise ValueError("an advisory signal must carry model provenance and a timestamp")
+        if not isinstance(entry.get("score"), (int, float)):
+            raise ValueError("an advisory signal must carry a score")
+        ranked[version_id] = {"score": float(entry["score"]),
+                              "confidence": entry.get("confidence"),
+                              "provenance": provenance}
+    return ranked
+
+
+def map_stories(connection: sqlite3.Connection, competencies: list[str], *,
+                employer: str | None = None, application_id: str | None = None,
+                advisory: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Which approved stories can answer each competency, and on what evidence.
+
+    Read-only, and it produces nothing submittable. A competency no story covers comes back
+    as a gap rather than as the nearest thing, because the nearest thing is how a bridging
+    claim gets invented.
+    """
+    require_table(connection, "story_versions")
+    ranked = _validate_advisory(advisory)
+    usage_counts = {row["story_id"]: row["uses"] for row in connection.execute(
+        "SELECT v.story_id AS story_id, COUNT(*) AS uses FROM story_usage_events e "
+        "JOIN story_versions v ON v.version_id = e.story_version_id GROUP BY v.story_id")}
+    current = connection.execute(
+        "SELECT v.* FROM stories s JOIN story_versions v ON v.version_id = s.current_version_id "
+        "WHERE s.status=? ORDER BY v.version_id", (APPROVED,)).fetchall()
+
+    eligible: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+    for version in current:
+        check = selectable(connection, version["version_id"])
+        if not check["selectable"]:
+            continue
+        if not _confidentiality_allows(check, employer, application_id):
+            continue
+        eligible.append((version, check))
+
+    result: dict[str, Any] = {}
+    for competency in competencies:
+        rows = []
+        for version, check in eligible:
+            ceiling = _evidence_ceiling(check["evidence_classes"])
+            fit = _fit(connection, version, competency, ceiling)
+            if not fit:
+                continue
+            entry = {"story_id": version["story_id"], "version_id": version["version_id"],
+                     "title": version["title"], "evidence_class": ceiling,
+                     "use_count": usage_counts.get(version["story_id"], 0), **fit}
+            if version["version_id"] in ranked:
+                entry["advisory"] = ranked[version["version_id"]]
+            rows.append(entry)
+        rows.sort(key=lambda row: (
+            -FIT_ORDER[row["fit"]],
+            -EVIDENCE_ORDER[row["evidence_class"]],
+            # Only after the deterministic keys tie: a model's opinion, then least-used, then
+            # the id, so the order is stable with or without an opinion being offered.
+            -(row.get("advisory") or {}).get("score", 0.0),
+            row["use_count"], row["version_id"]))
+        result[competency] = {"fit": rows[0]["fit"] if rows else GAP, "stories": rows}
+    return result
 
 
 def record_use(connection: sqlite3.Connection, version_id: str, question_type: str, *,
