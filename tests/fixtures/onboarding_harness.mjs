@@ -24,6 +24,21 @@ const script = source.slice(source.indexOf("<script>") + "<script>".length,
 
 const requests = [];
 
+// Seeded by the caller to stand for a tab that has already loaded the page once, and read
+// back afterwards to show what the page left behind for its own reload. `throws` is the
+// browser that refuses site data, where the accessor itself raises.
+const session = new Map(Object.entries(plan.session || {}));
+const sessionStorage = {
+  getItem(key) {
+    if (plan.sessionThrows) throw new Error("site data blocked");
+    return session.has(key) ? session.get(key) : null;
+  },
+  setItem(key, value) {
+    if (plan.sessionThrows) throw new Error("site data blocked");
+    session.set(key, String(value));
+  },
+};
+
 class Node {
   constructor(tag) {
     this.tag = tag;
@@ -62,7 +77,8 @@ const document = {
 };
 
 async function fetchStub(path, options) {
-  requests.push({ path, method: options?.method || "GET" });
+  requests.push({ path, method: options?.method || "GET",
+                  token: options?.headers?.["X-Jobloom-Token"] });
   const canned = plan.responses?.[path];
   if (canned === undefined) {
     return { ok: false, json: async () => ({ error: "no_canned_response", detail: path }) };
@@ -73,7 +89,9 @@ async function fetchStub(path, options) {
 const context = vm.createContext({
   document,
   fetch: fetchStub,
-  location: { search: "?token=harness", pathname: "/" },
+  location: { search: plan.urlToken === null ? "" : `?token=${plan.urlToken || "harness"}`,
+              pathname: "/" },
+  sessionStorage,
   history: { replaceState() {} },
   navigator: { language: plan.language || "en" },
   URLSearchParams,
@@ -89,6 +107,8 @@ await new Promise((resolve) => setTimeout(resolve, 50));
 const screen = document.getElementById("screen");
 process.stdout.write(JSON.stringify({
   requests,
+  token: vm.runInContext("TOKEN", context),
+  session: Object.fromEntries(session),
   screen: vm.runInContext("app.screen", context),
   entry: vm.runInContext("app.entry", context),
   stranded: vm.runInContext("app.stranded.length", context),

@@ -44,13 +44,14 @@ def state(has_profile=True, answered=False):
             "unresolved": {}, "open_round": None if answered else "onboarding-v1"}
 
 
-def open_window(profile_state, stranded):
+def open_window(profile_state, stranded, **how):
     if not shutil.which("node"):
         raise unittest.SkipTest("node is required to run the onboarding page harness")
     plan = {"responses": {"/api/state": profile_state,
                           "/api/resume-migrations": {"stranded": stranded,
                                                      "carryable": len(stranded)},
                           "/api/round": ROUND}}
+    plan.update(how)
     finished = subprocess.run(["node", str(HARNESS), json.dumps(plan)],
                               capture_output=True, text=True, cwd=str(ROOT), timeout=60)
     if finished.returncode != 0:
@@ -88,6 +89,43 @@ class OnboardingNavigationTests(unittest.TestCase):
         self.assertEqual(opened["screen"], "welcome")
         self.assertEqual([r["path"] for r in opened["requests"]],
                          ["/api/state", "/api/round"])
+
+
+class TokenAcrossAReloadTests(unittest.TestCase):
+    """Reloading the window is ordinary, and it used to end the session.
+
+    The token arrives in the URL and is taken straight out of the address bar, so a reload
+    had nothing to send and the page answered `bad_token`. The only way back in was to paste
+    the full URL again — which puts the token in the address bar and the history, the one
+    thing removing it was for. So the recovery defeated the measure it was recovering from.
+    """
+
+    def test_the_first_load_keeps_the_token_for_this_tab(self):
+        opened = open_window(state(answered=True), [])
+        self.assertEqual(opened["token"], "harness")
+        self.assertEqual(opened["session"], {"jobloom-token": "harness"})
+
+    def test_a_reload_with_no_token_in_the_address_still_works(self):
+        opened = open_window(state(answered=True), [], urlToken=None,
+                             session={"jobloom-token": "harness"})
+        self.assertEqual(opened["token"], "harness")
+        # What matters is not the variable but that the requests carry it.
+        self.assertTrue(opened["requests"])
+        for request in opened["requests"]:
+            self.assertEqual(request["token"], "harness")
+
+    def test_a_url_token_wins_over_a_remembered_one(self):
+        """Restarting the service issues a new token; the stale one must not shadow it."""
+        opened = open_window(state(answered=True), [], urlToken="fresh",
+                             session={"jobloom-token": "stale"})
+        self.assertEqual(opened["token"], "fresh")
+        self.assertEqual(opened["session"], {"jobloom-token": "fresh"})
+
+    def test_a_browser_that_refuses_site_data_still_opens(self):
+        """The accessor throws there rather than returning nothing, and the URL still has it."""
+        opened = open_window(state(answered=True), [], sessionThrows=True)
+        self.assertEqual(opened["token"], "harness")
+        self.assertEqual(opened["screen"], "migrations")
 
 
 if __name__ == "__main__":

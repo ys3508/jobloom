@@ -106,9 +106,33 @@
 <script>
 "use strict";
 
-const TOKEN = new URLSearchParams(location.search).get("token") || "";
 // The token is in the URL this process opened. Removing it from the address keeps it out of
 // the window's history and out of anything the user might copy and paste to somebody.
+//
+// It is kept for this tab first, because reloading is an ordinary thing to do and there was
+// nothing to reload with: the page came back `bad_token`, and the only way on was to paste
+// the full URL into the address bar again — putting the token exactly where removing it was
+// meant to keep it from. `sessionStorage` is this tab and no other: it is not shared with a
+// second tab, it does not survive the window closing, and it never enters history. Both
+// accesses are guarded because a browser told to block site data throws here rather than
+// returning nothing, and a window that cannot remember the token must still work with the
+// one in the URL.
+const urlToken = new URLSearchParams(location.search).get("token") || "";
+const remembered = (() => {
+  try {
+    return sessionStorage.getItem("jobloom-token") || "";
+  } catch (error) {
+    return "";
+  }
+})();
+if (urlToken) {
+  try {
+    sessionStorage.setItem("jobloom-token", urlToken);
+  } catch (error) {
+    // Nothing to do about it. The URL's token still serves this load; only reload is lost.
+  }
+}
+const TOKEN = urlToken || remembered;
 history.replaceState(null, "", location.pathname);
 
 const COPY = {
