@@ -28,6 +28,7 @@ def load_script(name):
 
 
 STORIES = load_script("story_core")
+APPLICATION_CORE = load_script("application_core")
 CANDIDATES = load_script("candidate_core")
 RESUMES = load_script("resume_core")
 EVIDENCE = load_script("evidence_units")
@@ -50,7 +51,8 @@ def story_content(**overrides):
     content = {
         "title": "INNSCI focus groups",
         "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
-        "primary_capability": "cap.survey-design",
+        "primary_capability": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c1", "c2"]},
         "secondary_capabilities": [],
         "domains": ["cap.domain.pharma-insights"],
         "earned_secret": FRAMING,
@@ -112,6 +114,27 @@ class StoryFixture(unittest.TestCase):
         path.write_text(json.dumps(candidate), encoding="utf-8")
         CANDIDATES.register_snapshot(self.db, self.store, path, "user", AT)
         return candidate["content_sha256"]
+
+    def an_application(self, application_id, employer):
+        """A real application row, because that is the only thing identity is read from."""
+        job_id = f"job-{application_id}"
+        self.db.execute(
+            "INSERT INTO jobs (job_id, canonical_url, original_url, employer, title, "
+            "location, normalized_employer, normalized_title, normalized_location, "
+            "description_sha256, job_card_json, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'Analyst', 'Boston', ?, 'analyst', 'boston', 'x', '{}', "
+            "'open', ?, ?)",
+            (job_id, f"https://example.invalid/{job_id}", f"https://example.invalid/{job_id}",
+             employer, APPLICATION_CORE.normalize_text(employer), AT.isoformat(),
+             AT.isoformat()))
+        self.db.execute(
+            "INSERT INTO applications (application_id, job_id, state, category, "
+            "submission_policy, attempts, max_attempts, pre_submit_check_passed, created_at, "
+            "updated_at) VALUES (?, ?, 'ready_to_fill', 'review', 'stop_before_submit', 0, 3, "
+            "0, ?, ?)",
+            (application_id, job_id, AT.isoformat(), AT.isoformat()))
+        self.db.commit()
+        return application_id
 
     def refs(self, snapshot=None):
         snapshot = snapshot or self.snapshot
@@ -401,8 +424,9 @@ class MappingFixture(StoryFixture):
             "title": "Analysis plan",
             "star": {"situation": "The team had no plan.", "task": "I owned it.",
                      "action": self.SECOND_ACTION, "result": self.SECOND_RESULT},
-            "primary_capability": primary,
-            "secondary_capabilities": list(secondary),
+            "primary_capability": {"capability_id": primary, "claim_ids": ["d1"]},
+            "secondary_capabilities": [{"capability_id": item, "claim_ids": ["d1"]}
+                                       for item in secondary],
             "domains": ["cap.domain.statistical-analytics"],
             "framing_spans": ["The team had no plan.", "I owned it.", self.SECOND_RESULT],
             "claims": [{"claim_id": "d1", "text": self.SECOND_ACTION,
@@ -426,7 +450,8 @@ class StoryMappingTests(MappingFixture):
         self.assertEqual(mapped["cap.survey-design"]["stories"][0]["why"], "primary_capability")
 
     def test_a_secondary_capability_is_workable_not_strong(self):
-        self.approved(secondary_capabilities=["cap.stakeholder-reporting"])
+        self.approved(secondary_capabilities=[
+            {"capability_id": "cap.stakeholder-reporting", "claim_ids": ["c1"]}])
         mapped = STORIES.map_stories(self.db, ["cap.stakeholder-reporting"])
         self.assertEqual(mapped["cap.stakeholder-reporting"]["fit"], "workable")
 
@@ -455,7 +480,7 @@ class StoryMappingTests(MappingFixture):
             STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]["fit"],
             "gap")
         STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
-                               "answers_with_limitation",
+                               ["c1"], "answers_with_limitation",
                                "the design was qualitative only", "user", AT)
         mapped = STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]
         self.assertEqual(mapped["fit"], "workable")
@@ -466,13 +491,13 @@ class StoryMappingTests(MappingFixture):
         drafted = self.approved()
         with self.assertRaises(ValueError):
             STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
-                                   "answers_with_limitation", "  ", "user", AT)
+                                   ["c1"], "answers_with_limitation", "  ", "user", AT)
 
     def test_a_mapping_names_a_reviewed_capability(self):
         drafted = self.approved()
         with self.assertRaises(ValueError):
-            STORIES.record_mapping(self.db, drafted["version_id"], "cap.made-up", "answers",
-                                   None, "user", AT)
+            STORIES.record_mapping(self.db, drafted["version_id"], "cap.made-up", ["c1"],
+                                   "answers", None, "user", AT)
 
 
 class RetrievalGateTests(MappingFixture):
@@ -489,24 +514,55 @@ class RetrievalGateTests(MappingFixture):
                          ["cap.survey-design"]["fit"], "gap")
 
     def test_an_employer_confidential_story_never_surfaces_for_another_employer(self):
-        """T3."""
+        """T3, with the employer read from the application rather than offered."""
         self.second_story(confidentiality="employer_confidential",
                           confidential_employer="Employer A")
+        self.an_application("app-a", "Employer A")
+        self.an_application("app-b", "Employer B")
         asked = ["cap.statistical-programming"]
-        self.assertEqual(STORIES.map_stories(self.db, asked, employer="Employer A")
+        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-a")
                          ["cap.statistical-programming"]["fit"], "strong")
-        for employer in ("Employer B", None):
-            self.assertEqual(STORIES.map_stories(self.db, asked, employer=employer)
+        for application_id in ("app-b", None):
+            self.assertEqual(STORIES.map_stories(self.db, asked, application_id=application_id)
                              ["cap.statistical-programming"]["fit"], "gap")
+
+    def test_the_employer_cannot_be_named_by_the_caller_at_all(self):
+        """The escalation this closes: naming the employer would be naming the password."""
+        self.second_story(confidentiality="employer_confidential",
+                          confidential_employer="Employer A")
+        with self.assertRaises(TypeError):
+            STORIES.map_stories(self.db, ["cap.statistical-programming"],
+                                employer="Employer A")
+
+    def test_an_unknown_application_carries_no_employer_identity(self):
+        self.second_story(confidentiality="employer_confidential",
+                          confidential_employer="Employer A")
+        self.assertIsNone(STORIES.application_identity(self.db, "app-missing"))
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.statistical-programming"],
+                                application_id="app-missing")
+            ["cap.statistical-programming"]["fit"], "gap")
+
+    def test_employer_identity_is_matched_on_the_normalized_name(self):
+        """"Employer A, Inc." typed one way and stored another is still one employer."""
+        self.second_story(confidentiality="employer_confidential",
+                          confidential_employer="Employer  A")
+        self.an_application("app-a", "employer a")
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.statistical-programming"],
+                                application_id="app-a")
+            ["cap.statistical-programming"]["fit"], "strong")
 
     def test_an_application_confidential_story_requires_that_exact_application(self):
         """T3."""
         self.second_story(confidentiality="application_confidential",
-                          confidential_application_id="app-1")
+                          confidential_application_id="app-a")
+        self.an_application("app-a", "Employer A")
+        self.an_application("app-b", "Employer B")
         asked = ["cap.statistical-programming"]
-        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-1")
+        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-a")
                          ["cap.statistical-programming"]["fit"], "strong")
-        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-2")
+        self.assertEqual(STORIES.map_stories(self.db, asked, application_id="app-b")
                          ["cap.statistical-programming"]["fit"], "gap")
 
 
@@ -527,7 +583,7 @@ class AdvisoryRankingTests(MappingFixture):
     def test_an_advisory_signal_cannot_change_a_fit_or_a_class(self):
         first = self.approved()
         self.snapshot = self.snapshot  # unchanged; the second story shares the profile
-        second = self.second_story(secondary=["cap.survey-design"])
+        second = self.second_story(secondary=("cap.survey-design",))
         plain = STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]
         boosted = STORIES.map_stories(
             self.db, ["cap.survey-design"],
@@ -559,3 +615,79 @@ class AdvisoryRankingTests(MappingFixture):
                         "provenance": {"source": "model", "model": "m", "at": "now"}}):
             with self.assertRaises(ValueError):
                 STORIES.map_stories(self.db, ["cap.survey-design"], advisory=[broken])
+
+
+class BoundEvidenceTests(StoryFixture):
+    """A capability is retrieved at the class of *its own* claims.
+
+    The hole this closes: the class used to be the strongest anywhere in the version, so a
+    capability supported only by transferable evidence was retrieved as `strong` whenever
+    some unrelated claim in the same story happened to be direct. That is G2 defeated by
+    arithmetic over the wrong set — no rule was missing, the rule was reading the wrong rows.
+    """
+
+    def mixed_story(self):
+        """`c1` direct, `c2` transferable, and the capability bound only to `c2`."""
+        self.snapshot = self.register([
+            {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+             "status": "locked", "locked": True, "evidence_strength": "direct"},
+            {"id": "fact-focus", "type": "experience_claim", "value": "Ran 2 focus groups",
+             "status": "confirmed", "locked": False, "evidence_strength": "direct"},
+            {"id": "fact-sales", "type": "experience_claim", "value": "Sales increased 17%",
+             "status": "confirmed", "locked": False, "evidence_strength": "transferable"}])
+        content = story_content()
+        content["claims"][1]["evidence_class"] = "transferable"
+        content["primary_capability"] = {"capability_id": "cap.survey-design",
+                                         "claim_ids": ["c2"]}
+        drafted = STORIES.draft_version(self.db, self.bind(content), at=AT)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"])
+        return drafted
+
+    def test_a_transferable_binding_is_not_promoted_by_a_direct_claim_elsewhere(self):
+        drafted = self.mixed_story()
+        mapped = STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]
+        self.assertEqual(mapped["fit"], "transferable")
+        self.assertEqual(mapped["stories"][0]["evidence_class"], "transferable")
+        self.assertEqual(mapped["stories"][0]["claim_ids"], ["c2"])
+        # The version's strongest claim is still direct; it just does not evidence this.
+        self.assertEqual(
+            STORIES.selectable(self.db, drafted["version_id"])["evidence_classes"]["c1"],
+            "direct")
+
+    def test_a_binding_reports_the_strongest_of_its_own_claims(self):
+        content = story_content()
+        content["primary_capability"] = {"capability_id": "cap.survey-design",
+                                         "claim_ids": ["c1"]}
+        drafted = STORIES.draft_version(self.db, self.bind(content), at=AT)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"])
+        mapped = STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]
+        self.assertEqual(mapped["fit"], "strong")
+        self.assertEqual(mapped["stories"][0]["claim_ids"], ["c1"])
+
+    def test_a_capability_must_name_the_claims_that_evidence_it(self):
+        content = story_content()
+        content["primary_capability"] = "cap.survey-design"
+        with self.assertRaises(ValueError) as caught:
+            STORIES.draft_version(self.db, self.bind(content), at=AT)
+        self.assertIn("must name the claims", str(caught.exception))
+
+    def test_a_capability_cannot_be_bound_to_a_claim_that_is_not_there(self):
+        content = story_content()
+        content["primary_capability"] = {"capability_id": "cap.survey-design",
+                                         "claim_ids": ["c9"]}
+        with self.assertRaises(ValueError) as caught:
+            STORIES.draft_version(self.db, self.bind(content), at=AT)
+        self.assertIn("does not have", str(caught.exception))
+
+    def test_a_reviewed_mapping_is_read_at_its_own_claims_too(self):
+        drafted = self.mixed_story()
+        STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
+                               ["c2"], "answers", None, "user", AT)
+        mapped = STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]
+        self.assertEqual(mapped["fit"], "transferable")
+
+    def test_a_mapping_cannot_name_a_claim_the_version_does_not_have(self):
+        drafted = self.approved()
+        with self.assertRaises(ValueError):
+            STORIES.record_mapping(self.db, drafted["version_id"], "cap.research-design",
+                                   ["c9"], "answers", None, "user", AT)

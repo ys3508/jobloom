@@ -78,6 +78,14 @@ def canonical_json(value: Any) -> str:
 def initialize(connection: sqlite3.Connection) -> None:
     story_core.initialize(connection)
     connection.executescript("""
+        CREATE TABLE IF NOT EXISTS question_form_competencies (
+            canonical_id TEXT NOT NULL,
+            competency TEXT NOT NULL,
+            reviewed_by TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL,
+            PRIMARY KEY (canonical_id, competency)
+        );
+
         CREATE TABLE IF NOT EXISTS story_answer_drafts (
             draft_id TEXT PRIMARY KEY,
             application_id TEXT NOT NULL,
@@ -85,6 +93,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             canonical_id TEXT NOT NULL,
             normalized_question TEXT NOT NULL,
             competency TEXT NOT NULL,
+            question_form_sha256 TEXT NOT NULL,
             story_version_id TEXT NOT NULL,
             evidence_refs_json TEXT NOT NULL,
             dependent_fact_ids_json TEXT NOT NULL,
@@ -110,6 +119,53 @@ def _outcome(decision: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {"decision": decision, "reason": reason, "auto_fill_ready": False, **extra}
 
 
+def record_question_competency(connection: sqlite3.Connection, canonical_id: str,
+                               competency: str, actor: str = "user",
+                               at: datetime | None = None) -> dict[str, Any]:
+    """Review that a canonical question meaning tests a capability.
+
+    This is the artifact that used to be a call argument. A caller naming the competency was
+    naming which of the user's stories it wanted, one step in front of the evidence gate; and
+    a model naming it would be doing the same thing less visibly. A meaning with no reviewed
+    competency still pauses — that is the point of writing it down rather than inferring it.
+    """
+    require_table(connection, "question_form_competencies")
+    if story_core._capability_layer(competency) != "SKILL":
+        raise ValueError(f"{competency} is not a reviewed SKILL capability")
+    if not isinstance(canonical_id, str) or not canonical_id.strip():
+        raise ValueError("a mapping must name the canonical question meaning")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "INSERT OR REPLACE INTO question_form_competencies (canonical_id, competency, "
+        "reviewed_by, reviewed_at) VALUES (?, ?, ?, ?)",
+        (canonical_id, competency, actor, timestamp))
+    connection.commit()
+    return {"canonical_id": canonical_id, "competency": competency, "reviewed_by": actor,
+            "reviewed_at": timestamp}
+
+
+def reviewed_competencies(connection: sqlite3.Connection, canonical_id: str) -> list[str]:
+    require_table(connection, "question_form_competencies")
+    return [row["competency"] for row in connection.execute(
+        "SELECT competency FROM question_form_competencies WHERE canonical_id=? "
+        "ORDER BY competency", (canonical_id,))]
+
+
+def question_form_digest(connection: sqlite3.Connection, question: str) -> str:
+    """A hash of every registered form for this question, as it stands right now.
+
+    The draft records which mapping authorized its meaning, not merely what the meaning was.
+    A form later remapped, unverified, or joined by a second canonical id is a different
+    answer to "what is this question", and a draft approved under the old one would carry a
+    provenance that no longer holds.
+    """
+    rows = connection.execute(
+        "SELECT normalized_question, canonical_id, match_level, verified_by_user, created_at "
+        "FROM question_forms WHERE normalized_question=? ORDER BY canonical_id",
+        (answer_library.normalize_question(question),)).fetchall()
+    return hashlib.sha256(canonical_json([dict(row) for row in rows]).encode("utf-8")).hexdigest()
+
+
 def _rendered(connection: sqlite3.Connection, version_id: str) -> str:
     """The story as approved, in STAR order. Assembled, never composed.
 
@@ -129,17 +185,25 @@ def _rendered(connection: sqlite3.Connection, version_id: str) -> str:
 
 def propose(connection: sqlite3.Connection, *, application_id: str, field_id: str,
             question: str, control: str, source_kind: str | None = None,
-            employer: str | None = None, competency: str | None = None,
             authorization_id: str | None = None, context: dict[str, Any] | None = None,
             legal_items: list[str] | None = None, chosen_version_id: str | None = None,
             at: datetime | None = None) -> dict[str, Any]:
-    """Decide what may answer one observed field, and draft only where that is a story."""
+    """Decide what may answer one observed field, and draft only where that is a story.
+
+    The application names itself and nothing else. Employer identity and the competency the
+    question tests are both resolved here, from rows somebody registered, because either one
+    accepted as an argument is a way to widen what a caller may reach.
+    """
     initialize(connection)
     at = at or now_utc()
+    identity = story_core.application_identity(connection, application_id)
+    if not identity:
+        return _outcome("pause", "application_unknown")
+    employer = identity["employer"]
     context = dict(context or {})
-    context.setdefault("application_id", application_id)
+    context["application_id"] = application_id
     if employer:
-        context.setdefault("company", employer)
+        context["company"] = employer
 
     stopped = sorted(set(legal_items or []) & pre_submit_core.MANDATORY_PAUSES)
     if stopped:
@@ -187,27 +251,40 @@ def propose(connection: sqlite3.Connection, *, application_id: str, field_id: st
         return _outcome("pause", "sensitive_requires_exact_answer",
                         canonical_id=canonical_id, domain=domain, family=family,
                         answer_reason=matched.get("reason"))
-    if not competency:
+    competencies = reviewed_competencies(connection, canonical_id)
+    if not competencies:
         return _outcome("pause", "competency_not_mapped", canonical_id=canonical_id)
 
-    mapped = story_core.map_stories(connection, [competency], employer=employer,
-                                    application_id=application_id)[competency]
-    options = mapped["stories"][:MAX_OPTIONS]
+    mapped = story_core.map_stories(connection, competencies, application_id=application_id)
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for competency in competencies:
+        for row in mapped[competency]["stories"]:
+            if row["version_id"] in seen:
+                continue
+            seen.add(row["version_id"])
+            merged.append({**row, "competency": competency})
+    merged.sort(key=lambda row: (-story_core.FIT_ORDER[row["fit"]],
+                                 -EVIDENCE_ORDER[row["evidence_class"]],
+                                 row["use_count"], row["version_id"]))
+    options = merged[:MAX_OPTIONS]
     if not options:
         return _outcome("gap", "no_story_covers_this", canonical_id=canonical_id,
-                        competency=competency)
+                        competencies=competencies)
     if chosen_version_id is None:
         return {"decision": "choose", "reason": "user_chooses_the_story",
-                "canonical_id": canonical_id, "competency": competency,
+                "canonical_id": canonical_id, "competencies": competencies,
                 "auto_fill_ready": False, "allow_none": NONE_OF_THESE,
                 "options": [{"version_id": row["version_id"], "story_id": row["story_id"],
                              "title": row["title"], "fit": row["fit"],
+                             "competency": row["competency"],
                              "evidence_class": row["evidence_class"],
-                             "why": row["why"], "limitation": row.get("limitation")}
+                             "why": row["why"], "claim_ids": row["claim_ids"],
+                             "limitation": row.get("limitation")}
                             for row in options]}
     if chosen_version_id == NONE_OF_THESE:
         return _outcome("gap", "user_chose_none", canonical_id=canonical_id,
-                        competency=competency)
+                        competencies=competencies)
     chosen = next((row for row in options if row["version_id"] == chosen_version_id), None)
     if not chosen:
         # Being offered is what makes a version choosable. A version named from outside the
@@ -215,8 +292,8 @@ def propose(connection: sqlite3.Connection, *, application_id: str, field_id: st
         return _outcome("pause", "choice_not_offered", canonical_id=canonical_id)
 
     return _draft(connection, application_id=application_id, employer=employer,
-                  canonical_id=canonical_id, question=question, competency=competency,
-                  chosen=chosen, at=at)
+                  canonical_id=canonical_id, question=question,
+                  competency=chosen["competency"], chosen=chosen, at=at)
 
 
 def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str | None,
@@ -227,10 +304,15 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
         "SELECT candidate_snapshot_sha256 FROM story_versions WHERE version_id=?",
         (version_id,)).fetchone()
     snapshot = version["candidate_snapshot_sha256"]
+    # Only the claims the chosen binding actually names. The draft cites the evidence behind
+    # the capability that was retrieved, not everything the story happens to contain.
+    bound = set(chosen["claim_ids"])
     refs, classes = [], []
     for claim in connection.execute(
-            "SELECT evidence_refs_json, evidence_class FROM story_claims WHERE version_id=? "
-            "ORDER BY claim_id", (version_id,)):
+            "SELECT claim_id, evidence_refs_json, evidence_class FROM story_claims "
+            "WHERE version_id=? ORDER BY claim_id", (version_id,)):
+        if claim["claim_id"] not in bound:
+            continue
         refs.extend(json.loads(claim["evidence_refs_json"]))
         classes.append(claim["evidence_class"])
     refs = sorted(set(refs))
@@ -247,8 +329,10 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
                   f"{competency}. Say so rather than letting it read as direct.")
     auto_fill_ready = False
 
+    form_digest = question_form_digest(connection, question)
     payload = {"application_id": application_id, "employer": employer,
                "canonical_id": canonical_id, "competency": competency,
+               "question_form_sha256": form_digest,
                "story_version_id": version_id, "evidence_refs": refs,
                "candidate_snapshot_sha256": snapshot, "evidence_class": evidence_class,
                "answer_text": text, "bridge": bridge}
@@ -256,12 +340,12 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
     draft_id = f"AD-{uuid.uuid4().hex[:12]}"
     connection.execute(
         "INSERT INTO story_answer_drafts (draft_id, application_id, employer, canonical_id, "
-        "normalized_question, competency, story_version_id, evidence_refs_json, "
-        "dependent_fact_ids_json, candidate_snapshot_sha256, evidence_class, answer_text, "
-        "bridge, content_sha256, auto_fill_ready, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "normalized_question, competency, question_form_sha256, story_version_id, "
+        "evidence_refs_json, dependent_fact_ids_json, candidate_snapshot_sha256, "
+        "evidence_class, answer_text, bridge, content_sha256, auto_fill_ready, status, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (draft_id, application_id, employer, canonical_id,
-         answer_library.normalize_question(question), competency, version_id,
+         answer_library.normalize_question(question), competency, form_digest, version_id,
          canonical_json(refs), canonical_json(fact_ids), snapshot, evidence_class, text,
          bridge, digest, int(auto_fill_ready), DRAFT, at.isoformat()))
     story_core._event(connection, chosen["story_id"], version_id, "system",
@@ -274,6 +358,7 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
             "draft_id": draft_id, "canonical_id": canonical_id,
             "story_version_id": version_id, "evidence_class": evidence_class,
             "evidence_refs": refs, "dependent_fact_ids": fact_ids,
+            "question_form_sha256": form_digest, "claim_ids": sorted(bound),
             "candidate_snapshot_sha256": snapshot, "answer_text": text, "bridge": bridge,
             "content_sha256": digest, "auto_fill_ready": auto_fill_ready,
             "next_step": "the user approves this exact content with a scope and an expiry"}
@@ -304,6 +389,15 @@ def approve_draft(connection: sqlite3.Connection, draft_id: str, content_sha256:
     if not check["selectable"]:
         raise ValueError(
             f"the story this was drafted from is no longer usable: {check['reasons'][0]}")
+    current_form = connection.execute(
+        "SELECT normalized_question, canonical_id, match_level, verified_by_user, created_at "
+        "FROM question_forms WHERE normalized_question=? ORDER BY canonical_id",
+        (row["normalized_question"],)).fetchall()
+    if hashlib.sha256(canonical_json([dict(form) for form in current_form]).encode(
+            "utf-8")).hexdigest() != row["question_form_sha256"]:
+        # The mapping that said what this question means is not the one the draft was written
+        # under. Approving would attach the answer to a meaning nobody reviewed it against.
+        raise ValueError("the question form changed since this draft was written")
     if row["evidence_class"] == "transferable" and auto_fill_allowed:
         raise ValueError("an answer resting on transferable evidence is not auto-fill on "
                          "first approval")

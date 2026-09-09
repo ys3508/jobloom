@@ -34,6 +34,7 @@ RESUMES = load_script("resume_core")
 APPLICATIONS = load_script("application_core")
 PRE_SUBMIT = load_script("pre_submit_core")
 EVIDENCE = load_script("evidence_units")
+APPLICATION_CORE = load_script("application_core")
 
 AT = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
 LATER = AT + timedelta(days=400)
@@ -61,7 +62,29 @@ class ProposeFixture(unittest.TestCase):
             module.initialize(self.db)
         self.snapshot = self.register()
         self.register_form(QUESTION, CANONICAL)
+        PROPOSE.record_question_competency(self.db, CANONICAL, COMPETENCY, "user", AT)
+        self.an_application("app-1", "Example Corp")
         self.story = self.approve_story()
+
+    def an_application(self, application_id, employer):
+        job_id = f"job-{application_id}"
+        self.db.execute(
+            "INSERT OR REPLACE INTO jobs (job_id, canonical_url, original_url, employer, "
+            "title, location, normalized_employer, normalized_title, normalized_location, "
+            "description_sha256, job_card_json, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'Analyst', 'Boston', ?, 'analyst', 'boston', 'x', '{}', "
+            "'open', ?, ?)",
+            (job_id, f"https://example.invalid/{job_id}", f"https://example.invalid/{job_id}",
+             employer, APPLICATION_CORE.normalize_text(employer), AT.isoformat(),
+             AT.isoformat()))
+        self.db.execute(
+            "INSERT OR REPLACE INTO applications (application_id, job_id, state, category, "
+            "submission_policy, attempts, max_attempts, pre_submit_check_passed, created_at, "
+            "updated_at) VALUES (?, ?, 'ready_to_fill', 'review', 'stop_before_submit', 0, 3, "
+            "0, ?, ?)",
+            (application_id, job_id, AT.isoformat(), AT.isoformat()))
+        self.db.commit()
+        return application_id
 
     def register(self, name="Verified Candidate", strength="direct"):
         candidate = {
@@ -97,7 +120,8 @@ class ProposeFixture(unittest.TestCase):
         content = {
             "title": "INNSCI focus groups",
             "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
-            "primary_capability": COMPETENCY, "secondary_capabilities": [],
+            "primary_capability": {"capability_id": COMPETENCY, "claim_ids": ["c1", "c2"]},
+            "secondary_capabilities": [],
             "domains": ["cap.domain.pharma-insights"],
             "framing_spans": [SITUATION, TASK],
             "claims": [
@@ -114,8 +138,7 @@ class ProposeFixture(unittest.TestCase):
 
     def ask(self, **overrides):
         call = {"application_id": "app-1", "field_id": "q_story", "question": QUESTION,
-                "control": "textarea", "competency": COMPETENCY, "employer": "Example Corp",
-                "at": AT}
+                "control": "textarea", "at": AT}
         call.update(overrides)
         return PROPOSE.propose(self.db, **call)
 
@@ -174,9 +197,17 @@ class GateOrderTests(ProposeFixture):
         self.assertEqual(self.drafts(), 0)
 
     def test_a_question_with_no_reviewed_competency_pauses(self):
-        outcome = self.ask(competency=None)
+        self.db.execute("DELETE FROM question_form_competencies WHERE canonical_id=?",
+                        (CANONICAL,))
+        self.db.commit()
+        outcome = self.ask()
         self.assertEqual((outcome["decision"], outcome["reason"]),
                          ("pause", "competency_not_mapped"))
+
+    def test_an_unknown_application_is_not_answered_for(self):
+        outcome = self.ask(application_id="app-missing")
+        self.assertEqual((outcome["decision"], outcome["reason"]),
+                         ("pause", "application_unknown"))
 
     def drafts(self):
         return self.db.execute("SELECT COUNT(*) FROM story_answer_drafts").fetchone()[0]
@@ -215,15 +246,14 @@ class ReuseTests(ProposeFixture):
         self.store_answer(expires_at=(AT + timedelta(days=1)).isoformat())
         outcome = PROPOSE.propose(
             self.db, application_id="app-1", field_id="q_story", question=QUESTION,
-            control="textarea", competency=COMPETENCY, employer="Example Corp",
-            authorization_id=self.authorize(), at=LATER)
+            control="textarea", authorization_id=self.authorize(), at=LATER)
         self.assertNotEqual(outcome["decision"], "reuse")
 
     def test_a_stale_answer_falls_through_to_the_story_choice(self):
         self.store_answer(expires_at=(AT + timedelta(days=1)).isoformat())
         outcome = PROPOSE.propose(
             self.db, application_id="app-1", field_id="q_story", question=QUESTION,
-            control="textarea", competency=COMPETENCY, employer="Example Corp", at=LATER)
+            control="textarea", at=LATER)
         self.assertEqual(outcome["decision"], "choose")
 
 
@@ -246,7 +276,12 @@ class ChoiceTests(ProposeFixture):
             "SELECT COUNT(*) FROM story_answer_drafts").fetchone()[0], 0)
 
     def test_a_competency_no_story_covers_is_a_gap(self):
-        outcome = self.ask(competency="cap.clinical-study-operations")
+        self.db.execute("DELETE FROM question_form_competencies WHERE canonical_id=?",
+                        (CANONICAL,))
+        self.db.commit()
+        PROPOSE.record_question_competency(self.db, CANONICAL,
+                                           "cap.clinical-study-operations", "user", AT)
+        outcome = self.ask()
         self.assertEqual((outcome["decision"], outcome["reason"]),
                          ("gap", "no_story_covers_this"))
 
@@ -256,12 +291,18 @@ class ChoiceTests(ProposeFixture):
                          ("pause", "choice_not_offered"))
 
     def test_a_confidential_story_is_not_offered_to_another_employer(self):
-        """T3, reaching the answer path."""
+        """T3, reaching the answer path, with the employer read from the application."""
         confidential = self.approve_story(confidentiality="employer_confidential",
                                           confidential_employer="Other Corp")
         offered = self.ask()["options"]
         self.assertNotIn(confidential["version_id"],
                          [option["version_id"] for option in offered])
+        # And it is offered to the employer it belongs to, so the gate is a gate and not a
+        # blanket refusal.
+        self.an_application("app-other", "Other Corp")
+        offered_there = self.ask(application_id="app-other")["options"]
+        self.assertIn(confidential["version_id"],
+                      [option["version_id"] for option in offered_there])
 
 
 class DraftTests(ProposeFixture):
@@ -403,3 +444,114 @@ class PrivacyTests(ProposeFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoWidestPathTests(ProposeFixture):
+    """Three ways a caller could have reached further than it was entitled to.
+
+    Each was a parameter the service trusted. The fix in every case is the same shape: the
+    caller names the application, and the service reads the rest out of rows somebody
+    registered — so the tests are that the parameter is gone and that the resolved value is
+    what decides.
+    """
+
+    def test_the_caller_cannot_name_the_employer(self):
+        with self.assertRaises(TypeError):
+            self.ask(employer="Other Corp")
+
+    def test_naming_an_application_at_another_employer_does_not_reach_its_stories(self):
+        confidential = self.approve_story(confidentiality="employer_confidential",
+                                          confidential_employer="Other Corp")
+        self.an_application("app-other", "Other Corp")
+        # The story is reachable from its own employer's application...
+        self.assertIn(confidential["version_id"],
+                      [row["version_id"] for row in self.ask(application_id="app-other")
+                       ["options"]])
+        # ...and not from this one, whatever the caller would like to claim.
+        self.assertNotIn(confidential["version_id"],
+                         [row["version_id"] for row in self.ask()["options"]])
+
+    def test_the_caller_cannot_name_the_competency(self):
+        with self.assertRaises(TypeError):
+            self.ask(competency="cap.statistical-programming")
+
+    def test_a_competency_reaches_only_what_the_review_mapped(self):
+        """A second capability the story has, which this question was never mapped to."""
+        self.db.execute("DELETE FROM question_form_competencies")
+        self.db.commit()
+        outcome = self.ask()
+        self.assertEqual(outcome["reason"], "competency_not_mapped")
+        PROPOSE.record_question_competency(self.db, CANONICAL, COMPETENCY, "user", AT)
+        self.assertEqual(self.ask()["decision"], "choose")
+
+    def test_a_mapping_names_a_reviewed_capability(self):
+        with self.assertRaises(ValueError):
+            PROPOSE.record_question_competency(self.db, CANONICAL, "cap.invented", "user", AT)
+
+
+class QuestionFormLockTests(ProposeFixture):
+    """The draft records which mapping said what the question means, not just the meaning."""
+
+    def draft(self):
+        return self.ask(chosen_version_id=self.story["version_id"])
+
+    def test_a_draft_records_the_form_that_authorized_its_meaning(self):
+        drafted = self.draft()
+        self.assertEqual(drafted["question_form_sha256"],
+                         PROPOSE.question_form_digest(self.db, QUESTION))
+        row = self.db.execute("SELECT question_form_sha256 FROM story_answer_drafts").fetchone()
+        self.assertEqual(row["question_form_sha256"], drafted["question_form_sha256"])
+
+    def test_a_remapped_question_cannot_be_approved_under_the_old_meaning(self):
+        drafted = self.draft()
+        self.db.execute(
+            "UPDATE question_forms SET canonical_id=? WHERE normalized_question=?",
+            ("experience.something_else", ANSWERS.normalize_question(QUESTION)))
+        self.db.commit()
+        with self.assertRaises(ValueError) as caught:
+            PROPOSE.approve_draft(self.db, drafted["draft_id"], drafted["content_sha256"],
+                                  scope={}, validity_class="stable", at=AT)
+        self.assertIn("question form changed", str(caught.exception))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+
+    def test_a_second_canonical_id_joining_the_question_invalidates_the_draft(self):
+        drafted = self.draft()
+        self.register_form(QUESTION, "experience.second_meaning")
+        with self.assertRaises(ValueError):
+            PROPOSE.approve_draft(self.db, drafted["draft_id"], drafted["content_sha256"],
+                                  scope={}, validity_class="stable", at=AT)
+
+    def test_an_unchanged_form_still_approves(self):
+        drafted = self.draft()
+        approved = PROPOSE.approve_draft(self.db, drafted["draft_id"],
+                                         drafted["content_sha256"], scope={},
+                                         validity_class="stable", at=AT)
+        self.assertEqual(approved["status"], "approved")
+
+
+class BoundEvidenceAtTheAnswerTests(ProposeFixture):
+    """The draft cites the evidence behind the capability retrieved, not the whole story."""
+
+    def test_a_draft_cites_only_the_claims_the_binding_names(self):
+        content = {
+            "title": "INNSCI focus groups",
+            "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
+            "primary_capability": {"capability_id": COMPETENCY, "claim_ids": ["c1"]},
+            "secondary_capabilities": [],
+            "domains": ["cap.domain.pharma-insights"],
+            "framing_spans": [SITUATION, TASK],
+            "claims": [
+                {"claim_id": "c1", "text": ACTION,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-focus")],
+                 "evidence_class": "direct"},
+                {"claim_id": "c2", "text": RESULT,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-sales")],
+                 "evidence_class": "direct"}]}
+        drafted_story = STORIES.draft_version(self.db, content, at=AT)
+        STORIES.approve_version(self.db, drafted_story["version_id"],
+                                drafted_story["content_sha256"], "user", AT)
+        outcome = self.ask(chosen_version_id=drafted_story["version_id"])
+        self.assertEqual(outcome["claim_ids"], ["c1"])
+        self.assertEqual(outcome["dependent_fact_ids"], ["fact-focus"])
+        self.assertEqual(outcome["evidence_refs"],
+                         [EVIDENCE.unit_id(self.snapshot, "fact-focus")])

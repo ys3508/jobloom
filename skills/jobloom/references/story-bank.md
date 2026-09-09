@@ -56,6 +56,24 @@ A claim's `evidence_class` is one of `mention_only`, `transferable`, `strongly_r
 - **`unsupported` may be drafted and never approved.** Writing down "this part has nothing
   behind it" is the point of the class; `approve_version` refuses it by name.
 
+## A capability names the claims that evidence it
+
+`primary_capability` and each `secondary_capabilities` entry is a **binding**, not a label:
+
+```json
+{"capability_id": "cap.survey-design", "claim_ids": ["c1", "c2"]}
+```
+
+The claim ids must exist in the same version, and a reviewed mapping
+(`record_mapping`) carries its own `claim_ids` for the same reason.
+
+**Why it is not a bare id.** The class a competency is retrieved at used to be the strongest
+class anywhere in the version, so a capability supported only by `transferable` evidence was
+retrieved as `strong` whenever some unrelated claim in the same story happened to be
+`direct`. No rule was missing — the rule was reading the wrong rows. `bound_class()` now
+computes the class from the binding's own claims, and a draft answer cites the evidence
+behind the capability that was retrieved rather than everything the story contains.
+
 ## Approval is of an exact content hash
 
 `approve_version(connection, version_id, content_sha256)` requires the hash as an argument
@@ -99,8 +117,15 @@ first drafted, and a confidential story must name what it is confidential to. `s
 returns the confidentiality alongside its answer so a caller cannot read one without the
 other, and `map_stories()` enforces it as a hard AND restriction: `employer_confidential:A`
 never surfaces for employer B, and — because absent context does not open a restriction — it
-does not surface when no employer was named either. `application_confidential` requires the
-exact application id.
+does not surface when no employer was resolved either. `application_confidential` requires
+the exact application id.
+
+**Identity is resolved, never supplied.** The only identity input is `application_id`;
+`application_identity()` reads the employer from the `applications` → `jobs` rows and matches
+on the normalized name. There is deliberately no `employer` parameter on `map_stories` or
+`propose`. A caller able to name the employer could unlock any employer-confidential story by
+naming the right one, which is not a restriction but a password written on the thing it
+protects.
 
 ## Mapping a story to a competency
 
@@ -156,12 +181,20 @@ The gates run in order of consequence, not likelihood:
 | 5 | an approved answer exists but cannot auto-fill | `review_existing_answer` — never a second text for one meaning |
 | 6 | unknown or conflicting question form | `pause` |
 | 7 | a domain rule fired but the meaning is supported (e.g. `discovery_source`) | `pause / sensitive_requires_exact_answer` — a story may not compose one |
-| 8 | no reviewed competency for the question | `pause / competency_not_mapped` |
+| 8 | no reviewed competency for the canonical meaning | `pause / competency_not_mapped` |
 | 9 | ordinary narrative question, stories retrieved | `choose` (≤3 options plus `none_of_these`), then `drafted` or `gap` |
 
-**Which competency a question tests is not inferred.** A model deciding that would sit in
-front of the evidence gate one step removed, so the caller supplies it and an unmapped
-question pauses. Resolving competency from a reviewed question form is not built.
+**Which competency a question tests is a reviewed artifact.** `record_question_competency(
+canonical_id, competency)` writes it to `question_form_competencies`; `propose` reads it from
+there and takes no competency argument. A meaning with no reviewed competency pauses. A
+caller naming the competency was naming which of the user's stories it wanted, one step in
+front of the evidence gate, and a model naming it would do the same thing less visibly.
+
+**The question form is locked onto the draft.** A draft records `question_form_sha256` — a
+hash of every registered form for that question, not merely the meaning it resolved to — and
+`approve_draft` recomputes it. A form later remapped, unverified, or joined by a second
+canonical id refuses approval: the mapping that said what the question means is not the one
+the draft was written under.
 
 **The draft is assembled, not composed.** Every span of an approved version is already either
 a bound claim or a reviewed framing span, so the draft is that version read back verbatim in

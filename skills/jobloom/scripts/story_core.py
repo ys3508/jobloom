@@ -54,6 +54,7 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import application_core  # noqa: E402
 import candidate_core  # noqa: E402
 import capability_ontology  # noqa: E402
 import evidence_units  # noqa: E402
@@ -122,6 +123,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             current_version_id TEXT,
             confidentiality TEXT NOT NULL,
             confidential_employer TEXT,
+            confidential_employer_normalized TEXT,
             confidential_application_id TEXT,
             applicability_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -138,7 +140,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             star_json TEXT NOT NULL,
             primary_capability TEXT NOT NULL,
-            secondary_capabilities_json TEXT NOT NULL,
+            capability_bindings_json TEXT NOT NULL,
             domains_json TEXT NOT NULL,
             earned_secret TEXT,
             reflection TEXT,
@@ -167,6 +169,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             version_id TEXT NOT NULL,
             competency TEXT NOT NULL,
             relation TEXT NOT NULL,
+            claim_ids_json TEXT NOT NULL,
             limitation TEXT,
             reviewed_by TEXT NOT NULL,
             reviewed_at TEXT NOT NULL,
@@ -299,27 +302,60 @@ def account_for(narrative: str, spans: list[str]) -> list[str]:
 # ---- drafting a version ------------------------------------------------------------
 
 
+def _binding(value: Any, label: str) -> dict[str, Any]:
+    """One capability and the claims that evidence *it*, not the story around it.
+
+    A capability used to be a bare id, and the class a competency retrieved at was the
+    strongest class anywhere in the version. So a capability whose only support was
+    transferable read as direct whenever some unrelated claim in the same story was direct —
+    G2 defeated at retrieval, by arithmetic over the wrong set. A binding names its own
+    claims, and the class is computed from those.
+    """
+    if isinstance(value, str):
+        raise ValueError(f"{label} must name the claims that evidence it")
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a capability binding")
+    capability_id = value.get("capability_id")
+    if _capability_layer(capability_id) != "SKILL":
+        raise ValueError(f"{capability_id} is not a reviewed SKILL capability")
+    claim_ids = value.get("claim_ids")
+    if not isinstance(claim_ids, list) or not claim_ids \
+            or any(not isinstance(item, str) for item in claim_ids):
+        raise ValueError(f"{capability_id} must be bound to at least one claim")
+    return {"capability_id": capability_id, "claim_ids": sorted(set(claim_ids))}
+
+
 def _validate_shape(content: dict[str, Any]) -> None:
-    for field in ("title", "primary_capability"):
-        if not isinstance(content.get(field), str) or not content[field].strip():
-            raise ValueError(f"a story version requires {field}")
+    if not isinstance(content.get("title"), str) or not content["title"].strip():
+        raise ValueError("a story version requires title")
     star = content.get("star")
     if not isinstance(star, dict) or any(
             not isinstance(star.get(part), str) or not star[part].strip() for part in STAR_PARTS):
         raise ValueError("a story version requires a complete STAR narrative")
-    for field in ("secondary_capabilities", "domains", "framing_spans"):
+    for field in ("domains", "framing_spans"):
         value = content.get(field, [])
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise ValueError(f"{field} must be a list of strings")
-    for capability_id in [content["primary_capability"], *content.get("secondary_capabilities", [])]:
-        if _capability_layer(capability_id) != "SKILL":
-            raise ValueError(f"{capability_id} is not a reviewed SKILL capability")
     for domain_id in content.get("domains", []):
         if _capability_layer(domain_id) != "DOMAIN":
             raise ValueError(f"{domain_id} is not a reviewed DOMAIN tag")
     claims = content.get("claims")
     if not isinstance(claims, list) or not claims:
         raise ValueError("a story version requires at least one claim")
+
+
+def _validate_bindings(content: dict[str, Any], claims: list[dict[str, Any]]) -> tuple:
+    known = {claim["claim_id"] for claim in claims}
+    primary = _binding(content.get("primary_capability"), "primary_capability")
+    secondary = [_binding(item, "secondary_capability")
+                 for item in content.get("secondary_capabilities", [])]
+    for binding in [primary, *secondary]:
+        missing = [claim_id for claim_id in binding["claim_ids"] if claim_id not in known]
+        if missing:
+            raise ValueError(
+                f"{binding['capability_id']} is bound to a claim this version does not "
+                f"have: {missing[0]}")
+    return primary, secondary
 
 
 def _validate_claims(content: dict[str, Any], index: dict[str, dict[str, Any]],
@@ -393,6 +429,7 @@ def draft_version(connection: sqlite3.Connection, content: dict[str, Any], *,
     narrative = _narrative(content)
     index = evidence_index(connection, snapshot)
     claims = _validate_claims(content, index, narrative)
+    primary, secondary = _validate_bindings(content, claims)
     framing = list(content.get("framing_spans", []))
     unbound = account_for(narrative, [claim["text"] for claim in claims] + framing)
 
@@ -407,14 +444,17 @@ def draft_version(connection: sqlite3.Connection, content: dict[str, Any], *,
         story_id = f"S-{uuid.uuid4().hex[:10]}"
         connection.execute(
             "INSERT INTO stories (story_id, status, current_version_id, confidentiality, "
-            "confidential_employer, confidential_application_id, applicability_json, "
-            "created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+            "confidential_employer, confidential_employer_normalized, "
+            "confidential_application_id, applicability_json, created_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             (story_id, DRAFT, confidentiality, confidential_employer,
+             application_core.normalize_text(confidential_employer)
+             if confidential_employer else None,
              confidential_application_id, canonical_json(applicability or {}), timestamp))
 
     stored = {"title": content["title"], "star": {part: content["star"][part] for part in STAR_PARTS},
-              "primary_capability": content["primary_capability"],
-              "secondary_capabilities": list(content.get("secondary_capabilities", [])),
+              "primary_capability": primary,
+              "secondary_capabilities": secondary,
               "domains": list(content.get("domains", [])),
               "earned_secret": content.get("earned_secret") or None,
               "reflection": content.get("reflection") or None,
@@ -425,12 +465,13 @@ def draft_version(connection: sqlite3.Connection, content: dict[str, Any], *,
     connection.execute(
         "INSERT INTO story_versions (version_id, story_id, content_sha256, "
         "candidate_snapshot_sha256, authored_by, title, star_json, primary_capability, "
-        "secondary_capabilities_json, domains_json, earned_secret, reflection, "
+        "capability_bindings_json, domains_json, earned_secret, reflection, "
         "framing_spans_json, unbound_spans_json, supersedes_version_id, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (version_id, story_id, digest, snapshot, authored_by, stored["title"],
-         canonical_json(stored["star"]), stored["primary_capability"],
-         canonical_json(stored["secondary_capabilities"]), canonical_json(stored["domains"]),
+         canonical_json(stored["star"]), primary["capability_id"],
+         canonical_json({"primary": primary, "secondary": secondary}),
+         canonical_json(stored["domains"]),
          stored["earned_secret"], stored["reflection"], canonical_json(framing),
          canonical_json(unbound), supersedes_version_id, timestamp))
     for claim in claims:
@@ -565,6 +606,7 @@ def selectable(connection: sqlite3.Connection, version_id: str) -> dict[str, Any
             "evidence_classes": classes,
             "confidentiality": story["confidentiality"],
             "confidential_employer": story["confidential_employer"],
+            "confidential_employer_normalized": story["confidential_employer_normalized"],
             "confidential_application_id": story["confidential_application_id"]}
 
 
@@ -666,8 +708,8 @@ def prepare_successor(connection: sqlite3.Connection, version_id: str,
     star = json.loads(version["star_json"])
     content = {
         "title": version["title"], "star": star,
-        "primary_capability": version["primary_capability"],
-        "secondary_capabilities": json.loads(version["secondary_capabilities_json"]),
+        "primary_capability": json.loads(version["capability_bindings_json"])["primary"],
+        "secondary_capabilities": json.loads(version["capability_bindings_json"])["secondary"],
         "domains": json.loads(version["domains_json"]),
         "earned_secret": version["earned_secret"], "reflection": version["reflection"],
         "framing_spans": json.loads(version["framing_spans_json"]),
@@ -715,12 +757,18 @@ COVERING = {"direct", "strongly_related"}
 
 
 def record_mapping(connection: sqlite3.Connection, version_id: str, competency: str,
-                   relation: str = ANSWERS, limitation: str | None = None,
-                   actor: str = "user", at: datetime | None = None) -> dict[str, Any]:
+                   claim_ids: list[str], relation: str = ANSWERS,
+                   limitation: str | None = None, actor: str = "user",
+                   at: datetime | None = None) -> dict[str, Any]:
     """Record that a reviewed version answers a competency its capabilities do not name.
 
     Stored rather than inferred on each use, so what a story is retrieved under is something
     a person decided once and can be shown, not something recomputed differently next time.
+
+    It names its own claims for the same reason a capability binding does: a mapping that
+    said only "this story answers that" would be retrieved at whatever the story's strongest
+    claim happened to be, and reaching a competency the capabilities do not name is exactly
+    where that is least likely to be the evidence anyone meant.
     """
     require_table(connection, "story_competency_mappings")
     if relation not in RELATIONS:
@@ -733,62 +781,87 @@ def record_mapping(connection: sqlite3.Connection, version_id: str, competency: 
         "SELECT story_id FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
     if not version:
         raise ValueError("story version not found")
+    if not isinstance(claim_ids, list) or not claim_ids:
+        raise ValueError("a mapping must name the claims that evidence it")
+    known = {row["claim_id"] for row in connection.execute(
+        "SELECT claim_id FROM story_claims WHERE version_id=?", (version_id,))}
+    missing = [claim_id for claim_id in claim_ids if claim_id not in known]
+    if missing:
+        raise ValueError(f"the mapping names a claim this version does not have: {missing[0]}")
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
         "INSERT OR REPLACE INTO story_competency_mappings (version_id, competency, relation, "
-        "limitation, reviewed_by, reviewed_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (version_id, competency, relation, limitation, actor, timestamp))
+        "claim_ids_json, limitation, reviewed_by, reviewed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (version_id, competency, relation, canonical_json(sorted(set(claim_ids))), limitation,
+         actor, timestamp))
     _event(connection, version["story_id"], version_id, actor, "story_mapping_recorded",
-           relation, {"competency": competency}, at)
+           relation, {"competency": competency, "claims": len(set(claim_ids))}, at)
     connection.commit()
     return {"version_id": version_id, "competency": competency, "relation": relation,
-            "limitation": limitation, "reviewed_by": actor, "reviewed_at": timestamp}
+            "claim_ids": sorted(set(claim_ids)), "limitation": limitation,
+            "reviewed_by": actor, "reviewed_at": timestamp}
 
 
-def _evidence_ceiling(classes: dict[str, str]) -> str | None:
-    """The strongest class the version can bring to bear, which is what it would cite."""
-    if not classes:
+def bound_class(classes: dict[str, str], claim_ids: list[str]) -> str | None:
+    """The class a *binding* can be cited at: the strongest of the claims it names.
+
+    Scoped to the binding, which is the whole correction. The strongest class anywhere in the
+    version says nothing about the capability being asked for, and using it let a capability
+    supported only by transferable evidence be retrieved as strong because some other claim
+    in the same story happened to be direct.
+    """
+    bound = [classes[claim_id] for claim_id in claim_ids if claim_id in classes]
+    if not bound:
         return None
-    return max(classes.values(), key=lambda name: EVIDENCE_ORDER[name])
+    return max(bound, key=lambda name: EVIDENCE_ORDER[name])
+
+
+def _band(evidence_class: str | None, covering_fit: str) -> dict[str, Any] | None:
+    if evidence_class in COVERING:
+        return {"fit": covering_fit, "evidence_class": evidence_class}
+    if evidence_class == TRANSFERABLE:
+        return {"fit": TRANSFERABLE, "evidence_class": evidence_class}
+    return None
 
 
 def _confidentiality_allows(check: dict[str, Any], employer: str | None,
                             application_id: str | None) -> bool:
-    """A hard AND restriction, not a retrieval hint. Absent context does not open it."""
+    """A hard AND restriction, not a retrieval hint. Absent context does not open it.
+
+    `employer` here is the normalized identity the *service* resolved from the application
+    row, never a name a caller offered. A caller able to say which employer it was would be
+    able to unlock every employer-confidential story by naming the right one.
+    """
     kind = check["confidentiality"]
     if kind == "employer_confidential":
-        return bool(employer) and employer == check["confidential_employer"]
+        return bool(employer) and employer == check["confidential_employer_normalized"]
     if kind == "application_confidential":
         return bool(application_id) and application_id == check["confidential_application_id"]
     return True
 
 
 def _fit(connection: sqlite3.Connection, version: sqlite3.Row, competency: str,
-         ceiling: str | None) -> dict[str, Any] | None:
-    if ceiling is None:
-        return None
-    covering = ceiling in COVERING
-    if version["primary_capability"] == competency:
-        if covering:
-            return {"fit": STRONG, "why": "primary_capability"}
-        if ceiling == TRANSFERABLE:
-            return {"fit": TRANSFERABLE, "why": "primary_capability"}
-        return None
-    if competency in json.loads(version["secondary_capabilities_json"]):
-        if covering:
-            return {"fit": WORKABLE, "why": "secondary_capability"}
-        if ceiling == TRANSFERABLE:
-            return {"fit": TRANSFERABLE, "why": "secondary_capability"}
-        return None
+         classes: dict[str, str]) -> dict[str, Any] | None:
+    """Which band this version answers one competency in, on the evidence bound to it."""
+    bindings = json.loads(version["capability_bindings_json"])
+    primary = bindings["primary"]
+    if primary["capability_id"] == competency:
+        band = _band(bound_class(classes, primary["claim_ids"]), STRONG)
+        return {**band, "why": "primary_capability",
+                "claim_ids": primary["claim_ids"]} if band else None
+    for secondary in bindings["secondary"]:
+        if secondary["capability_id"] == competency:
+            band = _band(bound_class(classes, secondary["claim_ids"]), WORKABLE)
+            return {**band, "why": "secondary_capability",
+                    "claim_ids": secondary["claim_ids"]} if band else None
     mapping = connection.execute(
         "SELECT * FROM story_competency_mappings WHERE version_id=? AND competency=?",
         (version["version_id"], competency)).fetchone()
     if mapping:
-        if ceiling == TRANSFERABLE:
-            return {"fit": TRANSFERABLE, "why": "reviewed_mapping",
-                    "limitation": mapping["limitation"]}
-        if covering:
-            return {"fit": WORKABLE, "why": "reviewed_mapping",
+        claim_ids = json.loads(mapping["claim_ids_json"])
+        band = _band(bound_class(classes, claim_ids), WORKABLE)
+        if band:
+            return {**band, "why": "reviewed_mapping", "claim_ids": claim_ids,
                     "limitation": mapping["limitation"]}
     return None
 
@@ -814,16 +887,40 @@ def _validate_advisory(advisory: Any) -> dict[str, dict[str, Any]]:
     return ranked
 
 
+def application_identity(connection: sqlite3.Connection,
+                         application_id: str) -> dict[str, Any] | None:
+    """Who an application is actually to, read from the rows that already know.
+
+    There is deliberately no way to pass an employer in. Confidentiality is decided against
+    this, and a caller that could name the employer could unlock an employer-confidential
+    story by naming the right one — which is not a restriction, it is a password everybody
+    can read off the story they want.
+    """
+    require_table(connection, "applications")
+    row = connection.execute(
+        "SELECT a.application_id, j.employer, j.normalized_employer FROM applications a "
+        "LEFT JOIN jobs j ON j.job_id = a.job_id WHERE a.application_id=?",
+        (application_id,)).fetchone()
+    if not row:
+        return None
+    return {"application_id": row["application_id"], "employer": row["employer"],
+            "normalized_employer": row["normalized_employer"]}
+
+
 def map_stories(connection: sqlite3.Connection, competencies: list[str], *,
-                employer: str | None = None, application_id: str | None = None,
+                application_id: str | None = None,
                 advisory: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Which approved stories can answer each competency, and on what evidence.
 
     Read-only, and it produces nothing submittable. A competency no story covers comes back
     as a gap rather than as the nearest thing, because the nearest thing is how a bridging
     claim gets invented.
+
+    The only identity input is `application_id`; the employer is resolved from it here.
     """
     require_table(connection, "story_versions")
+    identity = application_identity(connection, application_id) if application_id else None
+    employer = identity["normalized_employer"] if identity else None
     ranked = _validate_advisory(advisory)
     usage_counts = {row["story_id"]: row["uses"] for row in connection.execute(
         "SELECT v.story_id AS story_id, COUNT(*) AS uses FROM story_usage_events e "
@@ -845,12 +942,11 @@ def map_stories(connection: sqlite3.Connection, competencies: list[str], *,
     for competency in competencies:
         rows = []
         for version, check in eligible:
-            ceiling = _evidence_ceiling(check["evidence_classes"])
-            fit = _fit(connection, version, competency, ceiling)
+            fit = _fit(connection, version, competency, check["evidence_classes"])
             if not fit:
                 continue
             entry = {"story_id": version["story_id"], "version_id": version["version_id"],
-                     "title": version["title"], "evidence_class": ceiling,
+                     "title": version["title"],
                      "use_count": usage_counts.get(version["story_id"], 0), **fit}
             if version["version_id"] in ranked:
                 entry["advisory"] = ranked[version["version_id"]]
