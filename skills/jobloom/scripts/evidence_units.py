@@ -58,6 +58,17 @@ def strength_signals(fact: dict[str, Any], *, today: date | None = None) -> dict
             "quantified": any(x.startswith("quantified") for x in fired)}
 
 
+def unit_id(snapshot_sha256: str, fact_id: str) -> str:
+    """The EvidenceUnit identifier for one fact under one snapshot.
+
+    Its own function because a second caller now needs it. A unit is identified by the pair
+    it normalizes, so anything holding a reference to one — a Story claim, say — must derive
+    the reference the same way this module does rather than reimplementing the formula and
+    drifting from it.
+    """
+    return "eu-" + hashlib.sha256(f"{snapshot_sha256}:{fact_id}".encode()).hexdigest()[:16]
+
+
 def normalize_fact(fact: dict[str, Any], snapshot_sha256: str, *, today: date | None = None) -> dict[str, Any]:
     if fact.get("evidence_strength") not in EVIDENCE_ORDER:
         raise ValueError("EvidenceUnit source_strength is invalid")
@@ -70,7 +81,7 @@ def normalize_fact(fact: dict[str, Any], snapshot_sha256: str, *, today: date | 
     temporal.setdefault("months", _months(temporal.get("start"), temporal.get("end")))
     surfaces = [fact.get("value", ""), *(fact.get("keywords") or [])]
     unit = {
-        "unit_id": "eu-" + hashlib.sha256(f"{snapshot_sha256}:{fact_id}".encode()).hexdigest()[:16],
+        "unit_id": unit_id(snapshot_sha256, fact_id),
         "fact_id": fact_id, "snapshot_sha256": snapshot_sha256,
         "source_strength": fact["evidence_strength"],
         "surface_terms": sorted({token for surface in surfaces for token in tokens(str(surface))}),

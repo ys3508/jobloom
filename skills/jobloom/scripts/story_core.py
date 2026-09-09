@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""Stories: an approved, provenance-bound projection of the evidence bank.
+
+A Story is what a person says out loud about something they did — in an interview, or in the
+free-text box on an application form. Neither surface has an evidence system behind it today,
+and the reference implementations this is adapted from keep their stories as free markdown,
+where a number in the `Result` line is attached to nothing. That is the one thing this module
+exists to prevent.
+
+So a Story is **not** a source of truth. It is a versioned, user-approved projection over
+CandidateFacts that were already confirmed, and every factual assertion inside it is bound to
+the EvidenceUnits that support it. The narrative framing is real work — it is what makes a
+story tellable — but it is never promoted to evidence by having been written down.
+
+Three consequences worth stating, because they are what the tests are about.
+
+**Nothing unbound is selectable.** A version's narrative must be completely accounted for:
+every span of it is either a claim bound to evidence, or a span the user explicitly marked as
+framing. Whatever is left over is reported as `unbound_spans`, and a version with any of them
+cannot reach an answer, a coverage count, or an interview pack. It can still exist as a draft,
+because a half-written story is a normal thing to have.
+
+**A claim can weaken its evidence, never strengthen it.** The same rule
+`resume_core.validate_claims_manifest` applies to resume claims: a claim's `evidence_class`
+may not exceed the strongest source it cites. Transferable evidence stays transferable no
+matter how the sentence is phrased.
+
+**Approval is of an exact content hash.** Editing one character produces a new immutable
+version, and the previous approval does not follow it. That is also why capability mappings,
+domain tags and the earned secret live on the version rather than beside it: changing any of
+them changes what the user approved.
+
+A Story is bound to the CandidateSnapshot it was approved against. When the active snapshot
+changes, approval does not silently carry: the bindings are re-resolved against the new
+snapshot and the user is asked again, the same explicit successor pattern `resume_migration`
+uses for a resume. `prepare_successor` reports what actually moved so the second approval is
+answering a real question rather than clicking through.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import candidate_core  # noqa: E402
+import capability_ontology  # noqa: E402
+import evidence_units  # noqa: E402
+from _common import require_table  # noqa: E402
+from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
+
+DRAFT = "draft"
+APPROVED = "approved"
+REVOKED = "revoked"
+
+STAR_PARTS = ("situation", "task", "action", "result")
+CONFIDENTIALITY = ("reusable", "employer_confidential", "application_confidential")
+USABLE_FACT_STATUS = {"confirmed", "locked"}
+
+# A claim may carry any evidence class the ontology knows, except `none` — a claim supported
+# by nothing is not a weaker claim, it is an unsupported one, and it has its own handling.
+CLAIM_CLASSES = tuple(name for name in EVIDENCE_ORDER if name != "none")
+UNSUPPORTED = "unsupported"
+
+_ONTOLOGY: dict[str, Any] | None = None
+
+
+def ontology() -> dict[str, Any]:
+    """The shared, versioned capability ontology, loaded once.
+
+    Capability and domain tags are what a later step will retrieve a story by, so they are
+    canonical ids from this file rather than free text. A tag nobody reviewed would let a
+    story be found under a name the rest of the system does not use — the same drift the
+    evidence resolver was introduced to end.
+    """
+    global _ONTOLOGY
+    if _ONTOLOGY is None:
+        _ONTOLOGY = capability_ontology.load_ontology()
+    return _ONTOLOGY
+
+
+def _capability_layer(capability_id: str) -> str | None:
+    for entry in ontology()["capabilities"]:
+        if entry["capability_id"] == capability_id:
+            return entry["layer"]
+    return None
+
+
+# Characters that carry no assertion on their own, so a residue made only of these is not
+# unbound material. Punctuation in both scripts, because the fact library holds both.
+FILLER = re.compile(r"^[\s\.,;:!\?\-—–…\"'“”‘’()\[\]/、。，；：！？「」『』（）]*$")
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def content_hash(content: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(content).encode("utf-8")).hexdigest()
+
+
+def initialize(connection: sqlite3.Connection) -> None:
+    connection.executescript("""
+        CREATE TABLE IF NOT EXISTS stories (
+            story_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            current_version_id TEXT,
+            confidentiality TEXT NOT NULL,
+            confidential_employer TEXT,
+            confidential_application_id TEXT,
+            applicability_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            status_reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS story_versions (
+            version_id TEXT PRIMARY KEY,
+            story_id TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            candidate_snapshot_sha256 TEXT NOT NULL,
+            authored_by TEXT NOT NULL,
+            title TEXT NOT NULL,
+            star_json TEXT NOT NULL,
+            primary_capability TEXT NOT NULL,
+            secondary_capabilities_json TEXT NOT NULL,
+            domains_json TEXT NOT NULL,
+            earned_secret TEXT,
+            reflection TEXT,
+            framing_spans_json TEXT NOT NULL,
+            unbound_spans_json TEXT NOT NULL,
+            supersedes_version_id TEXT,
+            created_at TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            FOREIGN KEY (story_id) REFERENCES stories(story_id)
+        );
+        CREATE INDEX IF NOT EXISTS story_versions_story_idx
+            ON story_versions(story_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS story_claims (
+            version_id TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL,
+            evidence_class TEXT NOT NULL,
+            PRIMARY KEY (version_id, claim_id),
+            FOREIGN KEY (version_id) REFERENCES story_versions(version_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS story_usage_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_version_id TEXT NOT NULL,
+            application_id TEXT,
+            interview_id TEXT,
+            round_id TEXT,
+            question_type TEXT NOT NULL,
+            used_at TEXT NOT NULL,
+            outcome_ref TEXT
+        );
+        CREATE INDEX IF NOT EXISTS story_usage_version_idx
+            ON story_usage_events(story_version_id, used_at);
+
+        CREATE TABLE IF NOT EXISTS story_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            story_id TEXT,
+            version_id TEXT,
+            actor TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            metadata_json TEXT NOT NULL
+        );
+    """)
+    connection.commit()
+
+
+def _event(connection: sqlite3.Connection, story_id: str | None, version_id: str | None,
+           actor: str, event_type: str, reason_code: str, metadata: dict[str, Any],
+           at: datetime | None = None) -> None:
+    connection.execute(
+        "INSERT INTO story_events (created_at, story_id, version_id, actor, event_type, "
+        "reason_code, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ((at or now_utc()).isoformat(), story_id, version_id, actor, event_type, reason_code,
+         canonical_json(metadata)))
+
+
+# ---- resolving what the evidence actually says ------------------------------------
+
+
+def evidence_index(connection: sqlite3.Connection, snapshot_sha256: str) -> dict[str, dict[str, Any]]:
+    """Every EvidenceUnit a snapshot's usable facts produce, keyed by unit id.
+
+    Read from `candidate_facts` rather than from the snapshot file, because this is the same
+    table the rest of the system judges a fact by, and a claim must be answerable to that.
+    Facts that are neither confirmed nor locked are left out: a proposed fact is not evidence
+    yet, and a story that cited one would be selectable on the strength of a suggestion.
+    """
+    require_table(connection, "candidate_facts")
+    index: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+            "SELECT fact_id, status, locked, evidence_strength FROM candidate_facts "
+            "WHERE content_sha256=?", (snapshot_sha256,)):
+        if row["status"] not in USABLE_FACT_STATUS:
+            continue
+        index[evidence_units.unit_id(snapshot_sha256, row["fact_id"])] = {
+            "fact_id": row["fact_id"], "status": row["status"],
+            "locked": bool(row["locked"]), "source_strength": row["evidence_strength"]}
+    return index
+
+
+def _active_snapshot(connection: sqlite3.Connection) -> str:
+    require_table(connection, "candidate_snapshots")
+    row = connection.execute(
+        "SELECT content_sha256 FROM candidate_snapshots WHERE status='active' "
+        "AND registered_by='user'").fetchone()
+    if not row:
+        raise ValueError("no active user-registered candidate snapshot")
+    return row["content_sha256"]
+
+
+# ---- the narrative must be completely accounted for --------------------------------
+
+
+def _narrative(content: dict[str, Any]) -> str:
+    parts = [content["star"][part] for part in STAR_PARTS]
+    for optional in ("earned_secret", "reflection"):
+        if content.get(optional):
+            parts.append(content[optional])
+    return "\n".join(parts)
+
+
+def account_for(narrative: str, spans: list[str]) -> list[str]:
+    """What is left of the narrative once every claim and framing span is taken out.
+
+    The alternative was to ask a model which sentences make factual assertions, which puts a
+    model in front of the gate that decides whether a story may be used — the wrong side of
+    the ladder, and unfalsifiable besides. This asks the author instead: account for all of
+    it, either by binding it to evidence or by marking it framing. Whatever neither covers is
+    returned here, and its presence is what makes a version unselectable.
+
+    Spans are matched verbatim and never overlap; a span appearing twice covers only its
+    first free occurrence, so repeating a sentence does not silently cover the repeat.
+    """
+    covered = [False] * len(narrative)
+    for span in spans:
+        text = span.strip()
+        if not text:
+            continue
+        start = 0
+        while True:
+            found = narrative.find(text, start)
+            if found < 0:
+                break
+            if not any(covered[found:found + len(text)]):
+                for index in range(found, found + len(text)):
+                    covered[index] = True
+                break
+            start = found + 1
+    residue, current = [], []
+    for index, character in enumerate(narrative):
+        if covered[index]:
+            if current:
+                residue.append("".join(current))
+                current = []
+        else:
+            current.append(character)
+    if current:
+        residue.append("".join(current))
+    return [chunk.strip() for chunk in residue if not FILLER.match(chunk)]
+
+
+# ---- drafting a version ------------------------------------------------------------
+
+
+def _validate_shape(content: dict[str, Any]) -> None:
+    for field in ("title", "primary_capability"):
+        if not isinstance(content.get(field), str) or not content[field].strip():
+            raise ValueError(f"a story version requires {field}")
+    star = content.get("star")
+    if not isinstance(star, dict) or any(
+            not isinstance(star.get(part), str) or not star[part].strip() for part in STAR_PARTS):
+        raise ValueError("a story version requires a complete STAR narrative")
+    for field in ("secondary_capabilities", "domains", "framing_spans"):
+        value = content.get(field, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{field} must be a list of strings")
+    for capability_id in [content["primary_capability"], *content.get("secondary_capabilities", [])]:
+        if _capability_layer(capability_id) != "SKILL":
+            raise ValueError(f"{capability_id} is not a reviewed SKILL capability")
+    for domain_id in content.get("domains", []):
+        if _capability_layer(domain_id) != "DOMAIN":
+            raise ValueError(f"{domain_id} is not a reviewed DOMAIN tag")
+    claims = content.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise ValueError("a story version requires at least one claim")
+
+
+def _validate_claims(content: dict[str, Any], index: dict[str, dict[str, Any]],
+                     narrative: str) -> list[dict[str, Any]]:
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for claim in content["claims"]:
+        claim_id = claim.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id or claim_id in seen:
+            raise ValueError("every claim requires a unique claim_id")
+        seen.add(claim_id)
+        text = claim.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"claim {claim_id} requires text")
+        if text not in narrative:
+            # A claim is a span of what the story actually says. One that quotes nothing in
+            # the narrative binds evidence to a sentence nobody will ever tell.
+            raise ValueError(f"claim {claim_id} does not appear in the narrative")
+        refs = claim.get("evidence_refs")
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs):
+            raise ValueError(f"claim {claim_id} requires at least one evidence_ref")
+        evidence_class = claim.get("evidence_class")
+        if evidence_class == UNSUPPORTED:
+            # Allowed to exist so a draft can record "this is the part with nothing behind
+            # it". `selectable` refuses it, which is the whole point of writing it down.
+            resolved.append({"claim_id": claim_id, "text": text, "evidence_refs": list(refs),
+                             "evidence_class": UNSUPPORTED})
+            continue
+        if evidence_class not in CLAIM_CLASSES:
+            raise ValueError(f"claim {claim_id} has an invalid evidence_class")
+        missing = [ref for ref in refs if ref not in index]
+        if missing:
+            raise ValueError(
+                f"claim {claim_id} cites evidence the snapshot does not have: {missing[0]}")
+        strongest = max(EVIDENCE_ORDER[index[ref]["source_strength"]] for ref in refs)
+        if EVIDENCE_ORDER[evidence_class] > strongest:
+            # The rule `resume_core.validate_claims_manifest` applies to a resume claim,
+            # applied here for the same reason: a sentence cannot be better evidenced than
+            # the evidence it cites, however it is worded.
+            raise ValueError(f"claim {claim_id} inflates its supporting evidence")
+        resolved.append({"claim_id": claim_id, "text": text, "evidence_refs": list(refs),
+                         "evidence_class": evidence_class})
+    return resolved
+
+
+def draft_version(connection: sqlite3.Connection, content: dict[str, Any], *,
+                  story_id: str | None = None, authored_by: str = "user",
+                  confidentiality: str = "reusable",
+                  confidential_employer: str | None = None,
+                  confidential_application_id: str | None = None,
+                  applicability: dict[str, Any] | None = None,
+                  supersedes_version_id: str | None = None,
+                  snapshot_sha256: str | None = None,
+                  at: datetime | None = None) -> dict[str, Any]:
+    """Write an immutable draft version. Approves nothing.
+
+    The returned `content_sha256` is what the user must later approve by name, so the thing
+    they read and the thing that becomes usable are provably the same thing.
+    """
+    initialize(connection)
+    if authored_by not in {"user", "model_assisted"}:
+        raise ValueError("authored_by must be user or model_assisted")
+    if confidentiality not in CONFIDENTIALITY:
+        raise ValueError("invalid confidentiality")
+    if confidentiality == "employer_confidential" and not confidential_employer:
+        raise ValueError("employer_confidential requires the employer it is confidential to")
+    if confidentiality == "application_confidential" and not confidential_application_id:
+        raise ValueError("application_confidential requires its application_id")
+    snapshot = snapshot_sha256 or _active_snapshot(connection)
+    _validate_shape(content)
+    narrative = _narrative(content)
+    index = evidence_index(connection, snapshot)
+    claims = _validate_claims(content, index, narrative)
+    framing = list(content.get("framing_spans", []))
+    unbound = account_for(narrative, [claim["text"] for claim in claims] + framing)
+
+    timestamp = (at or now_utc()).isoformat()
+    if story_id:
+        story = connection.execute("SELECT * FROM stories WHERE story_id=?", (story_id,)).fetchone()
+        if not story:
+            raise ValueError("story not found")
+        if story["status"] == REVOKED:
+            raise ValueError("a revoked story takes no new versions")
+    else:
+        story_id = f"S-{uuid.uuid4().hex[:10]}"
+        connection.execute(
+            "INSERT INTO stories (story_id, status, current_version_id, confidentiality, "
+            "confidential_employer, confidential_application_id, applicability_json, "
+            "created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+            (story_id, DRAFT, confidentiality, confidential_employer,
+             confidential_application_id, canonical_json(applicability or {}), timestamp))
+
+    stored = {"title": content["title"], "star": {part: content["star"][part] for part in STAR_PARTS},
+              "primary_capability": content["primary_capability"],
+              "secondary_capabilities": list(content.get("secondary_capabilities", [])),
+              "domains": list(content.get("domains", [])),
+              "earned_secret": content.get("earned_secret") or None,
+              "reflection": content.get("reflection") or None,
+              "framing_spans": framing, "claims": claims,
+              "candidate_snapshot_sha256": snapshot}
+    digest = content_hash(stored)
+    version_id = f"SV-{uuid.uuid4().hex[:12]}"
+    connection.execute(
+        "INSERT INTO story_versions (version_id, story_id, content_sha256, "
+        "candidate_snapshot_sha256, authored_by, title, star_json, primary_capability, "
+        "secondary_capabilities_json, domains_json, earned_secret, reflection, "
+        "framing_spans_json, unbound_spans_json, supersedes_version_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (version_id, story_id, digest, snapshot, authored_by, stored["title"],
+         canonical_json(stored["star"]), stored["primary_capability"],
+         canonical_json(stored["secondary_capabilities"]), canonical_json(stored["domains"]),
+         stored["earned_secret"], stored["reflection"], canonical_json(framing),
+         canonical_json(unbound), supersedes_version_id, timestamp))
+    for claim in claims:
+        connection.execute(
+            "INSERT INTO story_claims (version_id, claim_id, claim_text, evidence_refs_json, "
+            "evidence_class) VALUES (?, ?, ?, ?, ?)",
+            (version_id, claim["claim_id"], claim["text"],
+             canonical_json(claim["evidence_refs"]), claim["evidence_class"]))
+    _event(connection, story_id, version_id, authored_by, "story_version_drafted",
+           "draft_written", {"claims": len(claims), "unbound_spans": len(unbound),
+                             "snapshot_sha256": snapshot}, at)
+    connection.commit()
+    return {"story_id": story_id, "version_id": version_id, "content_sha256": digest,
+            "status": DRAFT, "approved": False, "claims": claims,
+            "unbound_spans": unbound, "candidate_snapshot_sha256": snapshot,
+            "next_step": "the user reads the exact version and approves its content hash"}
+
+
+# ---- approving one exact version ---------------------------------------------------
+
+
+def approve_version(connection: sqlite3.Connection, version_id: str, content_sha256: str,
+                    actor: str = "user", at: datetime | None = None) -> dict[str, Any]:
+    """Approve the exact content the user read.
+
+    The hash is a required argument rather than something looked up, so an approval cannot
+    land on a version that changed between being shown and being confirmed.
+    """
+    require_table(connection, "story_versions")
+    version = connection.execute(
+        "SELECT * FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not version:
+        raise ValueError("story version not found")
+    if version["approved_at"]:
+        raise ValueError("that version is already approved")
+    if version["content_sha256"] != content_sha256:
+        raise ValueError("the approved content hash does not match this version")
+    story = connection.execute(
+        "SELECT * FROM stories WHERE story_id=?", (version["story_id"],)).fetchone()
+    if story["status"] == REVOKED:
+        raise ValueError("a revoked story takes no approvals")
+    if json.loads(version["unbound_spans_json"]):
+        raise ValueError("this version has narrative that is bound to nothing")
+    unsupported = connection.execute(
+        "SELECT claim_id FROM story_claims WHERE version_id=? AND evidence_class=?",
+        (version_id, UNSUPPORTED)).fetchone()
+    if unsupported:
+        raise ValueError(f"claim {unsupported['claim_id']} is supported by nothing")
+    if version["candidate_snapshot_sha256"] != _active_snapshot(connection):
+        raise ValueError("this version was written against a profile that is no longer active")
+
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE story_versions SET approved_by=?, approved_at=? WHERE version_id=? "
+        "AND approved_at IS NULL", (actor, timestamp, version_id))
+    connection.execute(
+        "UPDATE stories SET status=?, current_version_id=?, status_reason=? WHERE story_id=?",
+        (APPROVED, version_id, "user_approved", version["story_id"]))
+    _event(connection, version["story_id"], version_id, actor, "story_version_approved",
+           "user_approved", {"content_sha256": content_sha256}, at)
+    connection.commit()
+    return {"story_id": version["story_id"], "version_id": version_id, "status": APPROVED,
+            "approved_by": actor, "approved_at": timestamp}
+
+
+def revoke(connection: sqlite3.Connection, story_id: str, reason: str,
+           actor: str = "user", at: datetime | None = None) -> dict[str, Any]:
+    require_table(connection, "stories")
+    story = connection.execute("SELECT * FROM stories WHERE story_id=?", (story_id,)).fetchone()
+    if not story:
+        raise ValueError("story not found")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "UPDATE stories SET status=?, revoked_at=?, status_reason=? WHERE story_id=?",
+        (REVOKED, timestamp, reason, story_id))
+    _event(connection, story_id, story["current_version_id"], actor, "story_revoked", reason,
+           {}, at)
+    connection.commit()
+    return {"story_id": story_id, "status": REVOKED, "revoked_at": timestamp}
+
+
+# ---- whether a version may actually be used ----------------------------------------
+
+
+def selectable(connection: sqlite3.Connection, version_id: str) -> dict[str, Any]:
+    """The deterministic gate. No model, no scoring, no ranking — may this be used at all.
+
+    Every reason is a stable code rather than prose, because callers act on them and a
+    reader needs to know which one fired without reading English.
+    """
+    require_table(connection, "story_versions")
+    version = connection.execute(
+        "SELECT * FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not version:
+        return {"selectable": False, "reasons": ["version_unknown"]}
+    story = connection.execute(
+        "SELECT * FROM stories WHERE story_id=?", (version["story_id"],)).fetchone()
+    reasons: list[str] = []
+    if not version["approved_at"]:
+        reasons.append("version_not_approved")
+    if story["status"] == REVOKED:
+        reasons.append("story_revoked")
+    if story["current_version_id"] != version_id:
+        reasons.append("superseded_version")
+    if json.loads(version["unbound_spans_json"]):
+        reasons.append("narrative_not_fully_bound")
+
+    snapshot = version["candidate_snapshot_sha256"]
+    try:
+        active = _active_snapshot(connection)
+    except ValueError:
+        active = None
+    if snapshot != active:
+        reasons.append("candidate_snapshot_changed")
+    index = evidence_index(connection, snapshot)
+    classes: dict[str, str] = {}
+    for claim in connection.execute(
+            "SELECT * FROM story_claims WHERE version_id=?", (version_id,)):
+        if claim["evidence_class"] == UNSUPPORTED:
+            reasons.append("claim_unsupported")
+            continue
+        refs = json.loads(claim["evidence_refs_json"])
+        if any(ref not in index for ref in refs):
+            reasons.append("evidence_no_longer_valid")
+            continue
+        strongest = max(EVIDENCE_ORDER[index[ref]["source_strength"]] for ref in refs)
+        if EVIDENCE_ORDER[claim["evidence_class"]] > strongest:
+            reasons.append("evidence_weakened")
+        classes[claim["claim_id"]] = claim["evidence_class"]
+    return {"selectable": not reasons, "reasons": sorted(set(reasons)),
+            "version_id": version_id, "story_id": version["story_id"],
+            "evidence_classes": classes,
+            "confidentiality": story["confidentiality"],
+            "confidential_employer": story["confidential_employer"],
+            "confidential_application_id": story["confidential_application_id"]}
+
+
+# ---- carrying a story across a change of snapshot ----------------------------------
+
+
+def stranded(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Approved stories the active profile left behind, and what changed under each."""
+    require_table(connection, "stories")
+    try:
+        active = _active_snapshot(connection)
+    except ValueError:
+        return []
+    rows = connection.execute(
+        "SELECT s.story_id, s.current_version_id, v.candidate_snapshot_sha256, v.title "
+        "FROM stories s JOIN story_versions v ON v.version_id = s.current_version_id "
+        "WHERE s.status=? AND v.candidate_snapshot_sha256 != ? ORDER BY s.story_id",
+        (APPROVED, active)).fetchall()
+    return [{"story_id": row["story_id"], "version_id": row["current_version_id"],
+             "title": row["title"], "approved_against": row["candidate_snapshot_sha256"],
+             "changes": restate(connection, row["current_version_id"])} for row in rows]
+
+
+def restate(connection: sqlite3.Connection, version_id: str,
+            snapshot_sha256: str | None = None) -> dict[str, Any]:
+    """Re-resolve one version's bindings against a snapshot, and report what moved.
+
+    Read-only. The point is that the second approval is answering a real question — *these
+    claims were checked against who you were; are they still true of who you are now?* — and
+    a carry that could not say what changed would be asking the user to click, not to decide.
+    """
+    require_table(connection, "story_versions")
+    version = connection.execute(
+        "SELECT * FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not version:
+        raise ValueError("story version not found")
+    target = snapshot_sha256 or _active_snapshot(connection)
+    was = evidence_index(connection, version["candidate_snapshot_sha256"])
+    now = evidence_index(connection, target)
+    # A unit id is derived from the snapshot, so the same fact has a different id under the
+    # new one. The fact is the thing that persists; the reference is re-derived from it.
+    fact_of = {unit_id: entry["fact_id"] for unit_id, entry in was.items()}
+    by_fact = {entry["fact_id"]: unit_id for unit_id, entry in now.items()}
+
+    claims, changed, lost = [], [], []
+    for claim in connection.execute(
+            "SELECT * FROM story_claims WHERE version_id=? ORDER BY claim_id", (version_id,)):
+        refs = json.loads(claim["evidence_refs_json"])
+        facts = [fact_of.get(ref) for ref in refs]
+        carried = [by_fact.get(fact) for fact in facts]
+        missing = [fact for fact, unit in zip(facts, carried) if fact is None or unit is None]
+        entry = {"claim_id": claim["claim_id"], "text": claim["claim_text"],
+                 "evidence_class": claim["evidence_class"],
+                 "fact_ids": [fact for fact in facts if fact],
+                 "evidence_refs": [unit for unit in carried if unit]}
+        if missing:
+            entry["status"] = "evidence_missing"
+            lost.append(claim["claim_id"])
+        else:
+            strongest = max(EVIDENCE_ORDER[now[unit]["source_strength"]] for unit in carried)
+            if EVIDENCE_ORDER[claim["evidence_class"]] > strongest:
+                entry["status"] = "evidence_weakened"
+                entry["available_class"] = next(
+                    name for name, rank in sorted(EVIDENCE_ORDER.items(), key=lambda kv: -kv[1])
+                    if rank == strongest)
+                changed.append(claim["claim_id"])
+            else:
+                entry["status"] = "unchanged"
+        claims.append(entry)
+    return {"version_id": version_id, "target_snapshot_sha256": target,
+            "claims": claims, "changed_claims": changed, "lost_claims": lost,
+            "carryable": not lost,
+            "identical": not changed and not lost}
+
+
+def prepare_successor(connection: sqlite3.Connection, version_id: str,
+                      at: datetime | None = None) -> dict[str, Any]:
+    """Re-bind an approved version to the active snapshot as a new draft.
+
+    Preparing is not approving. The successor is written with references re-derived from the
+    same facts, and it arrives unapproved however little changed — an unchanged projection is
+    still a projection of a different profile, and the user is the one who says so.
+    """
+    require_table(connection, "story_versions")
+    version = connection.execute(
+        "SELECT * FROM story_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not version:
+        raise ValueError("story version not found")
+    if not version["approved_at"]:
+        raise ValueError("only an approved version has anything to carry forward")
+    target = _active_snapshot(connection)
+    if version["candidate_snapshot_sha256"] == target:
+        raise ValueError("this story is already bound to the active profile")
+    moved = restate(connection, version_id, target)
+    if moved["lost_claims"]:
+        raise ValueError(
+            "the active profile no longer supports every claim; the claim must be re-evidenced "
+            f"or removed: {moved['lost_claims'][0]}")
+    star = json.loads(version["star_json"])
+    content = {
+        "title": version["title"], "star": star,
+        "primary_capability": version["primary_capability"],
+        "secondary_capabilities": json.loads(version["secondary_capabilities_json"]),
+        "domains": json.loads(version["domains_json"]),
+        "earned_secret": version["earned_secret"], "reflection": version["reflection"],
+        "framing_spans": json.loads(version["framing_spans_json"]),
+        "claims": [{"claim_id": claim["claim_id"], "text": claim["text"],
+                    "evidence_refs": claim["evidence_refs"],
+                    # Weakened evidence is written down as weakened. It is never carried at
+                    # the class it used to hold, which is what G2 refuses in both directions.
+                    "evidence_class": claim.get("available_class", claim["evidence_class"])}
+                   for claim in moved["claims"]],
+    }
+    drafted = draft_version(connection, content, story_id=version["story_id"],
+                            authored_by="user", supersedes_version_id=version_id,
+                            snapshot_sha256=target, at=at)
+    drafted["restated"] = moved
+    drafted["next_step"] = ("the user reads what changed and approves the successor's "
+                            "content hash")
+    return drafted
+
+
+# ---- usage --------------------------------------------------------------------------
+
+
+def record_use(connection: sqlite3.Connection, version_id: str, question_type: str, *,
+               application_id: str | None = None, interview_id: str | None = None,
+               round_id: str | None = None, outcome_ref: str | None = None,
+               at: datetime | None = None) -> dict[str, Any]:
+    """Append one usage event. `use_count` and `last_used` are read from these, never set."""
+    require_table(connection, "story_usage_events")
+    if not connection.execute(
+            "SELECT 1 FROM story_versions WHERE version_id=?", (version_id,)).fetchone():
+        raise ValueError("story version not found")
+    timestamp = (at or now_utc()).isoformat()
+    connection.execute(
+        "INSERT INTO story_usage_events (story_version_id, application_id, interview_id, "
+        "round_id, question_type, used_at, outcome_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (version_id, application_id, interview_id, round_id, question_type, timestamp,
+         outcome_ref))
+    connection.commit()
+    return {"version_id": version_id, "used_at": timestamp}
+
+
+def usage(connection: sqlite3.Connection, story_id: str) -> dict[str, Any]:
+    require_table(connection, "story_usage_events")
+    rows = connection.execute(
+        "SELECT e.used_at FROM story_usage_events e JOIN story_versions v "
+        "ON v.version_id = e.story_version_id WHERE v.story_id=? ORDER BY e.used_at",
+        (story_id,)).fetchall()
+    return {"story_id": story_id, "use_count": len(rows),
+            "last_used": rows[-1]["used_at"] if rows else None}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stories bound to evidence.")
+    parser.add_argument("--db", required=True, type=Path)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("init")
+    commands.add_parser("stranded")
+    draft = commands.add_parser("draft")
+    draft.add_argument("--content", required=True, type=Path)
+    draft.add_argument("--story")
+    approve = commands.add_parser("approve")
+    approve.add_argument("--version", required=True)
+    approve.add_argument("--content-sha256", required=True)
+    check = commands.add_parser("selectable")
+    check.add_argument("--version", required=True)
+    carry = commands.add_parser("prepare-successor")
+    carry.add_argument("--version", required=True)
+    args = parser.parse_args()
+
+    connection = candidate_core.connect(args.db)
+    initialize(connection)
+    if args.command == "init":
+        result: Any = {"status": "initialized", "db": str(args.db)}
+    elif args.command == "stranded":
+        result = stranded(connection)
+    elif args.command == "draft":
+        result = draft_version(connection,
+                               json.loads(args.content.read_text(encoding="utf-8")),
+                               story_id=args.story)
+    elif args.command == "approve":
+        result = approve_version(connection, args.version, args.content_sha256)
+    elif args.command == "selectable":
+        result = selectable(connection, args.version)
+    else:
+        result = prepare_successor(connection, args.version)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
