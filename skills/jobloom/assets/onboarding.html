@@ -78,6 +78,10 @@
   td.state { text-align: right; white-space: nowrap; color: var(--muted); font-size: 13px; }
   ul.plain { margin: 0 0 14px; padding-left: 20px; }
   .error { color: var(--warn); margin-top: 14px; }
+  .choice { border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px;
+            margin: 0 0 14px; }
+  .choice h3 { font-size: 16px; margin: 0 0 6px; }
+  .choice p { margin: 0 0 12px; }
   iframe.paper { width: 100%; height: 420px; border: 1px solid var(--line);
                  border-radius: 8px; background: var(--bg); margin: 4px 0 18px; }
   label.check { display: flex; align-items: flex-start; gap: 4px; font-weight: 600; }
@@ -167,6 +171,15 @@ const COPY = {
     doneNext: "下一步是把受影响的简历对新快照重新审批并绑定。",
     close: "可以关掉这个窗口了",
     failed: "没能完成：",
+    landingTitle: "有两件事等着你",
+    landingBody: "它们互不相干，先做哪个都行。",
+    landingCarry: "恢复申请材料（{n} 份）",
+    landingCarryUrgent: "其中一份卡着一份已经准备好的申请。",
+    landingCarryWhy: "换资料快照之后，对旧快照批准过的简历不能再用于申请。",
+    landingCarryGo: "去恢复",
+    landingRound: "接着填基本资料",
+    landingRoundLeft: "这一轮问 {n} 项，还有 {m} 项没有填。",
+    landingRoundGo: "去填资料",
     migrationsTitle: "还有申请材料要恢复",
     migrationsBody: "换了资料快照之后，对旧快照批准过的简历不能再用于申请——这不是简历有问题，是它的批准记录指向了旧的你。把它带过来需要你重新看一眼并批准。",
     migrationsNone: "没有需要恢复的申请材料。",
@@ -250,6 +263,15 @@ const COPY = {
     doneNext: "Next is re-approving the affected resume against the new snapshot and binding it.",
     close: "You can close this window",
     failed: "Could not finish: ",
+    landingTitle: "Two things are waiting for you",
+    landingBody: "They have nothing to do with each other, so either one can go first.",
+    landingCarry: "Restore application materials ({n})",
+    landingCarryUrgent: "One of them is holding up an application that is otherwise ready.",
+    landingCarryWhy: "After a profile snapshot changes, a resume approved against the old one cannot be used for an application.",
+    landingCarryGo: "Restore them",
+    landingRound: "Carry on with your basics",
+    landingRoundLeft: "Still blank: {m} of the {n} things this round asks for.",
+    landingRoundGo: "Carry on",
     migrationsTitle: "Some application materials need restoring",
     migrationsBody: "A resume approved against your old profile cannot be used for an application any more. Nothing is wrong with the resume — its approval points at the older you. Carrying it across needs you to look at it again and approve it.",
     migrationsNone: "No application materials need restoring.",
@@ -325,7 +347,7 @@ const FIELD_COPY = {
 
 let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
 let app = { fields: [], answers: {}, screenGates: {}, index: 0, screen: "welcome", state: null,
-            draft: null, done: null, error: "", stranded: [], carry: null,
+            draft: null, done: null, error: "", stranded: [], carry: null, entry: null,
             pdfUrl: "", reviewed: false, busy: false, restored: null };
 
 const t = (key, vars) => {
@@ -622,6 +644,32 @@ function doneScreen() {
       el("button", { class: "primary", text: t("next"), onclick: openMigrations })));
 }
 
+// A profile round and a stranded resume are two different pieces of work, and the window
+// used to reach the second only through finishing the first. Whoever has an approved resume
+// that a snapshot change left behind has already registered a profile; making them answer a
+// round that has since grown before they can restore it puts an unrelated wait in front of an
+// application. So when both are outstanding, the window says so and lets the user choose.
+function landing() {
+  const carryable = app.stranded.filter((row) => row.migratable).length;
+  const urgent = app.stranded.some((row) => row.migratable && row.lock_lost && row.application_id);
+  const blank = app.state.fields_in_round.filter(
+    (id) => !app.state.resolvable.includes(id)).length;
+  return el("div", {},
+    el("h2", { text: t("landingTitle") }),
+    el("p", { text: t("landingBody") }),
+    el("section", { class: "choice" },
+      el("h3", { text: t("landingCarry", { n: carryable }) }),
+      el("p", { class: "muted", text: t("landingCarryWhy") }),
+      urgent ? el("p", { text: t("landingCarryUrgent") }) : null,
+      el("button", { class: "primary", text: t("landingCarryGo"),
+                     onclick: () => go("migrations") })),
+    el("section", { class: "choice" },
+      el("h3", { text: t("landingRound") }),
+      el("p", { class: "muted",
+                text: t("landingRoundLeft", { n: app.state.fields_in_round.length, m: blank }) }),
+      el("button", { text: t("landingRoundGo"), onclick: () => go("field", 0) })));
+}
+
 // ---- carrying the resumes the new profile left behind ---------------------------
 
 async function openMigrations() {
@@ -656,7 +704,10 @@ function migrationsScreen() {
     app.error ? el("p", { class: "error", text: t("failed") + app.error }) : null,
     el("footer", { class: "nav" },
       el("span", { class: "spacer" }),
-      el("button", { text: t("skipMigrations"), onclick: () => go("done") })));
+      // `done` says the profile round was just registered. It was not, when the carry was
+      // reached from the landing, so leaving goes back to where the choice was made.
+      el("button", { text: t("skipMigrations"),
+                     onclick: () => go(app.entry === "landing" ? "landing" : "done") })));
 }
 
 async function prepareCarry(row) {
@@ -822,14 +873,14 @@ function rerender(focusId) {
 function render() {
   const steps = (app.state && app.state.screens ? app.state.screens.length : 4);
   const total = steps + 3;
-  const at = app.screen === "welcome" ? 0
+  const at = app.screen === "welcome" || app.screen === "landing" ? 0
            : app.screen === "field" ? app.index + 1
            : app.screen === "review" ? steps + 1
            : app.screen === "impact" ? steps + 2 : total;
   const progress = document.getElementById("progress");
   progress.replaceChildren(...Array.from({ length: total }, (_, i) =>
     el("i", { class: i <= at ? "done" : "" })));
-  const screen = { welcome, field: fieldScreen, review: reviewScreen,
+  const screen = { welcome, landing, field: fieldScreen, review: reviewScreen,
                    impact: impactScreen, done: doneScreen,
                    migrations: migrationsScreen, carryReview: carryReviewScreen,
                    carryBind: carryBindScreen, restored: restoredScreen }[app.screen];
@@ -847,16 +898,22 @@ document.getElementById("lang").addEventListener("change", (event) => {
   document.documentElement.lang = lang;
   try {
     app.state = await api("/api/state");
+    // Asked whenever a profile exists, because a stranded resume is the other thing that can
+    // be outstanding and it is not conditional on the round being finished.
+    app.stranded = app.state.has_profile
+      ? (await api("/api/resume-migrations")).stranded : [];
     const round = app.state.fields_in_round.every((id) => app.state.resolvable.includes(id))
       ? null : await api("/api/round", {});
     if (round === null) {
       // The round is answered and registered. Coming back is for what is left over.
-      app.stranded = (await api("/api/resume-migrations")).stranded;
       app.fields = [];
       go("migrations");
       return;
     }
     app.fields = round.fields;
+    if (app.stranded.some((row) => row.migratable)) {
+      app.entry = "landing";
+    }
     document.getElementById("countries").replaceChildren(
       ...(round.countries || []).map((name) => el("option", { value: name })));
     for (const field of app.fields) {
@@ -865,6 +922,10 @@ document.getElementById("lang").addEventListener("change", (event) => {
       // asked.
       app.answers[field.canonical_id] = { value: field.value || "", complaint: "",
                                           suggestion: "" };
+    }
+    if (app.entry === "landing") {
+      go("landing");
+      return;
     }
     render();
   } catch (error) {
