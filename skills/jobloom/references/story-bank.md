@@ -2,11 +2,15 @@
 
 Spec: [`docs/jobloom-story-bank-spec.md`](../../../docs/jobloom-story-bank-spec.md).
 
-**What exists today is build-order steps 1–2 of that spec**: the registry, claim binding,
-approval, revocation, snapshot carry, reviewed competency mappings, and `story map`.
-`answer draft`, `story find-gaps`, retrieval drills, and interview usage reporting are
-**not implemented**. Nothing here can answer an employer's question yet; a Story reaches an
-application only through the AnswerLibrary, and that path is step 3.
+**What exists today is build-order steps 1–3 of that spec** — the first usable vertical
+slice: the registry, claim binding, approval, revocation, snapshot carry, reviewed competency
+mappings, `story map`, and `answer draft` through the existing AnswerLibrary.
+`story find-gaps`, retrieval drills, interview usage reporting, and `story improve` are
+**not implemented**.
+
+Nothing here fills a form or submits anything. `story_answers.propose` decides what may
+answer one observed field and, where that is a story, writes a draft the user must approve;
+approval authorizes reuse of that one answer and nothing else.
 
 ## What a Story is
 
@@ -132,6 +136,49 @@ and a score, or it is refused. It sorts only after fit and evidence class have t
 model's opinion cannot lift a `workable` story above a `strong` one, cannot add or remove a
 story, and cannot change a class. Without any advisory input the order is still total: fit,
 evidence class, least-used, version id.
+
+## Proposing an application answer
+
+`story_answers.propose()` is the only path from a story to an employer's form, and almost all
+of it is about what has to happen first. There is no second answer store and no second
+sensitive-question taxonomy: the disposition comes from `field_policy`, the stop boundary from
+`pre_submit_core.MANDATORY_PAUSES`, the question meaning and exact-reuse decision from
+`answer_library`, and an approved draft lands in the AnswerLibrary like any other answer.
+
+The gates run in order of consequence, not likelihood:
+
+| # | Gate | Outcome |
+|---|---|---|
+| 1 | an item or control on the existing mandatory-pause list | `pause / stop_boundary` |
+| 2 | `field_policy` disposition `always_manual` (EEO, compensation, sponsorship, employer conflict, referral contact) | `manual`, no draft |
+| 3 | disposition `unsupported` / `material` / `fact` | `pause` or `manual`, no draft |
+| 4 | AnswerLibrary exact match, fresh, scope-valid, independently authorized | `reuse`, **no model, no story touched** |
+| 5 | an approved answer exists but cannot auto-fill | `review_existing_answer` — never a second text for one meaning |
+| 6 | unknown or conflicting question form | `pause` |
+| 7 | a domain rule fired but the meaning is supported (e.g. `discovery_source`) | `pause / sensitive_requires_exact_answer` — a story may not compose one |
+| 8 | no reviewed competency for the question | `pause / competency_not_mapped` |
+| 9 | ordinary narrative question, stories retrieved | `choose` (≤3 options plus `none_of_these`), then `drafted` or `gap` |
+
+**Which competency a question tests is not inferred.** A model deciding that would sit in
+front of the evidence gate one step removed, so the caller supplies it and an unmapped
+question pauses. Resolving competency from a reviewed question form is not built.
+
+**The draft is assembled, not composed.** Every span of an approved version is already either
+a bound claim or a reviewed framing span, so the draft is that version read back verbatim in
+STAR order. Nothing rewrites it; a rewrite would be text generated outside the binding gate.
+
+**Transferable evidence is named, not softened.** The draft carries an explicit bridge saying
+the answer rests on adjacent experience, is never `auto_fill_ready` on first generation, and
+`approve_draft` refuses `auto_fill_allowed=True` for it.
+
+**A draft is not an answer.** It records the application, employer, canonical meaning, story
+version, exact evidence refs, snapshot and a content hash. `approve_draft(draft_id,
+content_sha256, scope=, validity_class=)` requires that exact hash, re-checks that the story
+is still selectable, and writes one AnswerLibrary entry with `source_type: user_confirmed`,
+`auto_submit_allowed: False`, and the facts behind the evidence as `dependent_fact_ids` — so
+the invalidation the library already runs reaches a story-derived answer like any other.
+Approval returns what it authorizes (`reuse_of_this_answer_only`) and what it does not
+(submit, Next/Continue, another question meaning).
 
 ## What is deliberately not here
 
