@@ -33,6 +33,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import application_core  # noqa: E402
 import direction_core  # noqa: E402
+import requirement_tiers  # noqa: E402
 
 SCHEMA_VERSION = "0.1.0"
 # Evidence the candidate can actually stand behind. `mention_only` is deliberately worth
@@ -72,8 +73,28 @@ def evidence_summary(routing: dict[str, Any], card: dict[str, Any]) -> dict[str,
     }
 
 
+def tier_summary(card: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Must-have, preferred and unknown coverage, counted separately.
+
+    The undifferentiated `stated_requirements` count above cannot tell "we need R" from "R a
+    plus", so a posting listing twelve wishes reads as harder than one listing two musts.
+    `requirement_tiers` reads the employer's own words for the weight; nothing here decides
+    it, and a requirement whose weight the posting never stated stays in its own column
+    rather than being folded into either of the others.
+    """
+    report = requirement_tiers.summarize(card.get("description", "") or "",
+                                         candidate.get("facts") or [])
+    return report["tiers"]
+
+
 def sort_key(row: dict[str, Any]) -> tuple:
-    """Weight, then evidence, then context density last — never the other way round.
+    """Weight, then must-have evidence, then the rest — never the other way round.
+
+    Must-have coverage sorts before total coverage, and must-have gaps sort before both,
+    because a posting whose mandatory requirements are uncovered is not made easier by
+    covering its wishes. Only `direct` evidence counts toward a must-have: transferable and
+    mention-only evidence is carried in its own column and would, if counted here, put a
+    posting the candidate cannot meet above one they can.
 
     Below the evidenced openings this ordering stops meaning anything, and it says so
     rather than inventing a tiebreak. Unlearn.AI's "Clinical Data Scientist" states eight
@@ -86,8 +107,12 @@ def sort_key(row: dict[str, Any]) -> tuple:
     put the nursing role above the data one.
     """
     evidence = row["evidence"]
+    tiers = row.get("tiers") or {}
+    must = tiers.get(requirement_tiers.MUST_HAVE) or {}
     return (
         -row["weight_percent"],
+        -must.get("direct", 0),
+        must.get("gaps", 0),
         -evidence["direct"],
         -evidence["covered"],
         -evidence["technical_hits"],
@@ -185,6 +210,9 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
             "weight_percent": primary["weight_percent"],
             "ranking_score": primary["ranking_score"],
             "evidence": primary["evidence"],
+            # Once per posting, not once per direction that matched it: what the employer
+            # wrote about a requirement's weight does not depend on which direction is reading.
+            "tiers": tier_summary(card, candidate),
             "review_reasons": primary["review_reasons"][:4],
             "also_matches": [item["direction_id"] for item in found[1:]],
             "employer": card["employer"],

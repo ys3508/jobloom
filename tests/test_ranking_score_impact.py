@@ -30,11 +30,22 @@ class Reachability(unittest.TestCase):
     def test_every_key_that_should_decide_does(self):
         self.assertEqual(set(self.result["sort_key"]["per_key"].values()), {"decides"})
 
-    def test_the_score_sits_behind_the_four_evidence_keys(self):
+    def test_the_score_sits_behind_every_evidence_key(self):
+        """Asserted as the property, not as an index.
+
+        This class says a reordering of the sort tuple cannot make it stale, and a hardcoded
+        position made it exactly that: adding the must-have keys moved the score from 4 to 6
+        and failed a test about something that had not changed.
+        """
         positions = self.result["sort_key"]["tuple_positions"]
-        self.assertEqual(positions["ranking_score"], [4])
-        for key in ("weight_percent", "direct", "covered", "technical_hits"):
-            self.assertLess(positions[key][0], positions["ranking_score"][0])
+        score = positions["ranking_score"][0]
+        for key, place in positions.items():
+            if key == "ranking_score":
+                continue
+            with self.subTest(key=key):
+                self.assertLess(place[0], score,
+                                f"{key} must decide before ranking_score")
+        self.assertEqual(score, max(place[0] for place in positions.values()))
 
 
 class StoredData(unittest.TestCase):
@@ -268,3 +279,25 @@ class Conclusions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StalenessTests(unittest.TestCase):
+    """This module reports on the sort key, so it must read it rather than remember it.
+
+    Both the score's position and the tiebreak comparison were written as the literal `4`.
+    Adding the must-have keys in front moved the score to 6, and the audit then reported on
+    a sort key that no longer existed — while the tests describing themselves as immune to
+    reordering were the ones that failed.
+    """
+
+    def test_the_score_position_is_measured_from_the_sort_key(self):
+        self.assertEqual(MODULE.score_index(),
+                         max(place[0] for place in
+                             MODULE.reachability()["sort_key"]["tuple_positions"].values()))
+
+    def test_the_audit_reads_every_key_the_queue_sorts_on(self):
+        """A key the queue sorts on and the audit ignores is a key nobody is measuring."""
+        measured = set(MODULE.reachability()["sort_key"]["tuple_positions"])
+        self.assertEqual(measured,
+                         {"weight_percent", "must_direct", "must_gaps", "direct", "covered",
+                          "technical_hits", "ranking_score"})

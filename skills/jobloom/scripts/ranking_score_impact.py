@@ -65,20 +65,28 @@ def sort_key_position(build_row, keys: list[str]) -> dict:
 
 
 def queue_row(weight_percent=50, direct=1, covered=1, technical_hits=1, ranking_score=100,
-              employer="acme", title="analyst"):
+              must_direct=1, must_gaps=1, employer="acme", title="analyst"):
     return {"weight_percent": weight_percent, "ranking_score": ranking_score,
             "employer": employer, "title": title,
             "evidence": {"direct": direct, "covered": covered,
-                         "technical_hits": technical_hits}}
+                         "technical_hits": technical_hits},
+            "tiers": {"must_have": {"direct": must_direct, "gaps": must_gaps},
+                      "preferred": {}, "unknown": {}}}
 
 
 def reachability() -> dict:
-    keys = ["weight_percent", "direct", "covered", "technical_hits", "ranking_score"]
+    # Every evidence key the queue sorts on, in the order it sorts on them. The
+    # must-have keys joined this list when requirement tiering did; leaving them out would
+    # have let the audit report on a sort key that no longer existed.
+    keys = ["weight_percent", "must_direct", "must_gaps", "direct", "covered",
+            "technical_hits", "ranking_score"]
 
     def build_row(key, value):
         overrides = {"weight_percent": 50, "direct": 1, "covered": 1, "technical_hits": 1,
-                     "ranking_score": 100}
-        overrides[key] = {"ranking_score": (100, 200)}.get(key, (1, 9))[value]
+                     "ranking_score": 100, "must_direct": 1, "must_gaps": 1}
+        # `must_gaps` sorts ascending — fewer gaps is better — so its pair is reversed.
+        pairs = {"ranking_score": (100, 200), "must_gaps": (9, 1)}
+        overrides[key] = pairs.get(key, (1, 9))[value]
         return queue_row(**overrides)
 
     positions = sort_key_position(build_row, keys)
@@ -161,13 +169,29 @@ def ranks(queue: dict) -> dict:
     return {row["job_id"]: row["rank"] for row in queue["rows"]}
 
 
+def score_index() -> int:
+    """Where the score sits in the sort tuple, measured rather than assumed.
+
+    It was written as a literal `4`, which made this module report on a sort key it no
+    longer had the moment one was added in front — the same staleness the reachability
+    tests describe themselves as immune to.
+    """
+    low = review_queue.sort_key(queue_row(ranking_score=100))
+    high = review_queue.sort_key(queue_row(ranking_score=200))
+    differing = [index for index, (a, b) in enumerate(zip(low, high)) if a != b]
+    if not differing:
+        raise ValueError("the sort key no longer reads ranking_score at all")
+    return differing[0]
+
+
 def tiebreak_reached(queue: dict) -> dict:
     """How often consecutive entries are separated only by the score."""
     rows = queue["rows"]
+    at = score_index()
     reached = 0
     for first, second in zip(rows, rows[1:]):
         a, b = review_queue.sort_key(first), review_queue.sort_key(second)
-        if a[:4] == b[:4] and a[4] != b[4]:
+        if a[:at] == b[:at] and a[at] != b[at]:
             reached += 1
     return {"adjacent_pairs": max(len(rows) - 1, 0), "separated_only_by_ranking_score": reached}
 

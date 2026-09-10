@@ -1,5 +1,37 @@
 # Job evaluation
 
+## Requirement tiers
+
+`requirement_tiers.py` reads what the employer said about each requirement's *weight* —
+`must_have`, `preferred`, or `unknown` — and `review_queue` reports and sorts on it. Audit
+and measurements: [`docs/requirement-tier-audit-2026-09-09.md`](../../../docs/requirement-tier-audit-2026-09-09.md).
+
+Three rules, each derived from the 112-posting queue before the code was written:
+
+1. **The line beats the heading.** 77 lines say "preferred" under a Required heading and
+   effectively one says the reverse.
+2. **Two weights in one sentence is `unknown`**, unless a semicolon separates them cleanly —
+   then it is two requirements, not one ambiguous one.
+3. **A heading decides only when it is explicit.** `Requirements` and `Minimum
+   Qualifications` do; `Qualifications`, `About You` and `Knowledge, Skills, and Abilities`
+   do not, and calling those must-have is an upgrade nobody wrote.
+
+`unknown` is never resolved quietly in either direction. It is not a weaker `preferred`; it
+is the tier for a requirement whose weight the posting did not state, and it is reported as
+its own column.
+
+**A must-have is covered only by `direct` evidence.** Transferable and mention-only evidence
+is reported in an `adjacent` column and never counted as covering a mandatory requirement —
+the whole reason for a must-have column is that adjacent experience does not fill it.
+
+Ordering is direction weight, then must-have coverage, then must-have gaps, then the older
+evidence keys. Every classification carries its reason code, the cue that fired, and the
+character offset of the requirement in the posting, so a misclassification can be looked at.
+
+**Read the coverage numbers with the distillation gap in mind:** 566 of 652 must-have lines
+in the current queue yield no controlled term, so coverage describes a minority of what the
+postings state. The audit says so in more detail.
+
 ## Sequence
 
 1. Normalize employer, title, location, work arrangement, compensation, employment type, posting date, source, canonical URL, application URL, ATS, and requisition ID.
