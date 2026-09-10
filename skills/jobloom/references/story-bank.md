@@ -207,18 +207,32 @@ the draft was written under.
 a bound claim or a reviewed framing span, so the draft is that version read back verbatim in
 STAR order. Nothing rewrites it; a rewrite would be text generated outside the binding gate.
 
-**Transferable evidence is named inside the answer, not beside it.** When the retrieved
-binding is `transferable`, or when any claim rendered into the text is weaker than
-`strongly_related`, the drafted `answer_text` itself ends with a fixed qualifier naming the
-competency it draws on adjacent evidence for. It is part of the text the user approves and
-therefore part of what the AnswerLibrary stores and hands back on reuse.
+**Weak evidence is named inside the answer, in the class it actually is.** The drafted
+`answer_text` ends with an evidence note when there is something to say, and it makes up to
+two separate statements:
 
-This is not decoration. The qualifier used to live in the draft's `bridge` column, beside the
-answer; only `answer_text` was written to the library, so an answer approved on transferable
-evidence came back on the next form reading exactly like one drawn from direct evidence —
-`transferable never upgrades` intact as a rule and walked around by the reuse path. A draft
-carrying the qualifier is never `auto_fill_ready`, and `approve_draft` refuses
-`auto_fill_allowed=True` for it.
+- the **competency's own footing**, when the retrieved binding is weaker than
+  `strongly_related`: *this draws on `<class>` rather than direct evidence of `<competency>`*;
+- the **rest of the text**, when any rendered claim is weaker than that: *some supporting
+  detail rests on `<class>` evidence* — listing the distinct weak classes present, minus the
+  binding's own if it was already stated.
+
+Both use the real class name. One fixed competency-level sentence was wrong twice: saying
+"transferable" about a `mention_only` claim promotes exactly the class the ladder puts
+lowest, in the sentence written to prevent promotion; and where the competency's binding was
+`direct` and some other sentence was weaker, it denied a direct footing the evidence had. A
+weak claim sitting inside a binding whose *strongest* claim carried it is reported too,
+because the binding's class is a maximum and can hide one.
+
+(A binding resting only on `mention_only` never reaches a draft at all — `mention_only` is
+not coverage, so the story is not retrieved.)
+
+The note is in the text rather than beside it because a note stored next to the answer is not
+read by whoever reuses the answer. It used to live in the draft's `bridge` column; only
+`answer_text` reaches the library, so an answer approved on transferable evidence came back
+on the next form reading exactly like one drawn from direct evidence — `transferable never
+upgrades` intact as a rule and walked around by the reuse path. A draft carrying a note is
+never `auto_fill_ready`, and `approve_draft` refuses `auto_fill_allowed=True` for it.
 
 **A draft is not an answer.** It records the application, employer, canonical meaning, story
 version, exact evidence refs, snapshot and a content hash. `approve_draft(draft_id,
@@ -231,7 +245,14 @@ Approval returns what it authorizes (`reuse_of_this_answer_only`) and what it do
 
 ## Opening a database written by an earlier schema
 
-`story_core._migrate` runs inside `initialize` and is idempotent. It adds
+`story_core._migrate` runs inside `initialize`, is idempotent, and is safe to re-run after a
+crash. Each step is its own transaction, and **what remains to do is read from the data, not
+from the schema**: a row whose `capability_bindings_json` is missing, empty or unparseable is
+a row still to backfill, whatever columns exist. The earlier version decided from column
+existence, so a crash between adding the column and filling it left every row at the `'{}'`
+default and the next run skipped the backfill entirely — a database that looked migrated and
+had lost its capabilities. `primary_capability` is never dropped, which is what makes the
+repair always possible, even once `secondary_capabilities_json` is gone. It adds
 `capability_bindings_json`, drops the `secondary_capabilities_json` it replaces, adds
 `confidential_employer_normalized` and backfills it through the same normalizer identity is
 matched with, and adds `claim_ids_json` to reviewed mappings. `story_answers.initialize` adds
@@ -249,8 +270,11 @@ promotion this schema exists to prevent, silently, on rows nobody would look at 
   it by name rather than comparing it against today's digest — today's answer to "what does
   this question mean" is not evidence about what it meant when the draft was written.
 
-The way back is the ordinary one: draft a successor with real bindings and approve it.
-Nothing is lost — the story, its text, its claims and its usage history are all still there.
+The way back is a person drafting a successor with real bindings and approving it. It is
+**not** `prepare_successor`: carrying re-derives evidence references from the same facts and
+cannot supply claim ids nobody recorded, so it refuses a migrated version by name and says
+what to do instead. Nothing is lost — the story, its text, its claims and its usage history
+are all still there.
 
 ## What is deliberately not here
 

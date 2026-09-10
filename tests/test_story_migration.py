@@ -12,6 +12,12 @@ becomes unselectable with a reason that says exactly that, and `prepare_successo
 back. The story, its text, its claims and its usage history are all preserved; the only thing
 withheld is the assertion that somebody reviewed the binding.
 
+`prepare_successor` is **not** that way back, and an earlier version of this docstring said it
+was. Carrying re-derives evidence references from the same facts; it cannot supply claim ids
+nobody ever recorded, and a binding with an empty claim list is refused by `_validate_bindings`
+before it could try. Recovery is a person drafting a successor with real bindings and
+approving it — which is what `test_the_migrated_story_comes_back_by_being_re_bound` does.
+
 The old DDL is written out here rather than imported from the old commit, so this test states
 the shape it is guarding against instead of depending on history staying reachable.
 """
@@ -419,3 +425,130 @@ class UnlockedDraftTests(MigrationFixture):
                                   validity_class="stable", at=AT)
         self.assertIn("predates the question-form lock", str(caught.exception))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM answers").fetchone()[0], 0)
+
+
+class InterruptedMigrationTests(MigrationFixture):
+    """A migration that stopped half way is fixed by running it again.
+
+    The version this replaces decided what to do from whether a column existed. Adding a
+    column and backfilling it are one change, so a crash between them left every row at the
+    `'{}'` default while the column's existence made the next run skip the backfill — a
+    database that looked migrated and had lost its capabilities. Each step is a transaction
+    now, and what remains to do is read from the data rather than from the schema.
+    """
+
+    def bindings(self, version_id="SV-old"):
+        return json.loads(self.db.execute(
+            "SELECT capability_bindings_json FROM story_versions WHERE version_id=?",
+            (version_id,)).fetchone()[0])
+
+    def test_a_run_that_stopped_after_adding_the_column_is_repaired(self):
+        self.db.execute(
+            "ALTER TABLE story_versions ADD COLUMN capability_bindings_json TEXT "
+            "NOT NULL DEFAULT '{}'")
+        self.db.commit()
+        self.assertEqual(self.bindings(), {})
+        STORIES.initialize(self.db)
+        self.assertEqual(self.bindings()["primary"],
+                         {"capability_id": "cap.survey-design", "claim_ids": []})
+        self.assertEqual(self.bindings()["secondary"],
+                         [{"capability_id": "cap.stakeholder-reporting", "claim_ids": []}])
+
+    def test_a_run_that_stopped_before_the_drop_completes_the_drop(self):
+        STORIES.initialize(self.db)
+        first = self.bindings()
+        # Re-create the situation: the replaced column back beside its replacement.
+        self.db.execute(
+            "ALTER TABLE story_versions ADD COLUMN secondary_capabilities_json TEXT "
+            "NOT NULL DEFAULT '[]'")
+        self.db.commit()
+        STORIES.initialize(self.db)
+        self.assertNotIn("secondary_capabilities_json",
+                         {row[1] for row in self.db.execute(
+                             "PRAGMA table_info(story_versions)")})
+        self.assertEqual(self.bindings(), first)
+
+    def test_a_row_left_at_the_default_after_the_drop_is_still_repaired(self):
+        """The worst ordering: the source column gone and a row never backfilled.
+
+        `primary_capability` is never dropped, which is what makes this recoverable at all.
+        """
+        STORIES.initialize(self.db)
+        self.db.execute(
+            "UPDATE story_versions SET capability_bindings_json='{}' WHERE version_id='SV-old'")
+        self.db.commit()
+        STORIES.initialize(self.db)
+        self.assertEqual(self.bindings()["primary"],
+                         {"capability_id": "cap.survey-design", "claim_ids": []})
+        self.assertEqual(self.bindings()["secondary"], [])
+
+    def test_unreadable_binding_json_counts_as_unmigrated(self):
+        STORIES.initialize(self.db)
+        self.db.execute(
+            "UPDATE story_versions SET capability_bindings_json='not json' "
+            "WHERE version_id='SV-old'")
+        self.db.commit()
+        STORIES.initialize(self.db)
+        self.assertEqual(self.bindings()["primary"]["capability_id"], "cap.survey-design")
+
+    def test_a_failure_during_the_backfill_leaves_no_half_written_rows(self):
+        """The transaction is the point: rows either all carry a binding or none do."""
+        original = STORIES.application_core.normalize_text
+
+        def explode(value):
+            raise RuntimeError("interrupted")
+
+        self.db.execute(
+            "ALTER TABLE stories ADD COLUMN confidential_employer_normalized TEXT")
+        self.db.commit()
+        STORIES.application_core.normalize_text = explode
+        try:
+            with self.assertRaises(RuntimeError):
+                STORIES.initialize(self.db)
+        finally:
+            STORIES.application_core.normalize_text = original
+        self.assertIsNone(self.db.execute(
+            "SELECT confidential_employer_normalized FROM stories "
+            "WHERE story_id='S-old'").fetchone()[0])
+        # And running again, uninterrupted, completes it.
+        STORIES.initialize(self.db)
+        self.assertEqual(self.db.execute(
+            "SELECT confidential_employer_normalized FROM stories "
+            "WHERE story_id='S-old'").fetchone()[0],
+            APPLICATIONS.normalize_text("Example  Corp"))
+
+    def test_migrating_is_safe_to_repeat_any_number_of_times(self):
+        for _ in range(4):
+            STORIES.initialize(self.db)
+            PROPOSE.initialize(self.db)
+        self.assertEqual(self.bindings()["primary"],
+                         {"capability_id": "cap.survey-design", "claim_ids": []})
+        self.assertEqual(STORIES.usage(self.db, "S-old")["use_count"], 1)
+
+
+class RecoveringAMigratedStoryTests(MigrationFixture):
+    """What the way back actually is, since the docstring once named the wrong one."""
+
+    def test_carrying_a_migrated_version_forward_is_refused_by_name(self):
+        STORIES.initialize(self.db)
+        # Move the profile, so the carry would otherwise be the natural next step.
+        candidate = json.loads((self.root / "candidate.json").read_text(encoding="utf-8"))
+        candidate["facts"][0]["value"] = "Renamed Candidate"
+        # The hash is over the profile without it, so the old one has to come out first.
+        candidate.pop("content_sha256")
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        moved = self.root / "candidate-2.json"
+        moved.write_text(json.dumps(candidate), encoding="utf-8")
+        CANDIDATES.register_snapshot(self.db, self.root / "store", moved, "user", AT)
+        with self.assertRaises(ValueError) as caught:
+            STORIES.prepare_successor(self.db, "SV-old", at=AT)
+        self.assertIn("names no claims", str(caught.exception))
+        self.assertIn("draft a successor with real capability bindings",
+                      str(caught.exception))
+
+    def test_a_hand_drafted_successor_is_the_way_back(self):
+        successor = self.rebound_story()
+        self.assertTrue(STORIES.selectable(self.db, successor["version_id"])["selectable"])
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]["fit"],
+            "strong")

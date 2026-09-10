@@ -340,7 +340,7 @@ class DraftTests(ProposeFixture):
         self.story = self.approve_story(evidence_class="transferable")
         outcome = self.drafted()
         self.assertEqual(outcome["evidence_class"], "transferable")
-        self.assertIn("adjacent experience", outcome["bridge"])
+        self.assertIn("transferable rather than direct", outcome["bridge"])
         self.assertFalse(outcome["auto_fill_ready"])
 
 
@@ -685,7 +685,7 @@ class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
         story = self.mixed_story()
         drafted = self.ask(chosen_version_id=story["version_id"])
         self.assertTrue(drafted["qualified"])
-        self.assertIn("Adjacent experience", drafted["answer_text"])
+        self.assertIn("Evidence note:", drafted["answer_text"])
         self.assertIn("transferable rather than direct", drafted["answer_text"])
         # It is in what the user approves, so approval covers it.
         self.assertIn("answer_text", drafted)
@@ -695,7 +695,7 @@ class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
         stored = json.loads(self.db.execute(
             "SELECT answer_json FROM answers WHERE answer_id=?",
             (approved["answer_id"],)).fetchone()["answer_json"])
-        self.assertIn("Adjacent experience", stored)
+        self.assertIn("Evidence note:", stored)
         self.assertIn("transferable rather than direct", stored)
 
     def test_the_text_handed_back_on_reuse_carries_it(self):
@@ -710,7 +710,7 @@ class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
         self.db.commit()
         again = self.ask(authorization_id="auth-reuse")
         self.assertEqual(again["decision"], "reuse")
-        self.assertIn("Adjacent experience", again["answer"])
+        self.assertIn("Evidence note:", again["answer"])
         self.assertIn(COMPETENCY, again["answer"])
 
     def test_a_wholly_direct_answer_is_not_qualified(self):
@@ -718,7 +718,7 @@ class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
         drafted = self.ask(chosen_version_id=self.story["version_id"])
         self.assertFalse(drafted["qualified"])
         self.assertIsNone(drafted["bridge"])
-        self.assertNotIn("Adjacent experience", drafted["answer_text"])
+        self.assertNotIn("Evidence note:", drafted["answer_text"])
 
     def test_a_qualified_answer_cannot_be_approved_as_auto_fill(self):
         story = self.mixed_story()
@@ -754,4 +754,107 @@ class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
         # ...and the rendered text still asserts something transferable, so it is qualified.
         self.assertEqual(drafted["rendered_evidence_floor"], "transferable")
         self.assertTrue(drafted["qualified"])
-        self.assertIn("Adjacent experience", drafted["answer_text"])
+        self.assertIn("Evidence note:", drafted["answer_text"])
+
+
+class TheQualifierStatesTheRightClassTests(EveryAssertionInTheAnswerIsCoveredTests):
+    """The qualifier says which class, about which part, and no more than it can.
+
+    The defect this closes: one fixed competency-level sentence, "transferable rather than
+    direct evidence of X", used whenever anything in the text was weaker than
+    `strongly_related`. It was wrong twice over. Where the weak claim was `mention_only`, it
+    called it transferable — promoting exactly the class the ladder puts lowest, in the
+    sentence written to prevent promotion. And where the competency's own binding was direct
+    and some *other* sentence was weaker, it denied a direct footing the evidence had.
+    """
+
+    def story_with(self, binding_claims, c1_class, c2_class, c1_strength, c2_strength):
+        self.snapshot = self.register_at(c1_strength, c2_strength)
+        content = {
+            "title": "INNSCI focus groups",
+            "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
+            "primary_capability": {"capability_id": COMPETENCY, "claim_ids": binding_claims},
+            "secondary_capabilities": [], "domains": ["cap.domain.pharma-insights"],
+            "framing_spans": [SITUATION, TASK],
+            "claims": [
+                {"claim_id": "c1", "text": self.UNRELATED,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-focus")],
+                 "evidence_class": c1_class},
+                {"claim_id": "c2", "text": self.TARGET,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-sales")],
+                 "evidence_class": c2_class}]}
+        drafted = STORIES.draft_version(self.db, content, at=AT)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"],
+                                "user", AT)
+        return self.ask(chosen_version_id=drafted["version_id"])
+
+    def register_at(self, focus_strength, sales_strength):
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False,
+                "confirmed": True},
+            "search": {},
+            "facts": [
+                {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+                 "status": "locked", "locked": True, "evidence_strength": "direct"},
+                {"id": "fact-focus", "type": "experience_claim",
+                 "value": "Ran 2 focus groups", "status": "confirmed", "locked": False,
+                 "evidence_strength": focus_strength},
+                {"id": "fact-sales", "type": "experience_claim",
+                 "value": "Sales increased 17%", "status": "confirmed", "locked": False,
+                 "evidence_strength": sales_strength}]}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        path = self.root / f"candidate-{candidate['content_sha256'][:12]}.json"
+        path.write_text(json.dumps(candidate), encoding="utf-8")
+        CANDIDATES.register_snapshot(self.db, self.root / "store", path, "user", AT)
+        return candidate["content_sha256"]
+
+    def test_a_mention_only_claim_is_never_called_transferable(self):
+        """The old fixed sentence said "transferable" about whatever the weak claim was."""
+        drafted = self.story_with(["c1"], "direct", "mention_only", "direct", "mention_only")
+        note = drafted["answer_text"]
+        self.assertIn("some supporting detail rests on mention-only evidence", note)
+        self.assertNotIn("transferable", note)
+
+    def test_a_capability_resting_only_on_mention_only_is_not_retrieved_at_all(self):
+        """Which is why a mention-only footing never reaches a drafted answer to be stated."""
+        outcome = self.story_with(["c2"], "direct", "mention_only", "direct", "mention_only")
+        self.assertEqual((outcome["decision"], outcome["reason"]),
+                         ("gap", "no_story_covers_this"))
+
+    def test_a_direct_competency_is_not_denied_by_a_weaker_sentence_elsewhere(self):
+        drafted = self.story_with(["c1"], "direct", "transferable", "direct", "transferable")
+        note = drafted["answer_text"]
+        self.assertEqual(drafted["evidence_class"], "direct")
+        # It reports the weak supporting detail...
+        self.assertIn("some supporting detail rests on transferable evidence", note)
+        # ...and says nothing denying the competency's own direct footing.
+        self.assertNotIn(f"rather than direct evidence of {COMPETENCY}", note)
+
+    def test_both_statements_are_made_when_both_are_true(self):
+        drafted = self.story_with(["c2"], "mention_only", "transferable",
+                                  "mention_only", "transferable")
+        note = drafted["answer_text"]
+        self.assertIn(f"transferable rather than direct evidence of {COMPETENCY}", note)
+        self.assertIn("some supporting detail rests on mention-only evidence", note)
+
+    def test_the_competency_class_is_not_repeated_as_supporting_detail(self):
+        """Both claims transferable and the binding is one of them: said once, not twice."""
+        drafted = self.story_with(["c2"], "transferable", "transferable",
+                                  "transferable", "transferable")
+        self.assertEqual(drafted["answer_text"].count("transferable"), 1)
+
+    def test_a_weak_claim_inside_a_strong_binding_is_still_reported(self):
+        """The binding's class is its strongest claim, so a weak one inside it can hide."""
+        drafted = self.story_with(["c1", "c2"], "direct", "mention_only",
+                                  "direct", "mention_only")
+        self.assertEqual(drafted["evidence_class"], "direct")
+        self.assertIn("some supporting detail rests on mention-only evidence",
+                      drafted["answer_text"])
+
+    def test_a_wholly_direct_answer_says_nothing_about_evidence(self):
+        drafted = self.story_with(["c1", "c2"], "direct", "direct", "direct", "direct")
+        self.assertIsNone(drafted["bridge"])
+        self.assertNotIn("Evidence note", drafted["answer_text"])

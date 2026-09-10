@@ -61,11 +61,11 @@ from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 
 NONE_OF_THESE = "none_of_these"
 
-# Part of the answer, not a note beside it. Fixed wording rather than composed: the point is
-# that whoever reuses the text reads the qualification, and reviewing it once is only
-# meaningful if it cannot come out differently the next time.
-ADJACENT_QUALIFIER = ("(Adjacent experience: this draws on transferable rather than direct "
-                      "evidence of {competency}.)")
+# Readable names for the classes, so a qualifier can say which one it means. There is no
+# entry for `unsupported`: an unsupported claim makes a version unapprovable, so it cannot
+# reach a rendered answer to be qualified.
+CLASS_WORDS = {"direct": "direct", "strongly_related": "strongly related",
+               "transferable": "transferable", "mention_only": "mention-only"}
 MAX_OPTIONS = 3
 
 DRAFT = "draft"
@@ -132,6 +132,38 @@ def initialize(connection: sqlite3.Connection) -> None:
 
 def _outcome(decision: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {"decision": decision, "reason": reason, "auto_fill_ready": False, **extra}
+
+
+def _qualifier(binding_class: str, competency: str,
+               rendered_classes: list[str]) -> str | None:
+    """What the answer has to admit about its own evidence, in the classes it actually has.
+
+    It goes into the answer text rather than beside it, because a note stored next to the
+    text is not read by whoever reuses the text.
+
+    Two separate statements, which one sentence could not make. A single
+    competency-level line saying "transferable rather than direct evidence of X" was wrong
+    twice over: it called a `mention_only` claim transferable, promoting exactly the class
+    the ladder puts lowest; and where the competency's own binding was direct and some other
+    sentence was weaker, it denied a direct footing the evidence actually had. So the
+    competency's footing and the rest of the text are said separately, each in its own class.
+    """
+    parts = []
+    if binding_class not in story_core.COVERING:
+        parts.append(f"this draws on {CLASS_WORDS[binding_class]} rather than direct "
+                     f"evidence of {competency}")
+        # Said once. What remains is whatever else the text asserts weakly, which includes a
+        # weak claim sitting inside a binding whose strongest claim carried it.
+    weak = {name for name in rendered_classes if name not in story_core.COVERING}
+    if parts:
+        weak.discard(binding_class)
+    if weak:
+        listed = " and ".join(CLASS_WORDS[name] for name in
+                              sorted(weak, key=lambda name: EVIDENCE_ORDER[name]))
+        parts.append(f"some supporting detail rests on {listed} evidence")
+    if not parts:
+        return None
+    return f"(Evidence note: {'; '.join(parts)}.)"
 
 
 def record_question_competency(connection: sqlite3.Connection, canonical_id: str,
@@ -343,17 +375,13 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
     rendered_floor = min(rendered_classes, key=lambda name: EVIDENCE_ORDER[name])
     text = _rendered(connection, version_id)
 
-    # The qualifier goes into the answer itself, not beside it. A note stored next to the
-    # text is not read by whoever reuses the text: an answer approved on transferable
-    # evidence would come back on the next form reading exactly like a direct one, which is
-    # `transferable never upgrades` defeated by the reuse path rather than by the rules.
-    qualified = (binding_class == story_core.TRANSFERABLE
-                 or rendered_floor not in story_core.COVERING)
+    qualifier = _qualifier(binding_class, competency, rendered_classes)
     bridge = None
-    if qualified:
-        bridge = ("This answer rests on adjacent experience rather than direct evidence of "
-                  f"{competency}. Say so rather than letting it read as direct.")
-        text = f"{text} {ADJACENT_QUALIFIER.format(competency=competency)}"
+    if qualifier:
+        bridge = (f"{qualifier[1:-1]} Say so rather than letting the answer read as stronger "
+                  "than its evidence.")
+        text = f"{text} {qualifier}"
+    qualified = bool(qualifier)
     auto_fill_ready = False
 
     form_digest = question_form_digest(connection, question)
