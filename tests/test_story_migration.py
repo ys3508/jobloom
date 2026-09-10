@@ -180,7 +180,7 @@ class MigrationFixture(unittest.TestCase):
             "INSERT INTO stories (story_id, status, current_version_id, confidentiality, "
             "confidential_employer, confidential_application_id, applicability_json, "
             "created_at, status_reason) VALUES ('S-old', 'approved', 'SV-old', "
-            "'employer_confidential', 'Example  Corp', NULL, '{}', ?, 'user_approved')",
+            "'reusable', NULL, NULL, '{}', ?, 'user_approved')",
             (AT.isoformat(),))
         self.db.execute(
             "INSERT INTO story_versions (version_id, story_id, content_sha256, "
@@ -279,9 +279,14 @@ class MigrationTests(MigrationFixture):
 
     def test_the_confidential_employer_is_normalized_by_the_migration(self):
         """Two spaces in the stored name; the new match is on the normalized identity."""
+        self.db.execute(
+            "INSERT INTO stories (story_id, status, confidentiality, confidential_employer, "
+            "applicability_json, created_at) VALUES ('S-conf', 'draft', "
+            "'employer_confidential', 'Example  Corp', '{}', ?)", (AT.isoformat(),))
+        self.db.commit()
         STORIES.initialize(self.db)
         self.assertEqual(self.db.execute(
-            "SELECT confidential_employer_normalized FROM stories WHERE story_id='S-old'"
+            "SELECT confidential_employer_normalized FROM stories WHERE story_id='S-conf'"
         ).fetchone()[0], APPLICATIONS.normalize_text("Example  Corp"))
 
     def test_running_the_migration_twice_changes_nothing(self):
@@ -500,6 +505,10 @@ class InterruptedMigrationTests(MigrationFixture):
 
         self.db.execute(
             "ALTER TABLE stories ADD COLUMN confidential_employer_normalized TEXT")
+        self.db.execute(
+            "INSERT INTO stories (story_id, status, confidentiality, confidential_employer, "
+            "applicability_json, created_at) VALUES ('S-conf', 'draft', "
+            "'employer_confidential', 'Example  Corp', '{}', ?)", (AT.isoformat(),))
         self.db.commit()
         STORIES.application_core.normalize_text = explode
         try:
@@ -509,12 +518,12 @@ class InterruptedMigrationTests(MigrationFixture):
             STORIES.application_core.normalize_text = original
         self.assertIsNone(self.db.execute(
             "SELECT confidential_employer_normalized FROM stories "
-            "WHERE story_id='S-old'").fetchone()[0])
+            "WHERE story_id='S-conf'").fetchone()[0])
         # And running again, uninterrupted, completes it.
         STORIES.initialize(self.db)
         self.assertEqual(self.db.execute(
             "SELECT confidential_employer_normalized FROM stories "
-            "WHERE story_id='S-old'").fetchone()[0],
+            "WHERE story_id='S-conf'").fetchone()[0],
             APPLICATIONS.normalize_text("Example  Corp"))
 
     def test_migrating_is_safe_to_repeat_any_number_of_times(self):
@@ -652,3 +661,167 @@ class DamagedBindingTests(MigrationFixture):
         self.assertEqual(json.loads(self.stored())["secondary"], [])
         self.assertEqual(json.loads(self.stored())["primary"]["capability_id"],
                          "cap.survey-design")
+
+
+class SemanticIntegrityTests(MigrationFixture):
+    """A binding can be perfectly well-formed and still mean nothing.
+
+    `read_bindings` answers the shape question. It does not, and should not, answer whether
+    the ids inside mean anything — whether the ontology has that capability, whether this
+    version has those claims. Validation at write time cannot stand in for the check, because
+    a database edited or half-written after the write never went through write time, and this
+    module explicitly supports opening one.
+    """
+
+    def bind(self, blob):
+        STORIES.initialize(self.db)
+        self.db.execute(
+            "UPDATE story_versions SET capability_bindings_json=? WHERE version_id='SV-old'",
+            (json.dumps(blob),))
+        self.db.commit()
+
+    def test_a_capability_the_ontology_does_not_have_is_refused(self):
+        self.bind({"primary": {"capability_id": "cap.invented", "claim_ids": ["c1"]},
+                   "secondary": []})
+        check = STORIES.selectable(self.db, "SV-old")
+        self.assertFalse(check["selectable"])
+        self.assertIn("capability_not_in_ontology", check["reasons"])
+
+    def test_a_domain_tag_smuggled_in_as_a_capability_is_refused(self):
+        """DOMAIN is a real ontology id and still not a capability a story answers under."""
+        self.bind({"primary": {"capability_id": "cap.domain.pharma-insights",
+                               "claim_ids": ["c1"]}, "secondary": []})
+        self.assertIn("capability_not_in_ontology",
+                      STORIES.selectable(self.db, "SV-old")["reasons"])
+
+    def test_a_claim_this_version_does_not_have_is_refused(self):
+        self.bind({"primary": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c1", "c9"]}, "secondary": []})
+        check = STORIES.selectable(self.db, "SV-old")
+        self.assertFalse(check["selectable"])
+        self.assertIn("capability_binding_claim_missing", check["reasons"])
+
+    def test_a_bad_secondary_binding_condemns_the_version_too(self):
+        self.bind({"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},
+                   "secondary": [{"capability_id": "cap.invented", "claim_ids": ["c1"]}]})
+        self.assertIn("capability_not_in_ontology",
+                      STORIES.selectable(self.db, "SV-old")["reasons"])
+
+    def test_an_invalid_binding_retrieves_nothing_even_asked_directly(self):
+        """Retrieval runs the check itself rather than trusting the gate to have run."""
+        self.bind({"primary": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c9"]}, "secondary": []})
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]["fit"],
+            "gap")
+
+    def test_a_valid_binding_on_a_migrated_database_still_works(self):
+        """The check has to refuse the damaged, not everything."""
+        self.bind({"primary": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c1", "c2"]}, "secondary": []})
+        check = STORIES.selectable(self.db, "SV-old")
+        self.assertTrue(check["selectable"], check["reasons"])
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]["fit"],
+            "strong")
+
+    def test_a_stored_mapping_naming_a_missing_claim_produces_no_fit(self):
+        self.bind({"primary": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c1", "c2"]}, "secondary": []})
+        self.db.execute(
+            "UPDATE story_competency_mappings SET claim_ids_json='[\"c9\"]' "
+            "WHERE version_id='SV-old'")
+        self.db.commit()
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]["fit"],
+            "gap")
+
+    def test_a_mapping_with_an_unreadable_claim_list_produces_no_fit(self):
+        self.bind({"primary": {"capability_id": "cap.survey-design",
+                               "claim_ids": ["c1", "c2"]}, "secondary": []})
+        self.db.execute(
+            "UPDATE story_competency_mappings SET claim_ids_json='not json' "
+            "WHERE version_id='SV-old'")
+        self.db.commit()
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.research-design"])["cap.research-design"]["fit"],
+            "gap")
+
+    def test_retiring_a_capability_from_the_ontology_closes_the_stories_bound_to_it(self):
+        """Stated as a deliberate consequence rather than discovered later."""
+        successor = self.rebound_story()
+        self.assertTrue(STORIES.selectable(self.db, successor["version_id"])["selectable"])
+        original = STORIES.ontology()
+        retired = {**original,
+                   "capabilities": [entry for entry in original["capabilities"]
+                                    if entry["capability_id"] != "cap.survey-design"]}
+        STORIES._ONTOLOGY = retired
+        try:
+            check = STORIES.selectable(self.db, successor["version_id"])
+            self.assertFalse(check["selectable"])
+            self.assertIn("capability_not_in_ontology", check["reasons"])
+        finally:
+            STORIES._ONTOLOGY = original
+
+
+class DiskMatchesBehaviourTests(MigrationFixture):
+    """Whatever the reader normalizes away is rewritten, not only the field first noticed."""
+
+    def stored(self):
+        return json.loads(self.db.execute(
+            "SELECT capability_bindings_json FROM story_versions WHERE version_id='SV-old'"
+        ).fetchone()[0])
+
+    def damage(self, raw):
+        STORIES.initialize(self.db)
+        self.db.execute(
+            "UPDATE story_versions SET capability_bindings_json=? WHERE version_id='SV-old'",
+            (raw,))
+        self.db.commit()
+        STORIES.initialize(self.db)
+
+    def test_a_secondary_of_the_wrong_type_is_rewritten(self):
+        self.damage('{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "secondary": 7}')
+        self.assertEqual(self.stored()["secondary"], [])
+        self.assertEqual(self.stored()["primary"]["claim_ids"], ["c1"])
+
+    def test_junk_entries_in_a_secondary_list_are_rewritten_away(self):
+        self.damage('{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "secondary": [null, 3, "cap.data-querying",'
+                    ' {"capability_id": "cap.data-querying", "claim_ids": ["c2", 9]}]}')
+        self.assertEqual(self.stored()["secondary"],
+                         [{"capability_id": "cap.data-querying", "claim_ids": ["c2"]}])
+
+    def test_a_usable_binding_is_kept_rather_than_flattened(self):
+        """Repair preserves what the row says; it does not reset it to the unreviewed form."""
+        self.damage('{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "secondary": 7}')
+        self.assertEqual(self.stored()["primary"]["capability_id"], "cap.survey-design")
+        self.assertNotIn("migrated_without_claims", self.stored())
+
+    def test_what_is_on_disk_reads_back_unchanged(self):
+        for raw in ('{"primary": {"capability_id": "cap.survey-design", "claim_ids": "c1"}}',
+                    '{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "secondary": 7}',
+                    '{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "extra": "ignored"}'):
+            with self.subTest(raw=raw):
+                self.damage(raw)
+                on_disk = self.db.execute(
+                    "SELECT capability_bindings_json FROM story_versions "
+                    "WHERE version_id='SV-old'").fetchone()[0]
+                self.assertEqual(json.loads(on_disk), STORIES.read_bindings(on_disk))
+
+    def test_an_ordinary_row_is_not_rewritten_on_every_start(self):
+        """The comparison must not churn rows that were written correctly."""
+        successor = self.rebound_story()
+        before = self.db.execute(
+            "SELECT capability_bindings_json FROM story_versions WHERE version_id=?",
+            (successor["version_id"],)).fetchone()[0]
+        for _ in range(3):
+            STORIES.initialize(self.db)
+        after = self.db.execute(
+            "SELECT capability_bindings_json FROM story_versions WHERE version_id=?",
+            (successor["version_id"],)).fetchone()[0]
+        self.assertEqual(before, after)

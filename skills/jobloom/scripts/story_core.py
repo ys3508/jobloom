@@ -262,6 +262,9 @@ def read_bindings(raw: str | None) -> dict[str, Any]:
     An empty result means "no usable binding", which is what the migration repairs and what
     `selectable` reports as `capability_binding_unreviewed`. Nothing here invents a claim id:
     a malformed `claim_ids` becomes empty, never a guess at what it meant.
+
+    This answers the *shape* question only. Whether the ids it holds mean anything —
+    a capability the ontology has, claims this version contains — is `binding_problems`.
     """
     try:
         value = json.loads(raw or "{}")
@@ -289,6 +292,13 @@ def read_bindings(raw: str | None) -> dict[str, Any]:
     return bindings
 
 
+def _loads(raw: str | None) -> Any:
+    try:
+        return json.loads(raw or "null")
+    except ValueError:
+        return None
+
+
 def _claim_ids(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -306,25 +316,54 @@ def _legacy_secondary(raw: str | None) -> list[str]:
     return [item for item in value if isinstance(item, str) and item.strip()]
 
 
-def _needs_binding(raw: str | None) -> bool:
-    """A row is unmigrated if it has no usable binding, however it came to be that way.
+def binding_problems(connection: sqlite3.Connection, version_id: str,
+                     bindings: dict[str, Any]) -> list[str]:
+    """Reasons a stored binding cannot be trusted, checked against what it names.
 
-    Also when the stored blob merely *reads* as one: a `claim_ids` that is not a list of
-    strings is normalized to empty on every read, and leaving the original on disk would mean
-    a person reading the row sees a binding the code does not act on. Rewritten so the two
-    agree — and rewritten to the unreviewed form, not to a guess at what it meant.
+    `read_bindings` answers whether the blob has the right *shape*. That is not the same
+    question as whether it means anything: a hand-edited or half-written row can name a
+    capability the ontology does not have, or claims this version does not contain, and be
+    perfectly well-formed while doing it. Validation at write time cannot stand in for this,
+    because a database that was edited after the write never went through write time.
+
+    So the check is against the world the binding refers to, and every anomaly fails closed.
+    A retired capability makes stories bound to it unselectable until they are re-bound,
+    which is the intended direction: the ontology is the reviewed vocabulary, and a story
+    retrievable under a name the system no longer uses is a story nobody reviewed under it.
+    """
+    if not bindings:
+        return ["capability_binding_unreviewed"]
+    reasons: list[str] = []
+    primary = bindings["primary"]
+    if not primary["claim_ids"]:
+        reasons.append("capability_binding_unreviewed")
+    known = {row["claim_id"] for row in connection.execute(
+        "SELECT claim_id FROM story_claims WHERE version_id=?", (version_id,))}
+    for binding in [primary, *bindings["secondary"]]:
+        if _capability_layer(binding["capability_id"]) != "SKILL":
+            reasons.append("capability_not_in_ontology")
+        if any(claim_id not in known for claim_id in binding["claim_ids"]):
+            reasons.append("capability_binding_claim_missing")
+    return sorted(set(reasons))
+
+
+def _needs_binding(raw: str | None) -> bool:
+    """A row is unmigrated if what is on disk is not what the code reads.
+
+    Not only when there is no usable binding: also when the blob merely *reads* as one after
+    normalization. A `claim_ids` holding a string, or a `secondary` of the wrong type, is
+    silently emptied on every read, and leaving the original in place would mean a person
+    inspecting the row sees a binding the code does not act on — the same gap between what a
+    thing reports and what it does that this repository has had to record before.
+
+    Comparing the canonical forms covers every field at once rather than the one that was
+    noticed, so a shape nobody thought of is repaired too.
     """
     bindings = read_bindings(raw)
     if not bindings:
         return True
-    try:
-        stored = json.loads(raw or "{}")
-    except ValueError:
-        return True
-    primary = stored.get("primary", {}) if isinstance(stored, dict) else {}
-    claim_ids = primary.get("claim_ids") if isinstance(primary, dict) else None
-    return not isinstance(claim_ids, list) \
-        or any(not isinstance(item, str) for item in claim_ids)
+    stored = _loads(raw)
+    return canonical_json(stored) != canonical_json(bindings)
 
 
 def _migrate_capability_bindings(connection: sqlite3.Connection) -> None:
@@ -344,12 +383,18 @@ def _migrate_capability_bindings(connection: sqlite3.Connection) -> None:
     if pending:
         with connection:
             for row in pending:
-                secondary = _legacy_secondary(row["secondary_capabilities_json"]) \
-                    if has_secondary else []
+                normalized = read_bindings(row["capability_bindings_json"])
+                if normalized:
+                    # Readable after normalization: keep what it says and write that down,
+                    # rather than flattening a usable binding to the unreviewed form.
+                    repaired = canonical_json(normalized)
+                else:
+                    secondary = _legacy_secondary(row["secondary_capabilities_json"]) \
+                        if has_secondary else []
+                    repaired = _unreviewed_binding(row["primary_capability"], secondary)
                 connection.execute(
                     "UPDATE story_versions SET capability_bindings_json=? WHERE version_id=?",
-                    (_unreviewed_binding(row["primary_capability"], secondary),
-                     row["version_id"]))
+                    (repaired, row["version_id"]))
     if has_secondary:
         # Only once nothing is pending, because the drop destroys what the backfill reads.
         # Dropped rather than left NOT NULL beside its replacement, where every future insert
@@ -764,10 +809,9 @@ def selectable(connection: sqlite3.Connection, version_id: str) -> dict[str, Any
     if json.loads(version["unbound_spans_json"]):
         reasons.append("narrative_not_fully_bound")
     bindings = read_bindings(version["capability_bindings_json"])
-    if not bindings.get("primary", {}).get("claim_ids"):
-        # A version carried forward from the schema where a capability was a bare label. The
-        # story is intact; nobody has said which claims evidence its capability.
-        reasons.append("capability_binding_unreviewed")
+    # Shape, then meaning. A binding may be perfectly well-formed and still name a
+    # capability the ontology does not have or claims this version does not contain.
+    reasons.extend(binding_problems(connection, version_id, bindings))
 
     snapshot = version["candidate_snapshot_sha256"]
     try:
@@ -1047,6 +1091,10 @@ def _fit(connection: sqlite3.Connection, version: sqlite3.Row, competency: str,
         # `selectable` refuses such a version first, so this is belt to that brace: a row
         # whose binding was never written is retrieved by nothing rather than raising.
         return None
+    if binding_problems(connection, version["version_id"], bindings):
+        # Checked here as well as at the gate, so retrieval does not rely on a caller having
+        # asked the gate first. A binding that cannot be trusted answers nothing.
+        return None
     if primary["capability_id"] == competency:
         band = _band(bound_class(classes, primary["claim_ids"]), STRONG)
         return {**band, "why": "primary_capability",
@@ -1060,7 +1108,11 @@ def _fit(connection: sqlite3.Connection, version: sqlite3.Row, competency: str,
         "SELECT * FROM story_competency_mappings WHERE version_id=? AND competency=?",
         (version["version_id"], competency)).fetchone()
     if mapping:
-        claim_ids = json.loads(mapping["claim_ids_json"])
+        claim_ids = _claim_ids(_loads(mapping["claim_ids_json"]))
+        if any(claim_id not in classes for claim_id in claim_ids):
+            # The same suspicion the capability bindings get: a stored mapping naming a claim
+            # this version does not have was not reviewed against this version.
+            return None
         band = _band(bound_class(classes, claim_ids), WORKABLE)
         if band:
             return {**band, "why": "reviewed_mapping", "claim_ids": claim_ids,

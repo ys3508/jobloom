@@ -263,8 +263,29 @@ holding well-formed JSON of the wrong type — `[]`, `null`, `5`, `"text"` — r
 than the one being guarded: nothing can be done to a database that will not start.
 
 Nothing is guessed at in the process. A `claim_ids` that is not a list of strings reads as
-empty rather than as one claim id, and the migration rewrites it to the unreviewed form so
-what a person reads on disk matches what the code acts on. It adds
+empty rather than as one claim id. Whatever the reader normalizes away is also rewritten —
+compared on the canonical forms, so a shape nobody anticipated is repaired too — and a
+binding that survives normalization is kept rather than flattened to the unreviewed form.
+
+**Shape is not meaning.** `read_bindings` says whether the blob is the right shape;
+`binding_problems()` says whether the ids inside refer to anything, and `selectable()` and
+retrieval both run it:
+
+| Reason | When |
+|---|---|
+| `capability_binding_unreviewed` | no usable binding, or a primary naming no claims |
+| `capability_not_in_ontology` | a primary or secondary capability the ontology has no SKILL entry for — a retired id, a typo, or a DOMAIN tag put where a capability goes |
+| `capability_binding_claim_missing` | a binding naming a claim this version does not contain |
+
+Validation at write time cannot stand in for this. A database edited by hand, or written
+half way, never went through write time — and opening one is a case this module explicitly
+supports. A stored reviewed mapping is read with the same suspicion: one naming a claim the
+version does not have produces no fit.
+
+A consequence worth stating rather than discovering: **retiring a capability from the
+ontology makes every story bound to it unselectable** until it is re-bound. That is the
+intended direction. The ontology is the reviewed vocabulary, and a story retrievable under a
+name the system no longer uses is a story nobody reviewed under that name. It adds
 `capability_bindings_json`, drops the `secondary_capabilities_json` it replaces, adds
 `confidential_employer_normalized` and backfills it through the same normalizer identity is
 matched with, and adds `claim_ids_json` to reviewed mappings. `story_answers.initialize` adds
