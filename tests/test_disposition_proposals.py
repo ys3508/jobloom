@@ -244,8 +244,16 @@ class AnnotateTests(unittest.TestCase):
 
     def test_the_rendered_sheet_explains_what_meets_requires(self):
         text = P.render(P.annotate(self.sheet(), FACTS))
-        self.assertIn("requires the requirement text to be read", text)
-        self.assertIn("nothing substantive in its text is left unread", text)
+        self.assertIn("comes from a reviewed parse, not from a sentence", text)
+        self.assertIn("nothing substantive in the text is left unread", text)
+
+    def test_every_row_shows_its_parse_status_and_why_it_cannot_conclude(self):
+        text = P.render(P.annotate(self.sheet(), FACTS))
+        self.assertIn("- **parse:** `ambiguous`", text)
+        self.assertIn("- **parse:** `unreviewed`", text)
+        self.assertIn("nothing here concludes `meets`", text)
+        self.assertIn("field biostatistics, statistics is written next to one alternative",
+                      text)
 
 
 if __name__ == "__main__":

@@ -214,9 +214,22 @@ class BranchStructureTests(unittest.TestCase):
         """(MS AND Statistics) OR (PhD AND Biology) — not {MS,PhD} × {Statistics,Biology}."""
         self.assertNotMeets("MS in Statistics or PhD in Biology", self.MS_BIOLOGY)
 
-    def test_the_branch_that_does_match_still_meets(self):
+    def test_the_branch_that_does_match_resolves_on_its_own_pairing(self):
+        """The positive control for the pairing, which no longer ends in `meets`.
+
+        `MS in Biology` is answered by the held degree, and the proposal says so with that
+        fact's id. It stops at `partially_meets` because credential-plus-field prose is not
+        one of the reviewed templates: what a field written on one alternative governs is
+        the question the parse refuses to guess at, and this shape is only safe because both
+        alternatives happen to carry their own. `parse_requirement` does not know that
+        "happen to" is not a rule.
+        """
         found = P.propose("MS in Statistics or MS in Biology", self.MS_BIOLOGY)
-        self.assertEqual(found["proposed_disposition"], P.MEETS)
+        self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
+        matched = [entry for entry in found["obligations"] if entry["strength"] == "direct"]
+        self.assertEqual([entry["obligation"] for entry in matched], ["MS in Biology"])
+        self.assertEqual(matched[0]["fact_ids"], ["e3"])
+        self.assertIn("parse_not_reviewed_complete", found["meets_invariant_problems"])
 
     def test_every_proposal_carries_its_obligations(self):
         """The two v2 `meets` had empty obligation lists, so nothing could be checked."""
@@ -229,6 +242,28 @@ class BranchStructureTests(unittest.TestCase):
                 for entry in found["obligations"]:
                     self.assertIn("fact_ids", entry)
                     self.assertIn("obligation", entry)
+
+
+class DegreeHasOneRouteTests(unittest.TestCase):
+    """A degree the credential resolver declined is not answered by the concept matcher.
+
+    The `degree` concept fires on any education fact naming a degree, so "advanced degree in
+    Engineering" came back directly evidenced by a Medical Technology bachelor's — a second
+    route to a credential, past the resolver that checks the field.
+    """
+
+    BS = [fact("e1", "education", "Bachelor of Science – Medical Technology")]
+
+    def test_an_unrecognised_level_is_unparsed_not_evidenced(self):
+        found = P.propose("Advanced degree in Engineering", self.BS)
+        kinds = {entry["kind"] for entry in found["obligations"]}
+        self.assertEqual(kinds, {"unparsed"})
+        self.assertEqual(found["proposed_disposition"], None)
+
+    def test_a_recognised_level_still_goes_through_the_credential_resolver(self):
+        found = P.propose("Master's degree in Engineering", self.BS)
+        self.assertEqual([entry["kind"] for entry in found["obligations"]], ["credential"])
+        self.assertEqual(found["obligations"][0]["strength"], "none")
 
 
 class ResidueProvesConsumptionTests(unittest.TestCase):
@@ -259,10 +294,19 @@ class ResidueProvesConsumptionTests(unittest.TestCase):
         found = P.propose("Executive-level communication skills", self.BORROWABLE)
         self.assertNotEqual(found["proposed_disposition"], P.MEETS)
 
-    def test_a_fully_consumed_requirement_can_still_meet(self):
+    def test_a_fully_consumed_requirement_leaves_no_residue(self):
+        """The positive control for consumption: nothing unread, and still not `meets`.
+
+        "Communication skills" is read completely — no qualifier survives, and the
+        presentation fact answers the concept directly. What is missing is a reviewed parse:
+        a bare capability noun is exactly where "delivered a presentation" was being read as
+        the whole of what an employer means, so prose does not conclude, it reports.
+        """
         found = P.propose("Communication skills", self.PRESENTATION)
-        self.assertEqual(found["proposed_disposition"], P.MEETS)
         self.assertEqual(found.get("unresolved_text"), [])
+        self.assertEqual(found["obligations"][0]["strength"], "direct")
+        self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
+        self.assertEqual(found["meets_invariant_problems"], ["parse_not_reviewed_complete"])
 
 
 class RenderingTests(unittest.TestCase):

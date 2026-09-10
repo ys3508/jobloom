@@ -8,12 +8,24 @@ and proposes a disposition, with the fact ids each part of it rests on.
 Nothing here decides anything. Every proposal carries `requires_user_confirmation: true` and
 `final_disposition: null`, and no queue row or application state is touched.
 
-**A requirement is a boolean structure, not a bag of words.** It parses into branches joined
-by `or`, each branch a set of obligations joined by `and`. A branch is satisfied when every
-obligation in it is satisfied; the requirement is satisfied when some branch is. Specialized
-resolvers — credential, duration, named technology, prose concept — answer *one obligation
-inside one branch*, and none of them may answer the sentence around it. A degree the profile
-holds says nothing about the five years of product management standing next to it.
+**A sentence cannot prove anything; a reviewed parse of it can.** Splitting requirement prose
+on `or` and `and` cannot recover what a modifier written once applies to. `(Python or R) and
+SQL` becomes `Python` / `R and SQL`, and Python alone satisfies it; `5+ years of production
+experience with Python or R` leaves an alternative consisting of the letter R. Each fix to the
+splitter moved the next wrong reading somewhere else, so the structure changed instead:
+`parse_requirement` produces a reviewable artifact — source text and hash, parse version,
+`or`-branches of `and`-obligations with exact spans into the sentence, any modifier whose
+scope nobody has attributed, and a `parse_status` of `reviewed_complete`, `ambiguous` or
+`unreviewed`. Only `reviewed_complete` may yield `meets`, and only two closed templates reach
+it: a bare degree level, and a flat list of credential alternatives. Everything else is read,
+resolved and reported — as a reading for a person to confirm, not as a conclusion.
+
+Inside a branch, specialized resolvers — credential, duration, named technology, prose concept
+— answer *one obligation*, and none may answer the sentence around it. Inside an obligation,
+every concept keeps its own strength and its own fact ids, and the obligation is worth the
+weakest of them: an obligation naming two capabilities asks for both. Taking a minimum after a
+sentence-level matcher had already reported the strongest concept does not recover this — by
+then the promotion has happened.
 
 **`meets` requires the requirement text to be consumed.** Each resolver records the span it
 read, and whatever is left over is residue. Substantive residue caps the answer at
@@ -33,6 +45,7 @@ is a judgement about their prose, not a fact about the candidate.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -48,7 +61,7 @@ import posting_sections  # noqa: E402
 import requirement_tiers  # noqa: E402
 from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 from evidence_matcher import REQUIREMENT_CONCEPTS  # noqa: E402
-from evidence_matcher import match_requirement, match_requirement_prose  # noqa: E402
+from evidence_matcher import concept_evidence, match_requirement  # noqa: E402
 
 MEETS = "meets"
 PARTIALLY_MEETS = "partially_meets"
@@ -192,17 +205,26 @@ def career_span_years(facts: list[dict[str, Any]], *, today: date | None = None
 def _proposal(disposition: str | None, *, confidence: str, reason: str,
               fact_ids: list[str] | None = None, evidence_class: str | None = None,
               status: str = NO_EVIDENCE, obligations: list[dict[str, Any]] | None = None,
-              unresolved: list[str] | None = None,
-              residue: list[str] | None = None) -> dict[str, Any]:
-    return {"proposed_disposition": disposition, "confidence": confidence,
-            "supporting_fact_ids": sorted(fact_ids or []),
-            "evidence_class": evidence_class, "short_reason": reason,
-            "candidate_evidence_status": status,
-            "obligations": obligations or [],
-            "unresolved_obligations": unresolved or [],
-            "unverified_obligations": sorted(set((unresolved or []) + (residue or []))),
-            "unresolved_text": residue or [],
-            "requires_user_confirmation": True, "final_disposition": None}
+              unresolved: list[str] | None = None, residue: list[str] | None = None,
+              parse: dict[str, Any] | None = None,
+              problems: list[str] | None = None) -> dict[str, Any]:
+    proposal = {"proposed_disposition": disposition, "confidence": confidence,
+                "supporting_fact_ids": sorted(fact_ids or []),
+                "evidence_class": evidence_class, "short_reason": reason,
+                "candidate_evidence_status": status,
+                "requirement_parse": parse,
+                "parse_status": (parse or {}).get("parse_status"),
+                "meets_invariant_problems": problems or [],
+                "obligations": obligations or [],
+                "unresolved_obligations": unresolved or [],
+                "unverified_obligations": sorted(set((unresolved or []) + (residue or []))),
+                "unresolved_text": residue or [],
+                "requires_user_confirmation": True, "final_disposition": None}
+    # The one place a `meets` can leave this module, so the one place worth asserting at.
+    if disposition == MEETS and proposal["meets_invariant_problems"]:
+        raise AssertionError("meets proposed while the invariant reports "
+                             f"{proposal['meets_invariant_problems']}")
+    return proposal
 
 
 # ---- credentials, matched by name -----------------------------------------------------
@@ -216,7 +238,9 @@ CREDENTIAL_FORMS = {
     "PharmD": (r"PharmD", r"doctor of pharmacy"),
     "DVM": (r"DVM", r"doctor of veterinary medicine"),
     "NP": (r"NP", r"nurse practitioner"),
-    "PA": (r"PA-C", r"physician assistant"),
+    # Bare "PA" is a physician assistant here and a state everywhere else; `STATE_SHAPED`
+    # removes ", PA" before this runs, which is what keeps Philadelphia out.
+    "PA": (r"PA-C", r"physician assistant", r"PA"),
     "RN": (r"RN", r"registered nurse"),
     "MPH": (r"MPH", r"master of public health"),
     "MPP": (r"MPP", r"master of public policy"),
@@ -255,7 +279,15 @@ def named_technologies(text: str) -> list[str]:
             if re.search(rf"(?<![A-Za-z0-9+#]){re.escape(tool)}(?![A-Za-z0-9+#])", text, re.I)]
 
 
-# ---- a requirement is a boolean structure ------------------------------------------
+# ---- a requirement is a parse, and the parse is reviewable ---------------------------
+
+# The version of the distiller that produced a parse. It is written into every artifact so a
+# reviewed parse cannot be silently inherited by a later, differently-behaved splitter.
+PARSE_VERSION = "requirement-parse/2026-09-10"
+
+REVIEWED_COMPLETE = "reviewed_complete"
+AMBIGUOUS = "ambiguous"
+UNREVIEWED = "unreviewed"
 
 # Words that carry no obligation of their own: articles, conjunctions, prepositions, and the
 # head nouns a concept surface already implies. Everything else left unconsumed is residue.
@@ -270,13 +302,8 @@ background understanding demonstrated demonstrable proven track record required 
 requirements year years plus_years work working
 """.split())
 
-# A comma list that ends in "or" is a list of alternatives: "MD, PharmD, NP, PA, RN, MPH, or
-# 5+ years". A comma list that ends in "and" is a list of demands. Splitting the second on
-# commas would turn a set of requirements into a menu.
-ALTERNATIVE_LIST = re.compile(r",\s*or\s+", re.I)
-OR_SPLIT = re.compile(r",\s*or\s+|\s+or\s+|,(?=\s)", re.I)
-AND_SPLIT = re.compile(r";|,\s*and\s+|\s+and\s+|,(?!\s*(?:e\.g\.|i\.e\.))", re.I)
-
+OR_JOIN = re.compile(r",\s*or\s+|\s+or\s+|,(?=\s)", re.I)
+AND_JOIN = re.compile(r";|,\s*and\s+|\s+and\s+|,(?!\s*(?:e\.g\.|i\.e\.))", re.I)
 
 # "Education:", "Analytical Rigor:", "Communication:" — a label naming what the sentence is
 # about, not an obligation inside it. And "or higher" extends a level rather than offering an
@@ -284,28 +311,201 @@ AND_SPLIT = re.compile(r";|,\s*and\s+|\s+and\s+|,(?!\s*(?:e\.g\.|i\.e\.))", re.I
 LABEL_PREFIX = re.compile(r"^[A-Z][A-Za-z /&'-]{2,34}:\s+")
 OR_HIGHER = re.compile(r"\s+or\s+(?:higher|above|greater|more)\b", re.I)
 
+# The two closed templates that may produce `meets`. Both are shapes with nowhere for a
+# modifier to hide: a bare degree level, and a flat list of credential alternatives. Anything
+# with a field, a domain, a duration or a qualifier attached is not on this list, because in
+# those shapes what the modifier attaches to is a judgement nobody has recorded.
+DEGREE_WORDS = frozenset("""
+bachelor bachelors master masters associate associates doctoral doctorate phd ms msc ma bs bsc
+ba mph mba degree degrees or s
+""".split())
+# Words a posting adds around a level that constrain nothing: they mark the line as a
+# requirement, which the tier already recorded. A word that narrows what is being asked for —
+# a field, a domain, an intensity — is deliberately not here, and keeps the line off the
+# template.
+OBLIGATION_FREE = frozenset("require required requires requirement requirements minimum".split())
+LEVEL_WORDS = DEGREE_WORDS - {"degree", "degrees", "or", "s"}
+COMMA_LIST = re.compile(r",\s*(?:or\s+)?", re.I)
+DURATION_HEAD = re.compile(r"^\s*(?:a\s+)?(?:minimum\s+of\s+|at\s+least\s+)?\d", re.I)
+BRACKETED_ALTERNATIVE = re.compile(r"\([^)]*\bor\b[^)]*\)")
 
-def branches_of(requirement: str) -> list[list[str]]:
-    """`or`-joined branches, each a list of `and`-joined obligations.
 
-    "MS in Statistics or PhD in Biology" is two branches, and the credential stays with its
-    field inside each. Matching credentials and fields as two independent sets let an MS in
-    Biology satisfy it by taking one half from each branch.
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _trim(text: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and text[start] in " \t•-–—;.,":
+        start += 1
+    while end > start and text[end - 1] in " \t•-–—;.,":
+        end -= 1
+    return start, end
+
+
+def _depth_at(text: str, index: int) -> int:
+    return text.count("(", 0, index) - text.count(")", 0, index)
+
+
+def _split(text: str, pattern: re.Pattern[str], start: int, end: int,
+           *, skip: re.Pattern[str] | None = None) -> list[tuple[int, int]]:
+    """Segments of `text[start:end]`, as spans into the original string.
+
+    Spans rather than substrings because a parse whose pieces cannot be pointed back at the
+    sentence they came from is not reviewable: nobody can check the scope of a modifier they
+    cannot locate. Matches inside brackets are left alone — a bracket is the one piece of
+    scope the author wrote down explicitly, and cutting through it discards it.
     """
-    text = OR_HIGHER.sub(" or higher", LABEL_PREFIX.sub("", requirement.strip()))
-    text = text.replace(" or higher", "")
-    if ALTERNATIVE_LIST.search(text):
-        parts = [part for part in OR_SPLIT.split(text) if part and part.strip()]
-    elif re.search(r"\s+or\s+", text, re.I):
-        parts = re.split(r"\s+or\s+", text, flags=re.I)
-    else:
-        parts = [text]
-    branches = []
-    for part in parts:
-        obligations = [item.strip(" ;.,") for item in AND_SPLIT.split(part)]
-        obligations = [item for item in obligations if len(item) > 1]
-        branches.append(obligations or [part.strip()])
-    return branches
+    pieces, cursor = [], start
+    for match in pattern.finditer(text, start, end):
+        if _depth_at(text, match.start()) > 0:
+            continue
+        if skip and skip.match(text, match.start()):
+            continue
+        pieces.append((cursor, match.start()))
+        cursor = match.end()
+    pieces.append((cursor, end))
+    spans = [_trim(text, first, last) for first, last in pieces]
+    return [(first, last) for first, last in spans if last > first]
+
+
+def _obligation(text: str, span: tuple[int, int]) -> dict[str, Any]:
+    start, end = span
+    return {"text": text[start:end], "span": [start, end]}
+
+
+def _branch(text: str, span: tuple[int, int],
+            obligations: list[dict[str, Any]]) -> dict[str, Any]:
+    start, end = span
+    return {"text": text[start:end], "span": [start, end], "obligations": obligations}
+
+
+def _degree_template(text: str, start: int, end: int) -> list[dict[str, Any]] | None:
+    """`Bachelor's degree`, `Master's degree or higher` — a level and nothing else."""
+    body = OR_HIGHER.sub(" ", text[start:end])
+    words = re.findall(r"[A-Za-z][A-Za-z.]*", body.replace("'", " ").replace("’", " "))
+    cleaned = [word.replace(".", "").casefold() for word in words]
+    if not cleaned or not all(word in DEGREE_WORDS | OBLIGATION_FREE for word in cleaned):
+        return None
+    if not any(word in LEVEL_WORDS for word in cleaned):
+        return None
+    return [_branch(text, (start, end), [_obligation(text, (start, end))])]
+
+
+def _credential_list(text: str, start: int, end: int
+                     ) -> tuple[list[dict[str, Any]], list[str]] | None:
+    """`MD, PharmD, NP, or 5+ years in clinical health IT` — alternatives, one per element.
+
+    Complete only while every element is a bare credential, plus optionally a final
+    alternative of a different kind — a duration, say — whose own modifiers cannot be read as
+    applying to the credentials before it. `MD, PharmD, or MPH in public health` fails that:
+    the field is written once, next to the last credential, and whether it governs all three
+    is exactly the question a parse is not allowed to guess at.
+    """
+    spans = _split(text, COMMA_LIST, start, end)
+    if len(spans) < 2 or not re.search(r",\s*or\s+", text[start:end], re.I):
+        return None
+    problems: list[str] = []
+    for index, (first, last) in enumerate(spans):
+        piece = text[first:last]
+        names = credentials_in(piece)
+        bare = len(names) == 1 and CREDENTIAL_PATTERN[names[0]].fullmatch(piece.strip())
+        if bare:
+            continue
+        if index < len(spans) - 1:
+            return None
+        if names:
+            # A credential with a tail: the tail may or may not distribute backwards.
+            problems.append(f"modifier {piece!r} sits on the last credential alternative and "
+                            "may govern the ones before it; nobody has attributed it")
+        elif not DURATION_HEAD.match(piece):
+            return None
+    branches = [_branch(text, span, [_obligation(text, span)]) for span in spans]
+    return branches, problems
+
+
+def _asymmetric_scope(text: str, branches: list[dict[str, Any]]) -> list[str]:
+    """Constraints one alternative carries and another does not.
+
+    `5+ years of production experience with Python or R` splits into a branch holding the
+    years, the production and the experience, and a branch holding the word `R`. Written out
+    that way the second alternative asks for nothing, which is not what the sentence says —
+    but which of the leading words reach across the `or` is a reading, not a fact. So the
+    parse records the asymmetry and stops.
+    """
+    if len(branches) < 2:
+        return []
+    problems = []
+    fields = [_fields_in(branch["text"]) for branch in branches]
+    if any(fields) and not all(fields):
+        named = sorted({term for group in fields for term in group})
+        problems.append(f"field {', '.join(named)} is written next to one alternative only")
+    durations = [bool(DURATION.search(branch["text"])) for branch in branches]
+    if any(durations) and not all(durations):
+        problems.append("a duration is written next to one alternative only")
+    substantive = [residue_of(branch["text"], named_technologies(branch["text"])
+                              + credentials_in(branch["text"]) + named_levels(branch["text"]))
+                   for branch in branches]
+    if any(substantive) and not all(substantive):
+        extra = sorted({token for group in substantive for token in group})
+        problems.append(f"{', '.join(extra)} qualifies one alternative only")
+    return problems
+
+
+def parse_requirement(requirement: str) -> dict[str, Any]:
+    """The reviewable artifact between a sentence and a proposal.
+
+    A regex that cuts on `or` cannot know what a modifier written once applies to, and each
+    time it guessed wrong the guess arrived as a `meets`. Extending the heuristics would only
+    move the next wrong guess somewhere else, so the parse now says which of three states it
+    is in, and only the first may be used to conclude that a requirement is met:
+
+    - `reviewed_complete` — the sentence is one of the closed templates below, which have
+      nowhere for an unattributed modifier to sit.
+    - `ambiguous` — a modifier's scope is genuinely undecided, and the parse says which one.
+    - `unreviewed` — split for reading, by rules nobody has reviewed as sound for this shape.
+
+    The AST is produced in all three cases, because the obligations and their evidence are
+    what a person reads while deciding. What changes is what may be concluded from it.
+    """
+    text = requirement.strip()
+    label = LABEL_PREFIX.match(text)
+    start, end = _trim(text, label.end() if label else 0, len(text))
+    parse: dict[str, Any] = {
+        "source_text": text, "source_sha256": _sha256(text), "parse_version": PARSE_VERSION,
+        "label": text[:label.end()].strip() if label else None,
+        "template": None, "parse_status": UNREVIEWED, "unattributed_scope": [], "branches": [],
+    }
+    if end <= start:
+        parse["branches"] = [_branch(text, (0, len(text)), [_obligation(text, (0, len(text)))])]
+        return parse
+
+    degree = _degree_template(text, start, end)
+    if degree:
+        parse.update({"template": "bare_degree_level", "parse_status": REVIEWED_COMPLETE,
+                      "branches": degree})
+        return parse
+
+    credentials = _credential_list(text, start, end)
+    if credentials:
+        branches, problems = credentials
+        parse.update({"template": "credential_alternatives", "branches": branches,
+                      "unattributed_scope": problems,
+                      "parse_status": AMBIGUOUS if problems else REVIEWED_COMPLETE})
+        return parse
+
+    branch_spans = _split(text, OR_JOIN, start, end, skip=OR_HIGHER)
+    parse["branches"] = [
+        _branch(text, span, [_obligation(text, piece)
+                             for piece in _split(text, AND_JOIN, span[0], span[1])]
+                or [_obligation(text, span)])
+        for span in branch_spans]
+    problems = _asymmetric_scope(text, parse["branches"])
+    if BRACKETED_ALTERNATIVE.search(text[start:end]):
+        problems.append("a bracketed alternative sits inside a longer requirement; what the "
+                        "text outside the brackets applies to is not written down")
+    if problems:
+        parse.update({"parse_status": AMBIGUOUS, "unattributed_scope": problems})
+    return parse
 
 
 def _fields_in(text: str) -> list[str]:
@@ -329,6 +529,37 @@ def residue_of(text: str, consumed: list[str]) -> list[str]:
         read.update(_tokens(span))
     return [token for token in _tokens(text)
             if token not in read and token not in FUNCTION_WORDS and len(token) > 1]
+
+
+# ---- what `meets` requires, in one place --------------------------------------------
+
+
+def meets_invariant_problems(parse: dict[str, Any],
+                             obligations: list[dict[str, Any]]) -> list[str]:
+    """Why this branch may not be called met. Empty is the only licence to say `meets`.
+
+    Checked wherever a `meets` is produced, so the conditions cannot drift apart from the
+    sentence that describes them: the parse was reviewed and complete, no modifier's scope is
+    unattributed, every obligation in the branch is directly evidenced, every mandatory
+    concept inside those obligations has facts of its own, and no part of the text is left
+    unread.
+    """
+    problems = []
+    if parse.get("parse_status") != REVIEWED_COMPLETE:
+        problems.append("parse_not_reviewed_complete")
+    if parse.get("unattributed_scope"):
+        problems.append("shared_scope_unattributed")
+    if not obligations:
+        problems.append("no_obligation")
+    for entry in obligations:
+        if entry.get("strength") not in requirement_tiers.COVERING:
+            problems.append("obligation_not_directly_evidenced")
+        if entry.get("residue"):
+            problems.append("unresolved_span")
+        for concept in entry.get("concepts") or []:
+            if not concept.get("fact_ids"):
+                problems.append("concept_without_facts")
+    return sorted(set(problems))
 
 
 # ---- resolving one obligation, inside its branch ------------------------------------
@@ -411,40 +642,60 @@ def _technology_obligation(obligation: str, facts: list[dict[str, Any]],
     named = named_technologies(obligation)
     if not named:
         return None
-    strengths, fact_ids = [], []
+    concepts, fact_ids = [], []
     for tool in named:
         found = match_requirement(tool, facts)
-        strengths.append(found["strength"])
+        concepts.append({"concept": tool, "strength": found["strength"],
+                         "fact_ids": sorted(found["fact_ids"])})
         fact_ids.extend(found["fact_ids"])
-    weakest = min(strengths, key=lambda name: EVIDENCE_ORDER[name])
-    missing = [tool for tool, strength in zip(named, strengths) if strength == "none"]
+    weakest = min((entry["strength"] for entry in concepts),
+                  key=lambda name: EVIDENCE_ORDER[name])
+    missing = [entry["concept"] for entry in concepts if entry["strength"] == "none"]
     return {"obligation": obligation, "kind": "named_technology", "strength": weakest,
-            "fact_ids": sorted(set(fact_ids)), "consumed": named,
+            "fact_ids": sorted(set(fact_ids)), "consumed": named, "concepts": concepts,
             "note": ("no fact for " + ", ".join(missing)) if missing
             else "covered: " + ", ".join(named)}
 
 
+# The concept for `degree` answers on any education fact naming a degree, which is a second
+# and much looser route to a credential the resolver above declined: "advanced degree in
+# Engineering" came back directly evidenced by a degree in something else. Degrees are settled
+# by the credential resolver or not at all.
+CONCEPTS_HANDLED_ELSEWHERE = frozenset({"degree"})
+
+
 def _concept_obligation(obligation: str, facts: list[dict[str, Any]],
                         degrees: list[dict[str, Any]], branch: str) -> dict[str, Any] | None:
-    """A controlled concept, consuming only the words its own surface matched.
+    """Every controlled concept in the obligation, each answered on its own facts.
+
+    An obligation naming two capabilities asks for both, so it is worth what the weaker of
+    them is worth. The sentence-level matcher reports the stronger — the right answer to a
+    different question, and the reason a skill-list mention of Analysis was arriving as
+    directly evidenced next to a presentation somebody actually gave.
 
     The consumed span is what makes the residue check work: the concept for communication
     reads "communication", so "Executive-level" is left over and the sentence cannot be met
     on a fact about presentations.
     """
-    consumed, concepts = [], []
+    consumed, names = [], []
     for name, rule in REQUIREMENT_CONCEPTS.items():
+        if name in CONCEPTS_HANDLED_ELSEWHERE:
+            continue
         match = re.search(rule["requirement"], obligation, re.I)
         if match:
             consumed.append(match.group(0))
-            concepts.append(name)
-    if not concepts:
+            names.append(name)
+    if not names:
         return None
-    found = match_requirement_prose(obligation, facts)
-    return {"obligation": obligation, "kind": "concept",
-            "strength": found.get("strength", "none") if found.get("recognized") else "none",
-            "fact_ids": sorted(set(found.get("fact_ids") or [])), "consumed": consumed,
-            "note": "concepts: " + ", ".join(concepts)}
+    concepts = [concept_evidence(name, facts) for name in names]
+    weakest = min((entry["strength"] for entry in concepts),
+                  key=lambda name: EVIDENCE_ORDER[name])
+    missing = [entry["concept"] for entry in concepts if entry["strength"] == "none"]
+    detail = ", ".join(f"{entry['concept']}: {entry['strength']}" for entry in concepts)
+    return {"obligation": obligation, "kind": "concept", "strength": weakest,
+            "fact_ids": sorted({fid for entry in concepts for fid in entry["fact_ids"]}),
+            "consumed": consumed, "concepts": concepts,
+            "note": ("no fact for " + ", ".join(missing)) if missing else detail}
 
 
 def propose(requirement: str, facts: list[dict[str, Any]], *,
@@ -460,36 +711,22 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
                          reason="company, eligibility or compensation prose rather than "
                                 "something the candidate's evidence answers")
 
-    parsed = branches_of(text)
-    # A field phrase that only the last branch carries modifies the branches before it:
-    # "Bachelor's or advanced degree in Engineering, Data Science, Statistics" states one
-    # field constraint over both levels. Splitting on `or` had left a bare "Bachelor's"
-    # branch with the field dropped, which is the pairing bug in a new place. Where every
-    # branch names its own field — "MS in Statistics or PhD in Biology" — nothing is shared.
-    per_branch_fields = [_fields_in(" ".join(obligations)) for obligations in parsed]
-    shared_fields = sorted({term for names in per_branch_fields for term in names}) \
-        if any(per_branch_fields) and not all(per_branch_fields) else []
-
+    parse = parse_requirement(text)
     evaluated = []
-    for obligations, own_fields in zip(parsed, per_branch_fields):
-        branch_text = " and ".join(obligations)
-        if not own_fields and shared_fields:
-            branch_text += " in " + " or ".join(shared_fields)
-        resolved = [_resolve(item, facts, degrees, branch_text) for item in obligations]
-        residue = sorted({token for entry in resolved for token in entry["residue"]})
-        classes = [entry["strength"] for entry in resolved if entry["strength"] != "none"]
-        unmet = [entry for entry in resolved if entry["strength"] == "none"]
-        weakest = min(classes, key=lambda name: EVIDENCE_ORDER[name]) if classes else None
-        evaluated.append({"obligations": resolved, "residue": residue, "unmet": unmet,
-                          "weakest": weakest,
-                          "satisfied": not unmet and not residue
-                          and weakest in requirement_tiers.COVERING})
+    for branch in parse["branches"]:
+        resolved = [_resolve(item["text"], facts, degrees, branch["text"])
+                    for item in branch["obligations"]]
+        evaluated.append({"obligations": resolved,
+                          "residue": sorted({token for entry in resolved
+                                             for token in entry["residue"]}),
+                          "unmet": [entry for entry in resolved
+                                    if entry["strength"] == "none"],
+                          "problems": meets_invariant_problems(parse, resolved)})
 
-    satisfied = next((branch for branch in evaluated if branch["satisfied"]), None)
+    satisfied = next((branch for branch in evaluated if not branch["problems"]), None)
     if satisfied:
-        obligations = satisfied["obligations"]
-        residue = satisfied["residue"]
-        unresolved: list[str] = []
+        obligations, residue, unresolved = satisfied["obligations"], satisfied["residue"], []
+        problems: list[str] = []
     else:
         # Nothing satisfied, so every alternative is still live and the reader needs all of
         # them. Reporting only the closest branch hid the obligations of the others: a
@@ -498,6 +735,8 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
         residue = sorted({token for branch in evaluated for token in branch["residue"]})
         unresolved = [entry["obligation"] for branch in evaluated
                       for entry in branch["unmet"]]
+        problems = min((branch["problems"] for branch in evaluated), key=len) \
+            if evaluated else ["no_obligation"]
     fact_ids = [fid for entry in obligations for fid in entry["fact_ids"]]
     # The resolvers' own notes, which say what was found or what is missing. Without them the
     # reason was a generic sentence and the specific finding — "the profile holds MPH", "the
@@ -505,8 +744,10 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
     notes = [entry["note"] for entry in obligations if entry.get("note")]
 
     if satisfied:
-        return _proposal(MEETS, confidence="medium", fact_ids=fact_ids,
-                         evidence_class=satisfied["weakest"], status=EVIDENCE_FOUND,
+        weakest = min((entry["strength"] for entry in obligations),
+                      key=lambda name: EVIDENCE_ORDER[name])
+        return _proposal(MEETS, confidence="medium", fact_ids=fact_ids, parse=parse,
+                         evidence_class=weakest, status=EVIDENCE_FOUND, problems=problems,
                          obligations=obligations, unresolved=unresolved, residue=residue,
                          reason="; ".join(notes) + " — every obligation in this branch "
                                 "resolved and the requirement text was fully read")
@@ -515,11 +756,14 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
         detail.append("unresolved: " + "; ".join(dict.fromkeys(unresolved)))
     if residue:
         detail.append("not read: " + ", ".join(residue))
+    if parse["unattributed_scope"]:
+        detail.append("scope not attributed: " + "; ".join(parse["unattributed_scope"]))
     if notes:
         detail.append("; ".join(dict.fromkeys(notes)))
     if not any(entry["strength"] != "none" for entry in obligations):
         return _proposal(None, confidence="none", fact_ids=fact_ids, status=NO_EVIDENCE,
                          obligations=obligations, unresolved=unresolved, residue=residue,
+                         parse=parse, problems=problems,
                          reason="; ".join(detail) or "no obligation resolved to a confirmed "
                                                      "fact")
     weakest = min((entry["strength"] for entry in obligations
@@ -527,9 +771,13 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
                   key=lambda name: EVIDENCE_ORDER[name])
     if weakest not in requirement_tiers.COVERING:
         detail.append(f"weakest evidence is {weakest}")
+    elif "parse_not_reviewed_complete" in problems:
+        detail.append("every obligation resolved, but no reviewed parse establishes what the "
+                      "sentence's modifiers apply to, so this is a reading for you to confirm "
+                      "rather than a conclusion")
     return _proposal(PARTIALLY_MEETS, confidence="medium", fact_ids=fact_ids,
-                     evidence_class=weakest, status=EVIDENCE_FOUND,
-                     obligations=obligations, unresolved=unresolved,
+                     evidence_class=weakest, status=EVIDENCE_FOUND, parse=parse,
+                     obligations=obligations, unresolved=unresolved, problems=problems,
                      residue=residue, reason="; ".join(detail) or "partly covered")
 
 
@@ -592,10 +840,13 @@ def render(sheet: dict[str, Any]) -> str:
         "education, employment or skills record is complete, so a requirement the facts do "
         "not answer is unrecorded, not unmet.",
         "",
-        "**`meets` requires the requirement text to be read.** A requirement parses into "
-        "`or` branches of `and` obligations; a branch is met only when every obligation in it "
-        "resolves *and* nothing substantive in its text is left unread. Whatever is left over "
-        "is listed as unread, which is why an unfamiliar qualifier cannot disappear.",
+        "**`meets` comes from a reviewed parse, not from a sentence.** Splitting prose on "
+        "`or` cannot recover what a modifier written once applies to, so every requirement "
+        "here carries a parse with a status. Only `reviewed_complete` — one of two closed "
+        "templates, a bare degree level or a flat list of credential alternatives — may "
+        "conclude `meets`, and only when every obligation in a branch is directly evidenced, "
+        "every concept inside it has facts of its own, and nothing substantive in the text is "
+        "left unread. Everything else is read and reported for you to decide.",
         "",
         "Full text below — nothing is shortened.", "",
     ]
@@ -625,6 +876,17 @@ def render(sheet: dict[str, Any]) -> str:
                 lines.append("")
             still = list(dict.fromkeys(
                 (item.get("unresolved_obligations") or []) + (item.get("unresolved_text") or [])))
+            parse = item.get("requirement_parse") or {}
+            if parse:
+                status = parse.get("parse_status")
+                note = {REVIEWED_COMPLETE: f"reviewed template `{parse.get('template')}`",
+                        AMBIGUOUS: "a modifier's scope is not attributable",
+                        UNREVIEWED: "no reviewed parse of this shape"}.get(status, status)
+                lines.append(f"- **parse:** `{status}` — {note}"
+                             + ("; nothing here concludes `meets`"
+                                if status != REVIEWED_COMPLETE else ""))
+                for problem in parse.get("unattributed_scope") or []:
+                    lines.append(f"  - {problem}")
             lines += [f"- **still to verify:** {'; '.join(still) if still else 'nothing'}",
                       f"- **why:** {item.get('short_reason') or '—'}",
                       f"- **your disposition:** {item.get('final_disposition') or '____'}",

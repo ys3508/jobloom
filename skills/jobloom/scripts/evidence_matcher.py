@@ -180,6 +180,36 @@ def match_requirement(requirement: str, facts: list[dict[str, Any]]) -> dict[str
     return {"requirement": requirement, "strength": best_strength, "fact_ids": fact_ids}
 
 
+def concept_evidence(concept: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    """One concept's own strength and the facts it rests on, merged with nothing else.
+
+    `match_requirement_prose` answers a whole sentence and reports the strongest concept in
+    it, which is what routing wants: a bullet naming five capabilities is worth surfacing on
+    the strength of the one that is really evidenced. A caller deciding whether a requirement
+    is *met* needs the opposite, and cannot get it by taking a minimum afterwards -- by then
+    the promotion has already happened inside. This returns the per-concept answer so such a
+    caller can keep the concepts apart and take the weakest necessary one itself.
+    """
+    aliases = REQUIREMENT_CONCEPTS[concept]["evidence"]
+    usable = [fact for fact in facts
+              if fact.get("status") in {"confirmed", "locked"}
+              and fact.get("evidence_strength") in EVIDENCE_ORDER
+              and fact.get("evidence_strength") != "none"
+              and not expired_or_invalid(fact.get("expires_at"))]
+    hits = [fact for fact in usable
+            if any(all(token in fact_tokens(fact) for token in tokens(alias))
+                   for alias in aliases)]
+    if not hits:
+        return {"concept": concept, "strength": "none", "fact_ids": []}
+    # Within one concept the strongest fact is the answer: any single confirmed fact can
+    # establish it. Across concepts it is not, which is why they never meet in here.
+    best = max((effective_strength(fact) for fact in hits),
+               key=lambda value: EVIDENCE_ORDER[value])
+    return {"concept": concept, "strength": best,
+            "fact_ids": sorted(fact["id"] for fact in hits
+                               if effective_strength(fact) == best)}
+
+
 def match_requirement_prose(requirement: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
     """Resolve a prose requirement through controlled capability surfaces.
 
