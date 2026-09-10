@@ -87,9 +87,13 @@ def tier_summary(card: dict[str, Any], candidate: dict[str, Any]) -> dict[str, A
     return report["tiers"]
 
 
-LANE_CLEAR = "assessed_no_known_gap"
-LANE_GAPPED = "assessed_with_known_gaps"
-LANE_UNASSESSED = "unassessed_needs_manual_review"
+# Named for what is known, not for a conclusion. The first version called lane 1 "assessed,
+# no known gap" and printed "every must-have line these postings state was read" above rows
+# reading 2/12 and 1/14 — a heading contradicted by the table beneath it. A lane says which
+# question was answered; it never says the posting fits.
+LANE_CLEAR = "partial_no_known_gap"
+LANE_GAPPED = "partial_with_known_shortfall"
+LANE_UNASSESSED = "no_requirement_assessment"
 LANES = (LANE_CLEAR, LANE_GAPPED, LANE_UNASSESSED)
 LANE_ORDER = {name: index for index, name in enumerate(LANES)}
 
@@ -287,19 +291,48 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
     }
 
 
-LANE_HEADINGS = {
-    LANE_CLEAR: ("Assessed — no known must-have gap",
-                 "Every must-have line these postings state was read, and the confirmed facts "
-                 "cover what was found. Only `direct` evidence counts here."),
-    LANE_GAPPED: ("Assessed — a must-have is known to be missing",
-                  "These were read and something mandatory is not covered, or is covered only "
-                  "by adjacent evidence. A known gap is a real finding, which is why they are "
-                  "below the lane above and above the one below."),
-    LANE_UNASSESSED: ("Not assessed — the requirements could not be read",
-                      "No must-have requirement in these postings reached a deterministic "
-                      "evidence outcome. **They have no known gaps because nothing was "
-                      "checked, not because nothing is missing.** They need reading by hand."),
+LANE_TITLES = {
+    LANE_CLEAR: "No gap found in the must-haves that were evaluated",
+    LANE_GAPPED: "A shortfall found in the must-haves that were evaluated",
+    LANE_UNASSESSED: "No must-have reached evidence evaluation",
 }
+
+
+def lane_description(name: str, rows: list[dict[str, Any]]) -> str:
+    """What this lane means, computed from the rows in it rather than asserted above them.
+
+    The claim and the table cannot disagree if the claim is derived from the table. The
+    previous version said "every must-have line these postings state was read" over rows that
+    had read two of twelve.
+    """
+    if not rows:
+        return "_None._"
+    must = [(row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE) or {} for row in rows]
+    partial = sum(1 for entry in must
+                  if entry.get("assessment") == requirement_tiers.PARTIALLY_ASSESSED)
+    parsed = sum(entry.get("parsed_lines", 0) for entry in must)
+    stated = sum(entry.get("stated_lines", 0) for entry in must)
+    coverage = f"{parsed} of {stated} stated must-have lines reached an evidence outcome"
+
+    if name == LANE_UNASSESSED:
+        return ("No must-have requirement in these postings reached a deterministic evidence "
+                "outcome. **They show no gaps because nothing was evaluated, not because "
+                "nothing is missing.** Each needs reading by hand; the unread requirements "
+                "are listed below.")
+    if name == LANE_CLEAR:
+        body = ("At least one must-have was evaluated, and none of the evaluated must-haves "
+                "produced a gap.")
+    else:
+        body = ("At least one evaluated must-have is missing, or is supported only by "
+                "adjacent evidence.")
+    if partial:
+        body += (f" **{partial} of {len(rows)} are only partially assessed** — {coverage}. "
+                 "Unevaluated requirements may still contain blockers, and two rows here are "
+                 "not fully comparable when they read different fractions of their posting. "
+                 "The unread requirements are listed below; read them before applying.")
+    else:
+        body += f" Every row here is fully assessed — {coverage}."
+    return body
 
 
 def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
@@ -310,21 +343,30 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
 
     counts = {name: sum(1 for row in queue["rows"] if row.get("lane") == name)
               for name in LANES}
+    fully = sum(1 for row in queue["rows"]
+                if ((row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE) or {})
+                .get("assessment") == requirement_tiers.FULLY_ASSESSED)
     lines = ["# Review queue", "",
              f"{queue['openings_in_queue']} openings out of {queue['openings_routed']} routed.",
              "",
-             "**Three lanes, and the queue never compares across them.** "
-             "\"We read it and it fits\", \"we read it and it does not\" and \"we could not "
-             "read it\" answer different questions. Ordering them on one scale let postings "
-             "nobody had evaluated outrank postings that had been, because unparsed "
-             "requirements produce zero known gaps and zero known gaps sorted like nothing "
-             "was missing.", "",
-             f"- {counts[LANE_CLEAR]} assessed with no known must-have gap",
-             f"- {counts[LANE_GAPPED]} assessed with a known must-have gap",
-             f"- {counts[LANE_UNASSESSED]} not assessed — requirements could not be read", "",
+             f"**{fully} of {queue['openings_in_queue']} postings are fully assessed.** A lane "
+             "says which question was answered about a posting, never that the posting fits. "
+             "Nothing here is a ranking to apply from: it is a triage list, and both of the "
+             "first two lanes are worth reading — a relevant role can sit in the second "
+             "precisely because it was evaluated well enough for a shortfall to be found.",
+             "",
+             "**Three lanes, and the queue never compares across them.** A posting whose "
+             "requirements could not be parsed has zero known gaps, and on one ordered scale "
+             "zero known gaps sorted like nothing was missing — so postings nobody had "
+             "evaluated outranked postings that had been.", "",
+             f"- {counts[LANE_CLEAR]} — no gap found in the must-haves that were evaluated",
+             f"- {counts[LANE_GAPPED]} — a shortfall found in the must-haves that were evaluated",
+             f"- {counts[LANE_UNASSESSED]} — no must-have reached evidence evaluation", "",
              "`parsed/stated` is how many of the posting's must-have lines reached a "
              "deterministic outcome. It decides the lane and is never a tiebreak inside one. "
-             "`review` means the rules did not exclude the posting — never that it is a match.",
+             "`review` means the rules did not exclude the posting — never that it is a match. "
+             "Sponsorship, seniority, location and required experience are separate hard "
+             "filters and are not applied here.",
              "",
              f"{queue['in_title_groups']} openings share an employer and title with another "
              "and are marked below. They are **not** one job listed several times: two "
@@ -333,19 +375,18 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
 
     for name in LANES:
         rows = [row for row in queue["rows"] if row.get("lane") == name]
-        heading, explanation = LANE_HEADINGS[name]
-        lines += ["", f"# {heading} ({len(rows)})", "", explanation, ""]
+        lines += ["", f"# {LANE_TITLES[name]} ({len(rows)})", "",
+                  lane_description(name, rows), ""]
         if not rows:
-            lines += ["_None._", ""]
             continue
         current = None
         for row in rows:
             if row["direction_id"] != current:
                 current = row["direction_id"]
                 lines += ["", f"## {label(current)} — weight {row['weight_percent']}%", "",
-                          "| # | must parsed | covered | adjacent | gaps | employer | title "
-                          "| location | covered terms | gap terms |",
-                          "|---:|---:|---:|---:|---:|---|---|---|---|---|"]
+                          "| # | assessment | must parsed | covered | adjacent | shortfall "
+                          "| employer | title | location | covered terms | gap terms |",
+                          "|---:|---|---:|---:|---:|---:|---|---|---|---|---|"]
             must = (row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE) or {}
             title = (f"[{row['title']}]({row['canonical_url']})"
                      if str(row["canonical_url"]).startswith("http") else row["title"])
@@ -356,7 +397,8 @@ def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
                     + ", ".join(f"#{s['rank']} {s['location']}" for s in group["siblings"])
                     if group else "")
             lines.append(
-                f"| {row['lane_rank']} | {must.get('parsed_lines', 0)}"
+                f"| {row['lane_rank']} | {must.get('assessment', '—')} "
+                f"| {must.get('parsed_lines', 0)}"
                 f"/{must.get('stated_lines', 0)} | {must.get('unique_direct', 0)} "
                 f"| {must.get('unique_adjacent', 0)} | {must.get('unique_gaps', 0)} "
                 f"| {row['employer']} | {title}{mark} | {row['location']} "

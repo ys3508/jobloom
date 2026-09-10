@@ -299,3 +299,53 @@ rate — not approached with more ad-hoc patterns.
 
 `.jobloom/review-queue-20260910-lanes.json` and `.md`. The 09-09 v1 and v2 queues remain
 **experimental** and must not be used to choose applications.
+
+
+---
+
+# Fourth round — the lane heading contradicted its own table, 2026-09-10
+
+The classifier and the lane mechanism were accepted. One reporting defect had to be fixed
+before the queue could be used for anything: Lane 1's heading read
+
+> Every must-have line these postings state was read
+
+directly above rows showing `2/12`, `1/14`, `1/8`. **None of the 112 postings is fully
+assessed.** The sentence was written when the lane was designed and was never checked against
+what the lane actually contained — the same failure `references/known-liabilities.md` records
+twice: a component reporting what it was meant to do rather than what it did.
+
+## Lanes renamed to what is known
+
+| lane | meaning |
+| --- | --- |
+| `partial_no_known_gap` | at least one must-have was evaluated; none of the evaluated ones produced a gap. Unevaluated requirements may still contain blockers. |
+| `partial_with_known_shortfall` | at least one evaluated must-have is missing or supported only by adjacent evidence. Unevaluated requirements may contain more. |
+| `no_requirement_assessment` | no must-have reached deterministic evidence evaluation. |
+
+`partially_assessed` and `fully_assessed` remain explicit per-row states and are printed in
+the table, so two rows in one lane are never presented as fully comparable when they read
+different fractions of their posting.
+
+## The prose is now derived from the rows
+
+`lane_description()` computes its claim from the rows in the lane. A heading cannot disagree
+with its table if the heading is calculated from it. It says "11 of 11 are only partially
+assessed — 13 of 97 stated must-have lines reached an evidence outcome", and it says
+"every row here is fully assessed" only when that is true of every row. A rendering test
+asserts the forbidden phrases never appear.
+
+The queue header now leads with **"0 of 112 postings are fully assessed"** and states plainly
+that a lane says which question was answered, never that a posting fits — and that sponsorship,
+seniority, location and required experience are separate hard filters not applied here.
+
+## How the queue is to be used
+
+As a manual triage list, not a ranking to apply from. **Both** of the first two lanes are
+read: Unlearn.AI's Biostatistician is the proof, sitting in the shortfall lane precisely
+because enough of it was evaluated for shortfalls to be found. A relevant role is not excluded
+for having known gaps. Every unread must-have is read before an application is chosen, and
+the reviewer's disposition for each is recorded.
+
+The first five supervised applications are what produce the hand-labelled requirement set the
+next distiller needs. They are not postponed until the distiller exists.

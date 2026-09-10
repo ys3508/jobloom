@@ -539,3 +539,83 @@ class ParentheticalScopeTests(unittest.TestCase):
     def test_a_line_that_is_only_a_parenthetical_is_not_local(self):
         self.assertEqual(one(posting("Requirements", "- Snowflake (preferred)"))["tier"],
                          PREFERRED)
+
+
+class LaneLanguageTests(unittest.TestCase):
+    """A heading may not claim more than the rows beneath it show.
+
+    The first version printed "Every must-have line these postings state was read" above rows
+    reading 2/12 and 1/14. The claim is derived from the rows now, so the two cannot disagree.
+    """
+
+    def row(self, assessment, parsed, stated, lane_rank=1):
+        return {"weight_percent": 85, "ranking_score": 0, "employer": "A", "title": "B",
+                "location": "Boston", "canonical_url": "https://example.invalid/x",
+                "direction_id": "d", "lane_rank": lane_rank, "rank": lane_rank,
+                "evidence": {"direct": 0, "covered": 0, "technical_hits": 0,
+                             "direct_requirements": [], "recognized_requirements": 0,
+                             "stated_requirements": stated},
+                "tiers": {MUST: {"assessment": assessment, "parsed_lines": parsed,
+                                 "stated_lines": stated, "unique_direct": 1,
+                                 "unique_adjacent": 0, "unique_gaps": 0,
+                                 "direct_terms": ["SAS"], "gap_terms": [],
+                                 "unrecognised_requirements": ["Ten years of leadership"]},
+                          PREFERRED: {}, UNKNOWN: {}}}
+
+    def test_a_partial_lane_does_not_claim_everything_was_read(self):
+        text = QUEUE.lane_description(QUEUE.LANE_CLEAR,
+                                      [self.row(TIERS.PARTIALLY_ASSESSED, 2, 12)])
+        self.assertIn("partially assessed", text)
+        self.assertIn("2 of 12", text)
+        self.assertNotIn("every must-have line", text.lower())
+
+    def test_a_partial_lane_warns_that_blockers_may_remain(self):
+        text = QUEUE.lane_description(QUEUE.LANE_CLEAR,
+                                      [self.row(TIERS.PARTIALLY_ASSESSED, 1, 14)])
+        self.assertIn("may still contain blockers", text)
+        self.assertIn("not fully comparable", text)
+
+    def test_only_a_fully_assessed_lane_says_everything_was_read(self):
+        text = QUEUE.lane_description(QUEUE.LANE_CLEAR,
+                                      [self.row(TIERS.FULLY_ASSESSED, 12, 12)])
+        self.assertIn("fully assessed", text)
+        self.assertNotIn("partially assessed", text)
+
+    def test_the_unassessed_lane_says_nothing_was_evaluated(self):
+        text = QUEUE.lane_description(QUEUE.LANE_UNASSESSED,
+                                      [self.row(TIERS.UNASSESSED, 0, 9)])
+        self.assertIn("nothing was evaluated", text)
+        self.assertNotIn("no gap", text.split("**")[0].lower())
+
+    def test_no_lane_name_asserts_a_fit(self):
+        for name in QUEUE.LANES:
+            with self.subTest(name=name):
+                self.assertNotIn("fits", name)
+                self.assertNotIn("good", name)
+                self.assertNotIn("match", name)
+
+    def test_the_lane_names_say_partial_where_partial_is_what_is_known(self):
+        self.assertEqual(QUEUE.LANE_CLEAR, "partial_no_known_gap")
+        self.assertEqual(QUEUE.LANE_GAPPED, "partial_with_known_shortfall")
+        self.assertEqual(QUEUE.LANE_UNASSESSED, "no_requirement_assessment")
+
+    def test_the_rendered_queue_never_claims_a_full_read_it_did_not_do(self):
+        queue = {"openings_in_queue": 2, "openings_routed": 9, "with_direct_evidence": 1,
+                 "in_title_groups": 0, "without_direct_evidence": 1,
+                 "rows": [dict(self.row(TIERS.PARTIALLY_ASSESSED, 2, 12),
+                               lane=QUEUE.LANE_CLEAR),
+                          dict(self.row(TIERS.UNASSESSED, 0, 7, lane_rank=1),
+                               lane=QUEUE.LANE_UNASSESSED)]}
+        rendered = QUEUE.render(queue).lower()
+        for forbidden in ("every must-have line", "we read it and it fits",
+                          "assessed with no gap"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, rendered)
+        self.assertIn("0 of 2 postings are fully assessed", rendered)
+
+    def test_the_row_keeps_its_own_assessment_state(self):
+        queue = {"openings_in_queue": 1, "openings_routed": 1, "with_direct_evidence": 1,
+                 "in_title_groups": 0, "without_direct_evidence": 0,
+                 "rows": [dict(self.row(TIERS.PARTIALLY_ASSESSED, 2, 12),
+                               lane=QUEUE.LANE_CLEAR)]}
+        self.assertIn("partially_assessed", QUEUE.render(queue))
