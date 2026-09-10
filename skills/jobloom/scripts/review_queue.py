@@ -88,13 +88,23 @@ def tier_summary(card: dict[str, Any], candidate: dict[str, Any]) -> dict[str, A
 
 
 def sort_key(row: dict[str, Any]) -> tuple:
-    """Weight, then must-have evidence, then the rest — never the other way round.
+    """Weight, then whether a must-have is known to be missing, then what is covered.
 
-    Must-have coverage sorts before total coverage, and must-have gaps sort before both,
-    because a posting whose mandatory requirements are uncovered is not made easier by
-    covering its wishes. Only `direct` evidence counts toward a must-have: transferable and
-    mention-only evidence is carried in its own column and would, if counted here, put a
-    posting the candidate cannot meet above one they can.
+    **A known must-have gap sorts before coverage**, and it is asymmetric on purpose. A gap
+    the resolver identified is a strong negative: the posting states a mandatory requirement
+    and the confirmed facts do not meet it. Coverage is a weak positive by comparison,
+    because roughly 87% of requirement text is not parsed at all, so "no gap detected" mostly
+    means "not read" rather than "nothing missing". Ranking a strong negative behind a weak
+    positive is what put an Infrastructure Engineer with uncovered AWS, Docker, Snowflake,
+    Spark and dbt at the top of the queue.
+
+    Coverage is counted in **unique** requirements. The same posting named GitHub in three
+    paragraphs and was credited three times for one piece of evidence; a requirement stated
+    twice is not two requirements met.
+
+    Only `direct` evidence counts toward a must-have. Transferable and mention-only are
+    carried in their own columns and would, if counted here, put a posting the candidate
+    cannot meet above one they can.
 
     Below the evidenced openings this ordering stops meaning anything, and it says so
     rather than inventing a tiebreak. Unlearn.AI's "Clinical Data Scientist" states eight
@@ -109,10 +119,12 @@ def sort_key(row: dict[str, Any]) -> tuple:
     evidence = row["evidence"]
     tiers = row.get("tiers") or {}
     must = tiers.get(requirement_tiers.MUST_HAVE) or {}
+    unique_gaps = must.get("unique_gaps", must.get("gaps", 0))
     return (
         -row["weight_percent"],
-        -must.get("direct", 0),
-        must.get("gaps", 0),
+        1 if unique_gaps else 0,
+        -must.get("unique_direct", 0),
+        unique_gaps,
         -evidence["direct"],
         -evidence["covered"],
         -evidence["technical_hits"],

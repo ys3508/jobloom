@@ -70,7 +70,8 @@ def queue_row(weight_percent=50, direct=1, covered=1, technical_hits=1, ranking_
             "employer": employer, "title": title,
             "evidence": {"direct": direct, "covered": covered,
                          "technical_hits": technical_hits},
-            "tiers": {"must_have": {"direct": must_direct, "gaps": must_gaps},
+            "tiers": {"must_have": {"unique_direct": must_direct, "unique_gaps": must_gaps,
+                                    "direct": must_direct, "gaps": must_gaps},
                       "preferred": {}, "unknown": {}}}
 
 
@@ -78,7 +79,8 @@ def reachability() -> dict:
     # Every evidence key the queue sorts on, in the order it sorts on them. The
     # must-have keys joined this list when requirement tiering did; leaving them out would
     # have let the audit report on a sort key that no longer existed.
-    keys = ["weight_percent", "must_direct", "must_gaps", "direct", "covered",
+    # `must_gaps` occupies two positions: whether any gap is known at all, then how many.
+    keys = ["weight_percent", "must_gaps", "must_direct", "direct", "covered",
             "technical_hits", "ranking_score"]
 
     def build_row(key, value):

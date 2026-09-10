@@ -119,3 +119,105 @@ python3 skills/jobloom/scripts/requirement_tiers.py --card <card.json> --lines
 
 The queue recomputation that produced the table above is in
 `.jobloom/review-queue-20260909.json`.
+
+
+---
+
+# Second round — spot check failed, 2026-09-09
+
+The owner's spot check of ranks 1, 2, 4, 8, 12, 30, 60 and 90 rejected the first queue. The
+tier framework held; the ordering was amplifying three classification faults. All three are
+fixed below, the ordering rule changed, and the queue was rebuilt as
+`.jobloom/review-queue-20260909-v2.json`. **The first queue
+(`review-queue-20260909.json`) is an experiment and must not be used to choose applications.**
+
+## What was wrong
+
+**One skill named repeatedly was paid for repeatedly.** Komodo Health's Infrastructure
+Engineer showed `must_have.direct = 3` from a single covered term: GitHub, named in three
+separate AI and CI paragraphs. That carried it to rank 1 past its own uncovered AWS, Docker,
+Snowflake, Spark and dbt. Ordering now reads `unique_direct` — unique canonical
+requirements — and line counts remain for describing the posting.
+
+**A weight word inside a bracket downgraded the requirement in front of it.**
+"3+ years in Life Sciences Consulting (Business or Management Consulting preferred)" was
+read as `preferred`, discarding a mandatory three years. The scope of a bracketed cue cannot
+be determined, so the line is `unknown`. A bracket that *opens* a line is different — it
+labels the line — and still applies.
+
+**Sub-headings inside a requirement list did not end or re-weight it.** The same Komodo
+posting ran an AI-expectations sub-heading, an "Additional skills and experience we'll
+prioritize…" transition, two salary sub-headings, an AI-policy section and a location section
+all under one Required heading: 27 must-haves, most of them not requirements. A heading-shaped
+line — one ending in a colon or an ellipsis — now ends the requirement list, unless it states
+a weight, in which case it reopens at that weight.
+
+**And one nobody had noticed.** 21 of the 112 postings write "What You’ll Do" and "Where
+You’ll Work" with U+2019, and `posting_sections`' heading tables are written with the
+straight apostrophe. Those headings matched nothing, so those postings' *responsibilities*
+were being tiered as requirements. Apostrophes are normalised before every heading test.
+
+## Ordering, as decided by the owner
+
+1. direction weight
+2. whether any must-have gap is known — none first
+3. unique direct must-have coverage
+4. number of known must-have gaps
+5. the existing evidence keys
+
+The asymmetry is deliberate: a known gap is a strong negative, while "no gap" is a weak
+positive because most requirement text is not parsed. `parsed / stated` is displayed and is
+**not** sorted on.
+
+## Second hand audit — the top 20, not a random sample
+
+Reviewing the new top 20 found two further faults, both in the top three, and both fixed:
+
+- **Sponsorship statements were must-have requirements.** "We are currently unable to consider
+  candidates who require sponsorship for work authorization" sat among the must-haves of the
+  two highest-ranked postings. It is a requirement and not this kind: `field_policy` puts the
+  sponsorship domain in `ALWAYS_MANUAL_DOMAINS` and routing already gates on it.
+- **Bare pay ranges survived in other postings.** `$195,000—$225,000 USD` contains none of the
+  words `FALLBACK_EXCLUSION` matches. The corpus-wide check found this; the 40-line hand
+  sample never showed it, because in Komodo a salary sub-heading happened to end the section
+  first.
+
+Two filters were **measured and rejected**:
+
+- **Requiring a `REQUIREMENT_CUE` word** would drop 21.6% of tiered lines, including
+  `Python (FastAPI, Pydantic, Pandas)` and `REST APIs and other web service backend
+  technologies` — precisely the parseable technical requirements. It would trade real
+  requirements for boilerplate.
+- **Using bullet markers** to tell a list from trailing prose: only 13 of 112 postings retain
+  bullets; the ATS strips them.
+
+## Result
+
+- Komodo Infrastructure Engineer: **rank 1 → rank 83** (unique coverage 1, unique gaps 2).
+- Komodo's must-have count: **27 → 8**, all eight real requirements.
+- Tiered lines across the queue: 2,383 → 1,372.
+- The top 20 contains no salary line, tracking tag, sponsorship statement or benefit line.
+
+## Still wrong, and reported rather than fixed
+
+**Company boilerplate is still tiered.** "At Beghou, you'll join a highly collaborative,
+values-driven team where technical excellence…" is a must-have in the top three. The only
+general filter available is the requirement-cue test measured above, which costs more than it
+saves. A narrow rule for this sentence shape would fit one employer. Left, and named.
+
+**Ordering now favours postings nobody could read.** 59 of 112 rows have `parsed 0/0` — no
+coverage, no gaps, nothing distilled — and gap-first ordering places them above any posting
+with a known gap. Unlearn.AI's Biostatistician, with 2 unique covered must-haves and 3 known
+gaps, sits at **rank 76**, below 59 postings about which nothing is known. This follows
+exactly from the rule as specified and from the distillation gap; it is a product decision,
+not a defect, and it is the strongest argument for closing the distillation gap next.
+
+## Regression tests
+
+`tests/test_requirement_tiers_real_postings.py` runs against complete real descriptions from
+the private corpus, pinned to `job-f93ad94ccd33` — the exact card that ranked 1, since several
+Komodo postings share that title and the first match was a different variant. The postings are
+**not committed**: `docs/implementation-plan-2026-08-31.md` forbids complete job descriptions
+in git-tracked fixtures, so the tests skip when `.jobloom/jobs-wide-20260907` is absent, and
+`tests/test_requirement_tiers.py` pins the same behaviours in structural fixtures that always
+run.
