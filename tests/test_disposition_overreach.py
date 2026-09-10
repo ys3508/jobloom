@@ -229,7 +229,7 @@ class BranchStructureTests(unittest.TestCase):
         matched = [entry for entry in found["obligations"] if entry["strength"] == "direct"]
         self.assertEqual([entry["obligation"] for entry in matched], ["MS in Biology"])
         self.assertEqual(matched[0]["fact_ids"], ["e3"])
-        self.assertIn("parse_not_reviewed_complete", found["meets_invariant_problems"])
+        self.assertIn("parse_not_eligible_to_conclude", found["meets_invariant_problems"])
 
     def test_every_proposal_carries_its_obligations(self):
         """The two v2 `meets` had empty obligation lists, so nothing could be checked."""
@@ -306,7 +306,7 @@ class ResidueProvesConsumptionTests(unittest.TestCase):
         self.assertEqual(found.get("unresolved_text"), [])
         self.assertEqual(found["obligations"][0]["strength"], "direct")
         self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
-        self.assertEqual(found["meets_invariant_problems"], ["parse_not_reviewed_complete"])
+        self.assertEqual(found["meets_invariant_problems"], ["parse_not_eligible_to_conclude"])
 
 
 class RenderingTests(unittest.TestCase):

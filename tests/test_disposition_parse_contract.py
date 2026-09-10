@@ -76,7 +76,7 @@ class SharedScopeTests(unittest.TestCase):
                             "5+ years of production experience with Python or R"):
             with self.subTest(requirement=requirement):
                 parse = P.parse_requirement(requirement)
-                self.assertNotEqual(parse["parse_status"], P.REVIEWED_COMPLETE)
+                self.assertNotIn(parse["parse_status"], P.MEETS_ELIGIBLE)
 
 
 class ConceptAggregationTests(unittest.TestCase):
@@ -117,25 +117,25 @@ class ParseStatusTests(unittest.TestCase):
         for requirement in ("Strong communication skills",
                             "Experience with Python and SQL in a regulated environment"):
             with self.subTest(requirement=requirement):
-                self.assertNotEqual(P.parse_requirement(requirement)["parse_status"],
-                                    P.REVIEWED_COMPLETE)
+                self.assertNotIn(P.parse_requirement(requirement)["parse_status"],
+                                 P.MEETS_ELIGIBLE)
 
     def test_a_closed_degree_template_is_complete(self):
         for requirement in ("Bachelor's degree", "Education: Bachelor's degree or higher",
                             "Master's degree or higher"):
             with self.subTest(requirement=requirement):
                 self.assertEqual(P.parse_requirement(requirement)["parse_status"],
-                                 P.REVIEWED_COMPLETE)
+                                 P.CLOSED_TEMPLATE)
 
     def test_a_flat_credential_alternative_list_is_complete(self):
         parse = P.parse_requirement(
             "MD, PharmD, NP, PA, RN, MPH, or 5+ years in clinical health IT")
-        self.assertEqual(parse["parse_status"], P.REVIEWED_COMPLETE)
+        self.assertEqual(parse["parse_status"], P.CLOSED_TEMPLATE)
 
     def test_a_credential_list_with_a_distributing_tail_is_not(self):
         """"MD, PharmD, or MPH in public health" shares a field nobody attributed."""
         parse = P.parse_requirement("MD, PharmD, or MPH in public health")
-        self.assertNotEqual(parse["parse_status"], P.REVIEWED_COMPLETE)
+        self.assertNotIn(parse["parse_status"], P.MEETS_ELIGIBLE)
 
     def test_the_parse_records_what_it_came_from(self):
         parse = P.parse_requirement("Bachelor's degree")
@@ -159,7 +159,7 @@ class MeetsInvariantTests(unittest.TestCase):
         problems = P.meets_invariant_problems(parse, [{"strength": "direct",
                                                        "concepts": [], "fact_ids": ["f1"],
                                                        "residue": []}])
-        self.assertIn("parse_not_reviewed_complete", problems)
+        self.assertIn("parse_not_eligible_to_conclude", problems)
 
     def test_an_unresolved_span_blocks_meets(self):
         parse = P.parse_requirement("Bachelor's degree")
@@ -186,6 +186,144 @@ class MeetsInvariantTests(unittest.TestCase):
                 found = P.propose(requirement, facts)
                 if found["proposed_disposition"] == P.MEETS:
                     self.assertEqual(found.get("meets_invariant_problems"), [])
+
+
+class ReviewIsSomethingAPersonDoesTests(unittest.TestCase):
+    """`reviewed_complete` was granted by a regex, which is not what the word means.
+
+    A template match says a machine recognised a shape. Whether anybody looked at this
+    sentence is a different fact, and the status name was asserting the second while
+    establishing only the first.
+    """
+
+    def test_a_template_match_is_not_called_reviewed(self):
+        parse = P.parse_requirement("Bachelor's degree")
+        self.assertEqual(parse["parse_status"], P.CLOSED_TEMPLATE)
+        self.assertIsNone(parse["reviewed_by"])
+
+    def test_a_closed_template_may_still_conclude(self):
+        self.assertIn(P.CLOSED_TEMPLATE, P.MEETS_ELIGIBLE)
+
+    def test_a_registry_entry_is_what_makes_a_parse_reviewed(self):
+        text = "Experience with Python and SQL in a regulated environment"
+        parse = P.parse_requirement(text)
+        self.assertEqual(parse["parse_status"], P.UNREVIEWED)
+        registry = {parse["source_sha256"]: {"parse_version": parse["parse_version"],
+                                             "ast_sha256": parse["ast_sha256"],
+                                             "approved_by": "sissi",
+                                             "approved_at": "2026-09-10"}}
+        reviewed = P.parse_requirement(text, registry=registry)
+        self.assertEqual(reviewed["parse_status"], P.REVIEWED_COMPLETE)
+        self.assertEqual(reviewed["reviewed_by"], "sissi")
+
+    def test_a_registry_entry_from_an_older_distiller_does_not_apply(self):
+        text = "Experience with Python and SQL"
+        parse = P.parse_requirement(text)
+        registry = {parse["source_sha256"]: {"parse_version": "requirement-parse/1900-01-01",
+                                             "ast_sha256": parse["ast_sha256"],
+                                             "approved_by": "sissi",
+                                             "approved_at": "2026-09-10"}}
+        stale = P.parse_requirement(text, registry=registry)
+        self.assertNotEqual(stale["parse_status"], P.REVIEWED_COMPLETE)
+        self.assertTrue(stale["registry_note"])
+
+    def test_a_registry_entry_for_a_different_tree_does_not_apply(self):
+        """Approving the text is not approving whatever a later splitter makes of it."""
+        text = "Experience with Python and SQL"
+        parse = P.parse_requirement(text)
+        registry = {parse["source_sha256"]: {"parse_version": parse["parse_version"],
+                                             "ast_sha256": "0" * 64,
+                                             "approved_by": "sissi",
+                                             "approved_at": "2026-09-10"}}
+        stale = P.parse_requirement(text, registry=registry)
+        self.assertNotEqual(stale["parse_status"], P.REVIEWED_COMPLETE)
+
+
+class ProvenanceIsCheckedTests(unittest.TestCase):
+    """The hash and the version were written down and never read."""
+
+    def test_a_source_hash_that_does_not_match_blocks_meets(self):
+        parse = P.parse_requirement("Bachelor's degree")
+        parse["source_sha256"] = "0" * 64
+        self.assertIn("source_hash_mismatch", P.meets_invariant_problems(parse, []))
+
+    def test_a_parse_from_another_version_blocks_meets(self):
+        parse = P.parse_requirement("Bachelor's degree")
+        parse["parse_version"] = "requirement-parse/1900-01-01"
+        self.assertIn("parse_version_mismatch", P.meets_invariant_problems(parse, []))
+
+    def test_a_span_that_does_not_match_its_source_blocks_meets(self):
+        parse = P.parse_requirement("Bachelor's degree")
+        parse["branches"][0]["obligations"][0]["span"] = [0, 3]
+        self.assertIn("span_does_not_match_source", P.meets_invariant_problems(parse, []))
+
+    def test_an_artifact_with_no_provenance_blocks_meets(self):
+        self.assertIn("missing_provenance", P.meets_invariant_problems({}, []))
+
+
+class ClosedTemplatesAreActuallyClosedTests(unittest.TestCase):
+    """A template that reads only the letters is not closed over what it skipped."""
+
+    BS = [fact("e1", "education", "Bachelor of Science – Medical Technology")]
+
+    def test_a_number_the_template_never_read_blocks_it(self):
+        """"Bachelor's degree, 5+" met on the degree; the 5 was invisible to the word scan."""
+        for requirement in ("Bachelor's degree, 5+", "Bachelor's degree + 3"):
+            with self.subTest(requirement=requirement):
+                parse = P.parse_requirement(requirement)
+                self.assertNotIn(parse["parse_status"], P.MEETS_ELIGIBLE)
+                self.assertNotEqual(P.propose(requirement, self.BS)["proposed_disposition"],
+                                    P.MEETS)
+
+    def test_characters_outside_the_word_scan_block_it(self):
+        parse = P.parse_requirement("Bachelor's degree 学历")
+        self.assertNotIn(parse["parse_status"], P.MEETS_ELIGIBLE)
+        self.assertNotEqual(P.propose("Bachelor's degree 学历", self.BS)["proposed_disposition"],
+                            P.MEETS)
+
+    def test_a_comma_list_is_not_a_bare_degree_level(self):
+        """It is a list of alternatives, and the list template is the one that reads it."""
+        parse = P.parse_requirement("MPH, MS, or MA")
+        self.assertEqual(parse["template"], "credential_alternatives")
+        self.assertEqual([branch["text"] for branch in parse["branches"]],
+                         ["MPH", "MS", "MA"])
+
+    def test_a_bare_level_still_reaches_the_template(self):
+        for requirement in ("Bachelor's degree", "Education: Bachelor's degree or higher",
+                            "Bachelor's degree required"):
+            with self.subTest(requirement=requirement):
+                self.assertEqual(P.parse_requirement(requirement)["template"],
+                                 "bare_degree_level")
+
+
+class CredentialsComeFromTheRecordThatCarriesThemTests(unittest.TestCase):
+    """A licence is not a degree, and `held_degrees` was answering for both."""
+
+    ADDRESS = [fact("e1", "education",
+                    "Bachelor of Science – Nursing; Philadelphia PA May 2018")]
+    NURSE = [fact("c1", "certification", "Registered Nurse (RN), Massachusetts license"),
+             fact("e1", "education", "Bachelor of Science – Nursing")]
+
+    def test_a_state_in_an_education_line_is_not_a_licence(self):
+        """"Philadelphia PA" made the profile hold a physician assistant licence."""
+        found = P.propose("MD, DO, or PA", self.ADDRESS)
+        self.assertNotEqual(found["proposed_disposition"], P.MEETS)
+
+    def test_a_licence_recorded_as_a_certification_answers_a_licence_requirement(self):
+        found = P.propose("RN, NP, or PA", self.NURSE)
+        self.assertEqual(found["proposed_disposition"], P.MEETS)
+        self.assertEqual(found["supporting_fact_ids"], ["c1"])
+
+    def test_an_academic_credential_still_comes_from_the_education_record(self):
+        mph = [fact("e2", "education", "Master of Public Health – Environmental Health")]
+        found = P.propose("MPH, MS, or MA", mph)
+        self.assertEqual(found["proposed_disposition"], P.MEETS)
+        self.assertEqual(found["supporting_fact_ids"], ["e2"])
+
+    def test_an_absent_licence_names_the_record_that_would_carry_it(self):
+        found = P.propose("RN, NP, or PA", [fact("e1", "education", "Bachelor of Science")])
+        self.assertIsNone(found["proposed_disposition"])
+        self.assertIn("certification", found["short_reason"])
 
 
 if __name__ == "__main__":

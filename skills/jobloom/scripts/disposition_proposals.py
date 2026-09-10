@@ -15,10 +15,15 @@ experience with Python or R` leaves an alternative consisting of the letter R. E
 splitter moved the next wrong reading somewhere else, so the structure changed instead:
 `parse_requirement` produces a reviewable artifact — source text and hash, parse version,
 `or`-branches of `and`-obligations with exact spans into the sentence, any modifier whose
-scope nobody has attributed, and a `parse_status` of `reviewed_complete`, `ambiguous` or
-`unreviewed`. Only `reviewed_complete` may yield `meets`, and only two closed templates reach
-it: a bare degree level, and a flat list of credential alternatives. Everything else is read,
-resolved and reported — as a reading for a person to confirm, not as a conclusion.
+scope nobody has attributed, and a `parse_status`. Two statuses may yield `meets`, and they
+are different claims: `closed_template` says a machine recognised one of two shapes with
+nowhere for a modifier to hide — a bare degree level, or a flat list of credential
+alternatives — where "nothing else" is checked against every character in the span, not
+against the words the scan happened to read; `reviewed_complete` says a person approved this
+parse, recorded in a registry against the sentence's hash, the distiller version and the tree
+they saw. `ambiguous` and `unreviewed` conclude nothing. The invariant reads that provenance
+rather than merely writing it, and `_proposal` recomputes it rather than believing a caller
+who says there is nothing wrong.
 
 Inside a branch, specialized resolvers — credential, duration, named technology, prose concept
 — answer *one obligation*, and none may answer the sentence around it. Inside an obligation,
@@ -208,6 +213,11 @@ def _proposal(disposition: str | None, *, confidence: str, reason: str,
               unresolved: list[str] | None = None, residue: list[str] | None = None,
               parse: dict[str, Any] | None = None,
               problems: list[str] | None = None) -> dict[str, Any]:
+    # Not `problems` as passed in: a caller that hands this an empty list would be granting
+    # itself the licence the invariant exists to withhold. For a `meets` the only list that
+    # counts is the one recomputed here, from the parse and the obligations being reported.
+    if disposition == MEETS:
+        problems = meets_invariant_problems(parse or {}, obligations or [])
     proposal = {"proposed_disposition": disposition, "confidence": confidence,
                 "supporting_fact_ids": sorted(fact_ids or []),
                 "evidence_class": evidence_class, "short_reason": reason,
@@ -255,6 +265,17 @@ CREDENTIAL_FORMS = {
     "BS": (r"B\.?S\.?", r"bachelor of science"),
     "BA": (r"B\.?A\.?", r"bachelor of arts"),
 }
+# A university awards a degree; a board issues a licence. They live in different records, and
+# reading both out of `held_degrees` meant a licence could be found in an education line —
+# "Philadelphia PA" made the profile hold a physician assistant — while a licence the profile
+# genuinely holds, recorded as a certification, could not be found at all.
+ACADEMIC_CREDENTIALS = frozenset({"MD", "DO", "PharmD", "DVM", "MPH", "MPP", "MBA", "MSN",
+                                  "MS", "MA", "PhD", "DrPH", "ScD", "BSN", "BS", "BA"})
+LICENCE_CREDENTIALS = frozenset({"NP", "PA", "RN"})
+CREDENTIAL_RECORD = {"education": ACADEMIC_CREDENTIALS, "certification": LICENCE_CREDENTIALS}
+CREDENTIAL_RECORD_NAME = {name: record for record, names in CREDENTIAL_RECORD.items()
+                          for name in names}
+
 CREDENTIAL_PATTERN = {
     name: re.compile("|".join(rf"(?<![A-Za-z]){form}(?![A-Za-z])" for form in forms), re.I)
     for name, forms in CREDENTIAL_FORMS.items()}
@@ -268,6 +289,28 @@ def credentials_in(text: str) -> list[str]:
     cleaned = STATE_SHAPED.sub(" ", str(text or ""))
     return [name for name, pattern in CREDENTIAL_PATTERN.items()
             if pattern.search(cleaned)]
+
+
+def held_credentials(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every credential the confirmed facts carry, from the record type that can carry it.
+
+    Academic credentials come from education facts and licences from certification facts.
+    Neither record answers for the other: an education line naming a state is not a licence,
+    and a licence nobody recorded is absent from the record, not absent from the world.
+    """
+    held = []
+    for fact in facts:
+        allowed = CREDENTIAL_RECORD.get(str(fact.get("type") or ""))
+        if not allowed or fact.get("status") not in USABLE:
+            continue
+        value = str(fact.get("value") or "")
+        for name in credentials_in(value):
+            if name not in allowed:
+                continue
+            held.append({"credential": name, "fact_id": fact["id"], "source": fact["type"],
+                         "fields": degree_fields(value) if fact["type"] == "education" else [],
+                         "value": value})
+    return held
 
 
 def named_technologies(text: str) -> list[str]:
@@ -285,9 +328,16 @@ def named_technologies(text: str) -> list[str]:
 # reviewed parse cannot be silently inherited by a later, differently-behaved splitter.
 PARSE_VERSION = "requirement-parse/2026-09-10"
 
+# `reviewed_complete` used to be granted by a regex, which is not what the word means. A
+# template match establishes that a machine recognised a closed shape; whether a person looked
+# at this sentence is a separate fact, and only a registry entry records it. Both may conclude
+# — the closed templates because there is nowhere in them for a modifier to hide, a reviewed
+# parse because somebody checked this one — but they are no longer the same claim.
+CLOSED_TEMPLATE = "closed_template"
 REVIEWED_COMPLETE = "reviewed_complete"
 AMBIGUOUS = "ambiguous"
 UNREVIEWED = "unreviewed"
+MEETS_ELIGIBLE = frozenset({CLOSED_TEMPLATE, REVIEWED_COMPLETE})
 
 # Words that carry no obligation of their own: articles, conjunctions, prepositions, and the
 # head nouns a concept surface already implies. Everything else left unconsumed is residue.
@@ -324,6 +374,9 @@ ba mph mba degree degrees or s
 # a field, a domain, an intensity — is deliberately not here, and keeps the line off the
 # template.
 OBLIGATION_FREE = frozenset("require required requires requirement requirements minimum".split())
+# `or higher` extends a level upward and constrains nothing the ladder does not already
+# handle. It is the only phrase allowed to survive inside the template's span.
+EXTENDS_UPWARD = frozenset("higher above greater more".split())
 LEVEL_WORDS = DEGREE_WORDS - {"degree", "degrees", "or", "s"}
 COMMA_LIST = re.compile(r",\s*(?:or\s+)?", re.I)
 DURATION_HEAD = re.compile(r"^\s*(?:a\s+)?(?:minimum\s+of\s+|at\s+least\s+)?\d", re.I)
@@ -332,6 +385,33 @@ BRACKETED_ALTERNATIVE = re.compile(r"\([^)]*\bor\b[^)]*\)")
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _ast_sha256(parse: dict[str, Any]) -> str:
+    """A fingerprint of the tree, so approving a sentence is not approving a later split."""
+    shape = [[obligation["span"] for obligation in branch["obligations"]]
+             for branch in parse.get("branches") or []]
+    return _sha256(json.dumps([parse.get("source_sha256"), parse.get("parse_version"),
+                               parse.get("template"), shape], sort_keys=True))
+
+
+# What may be left between the pieces a template read: whitespace, and the punctuation that
+# writes a degree name. A digit, a symbol or a character from another script is none of those,
+# and `Bachelor's degree, 5+` was reaching the template because the word scan could not see
+# the 5 — a duration, invisible, in a shape claiming to be closed over its own text.
+TEMPLATE_FILLER = re.compile(r"[\s'\u2019.\-\u2013\u2014]*$")
+WORD = re.compile(r"[A-Za-z][A-Za-z.]*")
+
+
+def _covers_everything(text: str, start: int, end: int,
+                       covered: list[tuple[int, int]]) -> bool:
+    """True when nothing but filler sits outside the pieces a template claims to have read."""
+    cursor, gaps = start, []
+    for first, last in sorted(covered):
+        gaps.append(text[cursor:first])
+        cursor = max(cursor, last)
+    gaps.append(text[cursor:end])
+    return all(TEMPLATE_FILLER.fullmatch(gap) for gap in gaps)
 
 
 def _trim(text: str, start: int, end: int) -> tuple[int, int]:
@@ -380,13 +460,24 @@ def _branch(text: str, span: tuple[int, int],
 
 
 def _degree_template(text: str, start: int, end: int) -> list[dict[str, Any]] | None:
-    """`Bachelor's degree`, `Master's degree or higher` — a level and nothing else."""
-    body = OR_HIGHER.sub(" ", text[start:end])
-    words = re.findall(r"[A-Za-z][A-Za-z.]*", body.replace("'", " ").replace("’", " "))
-    cleaned = [word.replace(".", "").casefold() for word in words]
-    if not cleaned or not all(word in DEGREE_WORDS | OBLIGATION_FREE for word in cleaned):
+    """`Bachelor's degree`, `Master's degree or higher` — a level, and nothing else at all.
+
+    "Nothing else" is checked against every character in the span, not against the words the
+    scan happened to recognise. A comma fails it too, which is right: a comma list is a list
+    of alternatives, and the template below is the one that reads those.
+    """
+    covered, cleaned = [], []
+    for match in WORD.finditer(text, start, end):
+        covered.append(match.span())
+        cleaned.append(match.group(0).replace(".", "").casefold())
+    # An apostrophe splits `Bachelor's` into two words for the scan; the `s` is filler.
+    cleaned = [word for word in cleaned if word != "s"]
+    allowed = DEGREE_WORDS | OBLIGATION_FREE | EXTENDS_UPWARD
+    if not cleaned or not all(word in allowed for word in cleaned):
         return None
     if not any(word in LEVEL_WORDS for word in cleaned):
+        return None
+    if not _covers_everything(text, start, end, covered):
         return None
     return [_branch(text, (start, end), [_obligation(text, (start, end))])]
 
@@ -451,7 +542,44 @@ def _asymmetric_scope(text: str, branches: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
-def parse_requirement(requirement: str) -> dict[str, Any]:
+def load_review_registry(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Parses a person has approved, keyed by the sha256 of the sentence they read.
+
+    An entry names the distiller version and the tree it was approved against, so approving a
+    sentence does not silently approve whatever a later splitter makes of it. No file means no
+    reviewed parses, which is the honest default: nobody has reviewed anything yet.
+    """
+    if not path or not Path(path).exists():
+        return {}
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    entries = raw.get("parses", raw) if isinstance(raw, dict) else {}
+    return {str(key): value for key, value in entries.items() if isinstance(value, dict)}
+
+
+def _apply_registry(parse: dict[str, Any], registry: dict[str, dict[str, Any]] | None
+                    ) -> dict[str, Any]:
+    entry = (registry or {}).get(parse["source_sha256"])
+    if not entry:
+        return parse
+    if entry.get("parse_version") != parse["parse_version"]:
+        parse["registry_note"] = (
+            f"a review exists for this sentence against {entry.get('parse_version')!r}; this "
+            f"parse is {parse['parse_version']!r}, so the approval does not carry over")
+        return parse
+    if entry.get("ast_sha256") != parse["ast_sha256"]:
+        parse["registry_note"] = ("a review exists for this sentence but against a different "
+                                  "tree; the approval does not carry over")
+        return parse
+    if not entry.get("approved_by"):
+        parse["registry_note"] = "a registry entry without an approver approves nothing"
+        return parse
+    parse.update({"parse_status": REVIEWED_COMPLETE, "reviewed_by": entry["approved_by"],
+                  "reviewed_at": entry.get("approved_at")})
+    return parse
+
+
+def parse_requirement(requirement: str, *,
+                      registry: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """The reviewable artifact between a sentence and a proposal.
 
     A regex that cuts on `or` cannot know what a modifier written once applies to, and each
@@ -474,24 +602,29 @@ def parse_requirement(requirement: str) -> dict[str, Any]:
         "source_text": text, "source_sha256": _sha256(text), "parse_version": PARSE_VERSION,
         "label": text[:label.end()].strip() if label else None,
         "template": None, "parse_status": UNREVIEWED, "unattributed_scope": [], "branches": [],
+        "reviewed_by": None, "reviewed_at": None, "registry_note": None, "ast_sha256": None,
     }
+
+    def settle(**fields: Any) -> dict[str, Any]:
+        parse.update(fields)
+        parse["ast_sha256"] = _ast_sha256(parse)
+        return _apply_registry(parse, registry)
+
     if end <= start:
-        parse["branches"] = [_branch(text, (0, len(text)), [_obligation(text, (0, len(text)))])]
-        return parse
+        return settle(branches=[_branch(text, (0, len(text)),
+                                        [_obligation(text, (0, len(text)))])])
 
     degree = _degree_template(text, start, end)
     if degree:
-        parse.update({"template": "bare_degree_level", "parse_status": REVIEWED_COMPLETE,
-                      "branches": degree})
-        return parse
+        return settle(template="bare_degree_level", parse_status=CLOSED_TEMPLATE,
+                      branches=degree)
 
     credentials = _credential_list(text, start, end)
     if credentials:
         branches, problems = credentials
-        parse.update({"template": "credential_alternatives", "branches": branches,
-                      "unattributed_scope": problems,
-                      "parse_status": AMBIGUOUS if problems else REVIEWED_COMPLETE})
-        return parse
+        return settle(template="credential_alternatives", branches=branches,
+                      unattributed_scope=problems,
+                      parse_status=AMBIGUOUS if problems else CLOSED_TEMPLATE)
 
     branch_spans = _split(text, OR_JOIN, start, end, skip=OR_HIGHER)
     parse["branches"] = [
@@ -503,9 +636,8 @@ def parse_requirement(requirement: str) -> dict[str, Any]:
     if BRACKETED_ALTERNATIVE.search(text[start:end]):
         problems.append("a bracketed alternative sits inside a longer requirement; what the "
                         "text outside the brackets applies to is not written down")
-    if problems:
-        parse.update({"parse_status": AMBIGUOUS, "unattributed_scope": problems})
-    return parse
+    return settle(unattributed_scope=problems,
+                  parse_status=AMBIGUOUS if problems else UNREVIEWED)
 
 
 def _fields_in(text: str) -> list[str]:
@@ -545,8 +677,27 @@ def meets_invariant_problems(parse: dict[str, Any],
     unread.
     """
     problems = []
-    if parse.get("parse_status") != REVIEWED_COMPLETE:
-        problems.append("parse_not_reviewed_complete")
+    if parse.get("parse_status") not in MEETS_ELIGIBLE:
+        problems.append("parse_not_eligible_to_conclude")
+    # Provenance was being written and never read, which made it decoration. A parse from
+    # another distiller version, or one whose text has moved under its hash, or whose spans no
+    # longer cut the sentence they claim to, cannot license anything.
+    required = ("source_text", "source_sha256", "parse_version", "ast_sha256", "branches")
+    if any(not parse.get(name) for name in required):
+        problems.append("missing_provenance")
+    else:
+        if parse["parse_version"] != PARSE_VERSION:
+            problems.append("parse_version_mismatch")
+        if parse["source_sha256"] != _sha256(parse["source_text"]):
+            problems.append("source_hash_mismatch")
+        if parse["ast_sha256"] != _ast_sha256(parse):
+            problems.append("ast_hash_mismatch")
+        source = parse["source_text"]
+        for branch in parse["branches"]:
+            for entry in branch["obligations"]:
+                first, last = entry["span"]
+                if source[first:last] != entry["text"]:
+                    problems.append("span_does_not_match_source")
     if parse.get("unattributed_scope"):
         problems.append("shared_scope_unattributed")
     if not obligations:
@@ -595,31 +746,41 @@ def _credential_obligation(obligation: str, facts: list[dict[str, Any]],
                      if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", branch.casefold())]
     consumed = list(wanted_credentials) + list(wanted_levels) + wanted_fields + [
         "degree", "degrees", "higher", "above", "education", "equivalent"]
-    for entry in degrees:
-        value = entry["value"]
-        held_credentials = credentials_in(value)
-        held_levels = named_levels(value)
-        if wanted_credentials:
-            hit = next((name for name in held_credentials if name in wanted_credentials), None)
-        elif held_levels and DEGREE_LEVELS.index(held_levels[-1]) \
-                >= DEGREE_LEVELS.index(wanted_levels[0]):
-            hit = f"{held_levels[-1]} degree"
-        else:
-            hit = None
-        if not hit:
-            continue
-        if wanted_fields and not (set(entry["fields"]) & set(wanted_fields)):
-            continue
-        return {"obligation": obligation, "kind": "credential", "strength": "direct",
-                "fact_ids": [entry["fact_id"]], "consumed": consumed,
-                "note": f"the profile holds {hit}"}
+
+    if wanted_credentials:
+        for entry in held_credentials(facts):
+            if entry["credential"] not in wanted_credentials:
+                continue
+            if wanted_fields and not (set(entry["fields"]) & set(wanted_fields)):
+                continue
+            return {"obligation": obligation, "kind": "credential", "strength": "direct",
+                    "fact_ids": [entry["fact_id"]], "consumed": consumed,
+                    "note": f"the profile holds {entry['credential']} "
+                            f"({entry['source']} fact {entry['fact_id']})"}
+    else:
+        for entry in degrees:
+            held_levels = named_levels(entry["value"])
+            if not held_levels or DEGREE_LEVELS.index(held_levels[-1]) \
+                    < DEGREE_LEVELS.index(wanted_levels[0]):
+                continue
+            if wanted_fields and not (set(entry["fields"]) & set(wanted_fields)):
+                continue
+            return {"obligation": obligation, "kind": "credential", "strength": "direct",
+                    "fact_ids": [entry["fact_id"]], "consumed": consumed,
+                    "note": f"the profile holds a {held_levels[-1]} degree "
+                            f"(education fact {entry['fact_id']})"}
+
     asked = " or ".join(wanted_credentials or [f"a {wanted_levels[0]} degree"])
     field_note = f" in {' or '.join(wanted_fields)}" if wanted_fields else ""
+    records = sorted({CREDENTIAL_RECORD_NAME[name] for name in wanted_credentials
+                      if name in CREDENTIAL_RECORD_NAME}) or ["education"]
+    consulted = sorted({fact["id"] for fact in facts
+                        if fact.get("type") in records and fact.get("status") in USABLE})
+    listed = " or ".join(records)
     return {"obligation": obligation, "kind": "credential", "strength": "none",
-            "fact_ids": sorted({entry["fact_id"] for entry in degrees}),
-            "consumed": consumed,
-            "note": f"asks for {asked}{field_note}; the recorded education facts do not name "
-                    "it, and nothing asserts the education list is complete"}
+            "fact_ids": consulted, "consumed": consumed,
+            "note": f"asks for {asked}{field_note}; the recorded {listed} facts do not name "
+                    f"it, and nothing asserts the {listed} record is complete"}
 
 
 def _duration_obligation(obligation: str, facts: list[dict[str, Any]],
@@ -700,7 +861,8 @@ def _concept_obligation(obligation: str, facts: list[dict[str, Any]],
 
 def propose(requirement: str, facts: list[dict[str, Any]], *,
             degrees: list[dict[str, Any]] | None = None,
-            span: dict[str, Any] | None = None) -> dict[str, Any]:
+            span: dict[str, Any] | None = None,
+            registry: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """One requirement, read against the confirmed facts. Decides nothing."""
     degrees = held_degrees(facts) if degrees is None else degrees
     text = requirement.strip()
@@ -711,7 +873,7 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
                          reason="company, eligibility or compensation prose rather than "
                                 "something the candidate's evidence answers")
 
-    parse = parse_requirement(text)
+    parse = parse_requirement(text, registry=registry)
     evaluated = []
     for branch in parse["branches"]:
         resolved = [_resolve(item["text"], facts, degrees, branch["text"])
@@ -782,13 +944,15 @@ def propose(requirement: str, facts: list[dict[str, Any]], *,
 
 
 def annotate(sheet: dict[str, Any], facts: list[dict[str, Any]],
-             at: datetime | None = None) -> dict[str, Any]:
+             at: datetime | None = None,
+             registry: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Add a proposal to every unread requirement in a worksheet. Changes nothing else."""
     degrees, span = held_degrees(facts), career_span_years(facts)
     counts: dict[str, int] = {}
     for entry in sheet.get("survivors", []):
         for item in entry.get("unread_requirements", []):
-            proposal = propose(item["requirement"], facts, degrees=degrees, span=span)
+            proposal = propose(item["requirement"], facts, degrees=degrees, span=span,
+                               registry=registry)
             item.update(proposal)
             key = proposal["proposed_disposition"] or "unproposed"
             counts[key] = counts.get(key, 0) + 1
@@ -796,6 +960,8 @@ def annotate(sheet: dict[str, Any], facts: list[dict[str, Any]],
         "built_at": (at or now_utc()).isoformat(),
         "candidate_snapshot_sha256": sheet.get("candidate_snapshot_sha256"),
         "counts": counts,
+        "parse_version": PARSE_VERSION,
+        "reviewed_parses_available": len(registry or {}),
         "decides_nothing": "every proposal requires user confirmation; no queue row or "
                            "application state is touched",
     }
@@ -840,13 +1006,15 @@ def render(sheet: dict[str, Any]) -> str:
         "education, employment or skills record is complete, so a requirement the facts do "
         "not answer is unrecorded, not unmet.",
         "",
-        "**`meets` comes from a reviewed parse, not from a sentence.** Splitting prose on "
-        "`or` cannot recover what a modifier written once applies to, so every requirement "
-        "here carries a parse with a status. Only `reviewed_complete` — one of two closed "
-        "templates, a bare degree level or a flat list of credential alternatives — may "
-        "conclude `meets`, and only when every obligation in a branch is directly evidenced, "
-        "every concept inside it has facts of its own, and nothing substantive in the text is "
-        "left unread. Everything else is read and reported for you to decide.",
+        "**`meets` comes from a parse, not from a sentence.** Splitting prose on `or` "
+        "cannot recover what a modifier written once applies to, so every requirement here "
+        "carries a parse with a status. Only two conclude: `closed_template`, a shape with "
+        "nowhere for a modifier to hide — a bare degree level, or a flat list of credential "
+        "alternatives — recognised by rule with nobody reviewing the line; and "
+        "`reviewed_complete`, a parse you approved against its hash and tree. Either way "
+        "every obligation in the branch must be directly evidenced, every concept inside it "
+        "must have facts of its own, and nothing substantive may be left unread. Everything "
+        "else is read and reported for you to decide.",
         "",
         "Full text below — nothing is shortened.", "",
     ]
@@ -879,12 +1047,17 @@ def render(sheet: dict[str, Any]) -> str:
             parse = item.get("requirement_parse") or {}
             if parse:
                 status = parse.get("parse_status")
-                note = {REVIEWED_COMPLETE: f"reviewed template `{parse.get('template')}`",
+                note = {CLOSED_TEMPLATE: f"closed template `{parse.get('template')}`, "
+                                         "recognised by rule — nobody reviewed this line",
+                        REVIEWED_COMPLETE: f"reviewed by {parse.get('reviewed_by')} on "
+                                           f"{parse.get('reviewed_at')}",
                         AMBIGUOUS: "a modifier's scope is not attributable",
                         UNREVIEWED: "no reviewed parse of this shape"}.get(status, status)
                 lines.append(f"- **parse:** `{status}` — {note}"
                              + ("; nothing here concludes `meets`"
-                                if status != REVIEWED_COMPLETE else ""))
+                                if status not in MEETS_ELIGIBLE else ""))
+                if parse.get("registry_note"):
+                    lines.append(f"  - {parse['registry_note']}")
                 for problem in parse.get("unattributed_scope") or []:
                     lines.append(f"  - {problem}")
             lines += [f"- **still to verify:** {'; '.join(still) if still else 'nothing'}",
@@ -897,16 +1070,30 @@ def render(sheet: dict[str, Any]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--worksheet", required=True, type=Path)
-    parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument("--worksheet", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--parse", metavar="TEXT",
+                        help="print the parse artifact for one requirement and stop. This is "
+                             "what a reviewer approves: it carries the source hash, the tree "
+                             "hash and the spans, which is what a registry entry pins.")
+    parser.add_argument("--review-registry", type=Path,
+                        help="JSON: source_sha256 -> {parse_version, ast_sha256, approved_by, "
+                             "approved_at}. Absent means nobody has reviewed a parse yet.")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--markdown", type=Path)
     args = parser.parse_args()
 
+    if args.parse:
+        print(json.dumps(parse_requirement(args.parse), indent=2, ensure_ascii=False))
+        return
+    if not args.worksheet or not args.candidate:
+        parser.error("--worksheet and --candidate are required unless --parse is given")
+
     sheet = json.loads(args.worksheet.read_text(encoding="utf-8"))
     candidate = json.loads(args.candidate.read_text(encoding="utf-8"))
     sheet["candidate_snapshot_sha256"] = candidate.get("content_sha256")
-    annotate(sheet, candidate.get("facts") or [])
+    annotate(sheet, candidate.get("facts") or [],
+             registry=load_review_registry(args.review_registry))
     if args.output:
         args.output.write_text(json.dumps(sheet, indent=2, ensure_ascii=False) + "\n",
                                encoding="utf-8")

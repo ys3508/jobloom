@@ -68,7 +68,7 @@ class CertificateIsNotADegreeTests(unittest.TestCase):
         education list is complete."""
         found = propose("MS or PhD in Statistics or Biostatistics")
         self.assertIsNone(found["proposed_disposition"])
-        self.assertIn("education list is complete", found["short_reason"])
+        self.assertIn("education record is complete", found["short_reason"])
         self.assertIn("fact-mph", found["supporting_fact_ids"])
 
 
@@ -244,8 +244,9 @@ class AnnotateTests(unittest.TestCase):
 
     def test_the_rendered_sheet_explains_what_meets_requires(self):
         text = P.render(P.annotate(self.sheet(), FACTS))
-        self.assertIn("comes from a reviewed parse, not from a sentence", text)
-        self.assertIn("nothing substantive in the text is left unread", text)
+        self.assertIn("comes from a parse, not from a sentence", text)
+        self.assertIn("nothing substantive may be left unread", text)
+        self.assertIn("recognised by rule with nobody reviewing the line", text)
 
     def test_every_row_shows_its_parse_status_and_why_it_cannot_conclude(self):
         text = P.render(P.annotate(self.sheet(), FACTS))

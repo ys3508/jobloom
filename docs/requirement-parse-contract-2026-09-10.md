@@ -88,3 +88,82 @@ Row by row against v3, the only movements are:
 
 Nothing is proposed as `does_not_meet`, unchanged: no fact in this schema asserts the
 education, employment or skills record is complete.
+
+---
+
+# Second round: five findings on `350dd4f`
+
+The contract above shipped with five holes, all found by review of the built code.
+
+## 1. `reviewed_complete` was granted by a regex
+
+A template match establishes that a machine recognised a shape. Whether a person looked at the
+sentence is a different fact, and the status name asserted the second while establishing only
+the first — the same substitution this repository refuses everywhere else.
+
+Two statuses now, and they are different claims:
+
+- `closed_template` — recognised by rule, **nobody reviewed this line**. Still allowed to
+  conclude, because the shape has nowhere for a modifier to hide; the rendered sheet says so
+  in those words.
+- `reviewed_complete` — a person approved *this* parse. It comes only from a review registry
+  entry keyed by the sha256 of the sentence, carrying the distiller version, the sha256 of the
+  tree they saw, and who approved it and when. A mismatch on any of those does not carry over,
+  and says why. No registry file means no reviewed parses, which is the honest default.
+
+`python3 disposition_proposals.py --parse "<requirement>"` prints the artifact a reviewer
+approves, with both hashes and every span.
+
+## 2. The provenance was written and never read
+
+`source_sha256` and `parse_version` were recorded and no check consulted them. The invariant
+now recomputes the source hash and the tree hash, rejects a parse from another distiller
+version, and re-slices every obligation span against the source text — a parse whose spans no
+longer cut the sentence they claim to cannot license anything (`source_hash_mismatch`,
+`ast_hash_mismatch`, `parse_version_mismatch`, `span_does_not_match_source`,
+`missing_provenance`).
+
+## 3. Both closed templates could still produce a wrong `meets`
+
+The degree template read the span with `[A-Za-z]+` and judged completeness on the words that
+scan returned, so everything it could not tokenise was invisible:
+
+| requirement | held | before | now |
+|---|---|---|---|
+| `Bachelor's degree, 5+` | a bachelor's | **meets** — the 5 was unreadable | `ambiguous` |
+| `Bachelor's degree 学历` | a bachelor's | **meets** | `unreviewed` |
+
+Completeness is now checked against every character in the span: only whitespace and the
+punctuation that writes a degree name may sit between the pieces the template read. A comma
+fails it too, which is right — `MPH, MS, or MA` is a list of alternatives, and the credential
+list template is the one that reads those. (Before, the degree template swallowed it into one
+obligation and only a coincidence — `STATE_SHAPED` eating `, MS` and `, MA` as state codes —
+kept it from concluding.)
+
+## 4. `_proposal()` believed the caller
+
+The assertion checked the `problems` list it was handed, so any caller passing `problems=[]`
+alongside `meets` granted itself the licence the invariant exists to withhold. For a `meets`
+the list is now recomputed inside `_proposal` from the parse and the obligations being
+reported; what the caller passed is ignored.
+
+## 5. Professional credentials were answered out of `held_degrees()`
+
+A university awards a degree; a board issues a licence. Reading both out of the education
+record broke in both directions:
+
+- **Over.** `Bachelor of Science – Nursing; Philadelphia PA May 2018` made the profile hold a
+  physician assistant licence, and `MD, DO, or PA` **met** on it. (With a comma before the
+  state it did not, so the bug was punctuation-deep.)
+- **Under.** A licence the profile genuinely holds, recorded as a `certification` fact, could
+  not answer a licence requirement at all.
+
+Academic credentials now come from education facts, licences from certification facts, and
+neither answers for the other. A missing licence names the record that would carry it: "the
+recorded certification facts do not name it, and nothing asserts the certification record is
+complete."
+
+## Effect on the worksheet
+
+Unchanged where it matters: 1 `meets` of 57, `Education: Bachelor's degree or higher`, now
+labelled `closed_template` — recognised by rule, reviewed by nobody.
