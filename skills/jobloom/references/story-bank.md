@@ -70,9 +70,16 @@ The claim ids must exist in the same version, and a reviewed mapping
 **Why it is not a bare id.** The class a competency is retrieved at used to be the strongest
 class anywhere in the version, so a capability supported only by `transferable` evidence was
 retrieved as `strong` whenever some unrelated claim in the same story happened to be
-`direct`. No rule was missing — the rule was reading the wrong rows. `bound_class()` now
-computes the class from the binding's own claims, and a draft answer cites the evidence
-behind the capability that was retrieved rather than everything the story contains.
+`direct`. No rule was missing — the rule was reading the wrong rows. `bound_class()` computes the class
+from the binding's own claims.
+
+**What the binding does not scope.** Two different questions live here and collapsing them
+was its own defect. *What evidences this capability* is binding-scoped and decides the
+retrieval band. *What does this text assert* is text-scoped: the answer is the whole rendered
+version, so its `evidence_refs` and `dependent_fact_ids` cover **every** claim in it. Scoping
+those to the binding left an answer asserting things whose evidence was not recorded, and
+whose loss would not have invalidated the answer because the fact was not among its
+dependencies.
 
 ## Approval is of an exact content hash
 
@@ -129,13 +136,13 @@ protects.
 
 ## Mapping a story to a competency
 
-`map_stories(competencies, employer=, application_id=, advisory=)` is read-only and produces
-nothing submittable. It runs in two layers, and the separation is the point.
+`map_stories(competencies, application_id=, advisory=)` is read-only and produces nothing
+submittable. It runs in two layers, and the separation is the point.
 
 **The deterministic layer** decides whether a version may be used at all and on what
-evidence. A version must pass `selectable()` and the confidentiality gate; then its
-*evidence ceiling* — the strongest class among its claims, the one it would actually cite —
-places it:
+evidence. A version must pass `selectable()` and the confidentiality gate; then
+`bound_class()` — the strongest class among the claims *the matching binding names* — places
+it:
 
 | Fit | When |
 |---|---|
@@ -200,9 +207,18 @@ the draft was written under.
 a bound claim or a reviewed framing span, so the draft is that version read back verbatim in
 STAR order. Nothing rewrites it; a rewrite would be text generated outside the binding gate.
 
-**Transferable evidence is named, not softened.** The draft carries an explicit bridge saying
-the answer rests on adjacent experience, is never `auto_fill_ready` on first generation, and
-`approve_draft` refuses `auto_fill_allowed=True` for it.
+**Transferable evidence is named inside the answer, not beside it.** When the retrieved
+binding is `transferable`, or when any claim rendered into the text is weaker than
+`strongly_related`, the drafted `answer_text` itself ends with a fixed qualifier naming the
+competency it draws on adjacent evidence for. It is part of the text the user approves and
+therefore part of what the AnswerLibrary stores and hands back on reuse.
+
+This is not decoration. The qualifier used to live in the draft's `bridge` column, beside the
+answer; only `answer_text` was written to the library, so an answer approved on transferable
+evidence came back on the next form reading exactly like one drawn from direct evidence —
+`transferable never upgrades` intact as a rule and walked around by the reuse path. A draft
+carrying the qualifier is never `auto_fill_ready`, and `approve_draft` refuses
+`auto_fill_allowed=True` for it.
 
 **A draft is not an answer.** It records the application, employer, canonical meaning, story
 version, exact evidence refs, snapshot and a content hash. `approve_draft(draft_id,
@@ -212,6 +228,29 @@ is still selectable, and writes one AnswerLibrary entry with `source_type: user_
 the invalidation the library already runs reaches a story-derived answer like any other.
 Approval returns what it authorizes (`reuse_of_this_answer_only`) and what it does not
 (submit, Next/Continue, another question meaning).
+
+## Opening a database written by an earlier schema
+
+`story_core._migrate` runs inside `initialize` and is idempotent. It adds
+`capability_bindings_json`, drops the `secondary_capabilities_json` it replaces, adds
+`confidential_employer_normalized` and backfills it through the same normalizer identity is
+matched with, and adds `claim_ids_json` to reviewed mappings. `story_answers.initialize` adds
+`question_form_sha256` to an existing drafts table.
+
+**What it will not backfill.** An older version named a capability and no claims, so nothing
+on disk says which claims evidenced it. Filling that in with "all of them" would recreate the
+promotion this schema exists to prevent, silently, on rows nobody would look at again. So:
+
+- the binding is carried with an empty claim list and `migrated_without_claims: true`;
+- `selectable()` returns `capability_binding_unreviewed`, so the version is preserved,
+  readable, and retrieved by nothing;
+- a migrated reviewed mapping gets `claim_ids: []` and likewise produces no fit;
+- a draft predating the question-form lock gets an empty digest, and `approve_draft` refuses
+  it by name rather than comparing it against today's digest — today's answer to "what does
+  this question mean" is not evidence about what it meant when the draft was written.
+
+The way back is the ordinary one: draft a successor with real bindings and approve it.
+Nothing is lost — the story, its text, its claims and its usage history are all still there.
 
 ## What is deliberately not here
 

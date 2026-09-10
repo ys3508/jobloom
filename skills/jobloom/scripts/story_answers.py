@@ -60,6 +60,12 @@ from _common import require_table  # noqa: E402
 from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
 
 NONE_OF_THESE = "none_of_these"
+
+# Part of the answer, not a note beside it. Fixed wording rather than composed: the point is
+# that whoever reuses the text reads the qualification, and reviewing it once is only
+# meaningful if it cannot come out differently the next time.
+ADJACENT_QUALIFIER = ("(Adjacent experience: this draws on transferable rather than direct "
+                      "evidence of {competency}.)")
 MAX_OPTIONS = 3
 
 DRAFT = "draft"
@@ -112,6 +118,15 @@ def initialize(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS story_answer_drafts_application_idx
             ON story_answer_drafts(application_id, status);
     """)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(story_answer_drafts)")}
+    if "question_form_sha256" not in columns:
+        # An existing drafts table predates the lock. The column is added empty rather than
+        # backfilled with today's digest, because today's digest is not evidence about what
+        # the form said when the draft was written — and pretending otherwise is the whole
+        # thing the lock is for. `approve_draft` refuses such a draft by name.
+        connection.execute(
+            "ALTER TABLE story_answer_drafts ADD COLUMN question_form_sha256 TEXT "
+            "NOT NULL DEFAULT ''")
     connection.commit()
 
 
@@ -304,29 +319,41 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
         "SELECT candidate_snapshot_sha256 FROM story_versions WHERE version_id=?",
         (version_id,)).fetchone()
     snapshot = version["candidate_snapshot_sha256"]
-    # Only the claims the chosen binding actually names. The draft cites the evidence behind
-    # the capability that was retrieved, not everything the story happens to contain.
-    bound = set(chosen["claim_ids"])
-    refs, classes = [], []
+    # Two different questions, and conflating them was a defect.
+    #
+    # *What evidence supports this capability* is binding-scoped: it decides which band the
+    # story was retrieved in, and reading it over the whole version is what let a transferable
+    # capability be promoted by an unrelated direct claim.
+    #
+    # *What does this text assert, and on what* is text-scoped. The answer is the whole
+    # rendered version, so provenance and invalidation must cover **every** claim in it.
+    # Narrowing these to the binding left the text asserting things whose evidence was not
+    # recorded and whose loss would not invalidate the answer.
+    bound = sorted(set(chosen["claim_ids"]))
+    refs, rendered_classes = [], []
     for claim in connection.execute(
             "SELECT claim_id, evidence_refs_json, evidence_class FROM story_claims "
             "WHERE version_id=? ORDER BY claim_id", (version_id,)):
-        if claim["claim_id"] not in bound:
-            continue
         refs.extend(json.loads(claim["evidence_refs_json"]))
-        classes.append(claim["evidence_class"])
+        rendered_classes.append(claim["evidence_class"])
     refs = sorted(set(refs))
     index = story_core.evidence_index(connection, snapshot)
     fact_ids = sorted({index[ref]["fact_id"] for ref in refs if ref in index})
-    evidence_class = min(classes, key=lambda name: EVIDENCE_ORDER[name])
+    binding_class = chosen["evidence_class"]
+    rendered_floor = min(rendered_classes, key=lambda name: EVIDENCE_ORDER[name])
     text = _rendered(connection, version_id)
 
+    # The qualifier goes into the answer itself, not beside it. A note stored next to the
+    # text is not read by whoever reuses the text: an answer approved on transferable
+    # evidence would come back on the next form reading exactly like a direct one, which is
+    # `transferable never upgrades` defeated by the reuse path rather than by the rules.
+    qualified = (binding_class == story_core.TRANSFERABLE
+                 or rendered_floor not in story_core.COVERING)
     bridge = None
-    if chosen["evidence_class"] == "transferable":
-        # Named, not softened. The user is told the answer rests on adjacent evidence, and
-        # the draft cannot be auto-filled on its first generation whatever else is current.
+    if qualified:
         bridge = ("This answer rests on adjacent experience rather than direct evidence of "
                   f"{competency}. Say so rather than letting it read as direct.")
+        text = f"{text} {ADJACENT_QUALIFIER.format(competency=competency)}"
     auto_fill_ready = False
 
     form_digest = question_form_digest(connection, question)
@@ -334,7 +361,8 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
                "canonical_id": canonical_id, "competency": competency,
                "question_form_sha256": form_digest,
                "story_version_id": version_id, "evidence_refs": refs,
-               "candidate_snapshot_sha256": snapshot, "evidence_class": evidence_class,
+               "candidate_snapshot_sha256": snapshot, "evidence_class": binding_class,
+               "rendered_evidence_floor": rendered_floor, "binding_claim_ids": bound,
                "answer_text": text, "bridge": bridge}
     digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
     draft_id = f"AD-{uuid.uuid4().hex[:12]}"
@@ -346,19 +374,20 @@ def _draft(connection: sqlite3.Connection, *, application_id: str, employer: str
         "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (draft_id, application_id, employer, canonical_id,
          answer_library.normalize_question(question), competency, form_digest, version_id,
-         canonical_json(refs), canonical_json(fact_ids), snapshot, evidence_class, text,
+         canonical_json(refs), canonical_json(fact_ids), snapshot, binding_class, text,
          bridge, digest, int(auto_fill_ready), DRAFT, at.isoformat()))
     story_core._event(connection, chosen["story_id"], version_id, "system",
                       "answer_drafted", "story_chosen_by_user",
                       {"draft_id": draft_id, "canonical_id": canonical_id,
-                       "evidence_class": evidence_class, "application_id": application_id},
+                       "evidence_class": binding_class, "application_id": application_id},
                       at)
     connection.commit()
     return {"decision": "drafted", "reason": "drafted_from_chosen_story",
             "draft_id": draft_id, "canonical_id": canonical_id,
-            "story_version_id": version_id, "evidence_class": evidence_class,
+            "story_version_id": version_id, "evidence_class": binding_class,
+            "rendered_evidence_floor": rendered_floor, "qualified": qualified,
             "evidence_refs": refs, "dependent_fact_ids": fact_ids,
-            "question_form_sha256": form_digest, "claim_ids": sorted(bound),
+            "question_form_sha256": form_digest, "binding_claim_ids": bound,
             "candidate_snapshot_sha256": snapshot, "answer_text": text, "bridge": bridge,
             "content_sha256": digest, "auto_fill_ready": auto_fill_ready,
             "next_step": "the user approves this exact content with a scope and an expiry"}
@@ -389,6 +418,9 @@ def approve_draft(connection: sqlite3.Connection, draft_id: str, content_sha256:
     if not check["selectable"]:
         raise ValueError(
             f"the story this was drafted from is no longer usable: {check['reasons'][0]}")
+    if not row["question_form_sha256"]:
+        raise ValueError("this draft predates the question-form lock and cannot say which "
+                         "meaning it was written under")
     current_form = connection.execute(
         "SELECT normalized_question, canonical_id, match_level, verified_by_user, created_at "
         "FROM question_forms WHERE normalized_question=? ORDER BY canonical_id",
@@ -398,7 +430,7 @@ def approve_draft(connection: sqlite3.Connection, draft_id: str, content_sha256:
         # The mapping that said what this question means is not the one the draft was written
         # under. Approving would attach the answer to a meaning nobody reviewed it against.
         raise ValueError("the question form changed since this draft was written")
-    if row["evidence_class"] == "transferable" and auto_fill_allowed:
+    if row["bridge"] and auto_fill_allowed:
         raise ValueError("an answer resting on transferable evidence is not auto-fill on "
                          "first approval")
 

@@ -201,7 +201,73 @@ def initialize(connection: sqlite3.Connection) -> None:
             metadata_json TEXT NOT NULL
         );
     """)
+    _migrate(connection)
     connection.commit()
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring a database written by an earlier schema forward, without inventing review.
+
+    `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it was, so a database
+    that already held stories would keep the old columns and every new read would fail on a
+    column that is not there. The columns are added and backfilled here.
+
+    The part that is not mechanical is capability bindings. An older version named a
+    capability and no claims, so there is no honest way to say which claims evidenced it —
+    and backfilling "all of them" would recreate precisely the promotion this schema exists
+    to prevent, silently, on data nobody looked at again. So the binding is carried with an
+    empty claim list, which makes the version unselectable with a reason that says why. The
+    story, its text and its claims are all preserved; what is withheld is the assertion that
+    somebody reviewed which claims support the capability. `prepare_successor` is the way
+    back: the user re-binds and re-approves.
+    """
+    versions = _columns(connection, "story_versions")
+    if "capability_bindings_json" not in versions:
+        connection.execute(
+            "ALTER TABLE story_versions ADD COLUMN capability_bindings_json TEXT "
+            "NOT NULL DEFAULT '{}'")
+        for row in connection.execute(
+                "SELECT version_id, primary_capability, secondary_capabilities_json "
+                "FROM story_versions").fetchall():
+            secondary = json.loads(row["secondary_capabilities_json"] or "[]")
+            connection.execute(
+                "UPDATE story_versions SET capability_bindings_json=? WHERE version_id=?",
+                (canonical_json({
+                    "primary": {"capability_id": row["primary_capability"], "claim_ids": []},
+                    "secondary": [{"capability_id": item, "claim_ids": []}
+                                  for item in secondary],
+                    "migrated_without_claims": True}), row["version_id"]))
+    if "secondary_capabilities_json" in _columns(connection, "story_versions"):
+        # Dropped rather than left NOT NULL beside its replacement, where every future insert
+        # would have to keep feeding a column nothing reads.
+        connection.execute("ALTER TABLE story_versions DROP COLUMN secondary_capabilities_json")
+
+    stories = _columns(connection, "stories")
+    if "confidential_employer_normalized" not in stories:
+        connection.execute(
+            "ALTER TABLE stories ADD COLUMN confidential_employer_normalized TEXT")
+        connection.execute(
+            "UPDATE stories SET confidential_employer_normalized="
+            "lower(trim(confidential_employer)) WHERE confidential_employer IS NOT NULL")
+        for row in connection.execute(
+                "SELECT story_id, confidential_employer FROM stories "
+                "WHERE confidential_employer IS NOT NULL").fetchall():
+            connection.execute(
+                "UPDATE stories SET confidential_employer_normalized=? WHERE story_id=?",
+                (application_core.normalize_text(row["confidential_employer"]),
+                 row["story_id"]))
+
+    mappings = _columns(connection, "story_competency_mappings")
+    if mappings and "claim_ids_json" not in mappings:
+        # Same withholding, for the same reason: a mapping that named no claims cannot be
+        # given some. It stops producing a fit until it is recorded again.
+        connection.execute(
+            "ALTER TABLE story_competency_mappings ADD COLUMN claim_ids_json TEXT "
+            "NOT NULL DEFAULT '[]'")
 
 
 def _event(connection: sqlite3.Connection, story_id: str | None, version_id: str | None,
@@ -578,6 +644,11 @@ def selectable(connection: sqlite3.Connection, version_id: str) -> dict[str, Any
         reasons.append("superseded_version")
     if json.loads(version["unbound_spans_json"]):
         reasons.append("narrative_not_fully_bound")
+    bindings = json.loads(version["capability_bindings_json"] or "{}")
+    if not bindings.get("primary", {}).get("claim_ids"):
+        # A version carried forward from the schema where a capability was a bare label. The
+        # story is intact; nobody has said which claims evidence its capability.
+        reasons.append("capability_binding_unreviewed")
 
     snapshot = version["candidate_snapshot_sha256"]
     try:

@@ -551,7 +551,207 @@ class BoundEvidenceAtTheAnswerTests(ProposeFixture):
         STORIES.approve_version(self.db, drafted_story["version_id"],
                                 drafted_story["content_sha256"], "user", AT)
         outcome = self.ask(chosen_version_id=drafted_story["version_id"])
-        self.assertEqual(outcome["claim_ids"], ["c1"])
-        self.assertEqual(outcome["dependent_fact_ids"], ["fact-focus"])
-        self.assertEqual(outcome["evidence_refs"],
-                         [EVIDENCE.unit_id(self.snapshot, "fact-focus")])
+        # The binding is what the capability was retrieved on...
+        self.assertEqual(outcome["binding_claim_ids"], ["c1"])
+        # ...and the provenance covers the whole text, because the whole text is the answer.
+        # This assertion was the other way round once, which left the rendered answer
+        # asserting `c2` with no reference to the evidence behind it.
+        self.assertEqual(outcome["dependent_fact_ids"], ["fact-focus", "fact-sales"])
+        self.assertEqual(sorted(outcome["evidence_refs"]),
+                         sorted([EVIDENCE.unit_id(self.snapshot, "fact-focus"),
+                                 EVIDENCE.unit_id(self.snapshot, "fact-sales")]))
+
+
+class EveryAssertionInTheAnswerIsCoveredTests(ProposeFixture):
+    """The answer is the whole story, so provenance has to be the whole story too.
+
+    The defect this closes: `evidence_refs` and `dependent_fact_ids` were narrowed to the
+    claims the capability binding named, while the rendered text stayed the entire version.
+    An answer therefore asserted things whose evidence was not recorded — and, worse, whose
+    loss would not have invalidated the answer, because the fact was not among its
+    dependencies. Two questions had been collapsed into one: what evidences this capability
+    (binding-scoped) and what does this text assert (text-scoped).
+    """
+
+    UNRELATED = "I ran 2 focus groups."
+    TARGET = "Sales rose 17 percent."
+
+    def mixed_story(self):
+        """The target capability rests on `c2` (transferable); `c1` is direct and unrelated."""
+        self.snapshot = self.register_mixed()
+        content = {
+            "title": "INNSCI focus groups",
+            "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
+            "primary_capability": {"capability_id": COMPETENCY, "claim_ids": ["c2"]},
+            "secondary_capabilities": [],
+            "domains": ["cap.domain.pharma-insights"],
+            "framing_spans": [SITUATION, TASK],
+            "claims": [
+                {"claim_id": "c1", "text": self.UNRELATED,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-focus")],
+                 "evidence_class": "direct"},
+                {"claim_id": "c2", "text": self.TARGET,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-sales")],
+                 "evidence_class": "transferable"}]}
+        drafted = STORIES.draft_version(self.db, content, at=AT)
+        STORIES.approve_version(self.db, drafted["version_id"], drafted["content_sha256"],
+                                "user", AT)
+        return drafted
+
+    def register_mixed(self):
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "candidate-1",
+            "work_authorization": {
+                "country": "US", "authorized_now": True, "sponsorship_now": False,
+                "sponsorship_future": False, "employer_action_required": False,
+                "confirmed": True},
+            "search": {},
+            "facts": [
+                {"id": "fact-name", "type": "identity", "value": "Verified Candidate",
+                 "status": "locked", "locked": True, "evidence_strength": "direct"},
+                {"id": "fact-focus", "type": "experience_claim",
+                 "value": "Ran 2 focus groups", "status": "confirmed", "locked": False,
+                 "evidence_strength": "direct"},
+                {"id": "fact-sales", "type": "experience_claim",
+                 "value": "Sales increased 17%", "status": "confirmed", "locked": False,
+                 "evidence_strength": "transferable"}]}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        path = self.root / f"candidate-{candidate['content_sha256'][:12]}.json"
+        path.write_text(json.dumps(candidate), encoding="utf-8")
+        CANDIDATES.register_snapshot(self.db, self.root / "store", path, "user", AT)
+        return candidate["content_sha256"]
+
+    def test_every_claim_rendered_into_the_answer_carries_its_own_evidence(self):
+        story = self.mixed_story()
+        outcome = self.ask(chosen_version_id=story["version_id"])
+        rendered = outcome["answer_text"]
+        claims = self.db.execute(
+            "SELECT claim_id, claim_text, evidence_refs_json FROM story_claims "
+            "WHERE version_id=?", (story["version_id"],)).fetchall()
+        cited = set(outcome["evidence_refs"])
+        for claim in claims:
+            with self.subTest(claim=claim["claim_id"]):
+                # If its text is in the answer, its evidence must be in the answer's refs.
+                self.assertIn(claim["claim_text"], rendered)
+                for ref in json.loads(claim["evidence_refs_json"]):
+                    self.assertIn(ref, cited)
+
+    def test_the_unrelated_direct_claim_is_a_dependency_of_the_answer(self):
+        story = self.mixed_story()
+        outcome = self.ask(chosen_version_id=story["version_id"])
+        self.assertIn(self.UNRELATED, outcome["answer_text"])
+        self.assertIn("fact-focus", outcome["dependent_fact_ids"])
+        self.assertIn("fact-sales", outcome["dependent_fact_ids"])
+        self.assertEqual(outcome["binding_claim_ids"], ["c2"])
+
+    def test_losing_the_unrelated_fact_invalidates_the_approved_answer(self):
+        """The point of recording it: the dependency has to reach the library's machinery."""
+        story = self.mixed_story()
+        drafted = self.ask(chosen_version_id=story["version_id"])
+        approved = PROPOSE.approve_draft(self.db, drafted["draft_id"],
+                                         drafted["content_sha256"], scope={},
+                                         validity_class="stable", at=AT)
+        row = self.db.execute("SELECT dependent_fact_ids_json FROM answers WHERE answer_id=?",
+                              (approved["answer_id"],)).fetchone()
+        self.assertIn("fact-focus", json.loads(row["dependent_fact_ids_json"]))
+
+    def test_the_capability_is_still_read_at_its_own_evidence(self):
+        """Widening provenance must not widen the class back out again."""
+        story = self.mixed_story()
+        outcome = self.ask(chosen_version_id=story["version_id"])
+        self.assertEqual(outcome["evidence_class"], "transferable")
+        mapped = STORIES.map_stories(self.db, [COMPETENCY], application_id="app-1")
+        self.assertEqual(mapped[COMPETENCY]["fit"], "transferable")
+
+
+class TheQualifierSurvivesReuseTests(EveryAssertionInTheAnswerIsCoveredTests):
+    """`transferable never upgrades` has to hold on the *second* form, not just the first.
+
+    The defect this closes: the adjacent-evidence note lived in the draft's `bridge` column,
+    beside the answer rather than in it. Only `answer_text` was written to the AnswerLibrary,
+    so the approved answer came back on the next form reading exactly like one drawn from
+    direct evidence. The rule was intact and the reuse path walked around it.
+    """
+
+    def approved_answer(self):
+        story = self.mixed_story()
+        drafted = self.ask(chosen_version_id=story["version_id"])
+        approved = PROPOSE.approve_draft(self.db, drafted["draft_id"],
+                                         drafted["content_sha256"], scope={},
+                                         validity_class="stable", at=AT)
+        return drafted, approved
+
+    def test_the_drafted_text_already_carries_the_qualification(self):
+        story = self.mixed_story()
+        drafted = self.ask(chosen_version_id=story["version_id"])
+        self.assertTrue(drafted["qualified"])
+        self.assertIn("Adjacent experience", drafted["answer_text"])
+        self.assertIn("transferable rather than direct", drafted["answer_text"])
+        # It is in what the user approves, so approval covers it.
+        self.assertIn("answer_text", drafted)
+
+    def test_the_stored_answer_text_carries_it(self):
+        _, approved = self.approved_answer()
+        stored = json.loads(self.db.execute(
+            "SELECT answer_json FROM answers WHERE answer_id=?",
+            (approved["answer_id"],)).fetchone()["answer_json"])
+        self.assertIn("Adjacent experience", stored)
+        self.assertIn("transferable rather than direct", stored)
+
+    def test_the_text_handed_back_on_reuse_carries_it(self):
+        """The one that matters: a later form gets the qualification, not a bare story."""
+        _, approved = self.approved_answer()
+        self.db.execute("UPDATE answers SET auto_fill_allowed=1 WHERE answer_id=?",
+                        (approved["answer_id"],))
+        ANSWERS.add_authorization(self.db, {
+            "authorization_id": "auth-reuse", "confirmed_at": AT.isoformat(),
+            "expires_at": (AT + timedelta(days=7)).isoformat(),
+            "scope": {"company": "Example Corp"}})
+        self.db.commit()
+        again = self.ask(authorization_id="auth-reuse")
+        self.assertEqual(again["decision"], "reuse")
+        self.assertIn("Adjacent experience", again["answer"])
+        self.assertIn(COMPETENCY, again["answer"])
+
+    def test_a_wholly_direct_answer_is_not_qualified(self):
+        """The qualifier is a statement about the evidence, not decoration on every answer."""
+        drafted = self.ask(chosen_version_id=self.story["version_id"])
+        self.assertFalse(drafted["qualified"])
+        self.assertIsNone(drafted["bridge"])
+        self.assertNotIn("Adjacent experience", drafted["answer_text"])
+
+    def test_a_qualified_answer_cannot_be_approved_as_auto_fill(self):
+        story = self.mixed_story()
+        drafted = self.ask(chosen_version_id=story["version_id"])
+        with self.assertRaises(ValueError):
+            PROPOSE.approve_draft(self.db, drafted["draft_id"], drafted["content_sha256"],
+                                  scope={}, validity_class="stable",
+                                  auto_fill_allowed=True, at=AT)
+
+    def test_a_weak_claim_anywhere_in_the_text_qualifies_it(self):
+        """Even when the capability's own binding is direct, the text still says the weak part."""
+        self.snapshot = self.register_mixed()
+        content = {
+            "title": "INNSCI focus groups",
+            "star": {"situation": SITUATION, "task": TASK, "action": ACTION, "result": RESULT},
+            # Bound to the direct claim only — the retrieval band is `strong`...
+            "primary_capability": {"capability_id": COMPETENCY, "claim_ids": ["c1"]},
+            "secondary_capabilities": [],
+            "domains": ["cap.domain.pharma-insights"],
+            "framing_spans": [SITUATION, TASK],
+            "claims": [
+                {"claim_id": "c1", "text": self.UNRELATED,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-focus")],
+                 "evidence_class": "direct"},
+                {"claim_id": "c2", "text": self.TARGET,
+                 "evidence_refs": [EVIDENCE.unit_id(self.snapshot, "fact-sales")],
+                 "evidence_class": "transferable"}]}
+        story = STORIES.draft_version(self.db, content, at=AT)
+        STORIES.approve_version(self.db, story["version_id"], story["content_sha256"],
+                                "user", AT)
+        drafted = self.ask(chosen_version_id=story["version_id"])
+        self.assertEqual(drafted["evidence_class"], "direct")
+        # ...and the rendered text still asserts something transferable, so it is qualified.
+        self.assertEqual(drafted["rendered_evidence_floor"], "transferable")
+        self.assertTrue(drafted["qualified"])
+        self.assertIn("Adjacent experience", drafted["answer_text"])
