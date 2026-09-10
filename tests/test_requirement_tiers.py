@@ -242,18 +242,20 @@ class CoverageTests(unittest.TestCase):
 
 
 class OrderingTests(unittest.TestCase):
-    """A known must-have gap outranks coverage, and coverage is counted once per requirement.
+    """Three lanes, and the queue never compares across them.
 
-    The asymmetry is deliberate. A gap the resolver identified is a strong negative — the
-    posting states a mandatory requirement the confirmed facts do not meet. Coverage is a
-    weak positive, because about 87% of requirement text is not parsed at all, so "no gap
-    detected" mostly means "not read".
+    The defect this replaces: one ordered score for every posting. A posting whose
+    requirements could not be parsed has zero known gaps, and zero known gaps sorted like
+    "nothing is missing", so postings nobody had evaluated outranked postings that had been.
     """
 
-    def row(self, weight=85, unique_direct=0, unique_gaps=0, direct=0, covered=0,
-            employer="A", title="A", **must):
-        must_have = {"unique_direct": unique_direct, "unique_gaps": unique_gaps,
-                     "direct": unique_direct, "gaps": unique_gaps, **must}
+    def row(self, weight=85, unique_direct=0, unique_gaps=0, unique_adjacent=0,
+            assessment=TIERS.FULLY_ASSESSED, parsed=2, stated=2, direct=0, covered=0,
+            employer="A", title="A"):
+        must_have = {"assessment": assessment, "unique_direct": unique_direct,
+                     "unique_gaps": unique_gaps, "unique_adjacent": unique_adjacent,
+                     "direct": unique_direct, "gaps": unique_gaps,
+                     "parsed_lines": parsed, "stated_lines": stated}
         return {
             "weight_percent": weight,
             "evidence": {"direct": direct, "covered": covered, "technical_hits": 0},
@@ -261,56 +263,148 @@ class OrderingTests(unittest.TestCase):
             "ranking_score": 0, "employer": employer, "title": title,
         }
 
-    def test_no_known_gap_outranks_more_coverage_with_a_gap(self):
-        clean = self.row(unique_direct=1, unique_gaps=0)
-        covered_but_gapped = self.row(unique_direct=5, unique_gaps=1)
-        self.assertLess(QUEUE.sort_key(clean), QUEUE.sort_key(covered_but_gapped))
+    # ---- which lane ---------------------------------------------------------------
 
-    def test_the_komodo_shape_does_not_reach_the_top(self):
-        """Three covered must-haves and five real gaps, against one covered and none."""
-        komodo = self.row(unique_direct=3, unique_gaps=5, direct=3, covered=5)
-        modest = self.row(unique_direct=1, unique_gaps=0, direct=1, covered=1)
-        self.assertLess(QUEUE.sort_key(modest), QUEUE.sort_key(komodo))
+    def test_a_posting_with_nothing_parsed_is_unassessed(self):
+        row = self.row(assessment=TIERS.UNASSESSED, parsed=0, stated=14)
+        self.assertEqual(QUEUE.lane(row), QUEUE.LANE_UNASSESSED)
 
-    def test_among_clean_rows_more_unique_coverage_wins(self):
-        more = self.row(unique_direct=3, unique_gaps=0)
-        fewer = self.row(unique_direct=1, unique_gaps=0)
-        self.assertLess(QUEUE.sort_key(more), QUEUE.sort_key(fewer))
+    def test_a_known_gap_puts_a_posting_in_the_gapped_lane(self):
+        self.assertEqual(QUEUE.lane(self.row(unique_direct=1, unique_gaps=1)),
+                         QUEUE.LANE_GAPPED)
 
-    def test_among_gapped_rows_fewer_gaps_wins(self):
-        few = self.row(unique_direct=1, unique_gaps=1)
-        many = self.row(unique_direct=1, unique_gaps=8)
-        self.assertLess(QUEUE.sort_key(few), QUEUE.sort_key(many))
+    def test_adjacent_only_evidence_is_a_known_shortfall_not_a_pass(self):
+        """Transferable evidence on a mandatory requirement is not meeting it."""
+        self.assertEqual(QUEUE.lane(self.row(unique_direct=1, unique_adjacent=1)),
+                         QUEUE.LANE_GAPPED)
+
+    def test_assessed_and_covered_is_the_clear_lane(self):
+        self.assertEqual(QUEUE.lane(self.row(unique_direct=2)), QUEUE.LANE_CLEAR)
+
+    def test_a_row_with_no_tiers_is_treated_as_unassessed(self):
+        row = self.row()
+        row.pop("tiers")
+        self.assertEqual(QUEUE.lane(row), QUEUE.LANE_UNASSESSED)
+
+    # ---- what the lanes stop --------------------------------------------------------
+
+    def test_an_unparsed_posting_cannot_outrank_an_assessed_clear_one(self):
+        """The acceptance check: zero gaps from ignorance must not look like zero gaps."""
+        ignorant = self.row(assessment=TIERS.UNASSESSED, parsed=0, stated=14,
+                            unique_direct=0, unique_gaps=0)
+        assessed = self.row(unique_direct=1, unique_gaps=0)
+        self.assertLess(QUEUE.sort_key(assessed), QUEUE.sort_key(ignorant))
+
+    def test_an_unparsed_posting_cannot_outrank_an_assessed_gapped_one(self):
+        """A gap that was actually found outranks a posting nobody could read."""
+        ignorant = self.row(assessment=TIERS.UNASSESSED, parsed=0, stated=14)
+        found_gaps = self.row(unique_direct=2, unique_gaps=3, parsed=5, stated=5)
+        self.assertLess(QUEUE.sort_key(found_gaps), QUEUE.sort_key(ignorant))
+
+    def test_the_biostatistician_shape_outranks_the_unread_ones(self):
+        """4 of 5 must-haves parsed and 3 real gaps, against a queue of parsed 0/0."""
+        biostat = self.row(unique_direct=2, unique_gaps=3, parsed=4, stated=5,
+                           assessment=TIERS.PARTIALLY_ASSESSED)
+        unread = [self.row(assessment=TIERS.UNASSESSED, parsed=0, stated=n)
+                  for n in (0, 1, 3, 6)]
+        for other in unread:
+            with self.subTest(stated=other["tiers"][MUST]["stated_lines"]):
+                self.assertLess(QUEUE.sort_key(biostat), QUEUE.sort_key(other))
+
+    def test_a_thinly_parsed_posting_is_not_promoted_for_its_silence(self):
+        """1 of 14 parsed with a lucky hit does not outrank 14 of 14 parsed and covered."""
+        thin = self.row(unique_direct=1, unique_gaps=0, parsed=1, stated=14,
+                        assessment=TIERS.PARTIALLY_ASSESSED)
+        thorough = self.row(unique_direct=1, unique_gaps=0, parsed=14, stated=14)
+        # Same lane and same coverage, so the queue does not claim one is better — but the
+        # row carries what a reader needs to tell them apart.
+        self.assertEqual(QUEUE.lane(thin), QUEUE.lane(thorough))
+        self.assertNotEqual(thin["tiers"][MUST]["parsed_lines"],
+                            thorough["tiers"][MUST]["parsed_lines"])
+        self.assertEqual(thin["tiers"][MUST]["assessment"], TIERS.PARTIALLY_ASSESSED)
+
+    # ---- ordering inside a lane -----------------------------------------------------
+
+    def test_within_a_lane_more_unique_coverage_wins(self):
+        self.assertLess(QUEUE.sort_key(self.row(unique_direct=3)),
+                        QUEUE.sort_key(self.row(unique_direct=1)))
+
+    def test_within_the_gapped_lane_fewer_gaps_wins(self):
+        self.assertLess(QUEUE.sort_key(self.row(unique_direct=1, unique_gaps=1)),
+                        QUEUE.sort_key(self.row(unique_direct=1, unique_gaps=8)))
 
     def test_repeating_a_requirement_does_not_buy_a_higher_rank(self):
         """`direct` counts lines and may repeat; ordering reads `unique_direct` only."""
-        repeated = self.row(unique_direct=1, unique_gaps=0, direct=1)
+        repeated = self.row(unique_direct=1)
         repeated["tiers"][MUST]["direct"] = 9
-        once = self.row(unique_direct=1, unique_gaps=0, direct=1)
-        self.assertEqual(QUEUE.sort_key(repeated), QUEUE.sort_key(once))
+        self.assertEqual(QUEUE.sort_key(repeated), QUEUE.sort_key(self.row(unique_direct=1)))
 
     def test_more_unique_coverage_still_beats_repetition(self):
-        two_real = self.row(unique_direct=2, unique_gaps=0)
-        one_repeated = self.row(unique_direct=1, unique_gaps=0)
+        one_repeated = self.row(unique_direct=1)
         one_repeated["tiers"][MUST]["direct"] = 9
-        self.assertLess(QUEUE.sort_key(two_real), QUEUE.sort_key(one_repeated))
+        self.assertLess(QUEUE.sort_key(self.row(unique_direct=2)),
+                        QUEUE.sort_key(one_repeated))
 
-    def test_direction_weight_still_comes_first(self):
+    def test_direction_weight_comes_first_inside_a_lane(self):
         heavy = self.row(weight=85, unique_direct=0, unique_gaps=9)
-        light = self.row(weight=5, unique_direct=4, unique_gaps=0)
+        light = self.row(weight=5, unique_direct=4, unique_gaps=9)
         self.assertLess(QUEUE.sort_key(heavy), QUEUE.sort_key(light))
 
-    def test_a_row_without_tiers_still_sorts(self):
-        """Ordering must not depend on a key a caller might not have computed."""
-        row = self.row()
-        row.pop("tiers")
-        QUEUE.sort_key(row)
+    def test_the_lane_comes_before_direction_weight(self):
+        """A heavy direction does not lift a posting out of the lane it belongs to."""
+        heavy_unread = self.row(weight=85, assessment=TIERS.UNASSESSED, parsed=0)
+        light_assessed = self.row(weight=5, unique_direct=1)
+        self.assertLess(QUEUE.sort_key(light_assessed), QUEUE.sort_key(heavy_unread))
 
-    def test_a_row_with_only_line_counts_falls_back_to_them(self):
-        """A queue written before unique counts existed still orders sensibly."""
-        row = self.row()
-        row["tiers"][MUST] = {"direct": 2, "gaps": 3}
-        self.assertEqual(QUEUE.sort_key(row)[1], 1)
+
+class AssessmentStateTests(unittest.TestCase):
+    """`unassessed` is a third answer, not a quiet version of one of the other two."""
+
+    FACTS = [{"id": "fact-sas", "type": "experience_claim",
+              "value": "Built SAS analysis programs", "status": "confirmed", "locked": False,
+              "evidence_strength": "direct", "keywords": ["SAS"]}]
+
+    def test_no_parsed_must_have_is_unassessed(self):
+        text = posting("Requirements", "- Strong academic track record",
+                       "- Excellent verbal and written communication skills")
+        must = TIERS.summarize(text, self.FACTS)["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.UNASSESSED)
+        self.assertEqual(must["parsed_lines"], 0)
+        self.assertEqual(must["unique_gaps"], 0)
+
+    def test_a_posting_with_no_must_have_lines_at_all_is_unassessed(self):
+        must = TIERS.summarize(posting("Nice to have", "- Experience with SAS"),
+                               self.FACTS)["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.UNASSESSED)
+
+    def test_some_parsed_and_some_not_is_partially_assessed(self):
+        text = posting("Requirements", "- Experience with SAS",
+                       "- Strong academic track record")
+        must = TIERS.summarize(text, self.FACTS)["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.PARTIALLY_ASSESSED)
+        self.assertEqual(must["parsed_lines"], 1)
+        self.assertEqual(must["unrecognised_lines"], 1)
+
+    def test_everything_parsed_is_fully_assessed(self):
+        text = posting("Requirements", "- Experience with SAS", "- Experience with Python")
+        must = TIERS.summarize(text, self.FACTS)["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.FULLY_ASSESSED)
+        self.assertEqual(must["unrecognised_lines"], 0)
+
+    def test_the_unread_requirements_are_kept_verbatim(self):
+        """A count looks like a small number; the sentences show what was not evaluated."""
+        text = posting("Requirements", "- Experience with SAS",
+                       "- Strong academic track record")
+        must = TIERS.summarize(text, self.FACTS)["tiers"][MUST]
+        self.assertEqual(must["unrecognised_requirements"], ["Strong academic track record"])
+
+    def test_unparsed_is_never_counted_as_covered_preferred_or_gap(self):
+        text = posting("Requirements", "- Strong academic track record")
+        must = TIERS.summarize(text, self.FACTS)["tiers"][MUST]
+        self.assertEqual((must["unique_direct"], must["unique_adjacent"], must["unique_gaps"]),
+                         (0, 0, 0))
+        self.assertEqual(must["stated_lines"], 1)
+        self.assertEqual(TIERS.summarize(text, self.FACTS)["tiers"][PREFERRED]["stated_lines"], 0)
 
 
 class FoundBySamplingTests(unittest.TestCase):

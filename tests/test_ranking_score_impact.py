@@ -299,5 +299,5 @@ class StalenessTests(unittest.TestCase):
         """A key the queue sorts on and the audit ignores is a key nobody is measuring."""
         measured = set(MODULE.reachability()["sort_key"]["tuple_positions"])
         self.assertEqual(measured,
-                         {"weight_percent", "must_gaps", "must_direct", "direct", "covered",
-                          "technical_hits", "ranking_score"})
+                         {"lane", "weight_percent", "must_gaps", "must_direct", "direct",
+                          "covered", "technical_hits", "ranking_score"})

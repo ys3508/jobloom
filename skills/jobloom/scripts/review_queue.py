@@ -87,42 +87,54 @@ def tier_summary(card: dict[str, Any], candidate: dict[str, Any]) -> dict[str, A
     return report["tiers"]
 
 
+LANE_CLEAR = "assessed_no_known_gap"
+LANE_GAPPED = "assessed_with_known_gaps"
+LANE_UNASSESSED = "unassessed_needs_manual_review"
+LANES = (LANE_CLEAR, LANE_GAPPED, LANE_UNASSESSED)
+LANE_ORDER = {name: index for index, name in enumerate(LANES)}
+
+
+def lane(row: dict[str, Any]) -> str:
+    """Which of three incomparable groups a posting belongs to.
+
+    One ordered score across all postings was the defect. A posting whose requirements could
+    not be parsed has zero known gaps, and zero known gaps sorted like "nothing is missing",
+    so postings nobody had evaluated outranked postings that had been. `parsed 0/0` rows sat
+    in the top twenty while a Biostatistician with four of five must-haves parsed sat at 76
+    for having three gaps that were actually found.
+
+    These are not points on one scale. "We checked and it fits", "we checked and it does not"
+    and "we could not read it" answer different questions, so they are three lanes and the
+    queue never compares across them.
+    """
+    must = (row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE) or {}
+    if must.get("assessment", requirement_tiers.UNASSESSED) == requirement_tiers.UNASSESSED:
+        return LANE_UNASSESSED
+    if must.get("unique_gaps", must.get("gaps", 0)) or must.get("unique_adjacent", 0):
+        # Adjacent evidence is a known shortfall on a mandatory requirement, not a pass.
+        return LANE_GAPPED
+    return LANE_CLEAR
+
+
 def sort_key(row: dict[str, Any]) -> tuple:
-    """Weight, then whether a must-have is known to be missing, then what is covered.
+    """Lane first, then weight, then evidence — and never a comparison across lanes.
 
-    **A known must-have gap sorts before coverage**, and it is asymmetric on purpose. A gap
-    the resolver identified is a strong negative: the posting states a mandatory requirement
-    and the confirmed facts do not meet it. Coverage is a weak positive by comparison,
-    because roughly 87% of requirement text is not parsed at all, so "no gap detected" mostly
-    means "not read" rather than "nothing missing". Ranking a strong negative behind a weak
-    positive is what put an Infrastructure Engineer with uncovered AWS, Docker, Snowflake,
-    Spark and dbt at the top of the queue.
+    Within a lane the order is deterministic and unchanged in spirit: direction weight, then
+    unique must-have coverage, then how many known gaps, then the older evidence keys.
+    Coverage is counted in **unique** requirements, because a posting naming one tool in
+    three paragraphs is not three requirements met.
 
-    Coverage is counted in **unique** requirements. The same posting named GitHub in three
-    paragraphs and was credited three times for one piece of evidence; a requirement stated
-    twice is not two requirements met.
-
-    Only `direct` evidence counts toward a must-have. Transferable and mention-only are
-    carried in their own columns and would, if counted here, put a posting the candidate
-    cannot meet above one they can.
-
-    Below the evidenced openings this ordering stops meaning anything, and it says so
-    rather than inventing a tiebreak. Unlearn.AI's "Clinical Data Scientist" states eight
-    requirements about wrangling and harmonizing datasets; Science 37's "Field Nursing
-    Operations Manager" states twenty-nine about nursing. Both distil to zero controlled
-    terms, zero covered requirements and zero technical hits — on every signal computed
-    here they are identical, so no key available can separate a distillation gap from a
-    genuinely different job. The stated-requirement count is carried on each row for the
-    reader instead: a long posting is not a better one, and sorting on its length would
-    put the nursing role above the data one.
+    `parsed / stated` decides the lane and is never a tiebreak inside one. A posting that
+    parsed one line of fourteen is in the same lane as one that parsed all fourteen only if
+    both are otherwise in the same state, and the row says which it is.
     """
     evidence = row["evidence"]
     tiers = row.get("tiers") or {}
     must = tiers.get(requirement_tiers.MUST_HAVE) or {}
     unique_gaps = must.get("unique_gaps", must.get("gaps", 0))
     return (
+        LANE_ORDER[lane(row)],
         -row["weight_percent"],
-        1 if unique_gaps else 0,
         -must.get("unique_direct", 0),
         unique_gaps,
         -evidence["direct"],
@@ -225,6 +237,8 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
             # Once per posting, not once per direction that matched it: what the employer
             # wrote about a requirement's weight does not depend on which direction is reading.
             "tiers": tier_summary(card, candidate),
+            # Assigned after the row is assembled, because it reads the tier summary above.
+            "lane": None,
             "review_reasons": primary["review_reasons"][:4],
             "also_matches": [item["direction_id"] for item in found[1:]],
             "employer": card["employer"],
@@ -239,9 +253,17 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
             "apply_url": ats.get("apply_url"),
             "posted_at": (ats.get("posted_at") or "")[:10],
         })
+    for row in rows:
+        row["lane"] = lane(row)
     rows.sort(key=sort_key)
     for index, row in enumerate(rows, 1):
         row["rank"] = index
+    # Rank within the lane as well as overall: a reader comparing two postings needs to know
+    # they are in the same lane before the numbers mean anything.
+    seen: dict[str, int] = {}
+    for row in rows:
+        seen[row["lane"]] = seen.get(row["lane"], 0) + 1
+        row["lane_rank"] = seen[row["lane"]]
     # After ranking, never before: grouping annotates the order, it does not change it.
     annotate_groups(rows)
     grouped = sum(1 for row in rows if row.get("group"))
@@ -265,43 +287,94 @@ def build_queue(cards: list[dict[str, Any]], candidate: dict[str, Any],
     }
 
 
+LANE_HEADINGS = {
+    LANE_CLEAR: ("Assessed — no known must-have gap",
+                 "Every must-have line these postings state was read, and the confirmed facts "
+                 "cover what was found. Only `direct` evidence counts here."),
+    LANE_GAPPED: ("Assessed — a must-have is known to be missing",
+                  "These were read and something mandatory is not covered, or is covered only "
+                  "by adjacent evidence. A known gap is a real finding, which is why they are "
+                  "below the lane above and above the one below."),
+    LANE_UNASSESSED: ("Not assessed — the requirements could not be read",
+                      "No must-have requirement in these postings reached a deterministic "
+                      "evidence outcome. **They have no known gaps because nothing was "
+                      "checked, not because nothing is missing.** They need reading by hand."),
+}
+
+
 def render(queue: dict[str, Any], labels: dict[str, str] | None = None) -> str:
     labels = labels or {}
+
     def label(direction_id: str) -> str:
         return labels.get(direction_id, direction_id)
+
+    counts = {name: sum(1 for row in queue["rows"] if row.get("lane") == name)
+              for name in LANES}
     lines = ["# Review queue", "",
-             f"{queue['openings_in_queue']} openings out of {queue['openings_routed']} routed. "
-             f"{queue['with_direct_evidence']} carry at least one requirement your confirmed "
-             f"facts cover directly and are ordered by how many. The remaining "
-             f"{queue['without_direct_evidence']} are not ordered by evidence because they "
-             f"have none to order by — they still state requirements, and the count is shown "
-             f"so a distillation gap can be told from a different job by reading.", "",
-             "Ordered by direction weight, then by directly evidenced requirements. "
-             "`review` means the rules did not exclude it — never that it is a match.", "",
+             f"{queue['openings_in_queue']} openings out of {queue['openings_routed']} routed.",
+             "",
+             "**Three lanes, and the queue never compares across them.** "
+             "\"We read it and it fits\", \"we read it and it does not\" and \"we could not "
+             "read it\" answer different questions. Ordering them on one scale let postings "
+             "nobody had evaluated outrank postings that had been, because unparsed "
+             "requirements produce zero known gaps and zero known gaps sorted like nothing "
+             "was missing.", "",
+             f"- {counts[LANE_CLEAR]} assessed with no known must-have gap",
+             f"- {counts[LANE_GAPPED]} assessed with a known must-have gap",
+             f"- {counts[LANE_UNASSESSED]} not assessed — requirements could not be read", "",
+             "`parsed/stated` is how many of the posting's must-have lines reached a "
+             "deterministic outcome. It decides the lane and is never a tiebreak inside one. "
+             "`review` means the rules did not exclude the posting — never that it is a match.",
+             "",
              f"{queue['in_title_groups']} openings share an employer and title with another "
              "and are marked below. They are **not** one job listed several times: two "
              "postings differing only in a single word score 0.997 on their text, so nothing "
              "here merges them. Each has its own application.", ""]
-    current = None
-    for row in queue["rows"]:
-        if row["direction_id"] != current:
-            current = row["direction_id"]
-            lines += ["", f"## {label(current)} — weight {row['weight_percent']}%", "",
-                      "| # | direct | covered | stated | employer | title | location | evidence |",
-                      "|---:|---:|---:|---:|---|---|---|---|"]
-        evidence = row["evidence"]
-        terms = ", ".join(evidence["direct_requirements"][:6]) or "—"
-        title = (f"[{row['title']}]({row['canonical_url']})"
-                 if str(row["canonical_url"]).startswith("http") else row["title"])
-        group = row.get("group")
-        mark = (f" <br>**{group['independent_openings']} independent openings** share this "
-                f"employer and title — same title is not the same job, and each has its own "
-                f"application: "
-                + ", ".join(f"#{s['rank']} {s['location']}" for s in group["siblings"])
-                if group else "")
-        lines.append(f"| {row['rank']} | {evidence['direct']} | {evidence['covered']}"
-                     f"/{evidence['recognized_requirements']} | {evidence['stated_requirements']} "
-                     f"| {row['employer']} | {title}{mark} | {row['location']} | {terms} |")
+
+    for name in LANES:
+        rows = [row for row in queue["rows"] if row.get("lane") == name]
+        heading, explanation = LANE_HEADINGS[name]
+        lines += ["", f"# {heading} ({len(rows)})", "", explanation, ""]
+        if not rows:
+            lines += ["_None._", ""]
+            continue
+        current = None
+        for row in rows:
+            if row["direction_id"] != current:
+                current = row["direction_id"]
+                lines += ["", f"## {label(current)} — weight {row['weight_percent']}%", "",
+                          "| # | must parsed | covered | adjacent | gaps | employer | title "
+                          "| location | covered terms | gap terms |",
+                          "|---:|---:|---:|---:|---:|---|---|---|---|---|"]
+            must = (row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE) or {}
+            title = (f"[{row['title']}]({row['canonical_url']})"
+                     if str(row["canonical_url"]).startswith("http") else row["title"])
+            group = row.get("group")
+            mark = (f" <br>**{group['independent_openings']} independent openings** share this "
+                    f"employer and title — same title is not the same job, and each has its own "
+                    f"application: "
+                    + ", ".join(f"#{s['rank']} {s['location']}" for s in group["siblings"])
+                    if group else "")
+            lines.append(
+                f"| {row['lane_rank']} | {must.get('parsed_lines', 0)}"
+                f"/{must.get('stated_lines', 0)} | {must.get('unique_direct', 0)} "
+                f"| {must.get('unique_adjacent', 0)} | {must.get('unique_gaps', 0)} "
+                f"| {row['employer']} | {title}{mark} | {row['location']} "
+                f"| {', '.join(must.get('direct_terms') or []) or '—'} "
+                f"| {', '.join(must.get('gap_terms') or []) or '—'} |")
+        # The lines the distiller could not read, verbatim. A count of them looks small; the
+        # sentences are what show that a posting was not actually evaluated.
+        unread = [(row, (row.get("tiers") or {}).get(requirement_tiers.MUST_HAVE, {})
+                   .get("unrecognised_requirements") or []) for row in rows]
+        unread = [(row, items) for row, items in unread if items]
+        if unread:
+            lines += ["", f"### Must-have requirements not read ({len(unread)} postings)", ""]
+            for row, items in unread:
+                lines.append(f"- **#{row['lane_rank']} {row['employer']} — {row['title']}** "
+                             f"({len(items)} unread)")
+                for item in items:
+                    lines.append(f"  - {item}")
+            lines.append("")
     return "\n".join(lines) + "\n"
 
 

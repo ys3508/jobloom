@@ -24,11 +24,20 @@ its own column.
 is reported in an `adjacent` column and never counted as covering a mandatory requirement —
 the whole reason for a must-have column is that adjacent experience does not fill it.
 
-Ordering is direction weight, then **whether any must-have gap is known** (none first), then
-unique must-have coverage, then the number of known gaps, then the older evidence keys. The
-asymmetry is deliberate: a known gap is a strong negative, while "no gap" is a weak positive
-because most requirement text is not parsed at all. Coverage is counted in **unique**
-requirements — a posting naming one tool in three paragraphs is not three requirements met. Every classification carries its reason code, the cue that fired, and the
+**Three lanes, never compared.** A posting whose requirements could not be parsed has zero
+known gaps, and on one ordered scale zero known gaps sorted like "nothing is missing" — so
+postings nobody had evaluated outranked postings that had been. `review_queue.lane()` splits
+them: `assessed_no_known_gap`, `assessed_with_known_gaps`, `unassessed_needs_manual_review`.
+Adjacent-only evidence on a mandatory requirement is a known shortfall, not a pass.
+
+Each tier reports an `assessment` — `unassessed`, `partially_assessed` or `fully_assessed` —
+and keeps the requirement lines it could not read **verbatim**. Unparsed is never counted as
+covered, preferred, or a gap.
+
+Within a lane: direction weight, unique must-have coverage, known gap count, then the older
+evidence keys. Coverage is counted in **unique** requirements — a posting naming one tool in
+three paragraphs is not three requirements met. `parsed / stated` decides the lane and is
+never a tiebreak inside one. Every classification carries its reason code, the cue that fired, and the
 character offset of the requirement in the posting, so a misclassification can be looked at.
 
 **Read the coverage numbers with the distillation gap in mind:** 566 of 652 must-have lines

@@ -221,3 +221,81 @@ Komodo postings share that title and the first match was a different variant. Th
 in git-tracked fixtures, so the tests skip when `.jobloom/jobs-wide-20260907` is absent, and
 `tests/test_requirement_tiers.py` pins the same behaviours in structural fixtures that always
 run.
+
+
+---
+
+# Third round — the classifier passed, the ordering did not, 2026-09-10
+
+The owner accepted the tier classifier and rejected the v2 ordering. The diagnosis was not
+another classification bug: **zero parsed requirements was being treated like zero known
+gaps, so ignorance outranked evaluation.** In the v2 queue several top-20 rows were
+`parsed 0/0`; the Associate Partner ranked 3 on `R`/`SAS` with 13 of 14 must-have lines
+unread; and Unlearn.AI's Biostatistician, with 4 of 5 parsed and three gaps genuinely found,
+sat at 76 for having found them.
+
+No further heading regexes were added.
+
+## Evaluation state
+
+`requirement_tiers.summarize` now reports, per tier, which of three states the must-have list
+reached. Unparsed is never read as covered, preferred, or gap.
+
+| state | when |
+| --- | --- |
+| `unassessed` | no must-have requirement reached a deterministic evidence outcome |
+| `partially_assessed` | at least one did, and at least one line remains unread |
+| `fully_assessed` | every tiered must-have line reached an outcome |
+
+The unread lines are kept **verbatim** as `unrecognised_requirements`, not just counted. A
+count of 13 looks like a small number; the thirteen sentences show that the posting was not
+evaluated.
+
+## Three lanes
+
+The queue no longer puts these on one scale. `review_queue.lane()` assigns:
+
+1. `assessed_no_known_gap` — read, and the confirmed facts cover what was found
+2. `assessed_with_known_gaps` — read, and something mandatory is missing or only adjacent
+3. `unassessed_needs_manual_review` — nothing readable; needs a person
+
+Adjacent-only evidence on a mandatory requirement counts as a known shortfall, not a pass.
+Within a lane the order is unchanged: direction weight, unique must-have coverage, known gap
+count, then the older evidence keys. `parsed / stated` decides the lane and is never a
+tiebreak inside one. Each row carries `lane`, `lane_rank`, `parsed_lines`, `stated_lines`,
+`unique_direct`, `unique_adjacent`, `unique_gaps`, `unrecognised_lines` and the unread lines
+themselves; the markdown renders one section per lane and lists the unread requirements under
+each.
+
+## Result
+
+| lane | postings |
+| --- | ---: |
+| assessed, no known must-have gap | 11 |
+| assessed, with known must-have gaps | 42 |
+| not assessed | 59 |
+
+- **Unlearn.AI Biostatistician: overall #76 → #1 of the assessed-with-gaps lane.** Four of
+  five must-haves parsed, two covered, three real gaps.
+- The 59 unreadable postings no longer compete with either assessed lane.
+- 17 of those 59 state no must-have line at all.
+
+## The finding that matters most
+
+**Not one posting of the 112 is `fully_assessed`.** Every row in the "no known gap" lane is
+partially assessed: `2/12`, `1/14`, `1/8`, `1/5`. So lane 1 does not mean "this fits" — it
+means *no gap was found in the one or two lines that could be read*, and the eight to
+thirteen unread lines are printed underneath so nobody has to take the lane on faith. The
+Associate Partner's unread lines include "Minimum of 10 years of managing and leading
+analytics", which is very likely a hard gap.
+
+That is the argument for the next project rather than for more rules here. 566 of 652
+must-have lines never reach controlled evidence matching, and no amount of lane structure
+changes what is known about them. Improving requirement distillation should be its own task,
+measured against a hand-labelled set of real postings for coverage and misclassification
+rate — not approached with more ad-hoc patterns.
+
+## Queues
+
+`.jobloom/review-queue-20260910-lanes.json` and `.md`. The 09-09 v1 and v2 queues remain
+**experimental** and must not be used to choose applications.

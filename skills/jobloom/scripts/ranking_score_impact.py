@@ -65,13 +65,17 @@ def sort_key_position(build_row, keys: list[str]) -> dict:
 
 
 def queue_row(weight_percent=50, direct=1, covered=1, technical_hits=1, ranking_score=100,
-              must_direct=1, must_gaps=1, employer="acme", title="analyst"):
+              must_direct=1, must_gaps=1, assessment="fully_assessed",
+              employer="acme", title="analyst"):
     return {"weight_percent": weight_percent, "ranking_score": ranking_score,
             "employer": employer, "title": title,
             "evidence": {"direct": direct, "covered": covered,
                          "technical_hits": technical_hits},
-            "tiers": {"must_have": {"unique_direct": must_direct, "unique_gaps": must_gaps,
-                                    "direct": must_direct, "gaps": must_gaps},
+            "tiers": {"must_have": {"assessment": assessment,
+                                    "unique_direct": must_direct, "unique_gaps": must_gaps,
+                                    "unique_adjacent": 0,
+                                    "direct": must_direct, "gaps": must_gaps,
+                                    "parsed_lines": 2, "stated_lines": 2},
                       "preferred": {}, "unknown": {}}}
 
 
@@ -79,16 +83,23 @@ def reachability() -> dict:
     # Every evidence key the queue sorts on, in the order it sorts on them. The
     # must-have keys joined this list when requirement tiering did; leaving them out would
     # have let the audit report on a sort key that no longer existed.
-    # `must_gaps` occupies two positions: whether any gap is known at all, then how many.
-    keys = ["weight_percent", "must_gaps", "must_direct", "direct", "covered",
+    # `lane` sorts ahead of everything and is what stops an unread posting being compared
+    # with an evaluated one; leaving it out would let the audit report on a sort key the
+    # queue no longer has, which is the failure this module has already had once.
+    keys = ["lane", "weight_percent", "must_gaps", "must_direct", "direct", "covered",
             "technical_hits", "ranking_score"]
 
     def build_row(key, value):
         overrides = {"weight_percent": 50, "direct": 1, "covered": 1, "technical_hits": 1,
-                     "ranking_score": 100, "must_direct": 1, "must_gaps": 1}
-        # `must_gaps` sorts ascending — fewer gaps is better — so its pair is reversed.
+                     "ranking_score": 100, "must_direct": 1, "must_gaps": 1,
+                     "assessment": "fully_assessed"}
+        # Pairs are (worse, better) for keys that sort ascending: fewer gaps is better, and
+        # an assessed posting outranks an unassessed one.
         pairs = {"ranking_score": (100, 200), "must_gaps": (9, 1)}
-        overrides[key] = pairs.get(key, (1, 9))[value]
+        if key == "lane":
+            overrides["assessment"] = ("unassessed", "fully_assessed")[value]
+        else:
+            overrides[key] = pairs.get(key, (1, 9))[value]
         return queue_row(**overrides)
 
     positions = sort_key_position(build_row, keys)

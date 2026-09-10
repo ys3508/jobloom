@@ -62,6 +62,13 @@ PREFERRED = "preferred"
 UNKNOWN = "unknown"
 TIERS = (MUST_HAVE, PREFERRED, UNKNOWN)
 
+# How much of a posting's must-have list actually reached a deterministic evidence outcome.
+# Separate from coverage on purpose: "nothing was parsed" and "nothing is missing" are
+# different facts, and treating the first as the second let ignorance outrank evaluation.
+UNASSESSED = "unassessed"
+PARTIALLY_ASSESSED = "partially_assessed"
+FULLY_ASSESSED = "fully_assessed"
+
 DIRECT = "direct"
 # What may count as covering a must-have. Named rather than implied, because the whole point
 # of a must-have column is that adjacent evidence does not fill it.
@@ -456,14 +463,15 @@ def summarize(description: str, facts: list[dict[str, Any]] | None = None,
         direct: list[str] = []
         adjacent: list[str] = []
         gaps: list[str] = []
-        unrecognised = 0
+        unrecognised: list[str] = []
         for entry in entries:
             distilled = posting_sections.distill_terms([entry["line"]], ontology=ontology)
             terms = list(dict.fromkeys([*distilled["terms"], *distilled["capabilities"]]))
             if not terms:
-                # A requirement nobody parsed is not a requirement nobody has. Counted so the
-                # reader can see how much of the posting the distiller could not read.
-                unrecognised += 1
+                # A requirement nobody parsed is not a requirement nobody has. Kept in full
+                # so the reader can see exactly what the distiller could not read, rather
+                # than a count that looks like a small number.
+                unrecognised.append(entry["line"])
                 continue
             strengths = [match_requirement(term, facts)["strength"] for term in terms]
             best = max(strengths, key=lambda name: _RANK.get(name, 0))
@@ -483,9 +491,18 @@ def summarize(description: str, facts: list[dict[str, Any]] | None = None,
         # paragraphs, so one piece of evidence counted three times and carried the posting
         # to the top of the queue past its own uncovered AWS, Docker, Snowflake, Spark and
         # dbt. A requirement named twice is not two requirements met.
+        parsed = len(entries) - len(unrecognised)
+        if parsed == 0:
+            state = UNASSESSED
+        elif unrecognised:
+            state = PARTIALLY_ASSESSED
+        else:
+            state = FULLY_ASSESSED
         report["tiers"][tier] = {
+            "assessment": state,
             "stated_lines": len(entries),
-            "unrecognised_lines": unrecognised,
+            "unrecognised_lines": len(unrecognised),
+            "unrecognised_requirements": unrecognised,
             "direct": counts["direct"],
             "adjacent": counts["adjacent"],
             "gaps": counts["gaps"],
@@ -495,7 +512,7 @@ def summarize(description: str, facts: list[dict[str, Any]] | None = None,
             "direct_terms": sorted(set(direct)),
             "adjacent_terms": sorted(set(adjacent)),
             "gap_terms": sorted(set(gaps)),
-            "parsed_lines": len(entries) - unrecognised,
+            "parsed_lines": parsed,
         }
     return report
 

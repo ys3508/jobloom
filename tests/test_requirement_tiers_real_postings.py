@@ -32,7 +32,16 @@ def load_script(name):
 
 
 TIERS = load_script("requirement_tiers")
+QUEUE = load_script("review_queue")
 MUST, PREFERRED, UNKNOWN = TIERS.MUST_HAVE, TIERS.PREFERRED, TIERS.UNKNOWN
+
+# The candidate's own confirmed facts are private, so these use the fact shape the tier
+# tests use. What is being checked is the evaluation state, not this candidate's coverage.
+FACTS = [
+    {"id": "fact-r", "type": "experience_claim", "value": "Statistical analysis in R and SAS",
+     "status": "confirmed", "locked": False, "evidence_strength": "direct",
+     "keywords": ["R", "SAS"]},
+]
 
 
 def find_by_id(job_id):
@@ -182,3 +191,61 @@ class CorpusWideSanityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvaluationStateOnRealPostingsTests(unittest.TestCase):
+    """Ignorance and evaluation must not land in the same lane.
+
+    The queue ordered every posting on one scale, so a posting whose requirements could not
+    be parsed showed zero known gaps and outranked postings that had actually been checked.
+    These pin the two real postings that made the case.
+    """
+
+    def row(self, card):
+        """A queue row shaped the way `build_queue` shapes one, for the lane functions."""
+        tiers = TIERS.summarize(card["description"], FACTS)["tiers"]
+        return {"weight_percent": 85, "ranking_score": 0,
+                "employer": card["employer"], "title": card["title"],
+                "evidence": {"direct": 0, "covered": 0, "technical_hits": 0},
+                "tiers": tiers}
+
+    def test_the_biostatistician_is_assessed_and_lands_in_the_gapped_lane(self):
+        """4 of 5 must-have lines parsed, and the gaps it has were actually found."""
+        row = self.row(find_by_id("job-a775e9d42e76"))
+        must = row["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.PARTIALLY_ASSESSED)
+        self.assertGreaterEqual(must["parsed_lines"], 3)
+        self.assertGreater(must["unique_gaps"], 0)
+        self.assertEqual(QUEUE.lane(row), QUEUE.LANE_GAPPED)
+
+    def test_a_posting_nobody_could_read_is_unassessed(self):
+        row = self.row(find_by_id("job-7be773a85c3a"))
+        must = row["tiers"][MUST]
+        self.assertEqual(must["assessment"], TIERS.UNASSESSED)
+        self.assertEqual(must["parsed_lines"], 0)
+        self.assertEqual(must["unique_gaps"], 0)
+        self.assertEqual(QUEUE.lane(row), QUEUE.LANE_UNASSESSED)
+
+    def test_the_evaluated_posting_outranks_the_unread_one(self):
+        """The acceptance check, on the two real postings rather than on fixtures."""
+        evaluated = self.row(find_by_id("job-a775e9d42e76"))
+        unread = self.row(find_by_id("job-7be773a85c3a"))
+        self.assertLess(QUEUE.sort_key(evaluated), QUEUE.sort_key(unread))
+
+    def test_an_unread_posting_reports_no_coverage_rather_than_a_clean_bill(self):
+        must = self.row(find_by_id("job-7be773a85c3a"))["tiers"][MUST]
+        self.assertEqual((must["unique_direct"], must["unique_adjacent"], must["unique_gaps"]),
+                         (0, 0, 0))
+        # And says so by name rather than by three zeroes that read like a pass.
+        self.assertEqual(must["assessment"], TIERS.UNASSESSED)
+
+    def test_every_unread_requirement_is_kept_verbatim(self):
+        if not CORPUS.is_dir():
+            raise unittest.SkipTest("private posting corpus not present")
+        for path in sorted(CORPUS.glob("job-*.json"))[:200]:
+            card = json.loads(path.read_text(encoding="utf-8"))
+            must = TIERS.summarize(card.get("description") or "", FACTS)["tiers"][MUST]
+            self.assertEqual(len(must["unrecognised_requirements"]),
+                             must["unrecognised_lines"])
+            self.assertEqual(must["parsed_lines"] + must["unrecognised_lines"],
+                             must["stated_lines"])
