@@ -50,7 +50,7 @@ def propose(requirement):
 
 
 class CertificateIsNotADegreeTests(unittest.TestCase):
-    """The substitution this repository refuses, in the one place it was actually happening."""
+    """The substitution this repository refuses, in the one place it was happening."""
 
     def test_a_certificate_named_beside_a_degree_is_not_the_degree_field(self):
         held = {entry["fact_id"]: entry for entry in P.held_degrees(FACTS)}
@@ -64,139 +64,114 @@ class CertificateIsNotADegreeTests(unittest.TestCase):
         self.assertNotIn("statistics", P.degree_fields("MPH (Certificate in Biostatistics)"))
 
     def test_the_mph_does_not_satisfy_an_ms_in_statistics(self):
+        """And the answer is "not recorded", not "does not hold": nothing asserts the
+        education list is complete."""
         found = propose("MS or PhD in Statistics or Biostatistics")
-        self.assertEqual(found["proposed_disposition"], P.DOES_NOT_MEET)
+        self.assertIsNone(found["proposed_disposition"])
+        self.assertIn("education list is complete", found["short_reason"])
         self.assertIn("fact-mph", found["supporting_fact_ids"])
-        self.assertIn("certificate is not the degree", found["short_reason"])
 
 
-class DegreeLevelTests(unittest.TestCase):
+class CredentialTests(unittest.TestCase):
+    """A named credential is matched by name; only a bare level uses the level ladder."""
 
-    def test_a_requirement_naming_two_levels_is_met_by_the_lower(self):
-        """"MS or PhD" is satisfied by a master's; taking the first match said "no doctorate"."""
-        self.assertEqual(P.named_levels("MS or PhD in Statistics"), ["master", "doctorate"])
+    def test_a_credential_list_is_met_only_by_a_credential_it_names(self):
+        found = propose("MD, PharmD, NP, PA, RN, MPH, or 5+ years in clinical practice")
+        self.assertEqual(found["proposed_disposition"], P.MEETS)
+        self.assertIn("MPH", found["short_reason"])
+        self.assertEqual(found["supporting_fact_ids"], ["fact-mph"])
 
-    def test_a_level_nobody_holds_is_a_positive_mismatch(self):
-        found = propose("PhD in Biostatistics required")
-        self.assertEqual(found["proposed_disposition"], P.DOES_NOT_MEET)
-        self.assertIn("none reaches that level", found["short_reason"])
+    def test_a_spelled_out_degree_matches_the_abbreviation_a_posting_uses(self):
+        self.assertEqual(P.credentials_in("Master of Public Health – Env Health"), ["MPH"])
 
-    def test_a_degree_with_no_field_named_is_met(self):
+    def test_a_state_abbreviation_is_not_a_credential(self):
+        self.assertEqual(P.credentials_in("Converse University; Spartanburg, SC May 2019"), [])
+
+    def test_a_bare_level_uses_the_ladder(self):
         found = propose("Bachelor's degree required")
         self.assertEqual(found["proposed_disposition"], P.MEETS)
-        self.assertTrue(found["supporting_fact_ids"])
 
+    def test_a_named_field_narrows_a_credential_match(self):
+        self.assertIsNone(propose("MS in Biology")["proposed_disposition"])
 
-class OpenEndedFieldTests(unittest.TestCase):
-    """An open list establishes nothing by not containing your field.
-
-    The first version proposed `does_not_meet` against "a quantitative field (e.g.,
-    Statistics…)" and "STEM … or equivalent" — over-claiming in exactly the way the rule
-    forbids, and only visible on real postings.
-    """
-
-    def test_an_eg_list_does_not_settle_a_mismatch(self):
-        found = propose("Bachelor's or Master's degree in a quantitative field "
-                        "(e.g., Statistics, Mathematics, Computer Science)")
+    def test_a_level_nobody_holds_is_not_a_mismatch(self):
+        """No completeness assertion exists, so an absent doctorate stays unproposed."""
+        found = propose("PhD in Biostatistics required")
         self.assertIsNone(found["proposed_disposition"])
         self.assertEqual(found["candidate_evidence_status"], P.NO_EVIDENCE)
 
-    def test_an_or_equivalent_clause_does_not_settle_a_mismatch(self):
-        found = propose("Bachelor's degree in a STEM, quantitative, or healthcare "
-                        "informatics field, or equivalent practical experience")
-        self.assertIsNone(found["proposed_disposition"])
-
-    def test_or_related_field_does_not_settle_a_mismatch(self):
-        self.assertIsNone(propose("BS in Statistics or a related field")
-                          ["proposed_disposition"])
-
-    def test_a_closed_list_still_settles_it(self):
-        self.assertEqual(propose("MS in Statistics or Biostatistics")["proposed_disposition"],
-                         P.DOES_NOT_MEET)
-
-    def test_an_unknown_field_word_is_not_read_as_no_field(self):
-        """"a quantitative field" names a field; the vocabulary just does not hold it."""
-        found = propose("Bachelor's degree in a quantitative field")
-        self.assertIsNone(found["proposed_disposition"])
-        self.assertIn("vocabulary does not hold", found["short_reason"])
-
 
 class DurationTests(unittest.TestCase):
-
-    def test_a_span_shorter_than_the_requirement_is_a_positive_mismatch(self):
-        span = P.career_span_years(FACTS, today=date(2026, 9, 10))
-        self.assertAlmostEqual(span["years"], 4.3, delta=0.2)
-        found = P.propose("Minimum of 10 years of managing analytics", FACTS, span=span)
-        self.assertEqual(found["proposed_disposition"], P.DOES_NOT_MEET)
-        self.assertEqual(found["supporting_fact_ids"], ["fact-job1", "fact-job2"])
-
-    def test_a_long_enough_span_does_not_make_the_requirement_met(self):
-        """The span says nothing about the domain the requirement names."""
-        span = P.career_span_years(FACTS, today=date(2026, 9, 10))
-        found = P.propose("3+ years of clinical trial operations", FACTS, span=span)
-        self.assertIsNone(found["proposed_disposition"])
-        self.assertIn("do not establish", found["short_reason"])
+    """A recorded span is reported. It is never read as the whole of a career."""
 
     def test_the_span_is_read_from_the_dated_headers(self):
         span = P.career_span_years(FACTS, today=date(2026, 9, 10))
         self.assertEqual(span["earliest"], "2020-06-01")
         self.assertEqual(span["latest"], "2024-10-01")
+        self.assertAlmostEqual(span["years"], 4.3, delta=0.2)
+
+    def test_a_requirement_longer_than_the_span_is_not_a_mismatch(self):
+        found = P.propose("Minimum of 10 years of managing analytics", FACTS)
+        self.assertIsNone(found["proposed_disposition"])
+        self.assertIn("nothing asserts that the employment record is complete",
+                      found["short_reason"])
+
+    def test_the_span_is_still_reported_with_its_facts(self):
+        found = P.propose("Minimum of 10 years of managing analytics", FACTS)
+        self.assertIn("4.3 years", found["short_reason"])
+        self.assertEqual(found["supporting_fact_ids"], ["fact-job1", "fact-job2"])
+
+    def test_a_long_enough_span_does_not_make_the_requirement_met(self):
+        found = P.propose("3+ years of clinical trial operations", FACTS)
+        self.assertIsNone(found["proposed_disposition"])
 
 
 class AbsenceIsNotProofTests(unittest.TestCase):
-    """The rule the module exists to keep."""
+    """The rule the module exists to keep, now with no exceptions at all."""
 
     def test_a_sentence_no_rule_reads_gets_no_disposition(self):
         found = propose("Ability to travel up to 10%")
         self.assertIsNone(found["proposed_disposition"])
         self.assertEqual(found["candidate_evidence_status"], P.NO_EVIDENCE)
-        self.assertIn("no controlled rule", found["short_reason"])
 
     def test_a_recognised_concept_with_no_match_is_absence_not_mismatch(self):
-        """"Strong communication skills" unmatched says the profile does not phrase it so."""
         found = propose("Strong organizational and time management skills")
-        self.assertIsNone(found["proposed_disposition"])
-        self.assertIn("not a mismatch", found["short_reason"])
+        self.assertNotEqual(found["proposed_disposition"], P.DOES_NOT_MEET)
 
-    def test_a_named_technology_the_profile_lacks_is_a_positive_mismatch(self):
+    def test_a_missing_tool_is_absence_not_mismatch(self):
         found = propose("Production experience with Docker and Snowflake")
-        self.assertEqual(found["proposed_disposition"], P.DOES_NOT_MEET)
-        self.assertIn("Docker", found["short_reason"])
+        self.assertIsNone(found["proposed_disposition"])
+
+    def test_a_mixed_tool_list_is_partial_and_names_what_is_missing(self):
+        found = propose("Experience with Python and Snowflake")
+        self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
+        self.assertIn("Snowflake", found["short_reason"])
 
     def test_a_skills_list_is_mention_only_and_never_proposed_as_met(self):
-        """"Programming: R, SAS, SQL, Python" is a list of names, not demonstrated use.
-
-        The resolver caps a skills-list fact at `mention_only`, and the proposal carries that
-        through rather than reading a tool's presence in a list as meeting the requirement.
-        """
+        """"Programming: R, SAS, SQL, Python" is a list of names, not demonstrated use."""
         found = propose("Strong SQL and Python")
         self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
         self.assertEqual(found["evidence_class"], "mention_only")
-        self.assertIn("fact-prog", found["supporting_fact_ids"])
-
-    def test_a_mixed_tool_list_is_partial_and_names_both_halves(self):
-        found = propose("Experience with Python and Snowflake")
-        self.assertEqual(found["proposed_disposition"], P.PARTIALLY_MEETS)
-        self.assertIn("covered: Python", found["short_reason"])
-        self.assertIn("not covered: Snowflake", found["short_reason"])
-
-    def test_a_tool_name_inside_a_longer_word_is_not_matched(self):
-        """`Terra` must not match inside `Terraform`."""
-        self.assertEqual(P.named_technologies("Terraform modules"), [])
 
     def test_no_unproposed_row_carries_a_disposition_by_accident(self):
-        for requirement in ("Ability to travel up to 10%", "Strong academic track record",
-                            "Excellent verbal and written communication skills"):
+        for requirement in ("Ability to travel up to 10%", "Strong academic track record"):
             with self.subTest(requirement=requirement):
                 self.assertIsNone(propose(requirement)["proposed_disposition"])
 
     def test_unclear_ask_employer_is_never_proposed(self):
-        """Whether an employer wrote ambiguously is not a fact about the candidate."""
-        for requirement in ("Experience with things", "Some familiarity, or equivalent",
-                            "Not a perfect match yet?"):
+        for requirement in ("Experience with things", "Some familiarity, or equivalent"):
             with self.subTest(requirement=requirement):
                 self.assertNotEqual(propose(requirement)["proposed_disposition"],
                                     "unclear_ask_employer")
+
+    def test_does_not_meet_is_not_reachable_at_all_yet(self):
+        """No completeness assertion exists in the schema, so nothing can establish absence."""
+        for requirement in ("PhD in Biostatistics required", "Docker in production",
+                            "Minimum of 20 years", "Experience with REDCap and Epic",
+                            "MS in Statistics", "Strong communication skills"):
+            with self.subTest(requirement=requirement):
+                self.assertNotEqual(propose(requirement)["proposed_disposition"],
+                                    P.DOES_NOT_MEET)
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -241,8 +216,8 @@ class AnnotateTests(unittest.TestCase):
 
     def test_annotate_fills_proposals_and_leaves_the_blocked_group_alone(self):
         sheet = P.annotate(self.sheet(), FACTS)
-        self.assertEqual(sheet["survivors"][0]["unread_requirements"][0]
-                         ["proposed_disposition"], P.DOES_NOT_MEET)
+        self.assertIsNone(sheet["survivors"][0]["unread_requirements"][0]
+                          ["proposed_disposition"])
         self.assertIsNone(sheet["survivors"][0]["unread_requirements"][1]
                           ["proposed_disposition"])
         self.assertEqual(sheet["blocked"][0]["decision"], "hard_reject")
@@ -251,21 +226,26 @@ class AnnotateTests(unittest.TestCase):
     def test_the_summary_says_it_decides_nothing(self):
         sheet = P.annotate(self.sheet(), FACTS)
         self.assertIn("requires user confirmation", sheet["proposals"]["decides_nothing"])
-        self.assertEqual(sheet["proposals"]["counts"],
-                         {P.DOES_NOT_MEET: 1, "unproposed": 1})
+        self.assertEqual(sheet["proposals"]["counts"], {"unproposed": 2})
 
-    def test_postings_with_a_blocking_proposal_are_surfaced_first(self):
+    def test_postings_with_the_least_unresolved_are_surfaced_first(self):
         sheet = P.annotate(self.sheet(), FACTS)
         sheet["survivors"].append({"employer": "X", "title": "Y", "location": "Z",
-                                   "lane": "partial_no_known_gap", "lane_rank": 1,
+                                   "lane": "partial_no_known_gap", "lane_rank": 2,
                                    "parsed_lines": 1, "stated_lines": 9,
                                    "unread_requirements": []})
-        self.assertEqual(P.decisive_first(sheet)[0]["employer"], "Unlearn")
+        self.assertEqual(P.decisive_first(sheet)[0]["employer"], "X")
 
     def test_the_rendered_sheet_states_that_absence_is_not_proof(self):
         text = P.render(P.annotate(self.sheet(), FACTS))
-        self.assertIn("Absence of evidence is not evidence of absence", text)
+        self.assertIn("unrecorded, not unmet", text)
+        self.assertIn("Nothing is proposed as `does_not_meet`", text)
         self.assertIn("fact-mph", text)
+
+    def test_the_rendered_sheet_explains_what_meets_requires(self):
+        text = P.render(P.annotate(self.sheet(), FACTS))
+        self.assertIn("every obligation in the sentence to resolve", text)
+        self.assertIn("weakest necessary part", text)
 
 
 if __name__ == "__main__":
