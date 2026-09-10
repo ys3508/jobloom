@@ -113,7 +113,7 @@ class DurationTests(unittest.TestCase):
     def test_a_requirement_longer_than_the_span_is_not_a_mismatch(self):
         found = P.propose("Minimum of 10 years of managing analytics", FACTS)
         self.assertIsNone(found["proposed_disposition"])
-        self.assertIn("nothing asserts that the employment record is complete",
+        self.assertIn("nothing asserts the employment record is complete",
                       found["short_reason"])
 
     def test_the_span_is_still_reported_with_its_facts(self):
@@ -244,8 +244,8 @@ class AnnotateTests(unittest.TestCase):
 
     def test_the_rendered_sheet_explains_what_meets_requires(self):
         text = P.render(P.annotate(self.sheet(), FACTS))
-        self.assertIn("every obligation in the sentence to resolve", text)
-        self.assertIn("weakest necessary part", text)
+        self.assertIn("requires the requirement text to be read", text)
+        self.assertIn("nothing substantive in its text is left unread", text)
 
 
 if __name__ == "__main__":

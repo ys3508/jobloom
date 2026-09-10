@@ -74,6 +74,8 @@ class NotMeetsTests(unittest.TestCase):
     def test_statistical_analysis_is_not_competitive_programming(self):
         found = self.assertNotMeets(
             "A strong analytical thinker and coder; ACM-ICPC, IOI or IPSC experience", STATS)
+        # Every branch's obligations are reported, so `coder` cannot vanish because another
+        # alternative came closer.
         self.assertIn("coder", " ".join(found.get("unverified_obligations") or []).lower())
 
     def test_an_mba_does_not_satisfy_a_clinical_credential_alternative(self):
@@ -175,3 +177,141 @@ class AbsenceIsNeverAMismatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BranchStructureTests(unittest.TestCase):
+    """A requirement is AND of obligations within OR of branches, and nothing skips that.
+
+    `_credential_proposal` used to answer the whole sentence before it was split, so a degree
+    the profile holds satisfied everything standing beside it. And it matched credentials and
+    fields as two independent sets, which loses the pairing: an MS in Biology satisfied
+    "MS in Statistics or PhD in Biology" by taking the credential from one branch and the
+    field from the other.
+    """
+
+    BS = [fact("e1", "education", "Bachelor of Science – Medical Technology")]
+    MPH = [fact("e2", "education", "Master of Public Health – Environmental Health Sciences")]
+    MS_BIOLOGY = [fact("e3", "education", "Master of Science in Biology")]
+
+    def assertNotMeets(self, requirement, facts):
+        found = P.propose(requirement, facts)
+        self.assertNotEqual(found["proposed_disposition"], P.MEETS,
+                            f"{requirement!r} answered by {facts[0]['value']!r}")
+        return found
+
+    def test_a_degree_does_not_answer_what_stands_beside_it(self):
+        self.assertNotMeets(
+            "Bachelor's degree and 5 years of product management experience", self.BS)
+
+    def test_a_degree_does_not_answer_a_qualifier_beside_it(self):
+        self.assertNotMeets(
+            "Bachelor's degree and executive-level communication skills", self.BS)
+
+    def test_two_credentials_joined_by_and_both_have_to_be_held(self):
+        self.assertNotMeets("MD and MPH required", self.MPH)
+
+    def test_a_credential_and_its_field_stay_in_the_same_branch(self):
+        """(MS AND Statistics) OR (PhD AND Biology) — not {MS,PhD} × {Statistics,Biology}."""
+        self.assertNotMeets("MS in Statistics or PhD in Biology", self.MS_BIOLOGY)
+
+    def test_the_branch_that_does_match_still_meets(self):
+        found = P.propose("MS in Statistics or MS in Biology", self.MS_BIOLOGY)
+        self.assertEqual(found["proposed_disposition"], P.MEETS)
+
+    def test_every_proposal_carries_its_obligations(self):
+        """The two v2 `meets` had empty obligation lists, so nothing could be checked."""
+        for requirement, facts in (
+                ("Bachelor's degree or higher", self.BS),
+                ("MD, PharmD, NP, PA, RN, MPH, or 5+ years in clinical practice", self.MPH)):
+            with self.subTest(requirement=requirement):
+                found = P.propose(requirement, facts)
+                self.assertTrue(found["obligations"], found)
+                for entry in found["obligations"]:
+                    self.assertIn("fact_ids", entry)
+                    self.assertIn("obligation", entry)
+
+
+class ResidueProvesConsumptionTests(unittest.TestCase):
+    """`meets` needs the requirement text consumed, not merely free of known qualifiers.
+
+    A curated qualifier list can only ever catch the wording someone already thought of.
+    "Advanced" and "in Mandarin" are not on it, and disappeared.
+    """
+
+    PRESENTATION = [fact("c1", "experience_claim", "Delivered a presentation")]
+    BORROWABLE = [
+        fact("c1", "experience_claim", "Delivered a presentation"),
+        fact("c2", "experience_claim", "Performed executive-level inventory classification"),
+    ]
+
+    def test_an_unlisted_intensity_word_is_residue(self):
+        found = P.propose("Advanced communication skills", self.PRESENTATION)
+        self.assertNotEqual(found["proposed_disposition"], P.MEETS)
+        self.assertTrue(found.get("unresolved_text"), found)
+
+    def test_an_unlisted_scope_phrase_is_residue(self):
+        found = P.propose("Communication skills in Mandarin", self.PRESENTATION)
+        self.assertNotEqual(found["proposed_disposition"], P.MEETS)
+        self.assertIn("mandarin", " ".join(found.get("unresolved_text") or []).lower())
+
+    def test_a_qualifier_cannot_be_borrowed_from_an_unrelated_fact(self):
+        """"executive-level" came from an inventory-classification fact the answer never cited."""
+        found = P.propose("Executive-level communication skills", self.BORROWABLE)
+        self.assertNotEqual(found["proposed_disposition"], P.MEETS)
+
+    def test_a_fully_consumed_requirement_can_still_meet(self):
+        found = P.propose("Communication skills", self.PRESENTATION)
+        self.assertEqual(found["proposed_disposition"], P.MEETS)
+        self.assertEqual(found.get("unresolved_text"), [])
+
+
+class RenderingTests(unittest.TestCase):
+    """The sheet a person confirms from must not hide the half of a sentence that decides it."""
+
+    LONG = ("Demonstrated organizational, time management, and project management skills, "
+            "with the ability to lead teams and manage multiple projects simultaneously "
+            "while documenting changes to established operational workflows and process "
+            "flows for a regulated environment")
+
+    def sheet(self):
+        return {"survivors": [{"employer": "E", "title": "T", "location": "L",
+                               "lane": "partial_no_known_gap", "lane_rank": 1,
+                               "parsed_lines": 1, "stated_lines": 9,
+                               "unread_requirements": [
+                                   {"requirement": self.LONG, "disposition": None,
+                                    "note": None}]}],
+                "blocked": []}
+
+    def test_the_whole_requirement_is_shown(self):
+        text = P.render(P.annotate(self.sheet(), [fact("c1", "experience_claim",
+                                                       "Built a database")]))
+        self.assertIn("while documenting changes", text)
+        self.assertIn("manage multiple projects simultaneously", text)
+
+    def test_nothing_is_truncated_without_saying_so(self):
+        text = P.render(P.annotate(self.sheet(), [fact("c1", "experience_claim",
+                                                       "Built a database")]))
+        for line in text.splitlines():
+            if line.startswith("|") and "…" in line:
+                self.fail(f"silently shortened: {line[:90]}")
+
+    def test_every_unresolved_obligation_reaches_still_to_verify(self):
+        sheet = P.annotate(self.sheet(), [fact("c1", "experience_claim", "Built a database")])
+        item = sheet["survivors"][0]["unread_requirements"][0]
+        unresolved = [entry["obligation"] for entry in item["obligations"]
+                      if entry["strength"] == "none"]
+        self.assertTrue(unresolved, item)
+        text = P.render(sheet)
+        for obligation in unresolved:
+            with self.subTest(obligation=obligation[:40]):
+                self.assertIn(obligation[:40], text)
+
+
+class DocstringTests(unittest.TestCase):
+
+    def test_the_module_does_not_advertise_a_path_it_closed(self):
+        source = (ROOT / "skills" / "jobloom" / "scripts"
+                  / "disposition_proposals.py").read_text(encoding="utf-8")
+        head = source[:source.index('"""', source.index('"""') + 3)]
+        self.assertNotIn("a **duration** longer than", head)
+        self.assertIn("does_not_meet", head)

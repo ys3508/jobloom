@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Proposing what the confirmed facts say about a requirement nothing could parse.
 
-Fifty-seven blank cells is not a review, it is a memory test, and the answers are already in
+Fifty-seven blank cells is a memory test, not a review, and the answers are largely already in
 the fact library. So this reads each unread requirement against the active CandidateSnapshot
-and proposes a disposition — with the fact ids it rests on, so the proposal can be checked
-rather than believed.
+and proposes a disposition, with the fact ids each part of it rests on.
 
 Nothing here decides anything. Every proposal carries `requires_user_confirmation: true` and
 `final_disposition: null`, and no queue row or application state is touched.
 
-The rule that shapes the whole module: **absence of evidence is not evidence of absence.**
-A requirement nothing matched gets no proposed disposition at all — it gets
-`candidate_evidence_status: no_supporting_evidence_found`, which is a different statement and
-leaves the judgement where it belongs. `does_not_meet` is proposed only where the confirmed
-facts *positively establish* the mismatch, and there are exactly three shapes where they can:
+**A requirement is a boolean structure, not a bag of words.** It parses into branches joined
+by `or`, each branch a set of obligations joined by `and`. A branch is satisfied when every
+obligation in it is satisfied; the requirement is satisfied when some branch is. Specialized
+resolvers — credential, duration, named technology, prose concept — answer *one obligation
+inside one branch*, and none of them may answer the sentence around it. A degree the profile
+holds says nothing about the five years of product management standing next to it.
 
-- a **degree** the profile does not hold, after reading every education fact;
-- a **duration** longer than the confirmed career timeline;
-- a **named technology** the controlled resolver recognised and found nothing for.
+**`meets` requires the requirement text to be consumed.** Each resolver records the span it
+read, and whatever is left over is residue. Substantive residue caps the answer at
+`partially_meets`, whatever else matched. This replaces the curated list of qualifiers that
+came before it: a list can only catch wording somebody already thought of, and "Advanced",
+"in Mandarin" and every phrasing after them were disappearing silently. A qualifier is
+evidenced by the facts supporting *its own* obligation, never borrowed from an unrelated one.
 
-Everything else that finds no evidence stays unproposed. `unclear_ask_employer` is never
-proposed: whether an employer wrote something ambiguous is a judgement about their prose, not
-a fact about the candidate, and inventing a detector for it would be inventing a distinction.
+**Nothing is proposed as `does_not_meet`.** No fact in this schema asserts that the education,
+employment or skills record is complete, so a requirement the facts do not answer is
+unrecorded rather than unmet. Three things would license it — a confirmed negative fact, a
+scoped completeness assertion, or a contradiction between positive facts — and none exists
+yet. `unclear_ask_employer` is likewise never proposed: whether an employer wrote ambiguously
+is a judgement about their prose, not a fact about the candidate.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ if SCRIPT_DIR not in sys.path:
 import posting_sections  # noqa: E402
 import requirement_tiers  # noqa: E402
 from evidence_matcher import EVIDENCE_ORDER  # noqa: E402
+from evidence_matcher import REQUIREMENT_CONCEPTS  # noqa: E402
 from evidence_matcher import match_requirement, match_requirement_prose  # noqa: E402
 
 MEETS = "meets"
@@ -185,173 +192,24 @@ def career_span_years(facts: list[dict[str, Any]], *, today: date | None = None
 def _proposal(disposition: str | None, *, confidence: str, reason: str,
               fact_ids: list[str] | None = None, evidence_class: str | None = None,
               status: str = NO_EVIDENCE, obligations: list[dict[str, Any]] | None = None,
-              unverified: list[str] | None = None) -> dict[str, Any]:
+              unresolved: list[str] | None = None,
+              residue: list[str] | None = None) -> dict[str, Any]:
     return {"proposed_disposition": disposition, "confidence": confidence,
             "supporting_fact_ids": sorted(fact_ids or []),
             "evidence_class": evidence_class, "short_reason": reason,
             "candidate_evidence_status": status,
             "obligations": obligations or [],
-            "unverified_obligations": unverified or [],
+            "unresolved_obligations": unresolved or [],
+            "unverified_obligations": sorted(set((unresolved or []) + (residue or []))),
+            "unresolved_text": residue or [],
             "requires_user_confirmation": True, "final_disposition": None}
 
 
-# ---- a requirement is a set of obligations, not a bag of words -----------------------
-
-# Qualifiers that are obligations in their own right. Each narrows what would otherwise be
-# met by ordinary evidence, and each was found endorsing a whole sentence off a fact that
-# spoke only to the noun it modifies: a classroom presentation answering "executive-level
-# communication", a database answering "lead teams and manage multiple projects".
-QUALIFIERS = (
-    ("executive", r"\bexecutive[-\s]level\b|\bexecutive\b|\bc[-\s]suite\b"),
-    ("senior", r"\bsenior\s+(?:stakeholder|leader|executive|management)"),
-    ("non-technical", r"\bnon[-\s]technical\b|\bnontechnical\b"),
-    ("lead teams", r"\blead(?:ing)?\s+(?:cross[-\s]functional\s+)?teams?\b"
-                   r"|\bpeople\s+manage(?:ment|r)\b|\bmanage\s+(?:a\s+)?team\b"),
-    ("multiple projects", r"\bmultiple\s+(?:projects|clients|workstreams)\b"
-                          r"|\bsimultaneous(?:ly)?\b|\bconcurrent(?:ly)?\b"),
-    ("fast-paced", r"\bfast[-\s]paced\b|\bdynamic\s+environment\b|\bambiguity\b"),
-    ("coder", r"\bcoder\b|\bcompetitive\s+programming\b|\backm?[-\s]icpc\b"
-              r"|\bicpc\b|\bio[ip]\b|\bipsc\b"),
-    ("modular", r"\bmodular\b|\bextensible\b|\bscalable\s+systems?\b"),
-    ("regulated", r"\bregulated\s+environment\b|\bgxp\b|\bcfr\s+part\s+11\b"),
-    ("client-facing", r"\bclient[-\s]facing\b|\bcustomer[-\s]facing\b"),
-    ("cross-functional", r"\bcross[-\s]functional\b"),
-    ("record-level", r"\brecord[-\s]level\b|\bpatient[-\s]level\b|\bclaims?\s+data\b"),
-)
-
-# Where a sentence divides into obligations that must each hold. `or` is deliberately absent:
-# it joins alternatives, and splitting on it would turn a choice into a list of demands.
-OBLIGATION_SPLIT = re.compile(r";|,\s+and\s+|\s+and\s+|,(?!\s*(?:e\.g\.|i\.e\.))", re.I)
-
-
-def obligations_of(requirement: str) -> list[str]:
-    """The parts of a requirement that must each hold, split on conjunctions only.
-
-    Never on `or`. "MD, PharmD, NP, PA, RN, MPH, or 5+ years" is one obligation with seven
-    ways to satisfy it, and splitting it into seven demands would be the opposite error to
-    the one this module is fixing.
-    """
-    if re.search(r"\bor\b", requirement, re.I):
-        return [requirement.strip()]
-    parts = [part.strip(" ;.,") for part in OBLIGATION_SPLIT.split(requirement)]
-    return [part for part in parts if len(part) > 2] or [requirement.strip()]
-
-
-def unverified_qualifiers(requirement: str, facts: list[dict[str, Any]]) -> list[str]:
-    """Qualifiers the sentence carries that no confirmed fact speaks to.
-
-    Checked against the facts' own text: a qualifier is verified only when some fact uses it,
-    not when the thing it qualifies is evidenced.
-    """
-    corpus = " ".join(str(fact.get("value") or "") for fact in facts
-                      if fact.get("status") in USABLE).casefold()
-    unverified = []
-    for name, pattern in QUALIFIERS:
-        if re.search(pattern, requirement, re.I) and not re.search(pattern, corpus, re.I):
-            unverified.append(name)
-    return unverified
-
-
-def propose(requirement: str, facts: list[dict[str, Any]], *,
-            degrees: list[dict[str, Any]] | None = None,
-            span: dict[str, Any] | None = None) -> dict[str, Any]:
-    """One requirement, read against the confirmed facts. Decides nothing.
-
-    `meets` is available only when every obligation in the sentence resolved and every
-    qualifier it carries is spoken to by a fact. Anything else caps at `partially_meets` or
-    stays unproposed: an unresolved part of a requirement does not disappear because another
-    part matched.
-    """
-    degrees = held_degrees(facts) if degrees is None else degrees
-    span = career_span_years(facts) if span is None else span
-    text = requirement.strip()
-
-    if MARKETING.search(text) or posting_sections.FALLBACK_EXCLUSION.search(text) \
-            or requirement_tiers.ELIGIBILITY_STATEMENT.search(text):
-        return _proposal(NOT_A_REQUIREMENT, confidence="high", status=NOT_APPLICABLE,
-                         reason="company, eligibility or compensation prose rather than "
-                                "something the candidate's evidence answers")
-
-    credential = _credential_proposal(text, facts)
-    if credential:
-        return credential
-    duration = _duration_proposal(text, span)
-    if duration:
-        return duration
-
-    parts = obligations_of(text)
-    resolved: list[dict[str, Any]] = []
-    for part in parts:
-        resolved.append(_resolve(part, facts))
-    unverified = unverified_qualifiers(text, facts)
-    unmet = [entry for entry in resolved if entry["strength"] == "none"]
-    fact_ids = [fid for entry in resolved for fid in entry["fact_ids"]]
-    classes = [entry["strength"] for entry in resolved if entry["strength"] != "none"]
-    # The weakest necessary component constrains a compound requirement. Taking the strongest
-    # is what let one directly evidenced clause carry four unevidenced ones.
-    weakest = min(classes, key=lambda name: EVIDENCE_ORDER[name]) if classes else None
-
-    if not classes:
-        return _proposal(None, confidence="none", status=NO_EVIDENCE, obligations=resolved,
-                         unverified=unverified,
-                         reason="no obligation in this requirement resolved to a confirmed "
-                                "fact")
-    if unmet or unverified:
-        detail = []
-        if unmet:
-            detail.append("unresolved: " + "; ".join(entry["obligation"][:60]
-                                                     for entry in unmet))
-        if unverified:
-            detail.append("no fact speaks to: " + ", ".join(unverified))
-        return _proposal(PARTIALLY_MEETS, confidence="medium", fact_ids=fact_ids,
-                         evidence_class=weakest, status=EVIDENCE_FOUND,
-                         obligations=resolved, unverified=unverified,
-                         reason="; ".join(detail))
-    if weakest not in requirement_tiers.COVERING:
-        return _proposal(PARTIALLY_MEETS, confidence="medium", fact_ids=fact_ids,
-                         evidence_class=weakest, status=EVIDENCE_FOUND,
-                         obligations=resolved, unverified=unverified,
-                         reason=f"every obligation resolved, but the weakest evidence is "
-                                f"{weakest} rather than direct")
-    return _proposal(MEETS, confidence="medium", fact_ids=fact_ids, evidence_class=weakest,
-                     status=EVIDENCE_FOUND, obligations=resolved, unverified=unverified,
-                     reason="every obligation in this requirement resolved to direct "
-                            "confirmed evidence")
-
-
-def named_technologies(text: str) -> list[str]:
-    """The controlled tool names a requirement mentions, matched on whole tokens.
-
-    Whole tokens because `Terra` is in the vocabulary and `Terraform` is not the same thing.
-    """
-    return [tool for tool in posting_sections.TOOL_TERMS
-            if re.search(rf"(?<![A-Za-z0-9+#]){re.escape(tool)}(?![A-Za-z0-9+#])", text, re.I)]
-
-
-def _resolve(obligation: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
-    """One obligation against the facts, carrying its own fact ids."""
-    named = named_technologies(obligation)
-    if named:
-        strengths, fact_ids = [], []
-        for tool in named:
-            found = match_requirement(tool, facts)
-            strengths.append(found["strength"])
-            fact_ids.extend(found["fact_ids"])
-        weakest = min(strengths, key=lambda name: EVIDENCE_ORDER[name])
-        return {"obligation": obligation, "kind": "named_technology",
-                "strength": weakest, "fact_ids": sorted(set(fact_ids))}
-    found = match_requirement_prose(obligation, facts)
-    return {"obligation": obligation,
-            "kind": "concept" if found.get("recognized") else "unparsed",
-            "strength": found.get("strength", "none") if found.get("recognized") else "none",
-            "fact_ids": sorted(set(found.get("fact_ids") or []))}
-
-
-# ---- credentials are matched by name, never by level --------------------------------
+# ---- credentials, matched by name -----------------------------------------------------
 
 # Each credential with the ways a posting or a transcript writes it. A profile records
 # "Master of Public Health"; a posting asks for "MPH". Matching only the abbreviation made
-# the one that was held invisible and sent a real requirement to manual review.
+# the one that was held invisible.
 CREDENTIAL_FORMS = {
     "MD": (r"MD", r"doctor of medicine"),
     "DO": (r"DO", r"doctor of osteopath\w*"),
@@ -388,36 +246,126 @@ def credentials_in(text: str) -> list[str]:
             if pattern.search(cleaned)]
 
 
-def _credential_proposal(text: str, facts: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """An explicit credential requirement, satisfied only by holding what it names.
+def named_technologies(text: str) -> list[str]:
+    """The controlled tool names a requirement mentions, matched on whole tokens.
 
-    Two ways a requirement can name one, and they behave differently:
-
-    - **By credential** — "MD, PharmD, NP, PA, RN, MPH" is a list of alternatives, and only
-      holding one of *those* satisfies it. Reading it as "a master's or higher" let an MBA
-      answer a clinical-credential requirement.
-    - **By level** — "Bachelor's degree required" names no credential, so the level ladder is
-      the right comparison and anything at or above it qualifies.
-
-    A named field narrows either: "MS in Statistics" is not satisfied by an MS in something
-    else. And nothing here proposes `does_not_meet`. Not finding a degree among the recorded
-    education facts is not the same as the candidate not holding it, and no fact in this
-    schema asserts that the education list is complete.
+    Whole tokens because `Terra` is in the vocabulary and `Terraform` is not the same thing.
     """
-    wanted_credentials = credentials_in(text)
-    wanted_levels = named_levels(text)
+    return [tool for tool in posting_sections.TOOL_TERMS
+            if re.search(rf"(?<![A-Za-z0-9+#]){re.escape(tool)}(?![A-Za-z0-9+#])", text, re.I)]
+
+
+# ---- a requirement is a boolean structure ------------------------------------------
+
+# Words that carry no obligation of their own: articles, conjunctions, prepositions, and the
+# head nouns a concept surface already implies. Everything else left unconsumed is residue.
+# Intensity and scope words are deliberately absent — "Advanced", "Executive-level" and
+# "in Mandarin" are exactly what must survive as residue.
+FUNCTION_WORDS = frozenset("""
+a an the and or of in with for to on at as is are be been being both either any all that this
+these those you your our we us their they it its from by into within across including include
+have has had must should will would can could may might plus etc e.g i.e via using use used
+skill skills ability abilities experience experiences knowledge proficiency proficient
+background understanding demonstrated demonstrable proven track record required requirement
+requirements year years plus_years work working
+""".split())
+
+# A comma list that ends in "or" is a list of alternatives: "MD, PharmD, NP, PA, RN, MPH, or
+# 5+ years". A comma list that ends in "and" is a list of demands. Splitting the second on
+# commas would turn a set of requirements into a menu.
+ALTERNATIVE_LIST = re.compile(r",\s*or\s+", re.I)
+OR_SPLIT = re.compile(r",\s*or\s+|\s+or\s+|,(?=\s)", re.I)
+AND_SPLIT = re.compile(r";|,\s*and\s+|\s+and\s+|,(?!\s*(?:e\.g\.|i\.e\.))", re.I)
+
+
+# "Education:", "Analytical Rigor:", "Communication:" — a label naming what the sentence is
+# about, not an obligation inside it. And "or higher" extends a level rather than offering an
+# alternative to it; splitting there produced a branch consisting of the word "higher".
+LABEL_PREFIX = re.compile(r"^[A-Z][A-Za-z /&'-]{2,34}:\s+")
+OR_HIGHER = re.compile(r"\s+or\s+(?:higher|above|greater|more)\b", re.I)
+
+
+def branches_of(requirement: str) -> list[list[str]]:
+    """`or`-joined branches, each a list of `and`-joined obligations.
+
+    "MS in Statistics or PhD in Biology" is two branches, and the credential stays with its
+    field inside each. Matching credentials and fields as two independent sets let an MS in
+    Biology satisfy it by taking one half from each branch.
+    """
+    text = OR_HIGHER.sub(" or higher", LABEL_PREFIX.sub("", requirement.strip()))
+    text = text.replace(" or higher", "")
+    if ALTERNATIVE_LIST.search(text):
+        parts = [part for part in OR_SPLIT.split(text) if part and part.strip()]
+    elif re.search(r"\s+or\s+", text, re.I):
+        parts = re.split(r"\s+or\s+", text, flags=re.I)
+    else:
+        parts = [text]
+    branches = []
+    for part in parts:
+        obligations = [item.strip(" ;.,") for item in AND_SPLIT.split(part)]
+        obligations = [item for item in obligations if len(item) > 1]
+        branches.append(obligations or [part.strip()])
+    return branches
+
+
+def _fields_in(text: str) -> list[str]:
+    return [term for term in FIELD_TERMS
+            if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", text.casefold())]
+
+
+def _tokens(text: str) -> list[str]:
+    return [token for token in re.findall(r"[A-Za-z][A-Za-z+#\-]*", text.casefold())]
+
+
+def residue_of(text: str, consumed: list[str]) -> list[str]:
+    """Words of an obligation that no resolver read.
+
+    The proof `meets` needs is that the requirement was consumed, not that it failed to trip
+    a known pattern. Anything substantive left here means some part of the sentence was never
+    answered, whatever else matched.
+    """
+    read = set()
+    for span in consumed:
+        read.update(_tokens(span))
+    return [token for token in _tokens(text)
+            if token not in read and token not in FUNCTION_WORDS and len(token) > 1]
+
+
+# ---- resolving one obligation, inside its branch ------------------------------------
+
+
+def _resolve(obligation: str, facts: list[dict[str, Any]],
+             degrees: list[dict[str, Any]], branch: str) -> dict[str, Any]:
+    """One obligation against the facts, carrying its own fact ids and what it consumed.
+
+    `branch` is the whole branch text, so a credential can find the field it is paired with
+    without any resolver seeing outside its own alternative.
+    """
+    for resolver in (_credential_obligation, _duration_obligation, _technology_obligation,
+                     _concept_obligation):
+        found = resolver(obligation, facts, degrees, branch)
+        if found:
+            found["residue"] = residue_of(obligation, found.get("consumed") or [])
+            return found
+    return {"obligation": obligation, "kind": "unparsed", "strength": "none",
+            "fact_ids": [], "consumed": [], "residue": residue_of(obligation, []),
+            "note": "no controlled resolver reads this"}
+
+
+def _credential_obligation(obligation: str, facts: list[dict[str, Any]],
+                           degrees: list[dict[str, Any]], branch: str
+                           ) -> dict[str, Any] | None:
+    """A credential named in this obligation, paired with a field named in its own branch."""
+    wanted_credentials = credentials_in(obligation)
+    wanted_levels = named_levels(obligation)
     if not wanted_credentials and not wanted_levels:
         return None
     wanted_fields = [term for term in FIELD_TERMS
-                     if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", text.casefold())]
-
-    reviewed, matches = [], []
-    for fact in facts:
-        if fact.get("type") not in ("education", "certification") \
-                or fact.get("status") not in USABLE:
-            continue
-        value = str(fact.get("value") or "")
-        reviewed.append(fact["id"])
+                     if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", branch.casefold())]
+    consumed = list(wanted_credentials) + list(wanted_levels) + wanted_fields + [
+        "degree", "degrees", "higher", "above", "education", "equivalent"]
+    for entry in degrees:
+        value = entry["value"]
         held_credentials = credentials_in(value)
         held_levels = named_levels(value)
         if wanted_credentials:
@@ -429,42 +377,160 @@ def _credential_proposal(text: str, facts: list[dict[str, Any]]) -> dict[str, An
             hit = None
         if not hit:
             continue
-        if wanted_fields and not (set(degree_fields(value)) & set(wanted_fields)):
-            # The right credential in the wrong subject. Not a match, and not a mismatch
-            # either — an open list may still admit it, and the user reads the field.
+        if wanted_fields and not (set(entry["fields"]) & set(wanted_fields)):
             continue
-        matches.append((hit, fact["id"]))
-
-    if matches:
-        return _proposal(MEETS, confidence="medium",
-                         fact_ids=[fid for _, fid in matches], evidence_class="direct",
-                         status=EVIDENCE_FOUND,
-                         reason=f"the profile holds {matches[0][0]}, which this requirement "
-                                "names" + (f" in {', '.join(wanted_fields)}"
-                                           if wanted_fields else ""))
+        return {"obligation": obligation, "kind": "credential", "strength": "direct",
+                "fact_ids": [entry["fact_id"]], "consumed": consumed,
+                "note": f"the profile holds {hit}"}
     asked = " or ".join(wanted_credentials or [f"a {wanted_levels[0]} degree"])
     field_note = f" in {' or '.join(wanted_fields)}" if wanted_fields else ""
-    return _proposal(None, confidence="none", fact_ids=sorted(set(reviewed)),
-                     status=NO_EVIDENCE,
-                     reason=f"asks for {asked}{field_note}; the recorded education facts do "
-                            "not name it, and nothing in the profile asserts that the "
-                            "education list is complete")
+    return {"obligation": obligation, "kind": "credential", "strength": "none",
+            "fact_ids": sorted({entry["fact_id"] for entry in degrees}),
+            "consumed": consumed,
+            "note": f"asks for {asked}{field_note}; the recorded education facts do not name "
+                    "it, and nothing asserts the education list is complete"}
 
 
-def _duration_proposal(text: str, span: dict[str, Any]) -> dict[str, Any] | None:
-    if span.get("years") is None:
-        return None
-    match = DURATION.search(text)
+def _duration_obligation(obligation: str, facts: list[dict[str, Any]],
+                         degrees: list[dict[str, Any]], branch: str) -> dict[str, Any] | None:
+    match = DURATION.search(obligation)
     if not match:
         return None
-    wanted = int(match.group(1))
-    # No fact says the employment history is complete, so the earliest recorded start is not
-    # the start of a career. The span is reported; the comparison is the user's.
-    return _proposal(None, confidence="none", fact_ids=span["fact_ids"],
-                     status=NO_EVIDENCE,
-                     reason=f"asks for {wanted} years; the recorded experience headers span "
-                            f"{span['years']} years ({span['earliest']} to {span['latest']}), "
-                            "and nothing asserts that the employment record is complete")
+    span = career_span_years(facts)
+    return {"obligation": obligation, "kind": "duration", "strength": "none",
+            "fact_ids": span["fact_ids"], "consumed": [match.group(0)],
+            "note": (f"asks for {match.group(1)} years; the recorded experience headers span "
+                     f"{span['years']} years and nothing asserts the employment record is "
+                     "complete") if span.get("years") is not None
+            else "no dated experience header to compare against"}
+
+
+def _technology_obligation(obligation: str, facts: list[dict[str, Any]],
+                           degrees: list[dict[str, Any]], branch: str
+                           ) -> dict[str, Any] | None:
+    named = named_technologies(obligation)
+    if not named:
+        return None
+    strengths, fact_ids = [], []
+    for tool in named:
+        found = match_requirement(tool, facts)
+        strengths.append(found["strength"])
+        fact_ids.extend(found["fact_ids"])
+    weakest = min(strengths, key=lambda name: EVIDENCE_ORDER[name])
+    missing = [tool for tool, strength in zip(named, strengths) if strength == "none"]
+    return {"obligation": obligation, "kind": "named_technology", "strength": weakest,
+            "fact_ids": sorted(set(fact_ids)), "consumed": named,
+            "note": ("no fact for " + ", ".join(missing)) if missing
+            else "covered: " + ", ".join(named)}
+
+
+def _concept_obligation(obligation: str, facts: list[dict[str, Any]],
+                        degrees: list[dict[str, Any]], branch: str) -> dict[str, Any] | None:
+    """A controlled concept, consuming only the words its own surface matched.
+
+    The consumed span is what makes the residue check work: the concept for communication
+    reads "communication", so "Executive-level" is left over and the sentence cannot be met
+    on a fact about presentations.
+    """
+    consumed, concepts = [], []
+    for name, rule in REQUIREMENT_CONCEPTS.items():
+        match = re.search(rule["requirement"], obligation, re.I)
+        if match:
+            consumed.append(match.group(0))
+            concepts.append(name)
+    if not concepts:
+        return None
+    found = match_requirement_prose(obligation, facts)
+    return {"obligation": obligation, "kind": "concept",
+            "strength": found.get("strength", "none") if found.get("recognized") else "none",
+            "fact_ids": sorted(set(found.get("fact_ids") or [])), "consumed": consumed,
+            "note": "concepts: " + ", ".join(concepts)}
+
+
+def propose(requirement: str, facts: list[dict[str, Any]], *,
+            degrees: list[dict[str, Any]] | None = None,
+            span: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One requirement, read against the confirmed facts. Decides nothing."""
+    degrees = held_degrees(facts) if degrees is None else degrees
+    text = requirement.strip()
+
+    if MARKETING.search(text) or posting_sections.FALLBACK_EXCLUSION.search(text) \
+            or requirement_tiers.ELIGIBILITY_STATEMENT.search(text):
+        return _proposal(NOT_A_REQUIREMENT, confidence="high", status=NOT_APPLICABLE,
+                         reason="company, eligibility or compensation prose rather than "
+                                "something the candidate's evidence answers")
+
+    parsed = branches_of(text)
+    # A field phrase that only the last branch carries modifies the branches before it:
+    # "Bachelor's or advanced degree in Engineering, Data Science, Statistics" states one
+    # field constraint over both levels. Splitting on `or` had left a bare "Bachelor's"
+    # branch with the field dropped, which is the pairing bug in a new place. Where every
+    # branch names its own field — "MS in Statistics or PhD in Biology" — nothing is shared.
+    per_branch_fields = [_fields_in(" ".join(obligations)) for obligations in parsed]
+    shared_fields = sorted({term for names in per_branch_fields for term in names}) \
+        if any(per_branch_fields) and not all(per_branch_fields) else []
+
+    evaluated = []
+    for obligations, own_fields in zip(parsed, per_branch_fields):
+        branch_text = " and ".join(obligations)
+        if not own_fields and shared_fields:
+            branch_text += " in " + " or ".join(shared_fields)
+        resolved = [_resolve(item, facts, degrees, branch_text) for item in obligations]
+        residue = sorted({token for entry in resolved for token in entry["residue"]})
+        classes = [entry["strength"] for entry in resolved if entry["strength"] != "none"]
+        unmet = [entry for entry in resolved if entry["strength"] == "none"]
+        weakest = min(classes, key=lambda name: EVIDENCE_ORDER[name]) if classes else None
+        evaluated.append({"obligations": resolved, "residue": residue, "unmet": unmet,
+                          "weakest": weakest,
+                          "satisfied": not unmet and not residue
+                          and weakest in requirement_tiers.COVERING})
+
+    satisfied = next((branch for branch in evaluated if branch["satisfied"]), None)
+    if satisfied:
+        obligations = satisfied["obligations"]
+        residue = satisfied["residue"]
+        unresolved: list[str] = []
+    else:
+        # Nothing satisfied, so every alternative is still live and the reader needs all of
+        # them. Reporting only the closest branch hid the obligations of the others: a
+        # requirement whose second branch was nearly met stopped mentioning `coder` at all.
+        obligations = [entry for branch in evaluated for entry in branch["obligations"]]
+        residue = sorted({token for branch in evaluated for token in branch["residue"]})
+        unresolved = [entry["obligation"] for branch in evaluated
+                      for entry in branch["unmet"]]
+    fact_ids = [fid for entry in obligations for fid in entry["fact_ids"]]
+    # The resolvers' own notes, which say what was found or what is missing. Without them the
+    # reason was a generic sentence and the specific finding — "the profile holds MPH", "the
+    # recorded headers span 4.3 years" — never reached the reader.
+    notes = [entry["note"] for entry in obligations if entry.get("note")]
+
+    if satisfied:
+        return _proposal(MEETS, confidence="medium", fact_ids=fact_ids,
+                         evidence_class=satisfied["weakest"], status=EVIDENCE_FOUND,
+                         obligations=obligations, unresolved=unresolved, residue=residue,
+                         reason="; ".join(notes) + " — every obligation in this branch "
+                                "resolved and the requirement text was fully read")
+    detail = []
+    if unresolved:
+        detail.append("unresolved: " + "; ".join(dict.fromkeys(unresolved)))
+    if residue:
+        detail.append("not read: " + ", ".join(residue))
+    if notes:
+        detail.append("; ".join(dict.fromkeys(notes)))
+    if not any(entry["strength"] != "none" for entry in obligations):
+        return _proposal(None, confidence="none", fact_ids=fact_ids, status=NO_EVIDENCE,
+                         obligations=obligations, unresolved=unresolved, residue=residue,
+                         reason="; ".join(detail) or "no obligation resolved to a confirmed "
+                                                     "fact")
+    weakest = min((entry["strength"] for entry in obligations
+                   if entry["strength"] != "none"),
+                  key=lambda name: EVIDENCE_ORDER[name])
+    if weakest not in requirement_tiers.COVERING:
+        detail.append(f"weakest evidence is {weakest}")
+    return _proposal(PARTIALLY_MEETS, confidence="medium", fact_ids=fact_ids,
+                     evidence_class=weakest, status=EVIDENCE_FOUND,
+                     obligations=obligations, unresolved=unresolved,
+                     residue=residue, reason="; ".join(detail) or "partly covered")
 
 
 def annotate(sheet: dict[str, Any], facts: list[dict[str, Any]],
@@ -504,6 +570,13 @@ def decisive_first(sheet: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def render(sheet: dict[str, Any]) -> str:
+    """The sheet a person confirms from. Nothing on it is shortened.
+
+    The previous version cut requirements at 130 characters and reasons at 150, with no
+    ellipsis and nowhere to expand — and what it cut was the deciding half: "…while
+    documenting changes", "…manage multiple projects simultaneously". A confirmation sheet
+    that hides the clause the answer turns on is worse than no sheet.
+    """
     counts = sheet["proposals"]["counts"]
     total = sum(counts.values())
     lines = [
@@ -517,16 +590,14 @@ def render(sheet: dict[str, Any]) -> str:
         "",
         "**Nothing is proposed as `does_not_meet`.** No fact in this profile asserts that the "
         "education, employment or skills record is complete, so a requirement the facts do "
-        "not answer is unrecorded, not unmet. Until a scoped completeness assertion exists, "
-        "the only honest answers are what the facts *do* support and silence.",
+        "not answer is unrecorded, not unmet.",
         "",
-        "**`meets` requires every obligation in the sentence to resolve.** A qualifier — "
-        "executive-level, senior, non-technical, lead teams, multiple projects, fast-paced, "
-        "coder, modular — is an obligation of its own, and stays listed as unverified rather "
-        "than disappearing because the noun it modifies matched. A compound requirement is "
-        "held to its weakest necessary part, never its strongest.",
+        "**`meets` requires the requirement text to be read.** A requirement parses into "
+        "`or` branches of `and` obligations; a branch is met only when every obligation in it "
+        "resolves *and* nothing substantive in its text is left unread. Whatever is left over "
+        "is listed as unread, which is why an unfamiliar qualifier cannot disappear.",
         "",
-        "Postings are ordered by how little is left to judge.", "",
+        "Full text below — nothing is shortened.", "",
     ]
     for entry in decisive_first(sheet):
         items = entry.get("unread_requirements", [])
@@ -536,18 +607,28 @@ def render(sheet: dict[str, Any]) -> str:
                   f"{entry['location']} · {entry['lane']} #{entry['lane_rank']} · "
                   f"{entry['parsed_lines']} of {entry['stated_lines']} must-have lines "
                   f"evaluated by the queue · **{len(open_questions)} of {len(items)} still "
-                  "open**", "",
-                  "| requirement | proposal | evidence | still to verify | why |",
-                  "|---|---|---|---|---|"]
-        for item in items:
-            requirement = item["requirement"].replace("|", "\\|")[:130]
-            proposal = item.get("proposed_disposition") or "—"
-            evidence = ", ".join(item.get("supporting_fact_ids") or []) or "—"
-            unverified = ", ".join(item.get("unverified_obligations") or []) or "—"
-            reason = (item.get("short_reason") or "").replace("|", "\\|")[:150]
-            lines.append(f"| {requirement} | **{proposal}** | {evidence} | {unverified} "
-                         f"| {reason} |")
-        lines.append("")
+                  "open**", ""]
+        for index, item in enumerate(items, 1):
+            proposal = item.get("proposed_disposition") or "unproposed"
+            lines += [f"### {index}. `{proposal}`", "",
+                      f"> {item['requirement']}", ""]
+            obligations = item.get("obligations") or []
+            if obligations:
+                lines += ["| obligation | read as | evidence | facts | unread |",
+                          "|---|---|---|---|---|"]
+                for ob in obligations:
+                    unread = ", ".join(ob.get("residue") or []) or "—"
+                    facts = ", ".join(ob.get("fact_ids") or []) or "—"
+                    lines.append(
+                        f"| {ob['obligation']} | {ob.get('kind', '—')} "
+                        f"| {ob.get('strength', '—')} | {facts} | {unread} |")
+                lines.append("")
+            still = list(dict.fromkeys(
+                (item.get("unresolved_obligations") or []) + (item.get("unresolved_text") or [])))
+            lines += [f"- **still to verify:** {'; '.join(still) if still else 'nothing'}",
+                      f"- **why:** {item.get('short_reason') or '—'}",
+                      f"- **your disposition:** {item.get('final_disposition') or '____'}",
+                      ""]
     return "\n".join(lines) + "\n"
 
 
