@@ -249,14 +249,82 @@ def _unreviewed_binding(primary_capability: str, secondary: list[str]) -> str:
         "migrated_without_claims": True})
 
 
-def _needs_binding(raw: str | None) -> bool:
-    """A row is unmigrated if it has no usable binding, however it came to be that way."""
+def read_bindings(raw: str | None) -> dict[str, Any]:
+    """Whatever is in the column, as a shape the rest of the module can rely on.
+
+    Total by construction: every caller of this reads a stored blob, and a stored blob can be
+    anything if a write was interrupted or a row was edited by hand. An earlier version
+    tolerated only *unparseable* JSON, so a column holding well-formed JSON of the wrong type
+    — `[]`, `null`, `5` — raised `AttributeError` inside `initialize` and the database could
+    not be opened at all. That is not an evidence escalation, but it is a worse failure than
+    the one it was guarding: nothing can be done to a database that will not start.
+
+    An empty result means "no usable binding", which is what the migration repairs and what
+    `selectable` reports as `capability_binding_unreviewed`. Nothing here invents a claim id:
+    a malformed `claim_ids` becomes empty, never a guess at what it meant.
+    """
     try:
-        bindings = json.loads(raw or "{}")
+        value = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    primary = value.get("primary")
+    if not isinstance(primary, dict) or not isinstance(primary.get("capability_id"), str) \
+            or not primary["capability_id"].strip():
+        return {}
+    bindings: dict[str, Any] = {
+        "primary": {"capability_id": primary["capability_id"],
+                    "claim_ids": _claim_ids(primary.get("claim_ids"))},
+        "secondary": [
+            {"capability_id": item["capability_id"],
+             "claim_ids": _claim_ids(item.get("claim_ids"))}
+            for item in (value.get("secondary") or [])
+            if isinstance(item, dict) and isinstance(item.get("capability_id"), str)
+            and item["capability_id"].strip()]
+        if isinstance(value.get("secondary"), list) else [],
+    }
+    if value.get("migrated_without_claims"):
+        bindings["migrated_without_claims"] = True
+    return bindings
+
+
+def _claim_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _legacy_secondary(raw: str | None) -> list[str]:
+    """The replaced column, read the same way: anything unusable is nothing, never an error."""
+    try:
+        value = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def _needs_binding(raw: str | None) -> bool:
+    """A row is unmigrated if it has no usable binding, however it came to be that way.
+
+    Also when the stored blob merely *reads* as one: a `claim_ids` that is not a list of
+    strings is normalized to empty on every read, and leaving the original on disk would mean
+    a person reading the row sees a binding the code does not act on. Rewritten so the two
+    agree — and rewritten to the unreviewed form, not to a guess at what it meant.
+    """
+    bindings = read_bindings(raw)
+    if not bindings:
+        return True
+    try:
+        stored = json.loads(raw or "{}")
     except ValueError:
         return True
-    return not isinstance(bindings.get("primary"), dict) \
-        or not bindings["primary"].get("capability_id")
+    primary = stored.get("primary", {}) if isinstance(stored, dict) else {}
+    claim_ids = primary.get("claim_ids") if isinstance(primary, dict) else None
+    return not isinstance(claim_ids, list) \
+        or any(not isinstance(item, str) for item in claim_ids)
 
 
 def _migrate_capability_bindings(connection: sqlite3.Connection) -> None:
@@ -276,7 +344,7 @@ def _migrate_capability_bindings(connection: sqlite3.Connection) -> None:
     if pending:
         with connection:
             for row in pending:
-                secondary = json.loads(row["secondary_capabilities_json"] or "[]") \
+                secondary = _legacy_secondary(row["secondary_capabilities_json"]) \
                     if has_secondary else []
                 connection.execute(
                     "UPDATE story_versions SET capability_bindings_json=? WHERE version_id=?",
@@ -695,7 +763,7 @@ def selectable(connection: sqlite3.Connection, version_id: str) -> dict[str, Any
         reasons.append("superseded_version")
     if json.loads(version["unbound_spans_json"]):
         reasons.append("narrative_not_fully_bound")
-    bindings = json.loads(version["capability_bindings_json"] or "{}")
+    bindings = read_bindings(version["capability_bindings_json"])
     if not bindings.get("primary", {}).get("claim_ids"):
         # A version carried forward from the schema where a capability was a bare label. The
         # story is intact; nobody has said which claims evidence its capability.
@@ -822,7 +890,7 @@ def prepare_successor(connection: sqlite3.Connection, version_id: str,
     target = _active_snapshot(connection)
     if version["candidate_snapshot_sha256"] == target:
         raise ValueError("this story is already bound to the active profile")
-    bindings = json.loads(version["capability_bindings_json"] or "{}")
+    bindings = read_bindings(version["capability_bindings_json"])
     if not (bindings.get("primary") or {}).get("claim_ids"):
         # Carrying re-derives evidence references from the same facts; it cannot supply claim
         # ids nobody recorded. A version migrated from the schema where a capability was a
@@ -973,7 +1041,7 @@ def _confidentiality_allows(check: dict[str, Any], employer: str | None,
 def _fit(connection: sqlite3.Connection, version: sqlite3.Row, competency: str,
          classes: dict[str, str]) -> dict[str, Any] | None:
     """Which band this version answers one competency in, on the evidence bound to it."""
-    bindings = json.loads(version["capability_bindings_json"] or "{}")
+    bindings = read_bindings(version["capability_bindings_json"])
     primary = bindings.get("primary") or {}
     if not primary.get("capability_id"):
         # `selectable` refuses such a version first, so this is belt to that brace: a row

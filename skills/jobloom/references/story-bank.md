@@ -252,7 +252,19 @@ a row still to backfill, whatever columns exist. The earlier version decided fro
 existence, so a crash between adding the column and filling it left every row at the `'{}'`
 default and the next run skipped the backfill entirely — a database that looked migrated and
 had lost its capabilities. `primary_capability` is never dropped, which is what makes the
-repair always possible, even once `secondary_capabilities_json` is gone. It adds
+repair always possible, even once `secondary_capabilities_json` is gone.
+
+**Reading a stored binding is total.** `read_bindings()` accepts whatever is in the column
+and returns a shape the rest of the module can rely on; an empty result means "no usable
+binding", which the migration repairs and `selectable` reports as
+`capability_binding_unreviewed`. It tolerated only *unparseable* JSON once, so a column
+holding well-formed JSON of the wrong type — `[]`, `null`, `5`, `"text"` — raised inside
+`initialize` and the database could not be opened at all. No escalation, but a worse failure
+than the one being guarded: nothing can be done to a database that will not start.
+
+Nothing is guessed at in the process. A `claim_ids` that is not a list of strings reads as
+empty rather than as one claim id, and the migration rewrites it to the unreviewed form so
+what a person reads on disk matches what the code acts on. It adds
 `capability_bindings_json`, drops the `secondary_capabilities_json` it replaces, adds
 `confidential_employer_normalized` and backfills it through the same normalizer identity is
 matched with, and adds `claim_ids_json` to reviewed mappings. `story_answers.initialize` adds

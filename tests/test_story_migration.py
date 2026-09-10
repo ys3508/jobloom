@@ -552,3 +552,103 @@ class RecoveringAMigratedStoryTests(MigrationFixture):
         self.assertEqual(
             STORIES.map_stories(self.db, ["cap.survey-design"])["cap.survey-design"]["fit"],
             "strong")
+
+
+class DamagedBindingTests(MigrationFixture):
+    """A database whose binding column holds something unexpected still opens.
+
+    The gap this closes: the migration tolerated *unparseable* JSON but not well-formed JSON
+    of the wrong type. A column holding `[]`, `null`, `5` or `"text"` raised `AttributeError`
+    inside `initialize`, so the database could not be opened at all — no escalation, but a
+    worse failure than the one being guarded, because nothing can be done to a database that
+    will not start. `read_bindings` is total: anything unusable reads as no binding, which is
+    what the migration repairs and what `selectable` reports.
+    """
+
+    UNUSABLE = ("[]", "null", "5", '"text"', "", "not json", "{}", '{"primary": null}',
+                '{"primary": "cap.survey-design"}', '{"primary": {"claim_ids": []}}',
+                '{"primary": {"capability_id": "  "}}')
+
+    def damage(self, raw):
+        STORIES.initialize(self.db)
+        self.db.execute(
+            "UPDATE story_versions SET capability_bindings_json=? WHERE version_id='SV-old'",
+            (raw,))
+        self.db.commit()
+
+    def stored(self):
+        return self.db.execute(
+            "SELECT capability_bindings_json FROM story_versions WHERE version_id='SV-old'"
+        ).fetchone()[0]
+
+    def test_the_database_opens_whatever_the_column_holds(self):
+        for raw in self.UNUSABLE:
+            with self.subTest(raw=raw):
+                self.damage(raw)
+                STORIES.initialize(self.db)
+                PROPOSE.initialize(self.db)
+
+    def test_an_unusable_binding_is_repaired_to_the_unreviewed_form(self):
+        for raw in self.UNUSABLE:
+            with self.subTest(raw=raw):
+                self.damage(raw)
+                STORIES.initialize(self.db)
+                bindings = json.loads(self.stored())
+                self.assertEqual(bindings["primary"],
+                                 {"capability_id": "cap.survey-design", "claim_ids": []})
+                self.assertTrue(bindings["migrated_without_claims"])
+
+    def test_a_damaged_row_is_refused_rather_than_raising(self):
+        for raw in self.UNUSABLE:
+            with self.subTest(raw=raw):
+                self.damage(raw)
+                check = STORIES.selectable(self.db, "SV-old")
+                self.assertFalse(check["selectable"])
+                self.assertIn("capability_binding_unreviewed", check["reasons"])
+                self.assertEqual(
+                    STORIES.map_stories(self.db, ["cap.survey-design"])
+                    ["cap.survey-design"]["fit"], "gap")
+
+    def test_reading_never_raises_on_any_of_them(self):
+        for raw in (*self.UNUSABLE, '{"primary": {"capability_id": "cap.x",'
+                    ' "claim_ids": "c1"}}', '{"primary": {"capability_id": "cap.x",'
+                    ' "claim_ids": ["c1", 7]}, "secondary": 7}'):
+            with self.subTest(raw=raw):
+                self.assertIsInstance(STORIES.read_bindings(raw), dict)
+
+    def test_a_claim_ids_that_is_not_a_list_of_strings_becomes_empty(self):
+        """Normalized, never guessed at: a string is not silently read as one claim id."""
+        self.assertEqual(
+            STORIES.read_bindings(
+                '{"primary": {"capability_id": "cap.x", "claim_ids": "c1"}}'
+            )["primary"]["claim_ids"], [])
+        self.assertEqual(
+            STORIES.read_bindings(
+                '{"primary": {"capability_id": "cap.x", "claim_ids": ["c1", 7, ""]}}'
+            )["primary"]["claim_ids"], ["c1"])
+
+    def test_a_malformed_claim_list_is_rewritten_so_disk_matches_behaviour(self):
+        self.damage('{"primary": {"capability_id": "cap.survey-design", "claim_ids": "c1"}}')
+        STORIES.initialize(self.db)
+        self.assertEqual(json.loads(self.stored())["primary"]["claim_ids"], [])
+        self.assertIn("capability_binding_unreviewed",
+                      STORIES.selectable(self.db, "SV-old")["reasons"])
+
+    def test_a_damaged_secondary_list_does_not_break_retrieval(self):
+        self.damage('{"primary": {"capability_id": "cap.survey-design", "claim_ids": ["c1"]},'
+                    ' "secondary": 7}')
+        STORIES.initialize(self.db)
+        self.assertEqual(
+            STORIES.map_stories(self.db, ["cap.data-querying"])["cap.data-querying"]["fit"],
+            "gap")
+
+    def test_a_legacy_secondary_column_holding_junk_still_migrates(self):
+        """The replaced column is read the same way: unusable is nothing, never an error."""
+        self.db.execute(
+            "UPDATE story_versions SET secondary_capabilities_json='not json' "
+            "WHERE version_id='SV-old'")
+        self.db.commit()
+        STORIES.initialize(self.db)
+        self.assertEqual(json.loads(self.stored())["secondary"], [])
+        self.assertEqual(json.loads(self.stored())["primary"]["capability_id"],
+                         "cap.survey-design")
