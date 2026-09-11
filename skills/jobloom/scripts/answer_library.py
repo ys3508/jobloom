@@ -227,15 +227,33 @@ def add_question_form(
     question: str,
     match_level: str = "exact",
     verified_by_user: bool = True,
+    platform_family: str | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> None:
+    """Record that this exact question means this. Matching is unchanged by the new columns.
+
+    `platform_family` and `provenance` are audit, not scope. A form registered from a Lever
+    page still matches by its normalised question alone, because that is what the question
+    *is*; scoping matches to a platform would mean the same sentence on two ATSs needed two
+    approvals and would quietly stop matching the day an employer moved.
+
+    Provenance is where the page hash and the raw wording live. Deliberately not a key: a form
+    locked to one page hash would expire the next time the employer edited anything else on
+    the page, which is not a fact about what the question means.
+    """
     if match_level not in {"exact", "semantic_equivalent"}:
         raise ValueError("match_level must be exact or semantic_equivalent")
     if match_level == "semantic_equivalent" and not verified_by_user:
         raise ValueError("semantic equivalents must be user-verified before reuse")
     normalized = normalize_question(question)
+    _add_question_form_columns(connection)
     connection.execute(
-        "INSERT INTO question_forms VALUES (?, ?, ?, ?, ?)",
-        (normalized, canonical_id, match_level, int(verified_by_user), now_utc().isoformat()),
+        "INSERT INTO question_forms (normalized_question, canonical_id, match_level,"
+        " verified_by_user, created_at, platform_family, provenance_json)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (normalized, canonical_id, match_level, int(verified_by_user),
+         now_utc().isoformat(), platform_family,
+         _json(provenance) if provenance else None),
     )
     question_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     audit(connection, "question_form_added", canonical_id, {"match_level": match_level, "question_hash": question_hash})
@@ -1051,6 +1069,16 @@ def authorization_current(
     if not context_matches(json.loads(row["scope_json"]), context):
         return False, "standing_authorization_scope_mismatch"
     return True, None
+
+
+def _add_question_form_columns(connection: sqlite3.Connection) -> None:
+    """Audit columns, added the way `saved_jobs` adds its own. Rows registered before these
+    existed stay NULL, which is honestly what their provenance is."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(question_forms)")}
+    if "platform_family" not in columns:
+        connection.execute("ALTER TABLE question_forms ADD COLUMN platform_family TEXT")
+    if "provenance_json" not in columns:
+        connection.execute("ALTER TABLE question_forms ADD COLUMN provenance_json TEXT")
 
 
 def canonical_meaning(connection: sqlite3.Connection,

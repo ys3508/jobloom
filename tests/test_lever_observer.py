@@ -122,6 +122,19 @@ class ReadsNoValueTest(unittest.TestCase):
             for key in ("value", "current_value", "answer", "text", "files"):
                 self.assertNotIn(key, field)
 
+    def test_the_page_script_writes_nothing_to_the_document(self):
+        """An observer that stamped an attribute on each question container was writing to a
+        page it promised never to change, and to one a person may be looking at."""
+        script = OBSERVER.READ_STRUCTURE
+        for write in ("dataset.", "setAttribute(", ".remove()\n", "appendChild",
+                      "insertBefore", "classList.add", ".innerHTML ="):
+            with self.subTest(write=write):
+                if write == ".remove()\n":
+                    # `remove()` appears, but only on a clone made for the heading text.
+                    self.assertIn("cloneNode", script)
+                    continue
+                self.assertNotIn(write, script)
+
     def test_the_module_calls_no_method_that_changes_a_page(self):
         source = (ROOT / "skills" / "jobloom" / "scripts" / "lever_observer.py").read_text(
             encoding="utf-8")
@@ -189,7 +202,9 @@ class FieldTest(unittest.TestCase):
                     label="Pronouns"),
         ])
         self.assertEqual(len(fields), 2)
-        self.assertEqual(fields[0]["automation"], "fillable")
+        # No reviewed meaning for "Pronouns" here, so the group itself is unplannable too —
+        # what is under test is that the odd control out is named as auxiliary regardless.
+        self.assertEqual(fields[0]["automation"], "no_canonical_meaning")
         self.assertEqual(fields[1]["automation"], "unsupported_auxiliary_control")
         self.assertEqual(fields[1]["grouping_basis"], "not_in_the_container_group")
         self.assertIsNone(fields[1]["canonical_id"], "nothing unfillable is ever matched")
@@ -424,11 +439,30 @@ class ChallengeFieldTest(unittest.TestCase):
         blob = json.dumps(fields)
         self.assertNotIn("captcha", blob.lower())
 
-    def test_a_control_nobody_can_see_is_excluded_and_counted(self):
-        fields, skipped = OBSERVER.build_fields(page([
-            control(), control(id="ghost", selector="#ghost", label="", visible=False)]), None)
-        self.assertEqual(len(fields), 1)
-        self.assertEqual(skipped["not_visible"], 1)
+    def test_a_hidden_control_is_observed_and_marked_never_fillable(self):
+        """Skipping them silently let a collapsed EEO section pass without being mentioned."""
+        fields, _ = OBSERVER.build_fields(page([
+            control(),
+            control(id="eeo-race", selector="#eeo-race", label="Race", visible=False)]), None)
+        self.assertEqual(len(fields), 2)
+        self.assertEqual(fields[1]["visibility"], "hidden")
+        self.assertEqual(fields[1]["automation"], "not_visible")
+        self.assertIsNone(fields[1]["canonical_id"])
+
+    def test_a_readable_field_with_no_reviewed_meaning_is_not_called_fillable(self):
+        """Nothing can supply a value for it, so a plan naming it could not be written."""
+        fields, _ = OBSERVER.build_fields(page([control(label="Anything unmapped")]), None)
+        self.assertEqual(fields[0]["automation"], "no_canonical_meaning")
+        self.assertIsNone(fields[0]["canonical_id"])
+
+    def test_a_hidden_control_nobody_can_read_is_hidden_unknown_and_blocks_the_planner(self):
+        fields, _ = OBSERVER.build_fields(page([
+            control(),
+            control(id="ghost", selector="#ghost", label="", label_source="none",
+                    visible=False)]), None)
+        self.assertEqual(fields[1]["automation"], "hidden_unknown")
+        self.assertIn("hidden_unknown", OBSERVER.AUTOMATION_STATES)
+        self.assertIn("hidden_unknown", OBSERVER.NOT_FILLABLE)
 
     def test_nothing_is_dropped_without_being_counted(self):
         _, skipped = OBSERVER.build_fields(page([
@@ -437,10 +471,9 @@ class ChallengeFieldTest(unittest.TestCase):
             control(id="off", selector="#off", label="Later", disabled=True),
             control(name="h-captcha-response", id="hc", selector="#hc", label="",
                     visible=False),
-            control(id="ghost", selector="#ghost", label="", visible=False),
         ]), None)
         self.assertEqual(skipped, {"structural": 1, "challenge_field": 1,
-                                   "disabled": 1, "not_visible": 1})
+                                   "disabled": 1, "not_visible": 0})
 
 
 class NormalizationTest(unittest.TestCase):

@@ -80,6 +80,7 @@ PAUSE_CODES = (
     "unknown_frame_present", "possible_form_frame", "captcha_gates_the_form",
     "duplicate_field_id", "conflicting_canonical_meaning", "unsupported_control",
     "unlabelled_field", "ambiguous_label", "no_fields_found",
+    "page_closed_or_navigated", "browser_error",
 )
 
 CAPTCHA_MARKERS = re.compile(
@@ -141,8 +142,31 @@ LABEL_NOISE_SELECTOR = (
     ".resume-upload-button, .filename, .parse-status, .application-field")
 
 # Why a control may not be planned against, beyond the dispositions `field_policy` owns.
-AUTOMATION_STATES = ("fillable", "manual_only", "unsupported_auxiliary_control",
-                     "not_visible")
+# What may be planned against, and why not when not. Every control gets exactly one, so a
+# planner never meets a field it has no instruction for.
+AUTOMATION_STATES = (
+    # A value may be filled, and only these are ever matched to a canonical meaning.
+    "fillable",
+    # The file input. Supplied from the application's material lock, never from an answer.
+    "material",
+    # `field_policy` says no authority here may speak: legal, compensation, EEO, conflict.
+    "manual_only",
+    # In a question container whose group it is not part of — a reveal toggle, not an answer.
+    "unsupported_auxiliary_control",
+    # Present in the document and not shown. Classified, reported, never filled. The EEO and
+    # demographic sections of a Lever form load collapsed, and skipping them silently meant a
+    # page could ask about race and veteran status without the observation saying so.
+    "not_visible",
+    # Hidden *and* not classifiable. Recorded rather than dropped, and it blocks the planner:
+    # a control nobody could read is a control nobody can promise is harmless.
+    "hidden_unknown",
+    # Readable, shown, and nothing can supply a value for it: no reviewed question form maps
+    # it to a meaning. Derived rather than judged — a field with no meaning has no source, so
+    # calling it fillable would describe a plan that cannot be written. Which of these deserve
+    # a form, a story or a permanent manual mark is a separate decision, per field.
+    "no_canonical_meaning",
+)
+NOT_FILLABLE = tuple(state for state in AUTOMATION_STATES if state != "fillable")
 
 
 class Paused(Exception):
@@ -302,13 +326,21 @@ READ_STRUCTURE = r"""
   });
 
   const out = [];
-  let qid = 0;
+  // Container identity without touching the page. An earlier version stamped a `data-`
+  // attribute on each question container, which is a write — on a page an observer promises
+  // never to change, and on one a person may be looking at. A Map holds the same identity in
+  // this function and leaves the document exactly as it found it.
+  const containerIds = new Map();
+  const containerId = (box) => {
+    if (!box) return '';
+    if (!containerIds.has(box)) containerIds.set(box, String(containerIds.size + 1));
+    return containerIds.get(box);
+  };
   for (const el of document.querySelectorAll('input, textarea, select')) {
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || (tag === 'input' ? 'text' : '')).toLowerCase();
     const heading = labelFor(el);
     const box = questionContainer(el);
-    if (box && !box.dataset.jobloomQid) box.dataset.jobloomQid = String(++qid);
     out.push({
       tag, type,
       name: el.getAttribute('name') || '',
@@ -321,7 +353,7 @@ READ_STRUCTURE = r"""
       had_required_marker: heading.had_required_marker,
       // Which of Lever's question containers this control sits in. An identity, not text: it
       // is how a control is *proved* to belong to a question rather than assumed to.
-      question_container: box ? box.dataset.jobloomQid : '',
+      question_container: containerId(box),
       choice_label: choiceLabel(el),
       required: el.required === true || el.getAttribute('aria-required') === 'true',
       disabled: el.disabled === true,
@@ -462,9 +494,10 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
             skipped["challenge_field"] += 1
         elif entry["disabled"]:
             skipped["disabled"] += 1
-        elif not entry.get("visible", True):
-            skipped["not_visible"] += 1
         else:
+            # Hidden controls are kept. What a page asks is worth knowing even where it is
+            # not shown yet, and the alternative — counting them and moving on — let a
+            # collapsed EEO section pass unmentioned.
             controls.append(entry)
     if not controls:
         raise Paused("no_fields_found")
@@ -481,19 +514,30 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
             kind = CONTROL_BY_INPUT_TYPE.get(type_name)
         if kind is None:
             raise Paused("unsupported_control", f"{tag}:{type_name}")
+        hidden = not control.get("visible", True)
         question = control["match_question"] or control["choice_label"]
-        if not question:
-            raise Paused("unlabelled_field", control["selector"] or f"{tag}:{type_name}")
-        if control["label_source"] == "none":
-            # No node Lever marks as a heading. Rather than cutting a string out of whatever
-            # text is nearby, say the label could not be proved.
+        illegible = not question or control["label_source"] == "none"
+        if illegible and not hidden:
+            # A shown control nobody can read stops the run: it is part of the form in front
+            # of the user and a guess about it would reach a real answer.
+            if not question:
+                raise Paused("unlabelled_field", control["selector"] or f"{tag}:{type_name}")
             raise Paused("ambiguous_label", control["selector"] or f"{tag}:{type_name}")
         if not control["selector"]:
             raise Paused("unlabelled_field", "no_stable_selector")
 
+        if illegible:
+            # Hidden and unreadable. Recorded with what little is provable — never a guessed
+            # question — and it blocks the planner by its automation state.
+            question = ""
         field_id = control["id"] or control["name"]
         field_id = re.sub(r"[^A-Za-z0-9._:-]", "-", field_id)[:128].strip("-")
         if not field_id:
+            if hidden:
+                # Nothing to name it by and nothing to read: counted, and the page is still
+                # observed, because the planner gate below refuses to run on it.
+                skipped["hidden_unnameable"] = skipped.get("hidden_unnameable", 0) + 1
+                continue
             raise Paused("unlabelled_field", "no_stable_identifier")
         if field_id in seen_ids:
             raise Paused("duplicate_field_id", field_id)
@@ -518,8 +562,12 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
             "control": kind,
             "required": required,
             "required_basis": basis,
-            "automation": control.get("automation", "fillable"),
+            "visibility": "hidden" if hidden else "visible",
             "grouping_basis": control.get("grouping_basis", "single_control"),
+            # Carried on the field rather than read from the loop variable of an earlier
+            # pass, which is what the first version did — and it left the auxiliary pronouns
+            # toggle marked fillable because `control` by then meant the last control seen.
+            "_grouping_automation": control.get("automation", "fillable"),
         }
         if control["options"]:
             field["options"] = control["options"]
@@ -536,18 +584,39 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
         field["disposition"] = disposition
         field["domain"] = domain
         field["family"] = family
-        if field["automation"] != "fillable" or disposition == "always_manual":
+        # One automation state per control, decided in order of consequence. A hidden control
+        # is still shown its disposition — a collapsed EEO section is `always_manual`, and
+        # saying so is the point of observing it at all.
+        if field["visibility"] == "hidden":
+            field["automation"] = "hidden_unknown" if not field["match_question"] \
+                else "not_visible"
+        elif field["_grouping_automation"] == "unsupported_auxiliary_control":
+            field["automation"] = "unsupported_auxiliary_control"
+        elif disposition == "always_manual":
+            field["automation"] = "manual_only"
+        elif field["control"] == "file":
+            field["automation"] = "material"
+        elif disposition == "unsupported":
+            field["automation"] = "unsupported_auxiliary_control"
+        else:
+            field["automation"] = "fillable"
+
+        if field["automation"] != "fillable":
             # Never planned against, so never matched: a meaning attached to a control nothing
             # may fill is an invitation for something later to try.
             field["canonical_id"] = None
+            field.pop("_grouping_automation", None)
             field["field_sha256"] = field_digest(field)
             continue
         canonical_id = meanings[field["match_question"]]
+        if canonical_id is None:
+            field["automation"] = "no_canonical_meaning"
         field["canonical_id"] = canonical_id
         if canonical_id is not None:
             if canonical_id in claimed and claimed[canonical_id] != field["field_id"]:
                 raise Paused("conflicting_canonical_meaning", canonical_id)
             claimed[canonical_id] = field["field_id"]
+        field.pop("_grouping_automation", None)
         field["field_sha256"] = field_digest(field)
     return fields, skipped
 
@@ -575,7 +644,7 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
     the page does not count as the form changing.
     """
     target = check_origin(url)
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
     with sync_playwright() as playwright:
         # Headed by default: this runs on a real employer's page, and the ADR's live gate is a
@@ -584,6 +653,7 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
         try:
             context = browser.new_context()
             page = context.new_page()
+            _ = page
             page.goto(target, wait_until="domcontentloaded", timeout=timeout_ms)
             if page.url.split("#")[0] != target.split("#")[0]:
                 # A redirect off the approved host is the case worth naming: the address bar
@@ -621,6 +691,14 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
                 raise Paused("page_changed_under_observation")
 
             observed_url = page.url
+        except PlaywrightError as error:
+            # A supervised run happens in a window a person can close, and losing the target
+            # mid-read is an ordinary thing rather than a crash. It is also what a page that
+            # navigates itself away looks like from here, so it stops with a code either way.
+            message = str(error).lower()
+            if "closed" in message or "navigat" in message:
+                raise Paused("page_closed_or_navigated") from None
+            raise Paused("browser_error") from None
         finally:
             browser.close()
 
@@ -646,6 +724,15 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
         # see, a disabled one, and the structural inputs every form carries.
         "skipped": skipped,
         # The three fields a later stage reads before it does anything at all.
+        # The planner gate, computed here so nothing downstream has to re-derive it.
+        # Every fillable field has a meaning by construction now, so the gate is about what
+        # could not be read at all and about nothing being left in an unnamed state.
+        "planner_ready": (not any(f["automation"] == "hidden_unknown" for f in fields)
+                          and all(f["automation"] in AUTOMATION_STATES for f in fields)
+                          and all(f["canonical_id"] for f in fields
+                                  if f["automation"] == "fillable")),
+        "automation_counts": {state: sum(1 for f in fields if f["automation"] == state)
+                              for state in AUTOMATION_STATES},
         "captcha_present": challenge,
         "captcha_handling": "user_required" if challenge else "not_present",
         "user_takeover_required": challenge,
@@ -670,7 +757,12 @@ def write_observation(observation: dict[str, Any], output: Path) -> dict[str, An
 
 def summarise(observation: dict[str, Any]) -> str:
     """What to print. Questions and dispositions, and no value, because there are none."""
-    lines = [f"{observation['field_count']} fields · page {observation['page_sha256'][:12]}"]
+    lines = [f"{observation['field_count']} fields · page {observation['page_sha256'][:12]}"
+             + (f" · planner_ready={observation['planner_ready']}"
+                if "planner_ready" in observation else "")]
+    if observation.get("automation_counts"):
+        lines.append("  automation: " + ", ".join(
+            f"{k}={v}" for k, v in observation["automation_counts"].items() if v))
     if observation.get("captcha_present"):
         lines.append(f"  CAPTCHA present · handling={observation['captcha_handling']}"
                      f" · scope={observation['automation_scope']}"
@@ -688,8 +780,9 @@ def summarise(observation: dict[str, Any]) -> str:
         meaning = field["canonical_id"] or "-"
         required = "required" if field["required"] else "optional"
         auto = field["automation"] if field["automation"] != "fillable" else ""
-        lines.append(f"  {field['control']:9} {required:8} {meaning:26} {auto:28}"
-                     f" {field['match_question'][:50]}")
+        hidden = "hidden" if field.get("visibility") == "hidden" else ""
+        lines.append(f"  {field['control']:9} {required:8} {hidden:6} {meaning:26}"
+                     f" {auto:28} {field['match_question'][:46]}")
     return "\n".join(lines)
 
 
