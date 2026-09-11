@@ -90,6 +90,7 @@ def state(connection: sqlite3.Connection, private_root: Path) -> dict[str, Any]:
             # A worksheet whose proposal is spent, or one from an older profile. Neither is an
             # error to show: the wizard offers a fresh round and this one is replaced.
             open_round = None
+    round_complete = candidate_profile.CORPUS_REQUIRED <= set(report.get("resolvable", []))
     return {
         "has_profile": report["active_snapshot"] is not None,
         "round": ROUND,
@@ -100,6 +101,11 @@ def state(connection: sqlite3.Connection, private_root: Path) -> dict[str, Any]:
                                               if f in candidate_profile.PROFILE_ROUNDS[ROUND]]}
                     for name, fields in candidate_profile.PROFILE_SCREENS],
         "fields_in_round": sorted(candidate_profile.PROFILE_ROUNDS[ROUND]),
+        # Optional and user-demand fields belong to the onboarding screen, but leaving one
+        # blank must not reopen the whole immutable-snapshot round after its measured floor
+        # has been registered. Reopening would ask the intake writer to add facts that the
+        # active snapshot already owns.
+        "round_complete": round_complete,
         "resolvable": report.get("resolvable", []),
         "unresolved": report.get("unresolved", {}),
         "open_round": open_round,
@@ -390,6 +396,9 @@ def start_round(connection: sqlite3.Connection, private_root: Path) -> dict[str,
     second would quietly be the one confirmed. Reopening the app is not a decision to start
     over.
     """
+    report = candidate_profile.status(connection)
+    if candidate_profile.CORPUS_REQUIRED <= set(report.get("resolvable", [])):
+        raise AppError("round_already_complete", 409)
     path = _worksheet_path(private_root)
     try:
         return {"fields": _fields(_read_worksheet(connection, private_root)), "resumed": True,

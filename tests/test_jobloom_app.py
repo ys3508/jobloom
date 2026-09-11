@@ -219,8 +219,32 @@ class AppTests(AppFixture):
         self.assertEqual(sorted(f for g in state["screens"] for f in g["fields"]),
                          sorted(NINE))
         self.assertEqual(state["resolvable"], [])
+        self.assertFalse(state["round_complete"])
         self.assertEqual(state["unresolved"]["contact.email"], "profile_fact_missing")
         self.assertIsNone(state["open_round"])
+
+    def test_registered_required_floor_does_not_reopen_round_for_optional_blanks(self):
+        """Missing optional profile fields cannot send a registered user through intake again."""
+        worksheet = self.call("/api/round", {})
+        answers = {}
+        for field in worksheet["fields"]:
+            canonical_id = field["canonical_id"]
+            required = canonical_id in PROFILE.CORPUS_REQUIRED
+            answers[canonical_id] = {
+                "value": TYPED.get(canonical_id, field.get("value") or ""),
+                "confirmed": required,
+                "autofill": required,
+            }
+        self.call("/api/answers", {"answers": answers})
+        draft = self.call("/api/draft", {})
+        self.call("/api/register", {"draft_sha256": draft["draft_sha256"]})
+
+        current = self.call("/api/state")
+        self.assertTrue(current["round_complete"])
+        self.assertTrue(PROFILE.CORPUS_REQUIRED <= set(current["resolvable"]))
+        self.assertTrue(set(PROFILE.PROFILE_ROUNDS[ROUND]) - set(current["resolvable"]))
+        status, payload = self.refused("/api/round", {})
+        self.assertEqual((status, payload["error"]), (409, "round_already_complete"))
 
     def test_a_round_is_opened_once_and_then_resumed(self):
         """Reopening the window is not a decision to start over."""

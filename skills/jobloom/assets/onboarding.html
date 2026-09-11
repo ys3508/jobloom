@@ -926,8 +926,7 @@ document.getElementById("lang").addEventListener("change", (event) => {
     // be outstanding and it is not conditional on the round being finished.
     app.stranded = app.state.has_profile
       ? (await api("/api/resume-migrations")).stranded : [];
-    const round = app.state.fields_in_round.every((id) => app.state.resolvable.includes(id))
-      ? null : await api("/api/round", {});
+    const round = app.state.round_complete ? null : await api("/api/round", {});
     if (round === null) {
       // The round is answered and registered. Coming back is for what is left over.
       app.fields = [];
