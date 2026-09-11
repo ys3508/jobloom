@@ -49,8 +49,99 @@ an open migration — it is not a way to read the resume store.
   `~/Library/Application Support/Jobloom/` (macOS) or the platform equivalent, and moving the
   existing data there is a migration a user performs, not something an app does to them on
   first launch.
-- **Everything past onboarding.** Resume import, the job queue, the tracker, answers, and the
-  pre-submission review are still commands or still the browser panel.
+- **Most of what follows onboarding.** Resume import, the tracker, and the pre-submission
+  review are still commands or still the browser panel. The exception is the read-only
+  application-assist slice below.
+
+## The application-assist slice
+
+The second vertical: the applications already decided on, what `evaluate_job` knows would stop
+one, and — from the form's own questions, pasted in — who may answer each of them.
+
+**Which profile answers.** The one active, user-registered CandidateSnapshot, read from the
+`snapshot_path` on its own row and re-verified before use: the file still hashing to
+`file_sha256`, and the document still hashing to `content_sha256`. Not
+`<private_root>/candidate.json` — that file is whatever was last written beside the database
+and after a registration it can be a superseded profile, which is what it was here when the
+first version of this slice read it. Profile meanings then resolve against the snapshot this
+application's *material lock* is bound to, through the join `archive_core` already uses, so a
+stale lock is visible as a reason instead of silently resolving against whatever is active.
+
+**It writes nothing, and that is tested rather than asserted.** `answer_library.inspect_answer`
+is the read-only sibling of `match_answer`: the same decision from the same extracted core,
+with no audit event and no commit. The audited path is unchanged and still runs where a value
+actually reaches a form. `tests/test_jobloom_app.py` classifies a page containing a real
+answer hit and compares every table's row count, `total_changes`, and the database file's bytes
+before and after.
+
+**Six lanes, because three of them used to be one.** A locked profile field, an answer with a
+live standing authorization, and an answer with none are different situations for the person
+reading the screen; calling all three "confirmed already" told someone a form was handled when
+what it meant was that a value existed somewhere. An answer waiting on an authorization is a
+blocking lane.
+
+  profile_ready · answer_ready · answer_needs_authorization · you_answer · manual_only ·
+  narrative_gap
+
+**Order of authority.** `field_policy` first and final — a legal, immigration, compensation,
+EEO, conflict or referral question is `manual_only` however it is worded. Then the reviewed
+meaning of the exact question, from `answer_library.canonical_meaning`: exact on the normalised
+text and nothing else, because a resemblance score deciding that a question means
+`work_authorized_now` is a machine concluding what an immigration field asks. The meaning is
+then shown to `field_policy` too, so a form whose label trips nothing — "Which of these
+describes you" — cannot carry `eeo.race` past the gate. Only an unmapped question reaches the
+StoryBank hint.
+
+**What the narrative hint offers.** An ordering of the user's own confirmed facts by shared
+content words, the words that put each one there, and how many facts were looked at. It is
+material to write from and claims nothing about sufficiency. It is deliberately not
+`evidence_matcher.related_facts`, which requires every token of its input to appear in the fact
+— correct for the requirement "SQL", impossible for a question containing the word "please",
+and in the first version it returned an empty column that read as "you have no relevant
+experience".
+
+**The page may not name anything.** It sends questions and an application id. A candidate path,
+a snapshot hash, a fact id, an answer id or an authorization decision arriving in a payload are
+ignored, and every response is built from an explicit allowlist rather than from a database row.
+Refusals are bare codes: a message could carry a path or a value.
+
+**Input is paste only.** A screenshot would need local OCR, and an OCR slip would feed a wrong
+question into a classification whose every reason code the user is meant to act on. Reading a
+live Workday page belongs to the fill-only worker ADR, not here.
+
+Endpoints: `GET /apply`, `GET /api/apply/queue`, `POST /api/apply/readiness`,
+`POST /api/apply/split`, `POST /api/apply/classify`. The page is `assets/apply.html`, under the
+same policy as the onboarding window: no storage, no external resource, the session token in
+the header of every call.
+
+**Not there yet.** Nothing records that an application was submitted, and no outcome is
+written back — steps a person still does by hand. The window is a preflight and stops at the
+checklist.
+
+## The sponsorship triage page
+
+`GET /triage`, served from `assets/triage.html`, over `GET /api/sponsorship/queue` and
+`POST /api/sponsorship/posting`. Both read a built queue file and a pull directory; neither
+opens the database.
+
+**Why it exists.** Over the 2026-09-10 queue, all 112 openings carry `sponsorship: unknown`,
+and the candidate's `sponsorship_future` is true, so `evaluate_job` sends every one of them to
+`sponsorship_requires_review`. For 28 of them the posting said something and nobody has read
+it. Those 28 are the page.
+
+**It chooses nothing.** No keyword scan, no suggested verdict, no pre-selected control. The
+extractor stopped short of a verdict on purpose and this page does not finish the job on its
+behalf: it shows the employer's sentence with enough of the posting either side to place it,
+the structured status as it stands, a way into the full description, and three choices.
+
+The three controls are inert in this version. Annotation and persistence are the next one, and
+a control that looked like it saved would cost someone an afternoon of triage. What the writing
+version must carry is already in the payload: `job_card_sha256` and a `statement_sha256` per
+sentence, so a verdict binds to the card and the wording it was read from and does not survive
+either being edited — the rule `direction_core` already applies to a routing record.
+
+`unclear` is not a weaker `supports`; only `does_not_support` reaches `evaluate_job`'s hard
+filter; and `supports` is evidence about one posting, never about the employer.
 
 ## Boundaries
 

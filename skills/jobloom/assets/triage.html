@@ -1,0 +1,247 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Jobloom — sponsorship 分诊</title>
+<!--
+  The sponsorship triage window. Every opening in the current queue carries `sponsorship:
+  unknown`, and for these the posting itself said something that nobody has read. This page
+  shows the employer's own sentence and three choices.
+
+  It chooses nothing. There is no keyword scan here and no pre-selected button: a page that
+  suggested a verdict would be the pattern-allowed-to-conclude defect the extractor exists to
+  avoid, one layer up. The three controls are rendered inert in this version, because the
+  annotation and its persistence are the next version and a button that looked like it saved
+  would lose someone's afternoon.
+
+  Nothing here writes. Both endpoints behind it read a built queue file and a pull directory,
+  and neither touches the database.
+-->
+<style>
+  :root {
+    --ink: #1a1c1f; --muted: #6b7280; --line: #e3e6ea; --bg: #f6f7f9;
+    --card: #ffffff; --accent: #1f6feb; --accent-ink: #ffffff;
+    --warn: #8a5a00; --warn-bg: #fff8e6; --good: #146c2e; --stop: #9b2d2d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e9ecef; --muted: #9aa4b2; --line: #2b3038; --bg: #14161a;
+      --card: #1c1f24; --accent: #4c8dff; --accent-ink: #0b0d10;
+      --warn: #f0c674; --warn-bg: #2a2418; --good: #6fcf8a; --stop: #f08a8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 800px; margin: 0 auto; padding: 28px 24px 80px; }
+  header.bar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; }
+  header.bar h1 { font-size: 17px; margin: 0; }
+  header.bar .spacer { flex: 1; }
+  select, button { font: inherit; }
+  select { color: inherit; background: transparent; border: 1px solid var(--line);
+           border-radius: 6px; padding: 3px 6px; }
+  .banner { background: var(--warn-bg); border: 1px solid var(--line);
+            border-left: 3px solid var(--warn); border-radius: 8px; padding: 12px 14px;
+            margin-bottom: 18px; font-size: 13.5px; }
+  .summary { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
+  .summary b { color: var(--ink); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 18px 20px; margin-bottom: 14px; }
+  .who { font-weight: 600; font-size: 16px; }
+  .where { color: var(--muted); font-size: 13.5px; margin-bottom: 4px; }
+  .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px; color: var(--muted); }
+  blockquote { margin: 12px 0; padding: 10px 14px; border-left: 3px solid var(--line);
+               background: var(--bg); border-radius: 0 8px 8px 0; }
+  blockquote .said { font-size: 14.5px; }
+  blockquote .ctx { color: var(--muted); font-size: 13px; }
+  .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;
+             padding-top: 14px; border-top: 1px solid var(--line); align-items: center; }
+  .choices button {
+    border-radius: 8px; padding: 7px 14px; border: 1px solid var(--line);
+    background: transparent; color: var(--muted); cursor: not-allowed;
+  }
+  .choices .soon { font-size: 12.5px; color: var(--muted); margin-left: auto; }
+  button.link { border: 0; background: transparent; color: var(--accent); cursor: pointer;
+                padding: 0; font-size: 13.5px; text-decoration: underline; }
+  pre.posting { white-space: pre-wrap; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo,
+                Consolas, monospace; background: var(--bg); border: 1px solid var(--line);
+                border-radius: 8px; padding: 14px; max-height: 420px; overflow: auto;
+                margin-top: 12px; }
+  .err { color: var(--stop); }
+</style>
+
+<main>
+  <header class="bar">
+    <h1>Jobloom</h1>
+    <span class="spacer"></span>
+    <select id="lang" aria-label="Language">
+      <option value="zh">中文</option>
+      <option value="en">English</option>
+    </select>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script>
+"use strict";
+
+const urlToken = new URLSearchParams(location.search).get("token") || "";
+const remembered = (() => {
+  try { return sessionStorage.getItem("jobloom-token") || ""; } catch (error) { return ""; }
+})();
+if (urlToken) {
+  try { sessionStorage.setItem("jobloom-token", urlToken); } catch (error) {}
+}
+const TOKEN = urlToken || remembered;
+history.replaceState(null, "", location.pathname);
+
+const COPY = {
+  zh: {
+    title: "sponsorship 人工分诊",
+    banner: "这一版只读。三个选择按钮是给你看形状的，点不动，也不会保存任何判定——标注和持久化是下一版。先告诉我这张卡上的信息够不够你判断。",
+    summary: "队列 <b>%q</b> 个岗位，全部是 <b>sponsorship: unknown</b>。其中 <b>%n</b> 个岗位的招聘正文自己说了话——下面是这 %n 个。",
+    queueFile: "队列文件",
+    said: "雇主原话",
+    current: "当前结构化状态",
+    supports: "supports",
+    does_not_support: "does_not_support",
+    unclear: "unclear",
+    soon: "下一版才可点",
+    viewPosting: "查看原招聘正文",
+    hidePosting: "收起正文",
+    empty: "当前队列里没有需要分诊的岗位。",
+    loading: "读取中…",
+    rules: "判定规则：unclear 继续算未决，不默认为支持；只有 does_not_support 进入硬淘汰；supports 只是这一个岗位的证据，不推广到这家公司的其他岗位。判定会绑定卡片 hash，卡片内容一变，旧判定自动失效。",
+  },
+  en: {
+    title: "Sponsorship triage",
+    banner: "This version is read-only. The three buttons are here so you can judge the shape — they do not click and nothing is saved. Annotation and persistence are the next version. Tell me whether this card carries enough to decide on.",
+    summary: "<b>%q</b> openings in the queue, every one of them <b>sponsorship: unknown</b>. For <b>%n</b> of them the posting itself said something — those %n are below.",
+    queueFile: "Queue file",
+    said: "What the employer wrote",
+    current: "Structured status today",
+    supports: "supports",
+    does_not_support: "does_not_support",
+    unclear: "unclear",
+    soon: "next version",
+    viewPosting: "Read the full posting",
+    hidePosting: "Hide the posting",
+    empty: "Nothing in the current queue needs triage.",
+    loading: "Loading…",
+    rules: "How a verdict behaves: unclear stays unresolved and never defaults to supported; only does_not_support reaches the hard filter; supports is evidence about this one posting, never about the employer. A verdict binds to the card's hash, so an edited card drops it.",
+  },
+};
+
+let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
+const t = (key) => COPY[lang][key] || key;
+const view = document.getElementById("view");
+const state = { report: null, error: "", open: {} };
+
+document.getElementById("lang").value = lang;
+document.getElementById("lang").addEventListener("change", (event) => {
+  lang = event.target.value;
+  render();
+});
+
+async function api(path, body) {
+  const options = { headers: { "X-Jobloom-Token": TOKEN } };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const payload = await response.json().catch(() => ({ error: "unreadable" }));
+  if (!response.ok) throw new Error(payload.detail || payload.error || "failed");
+  return payload;
+}
+
+const esc = (value) => String(value === null || value === undefined ? "" : value)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function statementBlock(statement) {
+  return `<blockquote>
+    ${statement.before ? `<div class="ctx">${esc(statement.before)}</div>` : ""}
+    <div class="said">${esc(statement.text)}</div>
+    ${statement.after ? `<div class="ctx">${esc(statement.after)}</div>` : ""}
+  </blockquote>`;
+}
+
+function cardBlock(item, index) {
+  const posting = state.open[item.job_id];
+  return `<div class="card">
+    <div class="who">${esc(item.title)}</div>
+    <div class="where">${esc(item.employer)} · ${esc(item.location || "")}</div>
+    <div class="status">${t("current")}: sponsorship = ${esc(item.sponsorship)}
+      · card ${esc((item.job_card_sha256 || "").slice(0, 12))}</div>
+    ${item.statements.map(statementBlock).join("")}
+    <button class="link" data-posting="${index}">${
+      posting ? t("hidePosting") : t("viewPosting")}</button>
+    ${posting ? `<pre class="posting">${esc(posting)}</pre>` : ""}
+    <div class="choices">
+      ${item.verdicts.map((verdict) =>
+        `<button disabled>${t(verdict)}</button>`).join("")}
+      <span class="soon">${t("soon")}</span>
+    </div>
+  </div>`;
+}
+
+function render() {
+  // Opening a posting re-renders the whole list, and on 28 cards that threw the reader back
+  // to the top of the page every time they expanded one. The position is restored after the
+  // new list is laid out, not before, or the page has not yet grown back to its height.
+  const restore = window.scrollY;
+  renderInto();
+  requestAnimationFrame(() => window.scrollTo(0, restore));
+}
+
+function renderInto() {
+  if (state.error) {
+    view.innerHTML = `<div class="card"><p class="err">${esc(state.error)}</p></div>`;
+    return;
+  }
+  const report = state.report;
+  if (!report) {
+    view.innerHTML = `<div class="card"><p>${t("loading")}</p></div>`;
+    return;
+  }
+  const summary = t("summary")
+    .replace(/%q/g, String(report.queued))
+    .replace(/%n/g, String(report.needing_triage));
+  view.innerHTML = `
+    <h2 style="margin:0 0 10px">${t("title")}</h2>
+    <div class="banner">${t("banner")}</div>
+    <div class="summary">${summary}<br>
+      ${t("queueFile")}: <code>${esc(report.queue_file)}</code></div>
+    <div class="summary">${t("rules")}</div>
+    ${report.items.length
+      ? report.items.map(cardBlock).join("")
+      : `<div class="card">${t("empty")}</div>`}`;
+  view.querySelectorAll("[data-posting]").forEach((node) => {
+    node.onclick = () => togglePosting(report.items[Number(node.dataset.posting)]);
+  });
+}
+
+async function togglePosting(item) {
+  if (state.open[item.job_id]) {
+    delete state.open[item.job_id];
+    render();
+    return;
+  }
+  try {
+    const payload = await api("/api/sponsorship/posting", { job_id: item.job_id });
+    state.open[item.job_id] = payload.description || "";
+  } catch (failure) { state.error = failure.message; }
+  render();
+}
+
+(async () => {
+  render();
+  try {
+    state.report = await api("/api/sponsorship/queue");
+  } catch (failure) { state.error = failure.message; }
+  render();
+})();
+</script>

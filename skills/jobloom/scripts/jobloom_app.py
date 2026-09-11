@@ -49,9 +49,12 @@ from urllib.parse import parse_qs, urlsplit
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+import apply_assist  # noqa: E402
+import candidate_core  # noqa: E402
 import candidate_profile  # noqa: E402
 import resume_core  # noqa: E402
 import resume_migration  # noqa: E402
+import sponsorship_triage  # noqa: E402
 from _common import require_table  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
@@ -98,6 +101,134 @@ def state(connection: sqlite3.Connection, private_root: Path) -> dict[str, Any]:
         "resolvable": report.get("resolvable", []),
         "unresolved": report.get("unresolved", {}),
         "open_round": open_round,
+    }
+
+
+# ---- the application-assist slice ----------------------------------------------
+#
+# The second vertical through this service, and it holds the same line the first one does:
+# the page asks and renders, and every verdict it shows was returned by the module that owns
+# it. `apply_assist` orders `field_policy`, `answer_library` and `evaluate_job`; nothing here
+# writes, so a person can open a form, find out where it is stuck, and close the window
+# having changed nothing.
+
+
+def _active_candidate(connection: sqlite3.Connection) -> tuple[dict[str, Any], str]:
+    """The one active, user-registered CandidateSnapshot, re-verified before it is read.
+
+    Not `<private_root>/candidate.json`. That file is whatever was last written beside the
+    database, and after a profile is registered it can be a superseded snapshot — it was one
+    here, and the first version of this slice answered forms from it. The row is the record of
+    which profile is in force, and `snapshot_path` on that row is the only path this reads: a
+    caller-supplied path would let the page choose which profile answered an employer.
+
+    Three checks before the document is trusted, reusing the functions the fill path already
+    runs rather than restating their rules: exactly one active row, the file still hashing to
+    `file_sha256`, and the document's own deterministic content hash still equal to
+    `content_sha256`. Every refusal is a bare code — a message here could carry a path.
+    """
+    require_table(connection, "candidate_snapshots")
+    rows = connection.execute(
+        "SELECT * FROM candidate_snapshots WHERE status='active' AND registered_by='user'"
+    ).fetchall()
+    if not rows:
+        raise AppError("no_active_candidate_snapshot", 409)
+    if len(rows) > 1:
+        # The schema has a partial unique index for this, so reaching it means the database was
+        # edited around the engine. Refusing is the only safe reading: picking one would answer
+        # an employer's form from a profile nobody arbitrated.
+        raise AppError("multiple_active_candidate_snapshots", 409)
+    row = rows[0]
+    try:
+        candidate_core.verify_snapshot_file(row)
+    except (OSError, ValueError):
+        raise AppError("candidate_snapshot_file_mismatch", 409) from None
+    try:
+        candidate, content_hash = resume_core.load_valid_candidate(Path(row["snapshot_path"]))
+    except (OSError, ValueError):
+        raise AppError("candidate_snapshot_unreadable", 409) from None
+    if content_hash != row["content_sha256"]:
+        raise AppError("candidate_snapshot_content_mismatch", 409)
+    return candidate, row["content_sha256"]
+
+
+def apply_queue(connection: sqlite3.Connection) -> dict[str, Any]:
+    return {"applications": apply_assist.queue(connection)}
+
+
+# What may leave the service for each screen. Written as allowlists rather than by handing back
+# whatever a row happens to hold: `applications` and `jobs` gain columns, and a page that
+# serialised the row would start publishing them without anybody deciding to.
+READINESS_APPLICATION_FIELDS = ("application_id", "job_id", "state", "category",
+                               "resume_version_id", "submission_policy",
+                               "employer", "title", "location", "canonical_url")
+EVALUATION_FIELDS = ("eligibility", "match", "action", "reasons", "hard_filter_failures",
+                     "uncertainties", "main_gap", "user_decision_required", "unavailable")
+CLASSIFIED_FIELDS = ("question", "lane", "reason", "source", "canonical_id", "domain",
+                     "family", "narrative_hint", "answer_exists", "auto_fill_ready",
+                     "auto_submit_ready", "authorization_reason", "related_fact_ids",
+                     "related_overlap", "facts_considered")
+
+
+def apply_readiness(connection: sqlite3.Connection,
+                    payload: dict[str, Any]) -> dict[str, Any]:
+    application_id = payload.get("application_id")
+    if not isinstance(application_id, str) or not application_id:
+        raise AppError("bad_application_id")
+    candidate, _ = _active_candidate(connection)
+    try:
+        report = apply_assist.readiness(connection, application_id, candidate)
+    except ValueError:
+        raise AppError("no_such_application", 404) from None
+    evaluation = report["evaluation"]
+    return {
+        "application": {key: report["application"].get(key)
+                        for key in READINESS_APPLICATION_FIELDS},
+        "sponsorship_statements": report["sponsorship_statements"],
+        "evaluation": {key: evaluation[key] for key in EVALUATION_FIELDS if key in evaluation},
+    }
+
+
+def apply_split(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"segments": apply_assist.split_questions(payload.get("text") or "")}
+
+
+def apply_classify(connection: sqlite3.Connection,
+                   payload: dict[str, Any]) -> dict[str, Any]:
+    """Sort a page of questions. Reads the active profile; writes nothing at all.
+
+    The payload carries questions and an application id, and nothing else is read from it. A
+    candidate path, a snapshot hash, a fact id, an answer id or an authorization decision
+    arriving from the page would each be the page choosing what answers an employer, so all of
+    them are resolved here from rows the service verified itself.
+    """
+    application_id = payload.get("application_id")
+    questions = payload.get("questions")
+    if not isinstance(application_id, str) or not application_id:
+        raise AppError("bad_application_id")
+    if not isinstance(questions, list) or not all(isinstance(q, str) for q in questions):
+        raise AppError("bad_questions")
+    candidate, active_sha256 = _active_candidate(connection)
+    locked_sha256, lock_reason = apply_assist.application_snapshot(connection, application_id)
+    context = {"application_id": application_id,
+               "country": candidate.get("work_authorization", {}).get("country")}
+    result = apply_assist.classify(
+        connection, questions, snapshot_sha256=locked_sha256, context=context,
+        facts=apply_assist.snapshot_facts(connection, active_sha256))
+    fact_values = {}
+    wanted = {fid for item in result["questions"] for fid in item["related_fact_ids"]}
+    for fact in apply_assist.snapshot_facts(connection, active_sha256):
+        if fact["id"] in wanted:
+            fact_values[fact["id"]] = fact["value"]
+    return {
+        "questions": [{key: item.get(key) for key in CLASSIFIED_FIELDS}
+                      for item in result["questions"]],
+        "counts": result["counts"],
+        "blocking": result["blocking"],
+        "fact_values": fact_values,
+        "materials_locked": locked_sha256 is not None,
+        "materials_reason": lock_reason,
+        "writes": False,
     }
 
 
@@ -311,8 +442,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_page(self) -> None:
-        body = (ASSETS / "onboarding.html").read_bytes()
+    def _send_page(self, asset: str = "onboarding.html") -> None:
+        body = (ASSETS / asset).read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -383,11 +514,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_page()
             return
+        if path == "/apply":
+            self._send_page("apply.html")
+            return
+        if path == "/triage":
+            self._send_page("triage.html")
+            return
         if not self._authorised():
             self._send(403, {"error": "bad_token"})
             return
         if path == "/api/state":
             self._run(lambda connection: state(connection, self.private_root))
+        elif path == "/api/apply/queue":
+            self._run(apply_queue)
+        elif path == "/api/sponsorship/queue":
+            self._run(lambda _: sponsorship_queue(self.private_root), needs_db=False)
         elif path == "/api/resume-migrations":
             self._run(migrations)
         elif path == "/api/resume-file":
@@ -422,6 +563,14 @@ class Handler(BaseHTTPRequestHandler):
                                                            payload))
         elif path == "/api/resume-migrations/approve":
             self._run(lambda connection: approve_migration(connection, payload))
+        elif path == "/api/apply/readiness":
+            self._run(lambda connection: apply_readiness(connection, payload))
+        elif path == "/api/sponsorship/posting":
+            self._run(lambda _: sponsorship_posting(self.private_root, payload), needs_db=False)
+        elif path == "/api/apply/split":
+            self._run(lambda _: apply_split(payload), needs_db=False)
+        elif path == "/api/apply/classify":
+            self._run(lambda connection: apply_classify(connection, payload))
         elif path == "/api/resume-migrations/bind":
             self._run(lambda connection: bind_migration(connection, payload))
         else:
@@ -496,7 +645,9 @@ def serve(db_path: Path, private_root: Path, store: Path, port: int = 0,
         print(f"Jobloom is open in a {where}. Leave this running while you use it.")
         print("Nothing here reaches the network; the page talks only to this process.")
     else:
-        print(url)
+        # Flushed, because this line is the whole point of `--no-browser`: the process then
+        # blocks serving, and a buffered URL does not appear until it is killed.
+        print(url, flush=True)
     return server
 
 

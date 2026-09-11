@@ -1,0 +1,416 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Jobloom — 申请辅助</title>
+<!--
+  The application-assist window. Like the onboarding page beside it, this one renders what the
+  local service gives it and decides nothing: which lane a question lands in comes from
+  `apply_assist`, which asks `field_policy`, `answer_library` and `evaluate_job` in that order.
+  A page that could be edited into moving a question out of `manual_only` would be a page
+  holding the gate.
+
+  Nothing here writes. The window can be opened on a form, read, and closed, and the database
+  is exactly as it was. Values live here only while the window is open; nothing is stored in
+  the browser, nothing is sent anywhere but the loopback service that opened this page, and the
+  page loads no font, script or image from outside itself.
+-->
+<style>
+  :root {
+    --ink: #1a1c1f; --muted: #6b7280; --line: #e3e6ea; --bg: #f6f7f9;
+    --card: #ffffff; --accent: #1f6feb; --accent-ink: #ffffff;
+    --warn: #8a5a00; --warn-bg: #fff8e6; --good: #146c2e;
+    --stop: #9b2d2d; --stop-bg: #fdf1f1; --story: #5b3fa8; --story-bg: #f4f1fc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e9ecef; --muted: #9aa4b2; --line: #2b3038; --bg: #14161a;
+      --card: #1c1f24; --accent: #4c8dff; --accent-ink: #0b0d10;
+      --warn: #f0c674; --warn-bg: #2a2418; --good: #6fcf8a;
+      --stop: #f08a8a; --stop-bg: #2a1a1a; --story: #b9a6f0; --story-bg: #221d2e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 24px 80px; }
+  header.bar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
+  header.bar h1 { font-size: 17px; margin: 0; letter-spacing: .01em; }
+  header.bar .spacer { flex: 1; }
+  select, button { font: inherit; }
+  select { color: inherit; background: transparent; border: 1px solid var(--line);
+           border-radius: 6px; padding: 3px 6px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 24px; margin-bottom: 16px; }
+  h2 { font-size: 21px; margin: 0 0 6px; }
+  h3 { font-size: 15px; margin: 22px 0 8px; }
+  p { margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: 13.5px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  button {
+    color: var(--accent-ink); background: var(--accent); border: 0; border-radius: 8px;
+    padding: 10px 16px; cursor: pointer;
+  }
+  button.quiet { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  textarea {
+    width: 100%; min-height: 190px; font: inherit; color: inherit; padding: 12px;
+    border-radius: 8px; border: 1px solid var(--line); background: var(--bg); resize: vertical;
+  }
+  ul.rows { list-style: none; margin: 0; padding: 0; }
+  ul.rows li { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+               margin-bottom: 8px; background: var(--card); }
+  ul.rows li.click { cursor: pointer; }
+  ul.rows li.click:hover { border-color: var(--accent); }
+  .title { font-weight: 600; }
+  .lane { display: inline-block; font-size: 12px; font-weight: 600; border-radius: 999px;
+          padding: 2px 9px; margin-right: 8px; white-space: nowrap; }
+  .lane.profile_ready { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+  .lane.answer_ready { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+  .lane.answer_needs_authorization { color: var(--warn); background: var(--warn-bg); }
+  .lane.you_answer { color: var(--warn); background: var(--warn-bg); }
+  .lane.manual_only { color: var(--stop); background: var(--stop-bg); }
+  .lane.narrative_gap { color: var(--story); background: var(--story-bg); }
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 18px; }
+  .note { border-left: 3px solid var(--line); padding-left: 12px; margin: 14px 0;
+          color: var(--muted); font-size: 13.5px; }
+  .stop { border-left-color: var(--stop); color: var(--ink); }
+  .seg { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0;
+         border-bottom: 1px solid var(--line); }
+  .seg:last-child { border-bottom: 0; }
+  .seg input { margin-top: 5px; }
+  .seg.skip .segtext { color: var(--muted); text-decoration: line-through; }
+  .err { color: var(--stop); font-size: 13.5px; }
+  .facts { margin: 8px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
+</style>
+
+<main>
+  <header class="bar">
+    <h1>Jobloom</h1>
+    <span class="muted" id="crumb"></span>
+    <span class="spacer"></span>
+    <select id="lang" aria-label="Language">
+      <option value="zh">中文</option>
+      <option value="en">English</option>
+    </select>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script>
+"use strict";
+
+// Identical to the onboarding page, and deliberately duplicated rather than shared: the two
+// pages are served as whole documents by the same process, and a shared script file would be
+// a second thing to fetch under a policy whose whole point is that this page fetches nothing.
+const urlToken = new URLSearchParams(location.search).get("token") || "";
+const remembered = (() => {
+  try { return sessionStorage.getItem("jobloom-token") || ""; } catch (error) { return ""; }
+})();
+if (urlToken) {
+  try { sessionStorage.setItem("jobloom-token", urlToken); } catch (error) {}
+}
+const TOKEN = urlToken || remembered;
+history.replaceState(null, "", location.pathname);
+
+const COPY = {
+  zh: {
+    queueTitle: "待申请岗位",
+    queueEmpty: "还没有申请。先用队列决定投哪些岗位，再回到这里。",
+    open: "打开",
+    readyTitle: "准备状态",
+    knockoutNone: "没有硬性淘汰项。",
+    knockoutSome: "以下条件会直接淘汰这份申请：",
+    uncertainSome: "以下需要你判断，Jobloom 不替你决定：",
+    resumeBound: "已绑定简历",
+    sponsorSaid: "招聘正文里关于 sponsorship 的原话",
+    toAssist: "进入申请辅助",
+    pasteTitle: "把表单问题粘贴进来",
+    pasteHelp: "从 Workday 页面把问题文字复制过来，一行一题。不用整理格式。",
+    pasteAction: "切分",
+    splitTitle: "确认切分",
+    splitHelp: "勾选的才会被分类。划掉的是 Jobloom 判断不是问题的行——如果判错了，勾回来。",
+    classifyAction: "分类",
+    resultTitle: "每道题归谁回答",
+    profile_ready: "档案已锁定",
+    answer_ready: "已确认且已授权",
+    answer_needs_authorization: "已有答案，缺授权",
+    you_answer: "你来回答",
+    manual_only: "禁止代答",
+    narrative_gap: "需要 StoryBank",
+    profileNote: "这些来自你已注册档案里的 locked CandidateFact，Jobloom 可以填。值不在这个页面上——预检只说明它答得上，真正取值是填写路径的事。",
+    answerReadyNote: "AnswerLibrary 里有你确认过的答案，且当前有一份有效的 standing authorization 覆盖这个申请。",
+    answerAuthNote: "答案存在，但现在没有任何有效授权能填它。这不是缺答案，是缺授权——去授权之后它才会变成可填。",
+    notLocked: "这个申请的材料没有锁定到当前生效的档案，所以档案类问题无法解析。原因：",
+    manualNote: "这些属于法律身份、薪酬、平权或利益冲突，Jobloom 永远不代答，也不生成草稿。由你在表单里亲自填。",
+    storyNote: "StoryBank 目前是空的（0 个已批准的 story）。下面列出的是可能用得上的已确认事实——它们是素材，不是答案，句子由你写。",
+    noFacts: "在 %c 条已确认事实里没有词面相关的。这是一个真实缺口，不是错误。",
+    overlapNote: "按共同词排序，不是判断它答得了这个问题。看过 %c 条已确认事实。",
+    checklistTitle: "最后检查",
+    checklistBody: "回到 Workday 手动填写并提交。Jobloom 不自动填、不自动提交。",
+    blocking: "还有 %n 项需要你处理",
+    nothingWritten: "这个窗口没有写入任何东西。关掉它，数据库和打开前一样。",
+    back: "返回",
+    loading: "读取中…",
+  },
+  en: {
+    queueTitle: "Applications",
+    queueEmpty: "No applications yet. Decide what to apply to in the queue, then come back.",
+    open: "Open",
+    readyTitle: "Readiness",
+    knockoutNone: "Nothing knocks this application out.",
+    knockoutSome: "These would knock this application out:",
+    uncertainSome: "These need your judgement. Jobloom does not decide them for you:",
+    resumeBound: "Resume bound",
+    sponsorSaid: "What the posting itself says about sponsorship",
+    toAssist: "Open the form assistant",
+    pasteTitle: "Paste the form's questions",
+    pasteHelp: "Copy the question text from the Workday page, one per line. No tidying needed.",
+    pasteAction: "Split",
+    splitTitle: "Confirm the split",
+    splitHelp: "Only ticked lines are classified. Struck-through lines are ones Jobloom read as not a question — tick them back if it got that wrong.",
+    classifyAction: "Classify",
+    resultTitle: "Who may answer each question",
+    profile_ready: "Locked in your profile",
+    answer_ready: "Confirmed and authorised",
+    answer_needs_authorization: "Answered, not authorised",
+    you_answer: "You answer",
+    manual_only: "Never answered for you",
+    narrative_gap: "Needs the StoryBank",
+    profileNote: "These come from locked CandidateFacts in your registered profile, and Jobloom may fill them. The values are not on this page: a preflight says the question is answerable, and resolving a value is the fill path's job.",
+    answerReadyNote: "You have confirmed an answer in the AnswerLibrary, and a live standing authorization is in scope for this application.",
+    answerAuthNote: "The answer exists, but nothing currently authorises filling it. That is a missing authorization, not a missing answer — grant one and it becomes fillable.",
+    notLocked: "This application's materials are not locked to the profile that is currently in force, so profile questions cannot resolve. Reason: ",
+    manualNote: "These are legal status, compensation, EEO or conflict-of-interest questions. Jobloom never answers them and never drafts them. You type these yourself.",
+    storyNote: "The StoryBank is empty (no approved stories). Below are confirmed facts that may be relevant — material, not an answer. You write the sentence.",
+    noFacts: "Nothing among your %c confirmed facts shares wording with this. That is a real gap, not an error.",
+    overlapNote: "Ordered by shared words, which is not a judgement that any of them answers the question. %c confirmed facts were looked at.",
+    checklistTitle: "Final check",
+    checklistBody: "Go back to Workday, fill it in and submit by hand. Jobloom does not fill and does not submit.",
+    blocking: "%n still need you",
+    nothingWritten: "This window wrote nothing. Close it and the database is as it was.",
+    back: "Back",
+    loading: "Loading…",
+  },
+};
+
+let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
+const t = (key, n, c) => (COPY[lang][key] || key)
+  .replace("%n", n).replace(/%c/g, c === undefined ? "" : c);
+const view = document.getElementById("view");
+const crumb = document.getElementById("crumb");
+const app = { application: null, readiness: null, segments: [], result: null };
+
+document.getElementById("lang").value = lang;
+document.getElementById("lang").addEventListener("change", (event) => {
+  lang = event.target.value;
+  render();
+});
+
+async function api(path, body) {
+  const options = { headers: { "X-Jobloom-Token": TOKEN } };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const payload = await response.json().catch(() => ({ error: "unreadable" }));
+  if (!response.ok) throw new Error(payload.detail || payload.error || "failed");
+  return payload;
+}
+
+const esc = (value) => String(value === null || value === undefined ? "" : value)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+let screen = "queue";
+let error = "";
+
+function render() {
+  crumb.textContent = app.application
+    ? `${app.application.employer} — ${app.application.title}` : "";
+  if (error) {
+    view.innerHTML = `<div class="card"><p class="err">${esc(error)}</p>
+      <button class="quiet" id="retry">${t("back")}</button></div>`;
+    document.getElementById("retry").onclick = () => { error = ""; screen = "queue"; load(); };
+    return;
+  }
+  ({ queue: queueScreen, readiness: readinessScreen, paste: pasteScreen,
+     split: splitScreen, result: resultScreen }[screen] || queueScreen)();
+}
+
+// ---- screens -------------------------------------------------------------------
+
+function queueScreen() {
+  const rows = (app.queue || []);
+  view.innerHTML = `<div class="card"><h2>${t("queueTitle")}</h2>
+    ${rows.length ? `<ul class="rows">${rows.map((row, index) => `
+      <li class="click" data-index="${index}">
+        <div class="title">${esc(row.title)}</div>
+        <div class="muted">${esc(row.employer)} · ${esc(row.location || "")}</div>
+        <div class="mono muted">${esc(row.state)}</div>
+      </li>`).join("")}</ul>`
+      : `<p class="muted">${t("queueEmpty")}</p>`}</div>`;
+  view.querySelectorAll("li.click").forEach((node) => {
+    node.onclick = () => openApplication(rows[Number(node.dataset.index)]);
+  });
+}
+
+function readinessScreen() {
+  const data = app.readiness || {};
+  const evaluation = data.evaluation || {};
+  const failures = evaluation.hard_filter_failures || [];
+  const uncertainties = evaluation.uncertainties || [];
+  const statements = data.sponsorship_statements || [];
+  view.innerHTML = `<div class="card">
+    <h2>${t("readyTitle")}</h2>
+    <p class="muted">${esc(app.application.employer)} · ${esc(app.application.location || "")}</p>
+    <div class="note">${t("resumeBound")}: <span class="mono">${esc(app.application.resume_version_id || "—")}</span></div>
+    ${failures.length
+      ? `<div class="note stop"><p>${t("knockoutSome")}</p><ul class="mono">${
+          failures.map((code) => `<li>${esc(code)}</li>`).join("")}</ul></div>`
+      : `<div class="note">${t("knockoutNone")}</div>`}
+    ${uncertainties.length
+      ? `<div class="note"><p>${t("uncertainSome")}</p><ul class="mono">${
+          uncertainties.map((code) => `<li>${esc(code)}</li>`).join("")}</ul></div>` : ""}
+    ${statements.length
+      ? `<h3>${t("sponsorSaid")}</h3><ul class="rows">${
+          statements.map((line) => `<li class="muted">${esc(line)}</li>`).join("")}</ul>` : ""}
+    <p style="margin-top:20px"><button id="go">${t("toAssist")}</button>
+      <button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("go").onclick = () => { screen = "paste"; render(); };
+  document.getElementById("back").onclick = () => { app.application = null; screen = "queue"; render(); };
+}
+
+function pasteScreen() {
+  view.innerHTML = `<div class="card">
+    <h2>${t("pasteTitle")}</h2>
+    <p class="muted">${t("pasteHelp")}</p>
+    <textarea id="paste" spellcheck="false"></textarea>
+    <p style="margin-top:14px"><button id="split">${t("pasteAction")}</button>
+      <button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("back").onclick = () => { screen = "readiness"; render(); };
+  document.getElementById("split").onclick = async () => {
+    const text = document.getElementById("paste").value;
+    if (!text.trim()) return;
+    try {
+      const payload = await api("/api/apply/split", { text });
+      app.segments = payload.segments.map((segment) => ({ ...segment, keep: !segment.skipped }));
+      screen = "split";
+      render();
+    } catch (failure) { error = failure.message; render(); }
+  };
+}
+
+function splitScreen() {
+  view.innerHTML = `<div class="card">
+    <h2>${t("splitTitle")}</h2>
+    <p class="muted">${t("splitHelp")}</p>
+    <div id="segs">${app.segments.map((segment, index) => `
+      <label class="seg ${segment.keep ? "" : "skip"}">
+        <input type="checkbox" data-index="${index}" ${segment.keep ? "checked" : ""}>
+        <span class="segtext">${esc(segment.text)}</span>
+      </label>`).join("")}</div>
+    <p style="margin-top:14px"><button id="classify">${t("classifyAction")}</button>
+      <button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("back").onclick = () => { screen = "paste"; render(); };
+  view.querySelectorAll("input[type=checkbox]").forEach((box) => {
+    box.onchange = () => {
+      app.segments[Number(box.dataset.index)].keep = box.checked;
+      box.parentElement.classList.toggle("skip", !box.checked);
+    };
+  });
+  document.getElementById("classify").onclick = async () => {
+    const questions = app.segments.filter((segment) => segment.keep).map((segment) => segment.text);
+    if (!questions.length) return;
+    try {
+      app.result = await api("/api/apply/classify",
+        { application_id: app.application.application_id, questions });
+      screen = "result";
+      render();
+    } catch (failure) { error = failure.message; render(); }
+  };
+}
+
+const LANE_NOTE = {
+  manual_only: ["stop", "manualNote"],
+  narrative_gap: ["", "storyNote"],
+  profile_ready: ["", "profileNote"],
+  answer_ready: ["", "answerReadyNote"],
+  answer_needs_authorization: ["", "answerAuthNote"],
+};
+
+function laneBlock(lane, items, factValues) {
+  if (!items.length) return "";
+  const spec = LANE_NOTE[lane];
+  const note = spec ? `<div class="note ${spec[0]}">${t(spec[1])}</div>` : "";
+  return `<h3><span class="lane ${lane}">${t(lane)}</span> ${items.length}</h3>${note}
+    <ul class="rows">${items.map((item) => `
+      <li>
+        <div class="title">${esc(item.question)}</div>
+        <div class="mono muted">${esc(item.reason)}${
+          item.canonical_id ? ` · ${esc(item.canonical_id)}` : ""}${
+          item.authorization_reason ? ` · ${esc(item.authorization_reason)}` : ""}</div>
+        ${lane === "narrative_gap" ? (item.related_fact_ids.length
+          ? `<ul class="facts">${item.related_fact_ids.map((id) =>
+              `<li>${esc(factValues[id] || id)}
+                <span class="mono">${esc((item.related_overlap[id] || []).join(" "))}</span>
+              </li>`).join("")}</ul>
+             <div class="muted" style="margin-top:6px;font-size:12.5px">${
+               t("overlapNote", 0, item.facts_considered)}</div>`
+          : `<div class="muted" style="margin-top:6px">${
+               t("noFacts", 0, item.facts_considered)}</div>`) : ""}
+      </li>`).join("")}</ul>`;
+}
+
+function resultScreen() {
+  const result = app.result || { questions: [], counts: {} };
+  // Most consequential first, and the two green lanes last: a person scanning this page is
+  // looking for what is not done.
+  const order = ["manual_only", "narrative_gap", "answer_needs_authorization", "you_answer",
+                 "answer_ready", "profile_ready"];
+  const facts = result.fact_values || {};
+  view.innerHTML = `<div class="card">
+    <h2>${t("resultTitle")}</h2>
+    <div class="counts">${order.map((lane) =>
+      `<span class="lane ${lane}">${t(lane)} ${result.counts[lane] || 0}</span>`).join("")}</div>
+    ${result.materials_locked === false
+      ? `<div class="note stop">${t("notLocked")}<span class="mono">${
+          esc(result.materials_reason)}</span></div>` : ""}
+    ${order.map((lane) => laneBlock(lane,
+      result.questions.filter((item) => item.lane === lane), facts)).join("")}
+    <h3>${t("checklistTitle")}</h3>
+    <p>${t("blocking", result.blocking)}</p>
+    <p class="muted">${t("checklistBody")}</p>
+    <div class="note">${t("nothingWritten")}</div>
+    <p><button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("back").onclick = () => { screen = "split"; render(); };
+}
+
+// ---- loading -------------------------------------------------------------------
+
+async function openApplication(row) {
+  app.application = row;
+  view.innerHTML = `<div class="card"><p class="muted">${t("loading")}</p></div>`;
+  try {
+    app.readiness = await api("/api/apply/readiness", { application_id: row.application_id });
+    screen = "readiness";
+  } catch (failure) { error = failure.message; }
+  render();
+}
+
+async function load() {
+  view.innerHTML = `<div class="card"><p class="muted">${t("loading")}</p></div>`;
+  try {
+    app.queue = (await api("/api/apply/queue")).applications;
+  } catch (failure) { error = failure.message; }
+  render();
+}
+
+load();
+</script>

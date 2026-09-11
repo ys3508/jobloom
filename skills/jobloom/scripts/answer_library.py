@@ -1053,13 +1053,49 @@ def authorization_current(
     return True, None
 
 
-def match_answer(
+def canonical_meaning(connection: sqlite3.Connection,
+                      question: str) -> tuple[str | None, str | None]:
+    """The reviewed meaning of this exact question, or the stable reason there is none.
+
+    Exact on the normalised question and nothing else. There is no similarity score here and
+    there will not be one: deciding that "Are you legally authorized to work in the US?" means
+    `work_authorized_now` because it resembles a form somebody reviewed is a machine concluding
+    what a question means, and the meanings this resolves to reach immigration and legal fields.
+    A question nobody has reviewed is `new_question`, which is a thing the user resolves by
+    reviewing it, not a thing to guess around.
+
+    Split out so the profile path and the answer path read the same mapping. A second lookup
+    with its own rules is how two callers come to disagree about what a question asks.
+    """
+    forms = connection.execute(
+        "SELECT * FROM question_forms WHERE normalized_question=?",
+        (normalize_question(question),),
+    ).fetchall()
+    if not forms:
+        return None, "new_question"
+    canonical_ids = {row["canonical_id"] for row in forms if row["verified_by_user"]}
+    if len(canonical_ids) != 1:
+        # Zero verified forms and two disagreeing ones are the same answer: nobody has settled
+        # what this question means, so nothing may answer it.
+        return None, "question_mapping_conflict"
+    return next(iter(canonical_ids)), None
+
+
+def _resolve_answer(
     connection: sqlite3.Connection,
     question: str,
     context: dict[str, Any],
     authorization_id: str | None = None,
     at: datetime | None = None,
 ) -> dict[str, Any]:
+    """The decision itself, and nothing else: no audit event, no commit, no write of any kind.
+
+    Split out of `match_answer` so that a read-only caller can ask the same question without
+    leaving a record that an answer was matched — see `inspect_answer`. The split is by
+    extraction rather than by a flag, because a flag on `match_answer` would be a way for any
+    caller to turn the audit off, and the audit is the record that a value was handed to a
+    form. One function decides; the caller that acts is the one that writes it down.
+    """
     at = at or now_utc()
     forms = connection.execute(
         "SELECT * FROM question_forms WHERE normalized_question=?",
@@ -1120,11 +1156,100 @@ def match_answer(
     }
     if not authorized:
         result["authorization_reason"] = authorization_reason
-    audit(connection, "answer_matched", selected["answer_id"], {
-        "canonical_id": canonical_id, "decision": result["decision"], "auto_fill_ready": result["auto_fill_ready"],
-    })
-    connection.commit()
     return result
+
+
+def match_answer(
+    connection: sqlite3.Connection,
+    question: str,
+    context: dict[str, Any],
+    authorization_id: str | None = None,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Resolve an answer for a field that is about to be filled, and record that it was.
+
+    The audit event is the point: a value left the library for an employer's form, and which
+    answer it was is a thing somebody may need to reconstruct later. Unchanged from before the
+    read-only path existed, and deliberately not parameterised — a caller who wants the
+    decision without the record calls `inspect_answer`, which cannot fill anything.
+    """
+    result = _resolve_answer(connection, question, context, authorization_id, at)
+    if result["decision"] == "use":
+        audit(connection, "answer_matched", result["answer_id"], {
+            "canonical_id": result["canonical_id"], "decision": result["decision"],
+            "auto_fill_ready": result["auto_fill_ready"],
+        })
+        connection.commit()
+    return result
+
+
+# The fields a read-only inspection may report. The answer's own value is deliberately absent:
+# a preflight exists to say whether this question is answered, and a screen that printed the
+# value would be handing out confirmed answers to a caller that cannot fill a form with them.
+INSPECT_FIELDS = ("decision", "reason", "canonical_id", "answer_id", "match_level",
+                  "channel_b_fresh", "per_application_recheck_required")
+
+
+def inspect_answer(
+    connection: sqlite3.Connection,
+    question: str,
+    context: dict[str, Any],
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Whether an answer covers this question, and whether anything currently authorises filling it.
+
+    Read-only in the strict sense: it executes no statement but SELECT, writes no audit event,
+    and does not commit. Nothing it returns may be filled into a form — `auto_fill_ready` is
+    reported as a fact about the world, not granted, and `auto_submit_ready` is not reported at
+    all because no inspection can confer it.
+
+    The two halves are separated on purpose. *An answer exists* is a property of the library;
+    *it may be filled right now* is a property of a standing authorization that expires on its
+    own schedule. A preflight that folded them together would go blank the day an authorization
+    lapsed, and would have told the user their form was unanswerable when it was merely
+    unauthorised.
+    """
+    at = at or now_utc()
+    decision = _resolve_answer(connection, question, context, None, at)
+    result = {key: decision[key] for key in INSPECT_FIELDS if key in decision}
+    if decision["decision"] != "use":
+        result["answer_exists"] = False
+        result["auto_fill_ready"] = False
+        return result
+    authorized, authorization_reason = _any_current_authorization(connection, context, at)
+    result["answer_exists"] = True
+    result["auto_fill_ready"] = authorized
+    if not authorized:
+        result["authorization_reason"] = authorization_reason
+    return result
+
+
+def _any_current_authorization(connection: sqlite3.Connection, context: dict[str, Any],
+                               at: datetime) -> tuple[bool, str | None]:
+    """Is any live standing authorization in scope for this context.
+
+    `authorization_current` answers it for one named authorization, which is the right shape
+    for a fill session that was handed one. A preflight has not been handed anything and is
+    asking a different question — whether the user would have to grant one — so it looks for
+    any that is active, unexpired and in scope, and says which of those three failed when none
+    is. It reads and returns; it never selects one for later use.
+    """
+    require_table(connection, "authorizations")
+    rows = connection.execute("SELECT * FROM authorizations WHERE status='active'").fetchall()
+    if not rows:
+        return False, "standing_authorization_missing"
+    reasons: list[str] = []
+    for row in rows:
+        if row["revoked_at"]:
+            reasons.append("standing_authorization_revoked")
+        elif at >= parse_time(row["expires_at"]):
+            reasons.append("standing_authorization_expired")
+        elif not context_matches(json.loads(row["scope_json"]), context):
+            reasons.append("standing_authorization_scope_mismatch")
+        else:
+            return True, None
+    # Sorted so the reason a caller sees does not depend on insertion order.
+    return False, sorted(set(reasons))[0]
 
 
 def add_authorization(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:

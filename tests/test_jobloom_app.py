@@ -19,7 +19,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -611,3 +611,308 @@ class MigrationSurfaceTests(AppFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- the application-assist preflight -------------------------------------------
+
+LOCKED_EMAIL = "preflight@example.invalid"
+LIBRARY_QUESTION = "How did you hear about this opportunity?"
+PROFILE_QUESTION = "Email Address"
+
+
+class PreflightFixture(AppFixture):
+    """A profile that is not the file beside the database, an application, and one answer.
+
+    The setup is deliberately adversarial on the point that mattered: `<private_root>/
+    candidate.json` is written with a *different* profile from the registered snapshot, so any
+    path that reads the file instead of the row answers with the wrong one and these tests say
+    so.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.db = sqlite3.connect(str(self.db_path))
+        self.db.row_factory = sqlite3.Row
+        self.stale = self.write_stale_candidate_file()
+        self.add_opening()
+        # The profile meaning the corpus reviewed for this label. Without it the question is
+        # unmapped, which is a different lane and not the one under test.
+        ANSWERS.add_question_form(self.db, "contact.email", PROFILE_QUESTION,
+                                  verified_by_user=True)
+        self.db.commit()
+
+    def tearDown(self):
+        self.db.close()
+
+    def write_stale_candidate_file(self):
+        """A superseded profile, at the path the first version of this slice trusted."""
+        candidate = {
+            "schema_version": "0.2.0", "profile_id": "stale-profile",
+            "work_authorization": {"country": "XX", "authorized_now": False,
+                                   "sponsorship_now": True, "sponsorship_future": True,
+                                   "employer_action_required": True, "confirmed": False},
+            "search": {}, "facts": []}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        (self.private / "candidate.json").write_text(json.dumps(candidate), encoding="utf-8")
+        return candidate
+
+    def add_opening(self):
+        card = {"job_id": "job-1", "canonical_url": "https://example.invalid/job-1",
+                "employer": "Example Labs", "title": "Data Analyst", "country": "US",
+                "location": "Testville", "work_arrangement": "remote",
+                "employment_type": "full_time", "status": "open", "sponsorship": "unknown",
+                "required_skills": [], "requirements_reviewed": False,
+                "sponsorship_statements": [], "already_applied": False}
+        self.db.execute(
+            "INSERT INTO jobs (job_id, canonical_url, original_url, employer, title, location,"
+            " normalized_employer, normalized_title, normalized_location, description_sha256,"
+            " source, ats, job_card_json, status, created_at, updated_at)"
+            " VALUES ('job-1', ?, ?, 'Example Labs', 'Data Analyst', 'Testville',"
+            " 'example labs', 'data analyst', 'testville', 'd', 'test', 'test', ?, 'open', ?, ?)",
+            (card["canonical_url"], card["canonical_url"], json.dumps(card),
+             AT.isoformat(), AT.isoformat()))
+        self.db.execute(
+            "INSERT INTO applications (application_id, job_id, state, category,"
+            " submission_policy, resume_version_id, created_at, updated_at)"
+            " VALUES ('app-1', 'job-1', 'ready_to_fill', 'review', 'stop_before_submit',"
+            " 'resume-a', ?, ?)", (AT.isoformat(), AT.isoformat()))
+
+    def register_snapshot(self, extra=()):
+        """The active profile: same composite contact fact, plus one locked profile field."""
+        return super().register_snapshot(extra=tuple(extra) + (
+            {"id": "fact-email", "type": "contact", "value": LOCKED_EMAIL,
+             "status": "locked", "locked": True, "evidence_strength": "direct",
+             "canonical_id": "contact.email"},
+        ))
+
+    def add_library_answer(self, *, authorized):
+        ANSWERS.add_question_form(self.db, "discovery_source", LIBRARY_QUESTION,
+                                  verified_by_user=True)
+        ANSWERS.add_answer(self.db, {
+            "answer_id": "answer-discovery", "canonical_id": "discovery_source",
+            "canonical_meaning": "How the opening was discovered",
+            "question": LIBRARY_QUESTION, "answer": "A careers page",
+            "source_type": "user_confirmed", "answer_type": "application_specific",
+            "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
+            "validity_class": "per_application", "scope": {"application_id": "app-1"},
+            "auto_fill_allowed": True, "auto_submit_allowed": False})
+        if authorized:
+            # A standing authorization may not run more than fourteen days, and the preflight
+            # asks whether one is live *now*, so this is anchored to the clock the request
+            # will use rather than to the fixture's frozen AT.
+            granted = datetime.now(timezone.utc) - timedelta(minutes=1)
+            ANSWERS.add_authorization(self.db, {
+                "authorization_id": "auth-1", "confirmed_at": granted.isoformat(),
+                "expires_at": (granted + timedelta(days=7)).isoformat(),
+                "scope": {"application_id": "app-1"}})
+        self.db.commit()
+
+    def classify(self, questions):
+        return self.call("/api/apply/classify",
+                         {"application_id": "app-1", "questions": questions})
+
+    def lane_for(self, question, payload):
+        return next(item for item in payload["questions"] if item["question"] == question)
+
+    def counts(self):
+        """Every table this database actually has, not a list that could drift past it."""
+        tables = [row[0] for row in self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        self.assertIn("audit_events", tables)
+        return {table: self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in tables}
+
+
+class PreflightBoundaryTests(PreflightFixture):
+    """The four routes as the page reaches them, and what they refuse."""
+
+    ROUTES = (("/api/apply/queue", None),
+              ("/api/apply/readiness", {"application_id": "app-1"}),
+              ("/api/apply/split", {"text": "Email Address"}),
+              ("/api/apply/classify", {"application_id": "app-1", "questions": ["x"]}))
+
+    def test_every_preflight_route_needs_the_session_token(self):
+        for path, body in self.ROUTES:
+            with self.subTest(path=path):
+                status, payload = self.refused(path, body, token="wrong")
+                self.assertEqual((status, payload["error"]), (403, "bad_token"))
+
+    def test_a_foreign_origin_is_refused_on_every_preflight_route(self):
+        for path, body in self.ROUTES:
+            with self.subTest(path=path):
+                status, payload = self.refused(path, body, origin="https://elsewhere.invalid")
+                self.assertEqual((status, payload["error"]), (403, "bad_token"))
+
+    def test_a_refusal_never_carries_a_path_a_value_or_an_exception(self):
+        self.add_library_answer(authorized=True)
+        refusals = [self.refused("/api/apply/readiness", {"application_id": "app-absent"})[1],
+                    self.refused("/api/apply/classify", {"application_id": 5,
+                                                         "questions": ["x"]})[1],
+                    self.refused("/api/apply/classify", {"application_id": "app-1",
+                                                         "questions": "not a list"})[1]]
+        blob = json.dumps(refusals)
+        for secret in (str(self.root), str(self.private), LOCKED_EMAIL, "A careers page",
+                       "answer-discovery", "Traceback", ".json", "sqlite"):
+            self.assertNotIn(secret, blob)
+        for refusal in refusals:
+            self.assertEqual(set(refusal), {"error"})
+
+    def test_the_page_cannot_name_the_profile_the_answer_or_the_authorization(self):
+        """Every extra key is ignored, and the answer is the one the rows already decided."""
+        self.add_library_answer(authorized=False)
+        smuggled = self.call("/api/apply/classify", {
+            "application_id": "app-1", "questions": [LIBRARY_QUESTION],
+            "candidate_path": str(self.private / "candidate.json"),
+            "snapshot_sha256": "0" * 64, "snapshot_path": str(self.root / "anything.json"),
+            "fact_id": "fact-email", "answer_id": "answer-discovery",
+            "authorization_id": "auth-1", "authorized": True, "auto_fill_ready": True,
+            "auto_submit_ready": True})
+        honest = self.classify([LIBRARY_QUESTION])
+        self.assertEqual(smuggled["questions"], honest["questions"])
+        self.assertEqual(self.lane_for(LIBRARY_QUESTION, smuggled)["lane"],
+                         "answer_needs_authorization")
+
+    def test_the_returned_shape_is_an_allowlist_not_a_database_row(self):
+        payload = self.classify([PROFILE_QUESTION])
+        self.assertEqual(set(payload["questions"][0]), set(APP.CLASSIFIED_FIELDS))
+        readiness = self.call("/api/apply/readiness", {"application_id": "app-1"})
+        self.assertEqual(set(readiness["application"]), set(APP.READINESS_APPLICATION_FIELDS))
+        self.assertTrue(set(readiness["evaluation"]) <= set(APP.EVALUATION_FIELDS))
+
+    def test_the_preflight_page_is_served_and_fetches_nothing_from_outside(self):
+        with urllib.request.urlopen(self.origin + "/apply", timeout=10) as response:
+            policy = response.headers["Content-Security-Policy"]
+            body = response.read().decode("utf-8")
+        self.assertIn("default-src 'none'", policy)
+        self.assertIn("connect-src 'self'", policy)
+        self.assertNotIn("http://", body.replace(self.origin, ""))
+        self.assertNotIn("localStorage", body)
+
+
+class PreflightProfileTests(PreflightFixture):
+    """Which profile answers, and what a profile field is allowed to look like."""
+
+    def test_the_active_snapshot_answers_not_the_file_beside_the_database(self):
+        readiness = self.call("/api/apply/readiness", {"application_id": "app-1"})
+        # The stale file says unauthorised, sponsorship required, country XX. The registered
+        # snapshot says authorised in the US, so the evaluation cannot have read the file.
+        self.assertNotIn("not_authorized_to_work_now",
+                         readiness["evaluation"]["hard_filter_failures"])
+        self.assertNotIn("country_outside_search_scope",
+                         readiness["evaluation"]["hard_filter_failures"])
+
+    def test_a_locked_profile_field_reaches_the_profile_lane(self):
+        payload = self.classify([PROFILE_QUESTION])
+        item = self.lane_for(PROFILE_QUESTION, payload)
+        self.assertEqual(item["lane"], "profile_ready")
+        self.assertEqual(item["canonical_id"], "contact.email")
+        self.assertEqual(item["source"], "profile")
+
+    def test_a_profile_field_that_is_only_confirmed_is_not_fillable(self):
+        """`fact-0002` is confirmed and not locked. Confirmed is not permission to fill."""
+        ANSWERS.add_question_form(self.db, "contact.phone", "Phone Number",
+                                  verified_by_user=True)
+        self.db.commit()
+        item = self.lane_for("Phone Number", self.classify(["Phone Number"]))
+        self.assertEqual(item["lane"], "you_answer")
+        self.assertFalse(item["auto_fill_ready"])
+        self.assertIn(item["reason"], {PROFILE.PROFILE_FACT_MISSING,
+                                       PROFILE.PROFILE_FACT_NOT_LOCKED,
+                                       PROFILE.PROFILE_FACT_AMBIGUOUS})
+
+    def test_no_lane_this_surface_returns_is_ever_submit_ready(self):
+        self.add_library_answer(authorized=True)
+        payload = self.classify([PROFILE_QUESTION, LIBRARY_QUESTION, "Race/Ethnicity",
+                                 "Tell us about a project you are proud of."])
+        for item in payload["questions"]:
+            self.assertIs(item["auto_submit_ready"], False)
+
+    def test_a_missing_active_snapshot_is_refused_with_a_bare_code(self):
+        self.db.execute("UPDATE candidate_snapshots SET status='superseded'")
+        self.db.commit()
+        status, payload = self.refused("/api/apply/classify",
+                                       {"application_id": "app-1", "questions": ["x"]})
+        self.assertEqual((status, payload), (409, {"error": "no_active_candidate_snapshot"}))
+
+
+class PreflightAnswerTests(PreflightFixture):
+    """An answer existing, and an answer being fillable, are two different screens."""
+
+    def test_an_answer_without_a_standing_authorization_is_not_shown_as_fillable(self):
+        self.add_library_answer(authorized=False)
+        item = self.lane_for(LIBRARY_QUESTION, self.classify([LIBRARY_QUESTION]))
+        self.assertEqual(item["lane"], "answer_needs_authorization")
+        self.assertTrue(item["answer_exists"])
+        self.assertFalse(item["auto_fill_ready"])
+        self.assertEqual(item["authorization_reason"], "standing_authorization_missing")
+
+    def test_an_answer_with_a_live_authorization_is_ready(self):
+        self.add_library_answer(authorized=True)
+        item = self.lane_for(LIBRARY_QUESTION, self.classify([LIBRARY_QUESTION]))
+        self.assertEqual(item["lane"], "answer_ready")
+        self.assertTrue(item["auto_fill_ready"])
+
+    def test_an_answer_value_never_crosses_the_boundary(self):
+        self.add_library_answer(authorized=True)
+        payload = self.classify([LIBRARY_QUESTION])
+        self.assertNotIn("A careers page", json.dumps(payload))
+
+    def test_classifying_a_hit_changes_nothing_in_the_database(self):
+        """The claim the docs make, checked against the thing that used to break it.
+
+        `match_answer` writes an `answer_matched` audit event and commits when an answer is
+        used, so the first version of this slice was read-only only while nothing matched.
+        """
+        self.add_library_answer(authorized=True)
+        before_counts = self.counts()
+        before_changes = self.db.total_changes
+        before_bytes = self.db_path.read_bytes()
+
+        payload = self.classify([LIBRARY_QUESTION, PROFILE_QUESTION])
+        self.assertEqual(self.lane_for(LIBRARY_QUESTION, payload)["lane"], "answer_ready")
+
+        self.assertEqual(self.counts(), before_counts)
+        self.assertEqual(self.db.total_changes, before_changes)
+        self.assertEqual(self.db_path.read_bytes(), before_bytes)
+        self.assertIs(payload["writes"], False)
+
+
+class PreflightRefusalTests(PreflightFixture):
+    """What the page may not talk the service into."""
+
+    def test_a_manual_only_question_cannot_be_talked_out_of_its_lane(self):
+        questions = ["Tell us about a time when you required visa sponsorship.",
+                     "Describe a time your salary expectations were not met.",
+                     "Why are you willing to disclose your race/ethnicity to us?",
+                     "Walk us through how you are related to an employee here."]
+        payload = self.classify(questions)
+        for item in payload["questions"]:
+            self.assertEqual(item["lane"], "manual_only")
+            self.assertFalse(item["narrative_hint"])
+            self.assertFalse(item["auto_fill_ready"])
+
+    def test_a_verified_form_cannot_route_a_forbidden_meaning_to_the_profile(self):
+        """A question form mapping to a forbidden meaning reaches the user, not the profile."""
+        ANSWERS.add_question_form(self.db, "eeo.race", "Which of these describes you",
+                                  verified_by_user=True)
+        self.db.commit()
+        item = self.lane_for("Which of these describes you",
+                             self.classify(["Which of these describes you"]))
+        self.assertEqual(item["lane"], "manual_only")
+
+    def test_an_oversized_paste_is_refused(self):
+        status, payload = self.refused("/api/apply/split", {"text": "x" * 100_001})
+        self.assertEqual(status, 409)
+        self.assertEqual(set(payload), {"error", "detail"})
+
+    def test_an_empty_or_oversized_question_list_is_refused(self):
+        for questions in ([], ["q"] * 251):
+            with self.subTest(count=len(questions)):
+                status, _ = self.refused("/api/apply/classify",
+                                         {"application_id": "app-1", "questions": questions})
+                self.assertEqual(status, 409)
+
+    def test_a_question_list_that_is_not_strings_is_refused_before_any_lookup(self):
+        status, payload = self.refused(
+            "/api/apply/classify", {"application_id": "app-1", "questions": [{"q": 1}]})
+        self.assertEqual((status, payload["error"]), (400, "bad_questions"))
