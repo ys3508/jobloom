@@ -20,12 +20,14 @@
     --ink: #1a1c1f; --muted: #6b7280; --line: #e3e6ea; --bg: #f6f7f9;
     --card: #ffffff; --accent: #1f6feb; --accent-ink: #ffffff;
     --warn: #8a5a00; --warn-bg: #fff8e6; --good: #146c2e; --stop: #9b2d2d;
+    --faint: #9aa1a8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ink: #e9ecef; --muted: #9aa4b2; --line: #2b3038; --bg: #14161a;
       --card: #1c1f24; --accent: #4c8dff; --accent-ink: #0b0d10;
       --warn: #f0c674; --warn-bg: #2a2418; --good: #6fcf8a; --stop: #f08a8a;
+      --faint: #6b737c;
     }
   }
   * { box-sizing: border-box; }
@@ -34,41 +36,59 @@
     font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
           "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   }
-  main { max-width: 800px; margin: 0 auto; padding: 28px 24px 80px; }
+  main { max-width: 820px; margin: 0 auto; padding: 28px 24px 90px; }
   header.bar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; }
   header.bar h1 { font-size: 17px; margin: 0; }
   header.bar .spacer { flex: 1; }
   select, button { font: inherit; }
   select { color: inherit; background: transparent; border: 1px solid var(--line);
            border-radius: 6px; padding: 3px 6px; }
+  h2 { font-size: 21px; margin: 0 0 10px; }
   .banner { background: var(--warn-bg); border: 1px solid var(--line);
             border-left: 3px solid var(--warn); border-radius: 8px; padding: 12px 14px;
-            margin-bottom: 18px; font-size: 13.5px; }
-  .summary { color: var(--muted); font-size: 13.5px; margin-bottom: 18px; }
+            margin-bottom: 16px; font-size: 13.5px; }
+  .summary { color: var(--muted); font-size: 13.5px; margin-bottom: 14px; }
   .summary b { color: var(--ink); }
+  .tabs { display: flex; gap: 6px; margin: 18px 0 14px; border-bottom: 1px solid var(--line); }
+  .tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent;
+                 color: var(--muted); padding: 8px 12px; cursor: pointer; }
+  .tabs button.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
           padding: 18px 20px; margin-bottom: 14px; }
-  .who { font-weight: 600; font-size: 16px; }
-  .where { color: var(--muted); font-size: 13.5px; margin-bottom: 4px; }
-  .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-            font-size: 12px; color: var(--muted); }
-  blockquote { margin: 12px 0; padding: 10px 14px; border-left: 3px solid var(--line);
+  .hint { display: inline-block; font-size: 11.5px; font-weight: 600; border-radius: 999px;
+          padding: 2px 9px; white-space: nowrap; }
+  .hint.employment_or_visa_signal { color: var(--good);
+          background: color-mix(in srgb, var(--good) 12%, transparent); }
+  .hint.mixed_signal { color: var(--warn); background: var(--warn-bg); }
+  .hint.possible_trial_sponsor_only { color: var(--faint);
+          background: color-mix(in srgb, var(--faint) 14%, transparent); }
+  .occ { font-size: 13.5px; color: var(--muted); margin: 8px 0 0; }
+  blockquote { margin: 10px 0; padding: 10px 14px; border-left: 3px solid var(--line);
                background: var(--bg); border-radius: 0 8px 8px 0; }
   blockquote .said { font-size: 14.5px; }
   blockquote .ctx { color: var(--muted); font-size: 13px; }
+  blockquote .mergetag { font-size: 11.5px; color: var(--faint);
+                         font-family: ui-monospace, Menlo, monospace; }
+  .who { font-weight: 600; }
+  .where { color: var(--muted); font-size: 13.5px; }
+  .members { margin: 10px 0 0; padding: 0; list-style: none; }
+  .members li { border-top: 1px solid var(--line); padding: 11px 0; display: flex;
+                gap: 10px; align-items: flex-start; }
+  .members input { margin-top: 4px; }
   .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px;
              padding-top: 14px; border-top: 1px solid var(--line); align-items: center; }
-  .choices button {
-    border-radius: 8px; padding: 7px 14px; border: 1px solid var(--line);
-    background: transparent; color: var(--muted); cursor: not-allowed;
-  }
+  .choices button { border-radius: 8px; padding: 7px 14px; border: 1px solid var(--line);
+                    background: transparent; color: var(--muted); cursor: not-allowed; }
   .choices .soon { font-size: 12.5px; color: var(--muted); margin-left: auto; }
+  .applyall { margin-top: 12px; font-size: 13.5px; color: var(--muted);
+              display: flex; gap: 8px; align-items: flex-start; }
   button.link { border: 0; background: transparent; color: var(--accent); cursor: pointer;
                 padding: 0; font-size: 13.5px; text-decoration: underline; }
-  pre.posting { white-space: pre-wrap; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo,
-                Consolas, monospace; background: var(--bg); border: 1px solid var(--line);
-                border-radius: 8px; padding: 14px; max-height: 420px; overflow: auto;
-                margin-top: 12px; }
+  .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px; color: var(--muted); }
+  pre.posting { white-space: pre-wrap; font: 13px/1.6 ui-monospace, Menlo, monospace;
+                background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+                padding: 14px; max-height: 420px; overflow: auto; margin-top: 12px; }
   .err { color: var(--stop); }
 </style>
 
@@ -100,44 +120,66 @@ history.replaceState(null, "", location.pathname);
 const COPY = {
   zh: {
     title: "sponsorship 人工分诊",
-    banner: "这一版只读。三个选择按钮是给你看形状的，点不动，也不会保存任何判定——标注和持久化是下一版。先告诉我这张卡上的信息够不够你判断。",
-    summary: "队列 <b>%q</b> 个岗位，全部是 <b>sponsorship: unknown</b>。其中 <b>%n</b> 个岗位的招聘正文自己说了话——下面是这 %n 个。",
+    banner: "这一版只读。判定按钮和勾选框都点不动，也不会保存任何东西——标注与持久化是下一版。先告诉我这个形状够不够你判断。",
+    summary: "队列 <b>%q</b> 个岗位，全部是 <b>sponsorship: unknown</b>。其中 <b>%n</b> 个岗位的招聘正文自己说了话，去重后是 <b>%g</b> 句不同的话。",
     queueFile: "队列文件",
-    said: "雇主原话",
-    current: "当前结构化状态",
-    supports: "supports",
-    does_not_support: "does_not_support",
-    unclear: "unclear",
+    byStatement: "按原句（%g）",
+    byJob: "按岗位（%n）",
+    employment_or_visa_signal: "像就业/签证",
+    mixed_signal: "两种都有",
+    possible_trial_sponsor_only: "可能只是试验申办方",
+    hintNote: "这三个标签只决定阅读顺序。%c 张卡一张不少，`sponsorship` 仍然是 unknown，系统不替你选任何判定。「可能只是试验申办方」是一个可能，不是结论——它也可以被你判成任意一种。",
+    occurrences: "同一句话出现在 %c 个独立岗位中",
+    expand: "展开查看 %c 个岗位及各自上下文",
+    collapse: "收起岗位列表",
+    supports: "支持",
+    does_not_support: "不支持",
+    unclear: "不清楚",
     soon: "下一版才可点",
+    applyAll: "将这次解释应用到下列 %c 个当前岗位",
+    applyNote: "不默认全选。每个岗位单独写一条记录，任何一张卡的内容变了，只让那一张失效——不会变成「这家公司都这样」。",
     viewPosting: "查看原招聘正文",
     hidePosting: "收起正文",
+    merged: "· 合并显示了 %c 句相邻原句，底层仍是 %c 条独立记录",
+    current: "当前结构化状态",
     empty: "当前队列里没有需要分诊的岗位。",
     loading: "读取中…",
-    rules: "判定规则：unclear 继续算未决，不默认为支持；只有 does_not_support 进入硬淘汰；supports 只是这一个岗位的证据，不推广到这家公司的其他岗位。判定会绑定卡片 hash，卡片内容一变，旧判定自动失效。",
+    rules: "判定规则：unclear 继续算未决，不默认为支持；只有 does_not_support 进入硬淘汰；supports 只解除这一个岗位的 uncertainty，不产生公司级规则。判定绑定卡片 hash 与原句 hash，任一改变即失效。",
   },
   en: {
     title: "Sponsorship triage",
-    banner: "This version is read-only. The three buttons are here so you can judge the shape — they do not click and nothing is saved. Annotation and persistence are the next version. Tell me whether this card carries enough to decide on.",
-    summary: "<b>%q</b> openings in the queue, every one of them <b>sponsorship: unknown</b>. For <b>%n</b> of them the posting itself said something — those %n are below.",
+    banner: "This version is read-only. The verdict buttons and the tick boxes do not click and nothing is saved — annotation and persistence are the next version. Tell me whether this shape is enough to decide on.",
+    summary: "<b>%q</b> openings in the queue, every one of them <b>sponsorship: unknown</b>. For <b>%n</b> of them the posting said something, which is <b>%g</b> distinct sentences.",
     queueFile: "Queue file",
-    said: "What the employer wrote",
-    current: "Structured status today",
+    byStatement: "By sentence (%g)",
+    byJob: "By opening (%n)",
+    employment_or_visa_signal: "Reads as employment / visa",
+    mixed_signal: "Both senses present",
+    possible_trial_sponsor_only: "May be trial sponsor only",
+    hintNote: "These three labels decide reading order and nothing else. All %c cards are here, `sponsorship` is still unknown, and nothing is chosen for you. \"May be trial sponsor only\" is a possibility, not a finding — you can still mark such a card any of the three ways.",
+    occurrences: "This same sentence appears in %c separate openings",
+    expand: "Show the %c openings and each one's context",
+    collapse: "Hide the openings",
     supports: "supports",
     does_not_support: "does_not_support",
     unclear: "unclear",
     soon: "next version",
+    applyAll: "Apply this reading to these %c current openings",
+    applyNote: "Nothing is ticked by default. Each opening gets its own record, and a card whose content changes invalidates only its own — it never becomes \"this employer always does this\".",
     viewPosting: "Read the full posting",
     hidePosting: "Hide the posting",
+    merged: "· %c adjacent sentences shown as one block; they remain %c separate records",
+    current: "Structured status today",
     empty: "Nothing in the current queue needs triage.",
     loading: "Loading…",
-    rules: "How a verdict behaves: unclear stays unresolved and never defaults to supported; only does_not_support reaches the hard filter; supports is evidence about this one posting, never about the employer. A verdict binds to the card's hash, so an edited card drops it.",
+    rules: "How a verdict behaves: unclear stays unresolved and never defaults to supported; only does_not_support reaches the hard filter; supports clears the uncertainty for this one opening and never becomes an employer-level rule. A verdict binds to the card hash and the sentence hash, and either changing drops it.",
   },
 };
 
 let lang = (navigator.language || "en").toLowerCase().startsWith("zh") ? "zh" : "en";
-const t = (key) => COPY[lang][key] || key;
+const t = (key, c) => (COPY[lang][key] || key).replace(/%c/g, c === undefined ? "" : c);
 const view = document.getElementById("view");
-const state = { report: null, error: "", open: {} };
+const state = { report: null, error: "", tab: "statement", open: {}, posting: {} };
 
 document.getElementById("lang").value = lang;
 document.getElementById("lang").addEventListener("change", (event) => {
@@ -161,37 +203,73 @@ async function api(path, body) {
 const esc = (value) => String(value === null || value === undefined ? "" : value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-function statementBlock(statement) {
-  return `<blockquote>
-    ${statement.before ? `<div class="ctx">${esc(statement.before)}</div>` : ""}
-    <div class="said">${esc(statement.text)}</div>
-    ${statement.after ? `<div class="ctx">${esc(statement.after)}</div>` : ""}
-  </blockquote>`;
-}
+const hintChip = (hint) => `<span class="hint ${hint}">${t(hint)}</span>`;
 
-function cardBlock(item, index) {
-  const posting = state.open[item.job_id];
+const choices = (verdicts) => `<div class="choices">
+  ${verdicts.map((v) => `<button disabled>${t(v)}</button>`).join("")}
+  <span class="soon">${t("soon")}</span>
+</div>`;
+
+// ---- by sentence ----------------------------------------------------------------
+
+function groupBlock(group, index) {
+  const open = state.open[group.statement_sha256];
   return `<div class="card">
-    <div class="who">${esc(item.title)}</div>
-    <div class="where">${esc(item.employer)} · ${esc(item.location || "")}</div>
-    <div class="status">${t("current")}: sponsorship = ${esc(item.sponsorship)}
-      · card ${esc((item.job_card_sha256 || "").slice(0, 12))}</div>
-    ${item.statements.map(statementBlock).join("")}
-    <button class="link" data-posting="${index}">${
-      posting ? t("hidePosting") : t("viewPosting")}</button>
-    ${posting ? `<pre class="posting">${esc(posting)}</pre>` : ""}
-    <div class="choices">
-      ${item.verdicts.map((verdict) =>
-        `<button disabled>${t(verdict)}</button>`).join("")}
-      <span class="soon">${t("soon")}</span>
+    ${hintChip(group.hint)}
+    <div class="occ">${t("occurrences", group.occurrences)}</div>
+    <blockquote><div class="said">${esc(group.text)}</div></blockquote>
+    <button class="link" data-group="${index}">${
+      open ? t("collapse") : t("expand", group.occurrences)}</button>
+    ${open ? `<ul class="members">${group.members.map((member) => `
+      <li>
+        <input type="checkbox" disabled ${member.selected ? "checked" : ""}>
+        <div>
+          <div class="who">${esc(member.title)}</div>
+          <div class="where">${esc(member.employer)} · ${esc(member.location || "")}</div>
+          <div class="status">card ${esc((member.job_card_sha256 || "").slice(0, 12))}</div>
+          ${member.before || member.after ? `<blockquote>
+            ${member.before ? `<div class="ctx">${esc(member.before)}</div>` : ""}
+            <div class="said">${esc(group.text)}</div>
+            ${member.after ? `<div class="ctx">${esc(member.after)}</div>` : ""}
+          </blockquote>` : ""}
+        </div>
+      </li>`).join("")}</ul>` : ""}
+    ${choices(group.verdicts)}
+    <div class="applyall">
+      <input type="checkbox" disabled>
+      <div>${t("applyAll", group.occurrences)}
+        <div class="status" style="margin-top:4px">${t("applyNote")}</div></div>
     </div>
   </div>`;
 }
 
+// ---- by opening -----------------------------------------------------------------
+
+function cardBlock(item, index) {
+  const posting = state.posting[item.job_id];
+  return `<div class="card">
+    ${hintChip(item.hint)}
+    <div class="who" style="margin-top:8px">${esc(item.title)}</div>
+    <div class="where">${esc(item.employer)} · ${esc(item.location || "")}</div>
+    <div class="status">${t("current")}: sponsorship = ${esc(item.sponsorship)}
+      · card ${esc((item.job_card_sha256 || "").slice(0, 12))}</div>
+    ${item.blocks.map((block) => `<blockquote>
+      ${block.before ? `<div class="ctx">${esc(block.before)}</div>` : ""}
+      <div class="said">${esc(block.text)}</div>
+      ${block.after ? `<div class="ctx">${esc(block.after)}</div>` : ""}
+      ${block.merged ? `<div class="mergetag">${
+        t("merged", block.statement_sha256s.length)}</div>` : ""}
+    </blockquote>`).join("")}
+    <button class="link" data-posting="${index}">${
+      posting ? t("hidePosting") : t("viewPosting")}</button>
+    ${posting ? `<pre class="posting">${esc(posting)}</pre>` : ""}
+    ${choices(item.verdicts)}
+  </div>`;
+}
+
+// ---- page -----------------------------------------------------------------------
+
 function render() {
-  // Opening a posting re-renders the whole list, and on 28 cards that threw the reader back
-  // to the top of the page every time they expanded one. The position is restored after the
-  // new list is laid out, not before, or the page has not yet grown back to its height.
   const restore = window.scrollY;
   renderInto();
   requestAnimationFrame(() => window.scrollTo(0, restore));
@@ -207,32 +285,56 @@ function renderInto() {
     view.innerHTML = `<div class="card"><p>${t("loading")}</p></div>`;
     return;
   }
-  const summary = t("summary")
-    .replace(/%q/g, String(report.queued))
-    .replace(/%n/g, String(report.needing_triage));
+  const summary = (COPY[lang].summary || "")
+    .replace("%q", report.queued).replace(/%n/g, report.needing_triage)
+    .replace(/%g/g, report.groups.length);
+  const counts = Object.entries(report.hint_counts)
+    .map(([hint, n]) => `${hintChip(hint)} ${n}`).join(" &nbsp; ");
   view.innerHTML = `
-    <h2 style="margin:0 0 10px">${t("title")}</h2>
+    <h2>${t("title")}</h2>
     <div class="banner">${t("banner")}</div>
-    <div class="summary">${summary}<br>
-      ${t("queueFile")}: <code>${esc(report.queue_file)}</code></div>
+    <div class="summary">${summary}<br>${t("queueFile")}:
+      <code>${esc(report.queue_file)}</code></div>
+    <div class="summary">${counts}</div>
+    <div class="summary">${t("hintNote", report.needing_triage)}</div>
     <div class="summary">${t("rules")}</div>
+    <div class="tabs">
+      <button data-tab="statement" class="${state.tab === "statement" ? "on" : ""}">${
+        (COPY[lang].byStatement || "").replace("%g", report.groups.length)}</button>
+      <button data-tab="job" class="${state.tab === "job" ? "on" : ""}">${
+        (COPY[lang].byJob || "").replace("%n", report.needing_triage)}</button>
+    </div>
     ${report.items.length
-      ? report.items.map(cardBlock).join("")
+      ? (state.tab === "statement"
+          ? report.groups.map(groupBlock).join("")
+          : report.items.map(cardBlock).join(""))
       : `<div class="card">${t("empty")}</div>`}`;
+
+  view.querySelectorAll("[data-tab]").forEach((node) => {
+    node.onclick = () => { state.tab = node.dataset.tab; render(); };
+  });
+  view.querySelectorAll("[data-group]").forEach((node) => {
+    node.onclick = () => {
+      const group = report.groups[Number(node.dataset.group)];
+      if (state.open[group.statement_sha256]) delete state.open[group.statement_sha256];
+      else state.open[group.statement_sha256] = true;
+      render();
+    };
+  });
   view.querySelectorAll("[data-posting]").forEach((node) => {
     node.onclick = () => togglePosting(report.items[Number(node.dataset.posting)]);
   });
 }
 
 async function togglePosting(item) {
-  if (state.open[item.job_id]) {
-    delete state.open[item.job_id];
+  if (state.posting[item.job_id]) {
+    delete state.posting[item.job_id];
     render();
     return;
   }
   try {
     const payload = await api("/api/sponsorship/posting", { job_id: item.job_id });
-    state.open[item.job_id] = payload.description || "";
+    state.posting[item.job_id] = payload.description || "";
   } catch (failure) { state.error = failure.message; }
   render();
 }

@@ -232,6 +232,25 @@ def apply_classify(connection: sqlite3.Connection,
     }
 
 
+def sponsorship_queue(private_root: Path) -> dict[str, Any]:
+    """The queued openings a person could settle by reading the employer's own sentence.
+
+    No database at all: the queue is a built file and the cards are the pull it was built
+    from, so this endpoint cannot write even by accident.
+    """
+    return sponsorship_triage.build(Path(private_root))
+
+
+def sponsorship_posting(private_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    job_id = payload.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise AppError("bad_job_id")
+    try:
+        return sponsorship_triage.posting(Path(private_root), job_id)
+    except ValueError:
+        raise AppError("no_such_opening", 404) from None
+
+
 def _worksheet_path(private_root: Path) -> Path:
     return Path(private_root) / WORKSHEET_NAME
 

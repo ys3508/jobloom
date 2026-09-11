@@ -129,53 +129,39 @@ and the candidate's `sponsorship_future` is true, so `evaluate_job` sends every 
 `sponsorship_requires_review`. For 28 of them the posting said something and nobody has read
 it. Those 28 are the page.
 
-**It chooses nothing.** No keyword scan, no suggested verdict, no pre-selected control. The
-extractor stopped short of a verdict on purpose and this page does not finish the job on its
-behalf: it shows the employer's sentence with enough of the posting either side to place it,
-the structured status as it stands, a way into the full description, and three choices.
+**It chooses nothing.** No suggested verdict, no pre-selected control, nothing ticked by
+default. The extractor stopped short of a verdict on purpose and this page does not finish the
+job on its behalf.
 
-The three controls are inert in this version. Annotation and persistence are the next one, and
-a control that looked like it saved would cost someone an afternoon of triage. What the writing
-version must carry is already in the payload: `job_card_sha256` and a `statement_sha256` per
-sentence, so a verdict binds to the card and the wording it was read from and does not survive
-either being edited — the rule `direction_core` already applies to a routing record.
+**One hint, for ordering only.** In clinical research a *sponsor* is the organisation running a
+trial, and `ingest_job` matches the bare word, so in this corpus 11 of the 28 cards carry only
+trial sentences and 1 carries both. Each card is labelled `employment_or_visa_signal`,
+`mixed_signal` or `possible_trial_sponsor_only` and the page reads in that order. The upstream
+markers are deliberately not narrowed: they over-recall, which costs reading time, and dropping
+the bare word would risk a false negative — a real visa sentence never shown. So every card
+stays, `sponsorship` stays `unknown`, the hint reaches no JobCard, routing decision or
+eligibility result, and a `possible_trial_sponsor_only` card still offers all three verdicts.
+
+**Two layers, because reading and deciding are different sizes.** Grouped on the hash of the
+exact sentence — 52 occurrences over that queue collapse to 21 sentences, three of which cover
+26 occurrences — so a person reads a sentence once. Nothing looser than exact: grouping by
+similarity or by employer is how "Beghou said no once" becomes "Beghou never sponsors". A
+group supports one *interpretation*; the decision stays per opening, which is why every member
+carries its own `job_id`, `job_card_sha256` and context, why applying a reading to a set of
+openings has to be an explicit act, and why no member is selected by default.
+
+**Merging is display only.** Statements whose 220-character context windows would overlap are
+shown as one block, because rendering two adjacent sentences separately makes the reader read
+the same paragraph twice. A block's text is the posting's own contiguous run, never a
+concatenation, and it carries the hashes of the statements inside it. **A block has no identity
+of its own** — no hash is minted for it, and a verdict binds to the statements and the JobCard,
+so a block gaining or losing a member changes what is displayed and not what was decided.
+
+**The controls are inert in this version.** Annotation and persistence are the next one, and a
+control that looked like it saved would cost someone an afternoon of triage. What the writing
+version needs is already in the payload: `job_card_sha256`, a `statement_sha256` per sentence,
+and the per-opening membership. Both invalidation rules belong there too — a changed JobCard
+hash, or a changed set of statement hashes, drops that opening's verdict and no other's.
 
 `unclear` is not a weaker `supports`; only `does_not_support` reaches `evaluate_job`'s hard
-filter; and `supports` is evidence about one posting, never about the employer.
-
-## Boundaries
-
-Kept in the service, not trusted to the page:
-
-| Boundary | How |
-| --- | --- |
-| Nothing on the network reaches it | Binds `127.0.0.1` only |
-| Another page cannot call it | A session token, generated per run, never written to disk; it arrives in the URL this process opens, so nobody types or pastes one |
-| A website cannot post to it by guessing the port | A request whose `Origin` is present and is not this server's own is refused |
-| The page cannot fetch anything | `Content-Security-Policy: default-src 'none'; connect-src 'self'` |
-| No value is logged | The request log is off; unexpected errors return a bare code, because a message may carry a path or a value |
-| The page holds nothing | No storage of any kind; values live in the window while it is open and go to the private worksheet |
-| A document under review can be read and nothing else | `frame-src blob:` only, the PDF fetched with the token and shown from a blob; served `inline`, `no-store`, and only for a version an open migration is carrying |
-| A cover letter is not left behind | A bound cover letter approved against the old snapshot stops the carry by name, before the application moves |
-
-The token is in the URL the process opens, and the page removes it from the address bar on
-load, so it stays out of history and out of anything a user might copy to somebody.
-
-## What the window trades away
-
-**The exact-hash approval moves off the person.** At the terminal, registering means naming a
-draft by its 64-character digest, which is how the approval binds to one specific set of facts
-rather than to whatever is pending. The window keeps the binding — the button carries the hash
-of the draft whose impact is on the screen — and drops the part where a person could check that
-hash against the one they were shown. That is the trade a window makes for not asking anyone to
-compare 64 characters. It is recorded here rather than glossed, and it is the reason the page
-is served from a process the user started rather than from anywhere else.
-
-## Running it
-
-```bash
-python3 skills/jobloom/scripts/jobloom_app.py --db .jobloom/jobloom.db
-```
-
-`--private-root` and `--store` default beside the database. `--no-browser` prints the URL
-instead of opening it. `--port` is chosen by the OS unless given.
+filter; `supports` clears the uncertainty for one opening and never becomes an employer rule.

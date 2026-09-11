@@ -916,3 +916,103 @@ class PreflightRefusalTests(PreflightFixture):
         status, payload = self.refused(
             "/api/apply/classify", {"application_id": "app-1", "questions": [{"q": 1}]})
         self.assertEqual((status, payload["error"]), (400, "bad_questions"))
+
+
+# ---- the sponsorship triage page -------------------------------------------------
+
+TRIAGE_VISA = ("We are currently unable to consider candidates who require, or will require "
+               "in the future, sponsorship for work authorization.")
+TRIAGE_SECOND = ("Applicants must be authorized to work in the US on a permanent and ongoing "
+                 "basis without employer-sponsored work authorization.")
+TRIAGE_TRIAL = "Assists with coordinating Investigator Meeting attendees with Sponsor(s)."
+
+
+class TriageSurfaceTests(AppFixture):
+    """The triage routes as the page reaches them.
+
+    Written because the routes existed for a commit with no test behind them, and a refactor
+    deleted the two functions they called: every unit test still passed and the page answered
+    `app_failure`. A route nothing calls over HTTP is a route nothing checks.
+    """
+
+    def setUp(self):
+        super().setUp()
+        (self.private / "jobs-wide").mkdir()
+        rows = []
+        for job_id, employer, statements in (
+            ("job-t1", "Beghou Consulting", [TRIAGE_VISA, TRIAGE_SECOND]),
+            ("job-t2", "Beghou Consulting", [TRIAGE_VISA, TRIAGE_SECOND]),
+            ("job-t3", "Science 37", [TRIAGE_TRIAL]),
+            ("job-t4", "Veeva Systems", []),
+        ):
+            body = ("About the role. " + " ".join(statements) + " Join a great team.")
+            card = {"job_id": job_id, "employer": employer, "title": "Analyst",
+                    "location": "Boston", "canonical_url": f"https://example.invalid/{job_id}",
+                    "sponsorship": "unknown", "sponsorship_statements": statements,
+                    "description": body, "description_sha256": "0" * 64}
+            (self.private / "jobs-wide" / f"{job_id}.json").write_text(
+                json.dumps(card), encoding="utf-8")
+            rows.append({"job_id": job_id})
+        (self.private / "review-queue-app-test.json").write_text(
+            json.dumps({"rows": rows}), encoding="utf-8")
+
+    def test_the_triage_page_and_both_routes_answer(self):
+        with urllib.request.urlopen(self.origin + "/triage", timeout=10) as response:
+            policy = response.headers["Content-Security-Policy"]
+            body = response.read().decode("utf-8")
+        self.assertIn("default-src 'none'", policy)
+        self.assertNotIn("localStorage", body)
+        report = self.call("/api/sponsorship/queue")
+        self.assertEqual(report["needing_triage"], 3)
+        self.assertIs(report["writes"], False)
+        posting = self.call("/api/sponsorship/posting", {"job_id": "job-t1"})
+        self.assertIn(TRIAGE_VISA, posting["description"])
+
+    def test_both_triage_routes_need_the_token_and_this_origin(self):
+        for path, body in (("/api/sponsorship/queue", None),
+                           ("/api/sponsorship/posting", {"job_id": "job-t1"})):
+            with self.subTest(path=path):
+                self.assertEqual(self.refused(path, body, token="wrong")[1]["error"],
+                                 "bad_token")
+                self.assertEqual(
+                    self.refused(path, body, origin="https://elsewhere.invalid")[1]["error"],
+                    "bad_token")
+
+    def test_an_unknown_opening_is_refused_with_a_bare_code(self):
+        status, payload = self.refused("/api/sponsorship/posting", {"job_id": "job-absent"})
+        self.assertEqual((status, payload), (404, {"error": "no_such_opening"}))
+        status, payload = self.refused("/api/sponsorship/posting", {"job_id": 5})
+        self.assertEqual((status, payload), (400, {"error": "bad_job_id"}))
+
+    def test_the_hint_orders_the_page_and_hides_nothing(self):
+        report = self.call("/api/sponsorship/queue")
+        self.assertEqual([item["hint"] for item in report["items"]],
+                         ["employment_or_visa_signal", "employment_or_visa_signal",
+                          "possible_trial_sponsor_only"])
+        self.assertIn("job-t3", [item["job_id"] for item in report["items"]])
+        for item in report["items"]:
+            self.assertEqual(item["sponsorship"], "unknown")
+
+    def test_identical_sentences_group_while_each_opening_keeps_its_own_identity(self):
+        report = self.call("/api/sponsorship/queue")
+        by_text = {group["text"]: group for group in report["groups"]}
+        self.assertEqual(by_text[TRIAGE_VISA]["occurrences"], 2)
+        members = by_text[TRIAGE_VISA]["members"]
+        self.assertEqual(sorted(m["job_id"] for m in members), ["job-t1", "job-t2"])
+        self.assertEqual(len({m["job_card_sha256"] for m in members}), 2)
+        for member in members:
+            self.assertIs(member["selected"], False)
+
+    def test_adjacent_sentences_are_merged_for_display_only(self):
+        report = self.call("/api/sponsorship/queue")
+        item = next(i for i in report["items"] if i["job_id"] == "job-t1")
+        self.assertEqual(len(item["statements"]), 2)
+        self.assertEqual(len(item["blocks"]), 1)
+        self.assertEqual(len(item["blocks"][0]["statement_sha256s"]), 2)
+        self.assertEqual([s["statement_sha256"] for s in item["statements"]],
+                         item["blocks"][0]["statement_sha256s"])
+
+    def test_the_triage_payload_suggests_no_verdict_anywhere(self):
+        blob = json.dumps(self.call("/api/sponsorship/queue"))
+        for key in ('"verdict"', '"suggested"', '"default"', '"eligibility"'):
+            self.assertNotIn(key, blob)

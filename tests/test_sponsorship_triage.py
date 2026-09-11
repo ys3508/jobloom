@@ -129,5 +129,183 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(TRIAGE.build(self.root)["queue_file"], "review-queue-test.json")
 
 
+
+TRIAL_SENSE = ("Assists with coordinating Investigator Meeting attendees and items "
+               "with Sponsor(s)")
+VISA_SENSE = ("Veeva Systems does not anticipate providing sponsorship for employment "
+              "visa status (e.g., H-1B).")
+
+
+class HintTest(unittest.TestCase):
+    """The reading-order hint, and the three things it is not allowed to be."""
+
+    def test_the_employment_sense_is_told_from_the_clinical_one(self):
+        self.assertEqual(TRIAGE.statement_hint(SAYS_NO), "employment_or_visa_signal")
+        self.assertEqual(TRIAGE.statement_hint(VISA_SENSE), "employment_or_visa_signal")
+        self.assertEqual(TRIAGE.statement_hint(TRIAL_SENSE), "possible_trial_sponsor_only")
+
+    def test_a_card_carrying_both_senses_is_its_own_tier(self):
+        both = [{"hint": "employment_or_visa_signal"}, {"hint": "possible_trial_sponsor_only"}]
+        self.assertEqual(TRIAGE.card_hint(both), "mixed_signal")
+        self.assertEqual(TRIAGE.card_hint(both[:1]), "employment_or_visa_signal")
+        self.assertEqual(TRIAGE.card_hint(both[1:]), "possible_trial_sponsor_only")
+
+
+class HintDoesNotDecideTest(unittest.TestCase):
+    """A hint orders the page. It may not remove a card, settle a field, or pick a verdict."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        os.chmod(self.root, 0o700)
+        (self.root / "jobs-wide").mkdir()
+        for job_id, statements in (("job-visa", [SAYS_NO]),
+                                   ("job-trial", [TRIAL_SENSE]),
+                                   ("job-both", [SAYS_NO, TRIAL_SENSE])):
+            value = card(job_id, statements=statements,
+                         description="Intro. " + " ".join(statements) + " Outro.")
+            (self.root / "jobs-wide" / f"{job_id}.json").write_text(
+                json.dumps(value), encoding="utf-8")
+        (self.root / "review-queue-test.json").write_text(json.dumps({
+            "rows": [{"job_id": j} for j in ("job-trial", "job-both", "job-visa")]
+        }), encoding="utf-8")
+        self.report = TRIAGE.build(self.root)
+
+    def test_a_trial_only_card_is_kept_not_filtered_out(self):
+        self.assertEqual(self.report["needing_triage"], 3)
+        self.assertIn("job-trial", [item["job_id"] for item in self.report["items"]])
+
+    def test_the_hint_orders_the_page(self):
+        self.assertEqual([item["hint"] for item in self.report["items"]],
+                         ["employment_or_visa_signal", "mixed_signal",
+                          "possible_trial_sponsor_only"])
+        self.assertEqual(self.report["hint_counts"],
+                         {"employment_or_visa_signal": 1, "mixed_signal": 1,
+                          "possible_trial_sponsor_only": 1})
+
+    def test_the_hint_never_becomes_a_verdict_or_settles_the_field(self):
+        for item in self.report["items"]:
+            self.assertEqual(item["sponsorship"], "unknown")
+            self.assertEqual(item["verdicts"], list(TRIAGE.VERDICTS))
+            for key in ("verdict", "suggested", "suggested_verdict", "likely", "default",
+                        "eligibility", "hard_filter_failures"):
+                self.assertNotIn(key, item)
+
+    def test_a_trial_only_card_still_offers_all_three_verdicts(self):
+        trial = next(i for i in self.report["items"] if i["job_id"] == "job-trial")
+        self.assertEqual(trial["verdicts"], ["supports", "does_not_support", "unclear"])
+
+
+class GroupingTest(unittest.TestCase):
+    """One reading per sentence; one decision per opening."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        os.chmod(self.root, 0o700)
+        (self.root / "jobs-wide").mkdir()
+        # The same sentence in three openings, two of them the same employer, plus one
+        # opening whose sentence differs by a single word.
+        almost = SAYS_NO.replace("currently ", "")
+        for job_id, text in (("job-a", SAYS_NO), ("job-b", SAYS_NO), ("job-c", SAYS_NO),
+                             ("job-d", almost)):
+            value = card(job_id, statements=[text], description="Intro. " + text + " Outro.")
+            value["employer"] = "Beghou Consulting" if job_id != "job-c" else "Other Co"
+            (self.root / "jobs-wide" / f"{job_id}.json").write_text(
+                json.dumps(value), encoding="utf-8")
+        (self.root / "review-queue-test.json").write_text(json.dumps({
+            "rows": [{"job_id": j} for j in ("job-a", "job-b", "job-c", "job-d")]
+        }), encoding="utf-8")
+        self.report = TRIAGE.build(self.root)
+
+    def test_identical_sentences_group_and_a_one_word_difference_does_not(self):
+        groups = self.report["groups"]
+        self.assertEqual([group["occurrences"] for group in groups], [3, 1])
+        self.assertNotEqual(groups[0]["statement_sha256"], groups[1]["statement_sha256"])
+
+    def test_every_opening_keeps_its_own_identity_inside_a_group(self):
+        members = self.report["groups"][0]["members"]
+        self.assertEqual(len(members), 3)
+        for member in members:
+            self.assertRegex(member["job_card_sha256"], r"^[0-9a-f]{64}$")
+            self.assertIn("job_id", member)
+        self.assertEqual(len({member["job_card_sha256"] for member in members}), 3)
+
+    def test_a_group_never_carries_an_employer_level_identity(self):
+        """Grouping is by sentence. Two openings at one employer are still two openings."""
+        for group in self.report["groups"]:
+            for key in ("employer", "employers", "applies_to_employer", "company_rule"):
+                self.assertNotIn(key, group)
+
+    def test_nothing_in_a_group_is_selected_by_default(self):
+        for group in self.report["groups"]:
+            for member in group["members"]:
+                self.assertIs(member["selected"], False)
+
+    def test_a_group_offers_the_three_verdicts_and_suggests_none(self):
+        for group in self.report["groups"]:
+            self.assertEqual(group["verdicts"], list(TRIAGE.VERDICTS))
+            self.assertNotIn("verdict", group)
+
+    def test_every_card_still_appears_as_its_own_item(self):
+        self.assertEqual(self.report["needing_triage"], 4)
+
+
+class DisplayBlockTest(unittest.TestCase):
+    """Merging is a way of showing sentences and never a new identity for them."""
+
+    def setUp(self):
+        self.second = ("Applicants must be authorized to work in the US on a permanent "
+                       "and ongoing basis.")
+        self.description = "Intro paragraph. " + SAYS_NO + " " + self.second + " Outro."
+        self.statements = []
+        for text in (SAYS_NO, self.second):
+            entry = {"text": text, "statement_sha256": TRIAGE.resume_core.canonical_hash(text),
+                     "hint": TRIAGE.statement_hint(text)}
+            entry.update(TRIAGE.statement_context(self.description, text))
+            self.statements.append(entry)
+
+    def test_adjacent_sentences_become_one_block(self):
+        blocks = TRIAGE.display_blocks(self.description, self.statements)
+        self.assertEqual(len(blocks), 1)
+        self.assertTrue(blocks[0]["merged"])
+
+    def test_a_block_is_the_posting_s_own_run_not_a_concatenation(self):
+        blocks = TRIAGE.display_blocks(self.description, self.statements)
+        self.assertIn(blocks[0]["text"], self.description)
+
+    def test_a_block_names_every_statement_inside_it(self):
+        blocks = TRIAGE.display_blocks(self.description, self.statements)
+        self.assertEqual(blocks[0]["statement_sha256s"],
+                         [s["statement_sha256"] for s in self.statements])
+
+    def test_the_underlying_statements_keep_text_span_and_hash(self):
+        for statement in self.statements:
+            start, end = statement["span"]
+            self.assertEqual(self.description[start:end], statement["text"])
+            self.assertRegex(statement["statement_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_a_block_has_no_identity_of_its_own(self):
+        """Nothing binds to a block, so it must not carry a hash that could be bound to."""
+        blocks = TRIAGE.display_blocks(self.description, self.statements)
+        for key in ("block_sha256", "sha256", "statement_sha256", "id"):
+            self.assertNotIn(key, blocks[0])
+
+    def test_distant_sentences_are_not_merged(self):
+        far = "Intro. " + SAYS_NO + ("filler " * 200) + self.second + " Outro."
+        statements = []
+        for text in (SAYS_NO, self.second):
+            entry = {"text": text, "statement_sha256": TRIAGE.resume_core.canonical_hash(text),
+                     "hint": TRIAGE.statement_hint(text)}
+            entry.update(TRIAGE.statement_context(far, text))
+            statements.append(entry)
+        self.assertEqual(len(TRIAGE.display_blocks(far, statements)), 2)
+
+    def test_a_statement_that_cannot_be_located_keeps_its_own_block(self):
+        orphan = {"text": "Never written in the posting.", "hint": "possible_trial_sponsor_only",
+                  "statement_sha256": TRIAGE.resume_core.canonical_hash("orphan"),
+                  "before": "", "after": "", "located": False, "span": None}
+        blocks = TRIAGE.display_blocks(self.description, self.statements + [orphan])
+        self.assertEqual(len(blocks), 2)
+        self.assertIs(blocks[-1]["located"], False)
+
 if __name__ == "__main__":
     unittest.main()
