@@ -389,26 +389,141 @@ class ApplicationJoinTests(unittest.TestCase):
         row = SAVED.tracker_rows(self.db, today=TODAY)[0]
         self.assertEqual(row["applied_evidence"], "confirmed after applying")
 
+    def _submitted_history(self, application_id="app-2", state="submitted"):
+        """The two rows a real `submitted` transition leaves: the stamp and the event.
+
+        A minimal credible fixture rather than a direct state edit. What the label reads is
+        the *event*, so a test that only set the state would assert nothing about the rule —
+        and a test that only set the state is what the old version of this did, which is why
+        a hand-set `submitted_at` used to count.
+        """
+        self.db.execute(
+            "UPDATE applications SET state=?, submitted_at=? WHERE application_id=?",
+            (state, AT.isoformat(), application_id))
+        self.db.execute(
+            "INSERT INTO application_events (application_id, created_at, actor,"
+            " from_state, to_state, reason_code, metadata_json)"
+            " VALUES (?, ?, 'system', 'submitting', 'submitted', 'confirmation_received', '{}')",
+            (application_id, AT.isoformat()))
+
     def test_a_submission_application_core_saw_is_named_apart_from_a_self_report(self):
         SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
         self._application_for_the_saved_job()
         SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
-        # The state a real submission leaves behind. Set directly rather than driven through
-        # the transition chain, which needs evidence rows, an approved review and a lock;
-        # what is under test is how the tracker reads the result, not how it is reached.
-        self.db.execute("UPDATE applications SET state='submitted', submitted_at=? "
-                        "WHERE application_id='app-2'", (AT.isoformat(),))
+        self._submitted_history()
         row = SAVED.tracker_rows(self.db, today=TODAY)[0]
         self.assertEqual(row["applied_evidence"], "tracked application")
 
-    def test_a_withdrawn_application_does_not_count_as_evidenced(self):
-        """`submitted_at` is cleared by nothing, so the state has to agree with it."""
+    def test_a_submitted_application_later_withdrawn_is_still_evidenced(self):
+        """Withdrawing does not un-send an application; the employer still has it.
+
+        The previous rule read the current state and dropped these, which took a real
+        submission out of the denominator of every rate computed over it.
+        """
         SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
         self._application_for_the_saved_job()
-        self.db.execute("UPDATE applications SET state='withdrawn', submitted_at=? "
+        self._submitted_history(state="withdrawn")
+        self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
+                         "tracked application")
+
+    def test_a_post_submission_state_with_the_event_is_evidenced(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        self._submitted_history(state="interview")
+        self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
+                         "tracked application")
+
+    def test_a_submitted_at_with_no_transition_behind_it_is_not_evidenced(self):
+        """A stamp written around the engine proves nothing about what was sent."""
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        self.db.execute("UPDATE applications SET state='submitted', submitted_at=? "
                         "WHERE application_id='app-2'", (AT.isoformat(),))
         self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
                          "stated at decision")
+
+    def test_an_event_with_no_stamp_beside_it_is_not_evidenced(self):
+        """The two are written by one transition; one without the other has been edited."""
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        self.db.execute(
+            "INSERT INTO application_events (application_id, created_at, actor,"
+            " from_state, to_state, reason_code, metadata_json)"
+            " VALUES ('app-2', ?, 'system', 'submitting', 'submitted', 'x', '{}')",
+            (AT.isoformat(),))
+        self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
+                         "stated at decision")
+
+    def test_a_hand_made_submission_has_no_submitted_event_and_stays_rung_two(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
+        self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
+                         "confirmed after applying")
+
+
+class ReferenceTests(unittest.TestCase):
+    """A confirmation reference is kept whole or refused. It is never shortened."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
+        APPLICATIONS.initialize(self.db)
+        SAVED.initialize(self.db)
+        self.addCleanup(self.db.close)
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+
+    def confirm(self, reference, kind="confirmation_id"):
+        return SAVED.confirm_submitted(self.db, "https://jobs.example.com/1",
+                                       reference_kind=kind, reference=reference, at=AT)
+
+    def stored(self):
+        return self.db.execute(
+            "SELECT submitted_confirmed_at, submitted_reference FROM saved_jobs").fetchone()
+
+    def test_exactly_the_limit_is_stored_whole(self):
+        reference = "A" * SAVED.MAX_REFERENCE
+        self.confirm(reference)
+        self.assertEqual(self.stored()["submitted_reference"], reference)
+
+    def test_one_past_the_limit_refuses_the_whole_confirmation(self):
+        with self.assertRaises(ValueError):
+            self.confirm("A" * (SAVED.MAX_REFERENCE + 1))
+        row = self.stored()
+        self.assertIsNone(row["submitted_confirmed_at"])
+        self.assertIsNone(row["submitted_reference"])
+
+    def test_the_limit_counts_code_points_not_bytes(self):
+        """Stated because "characters" stops being obvious once the string is not ASCII.
+
+        An astral character is one code point and four UTF-8 bytes; a limit counted in bytes
+        would refuse a quarter of what this accepts, and neither rule is wrong — but only one
+        of them can be the documented one.
+        """
+        self.confirm("\U0001F600" * SAVED.MAX_REFERENCE)
+        self.assertEqual(len(self.stored()["submitted_reference"]), SAVED.MAX_REFERENCE)
+
+    def test_surrounding_whitespace_is_not_part_of_what_was_typed(self):
+        self.confirm("  RQ-4077023  ")
+        self.assertEqual(self.stored()["submitted_reference"], "RQ-4077023")
+
+    def test_whitespace_does_not_let_a_value_past_the_limit(self):
+        with self.assertRaises(ValueError):
+            self.confirm(" " + "A" * (SAVED.MAX_REFERENCE + 1) + " ")
+
+    def test_a_refusal_names_no_value(self):
+        secret = "RQ-" + "9" * SAVED.MAX_REFERENCE
+        with self.assertRaises(ValueError) as caught:
+            self.confirm(secret)
+        self.assertNotIn("9", str(caught.exception))
+        self.assertNotIn("RQ-", str(caught.exception))
+
+    def test_a_reference_that_is_not_text_is_refused(self):
+        for value in (5, ["RQ-1"], {"id": "RQ-1"}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.confirm(value)
 
     def test_a_kept_job_that_was_applied_to_says_so(self):
         SAVED.save(self.db, card(), actor="user", at=AT)

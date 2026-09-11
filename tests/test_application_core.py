@@ -328,6 +328,32 @@ class ApplicationCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive submission evidence"):
             CORE.transition(self.db, "app-1", "submitted", "system", "submit_clicked", at=AT)
 
+    def test_a_real_submission_leaves_both_the_stamp_and_the_event(self):
+        """The pair the tracker reads to tell rung 3 from a self-report.
+
+        `saved_jobs._evidenced_application_urls` requires `submitted_at` *and* an
+        `application_events` row moving to `submitted`, because either alone can be written
+        around the engine. This is the test that the pair is what a real submission actually
+        produces, so the minimal fixtures elsewhere are not asserting a shape nothing makes.
+        """
+        self.add_job_and_application(policy="approved_queue")
+        self.move_to_pre_submit()
+        self.add_authorization()
+        CORE.transition(
+            self.db, "app-1", "submitting", "system", "submit_requested",
+            {"authorization_id": "auth-1", "approved_queue": True}, AT,
+        )
+        CORE.record_evidence(self.db, "ev-1", "app-1", "confirmation_id",
+                             confirmation_id="ABC-123", at=AT)
+        CORE.transition(self.db, "app-1", "submitted", "system", "confirmation_received", at=AT)
+        row = self.db.execute(
+            "SELECT submitted_at FROM applications WHERE application_id='app-1'").fetchone()
+        self.assertIsNotNone(row["submitted_at"])
+        event = self.db.execute(
+            "SELECT to_state FROM application_events WHERE application_id='app-1'"
+            " AND to_state='submitted'").fetchone()
+        self.assertIsNotNone(event)
+
     def test_success_evidence_allows_submitted_state(self):
         self.add_job_and_application(policy="approved_queue")
         self.move_to_pre_submit()

@@ -24,6 +24,10 @@ from _common import require_table  # noqa: E402
 
 TRACKING_PARAMETERS = {"source", "src", "ref", "referrer", "trackingid", "gh_src"}
 SUCCESS_EVIDENCE_TYPES = {"success_page", "confirmation_id", "account_record", "email_confirmation"}
+# The one reason code that may move an application to `submitted_by_user_unverified`, and the
+# actor that may use it. Pinned as a constant so the guard and its caller cannot drift apart,
+# and so a search for the code finds the rule.
+MANUAL_SUBMISSION_REASON = "manual_submission_confirmed_by_user"
 FAILURE_CODES = {
     "closed_job", "invalid_url", "login_failure", "captcha", "unsupported_form", "upload_failure",
     "new_question", "eligibility_failure", "location_failure", "compensation_failure", "network_failure",
@@ -33,7 +37,8 @@ APPLICATION_STATES = {
     "discovered", "pending_analysis", "filtered", "needs_user_review", "precision_recommended",
     "broad_recommended", "approved", "materials_in_progress", "ready_to_fill", "filling",
     "waiting_for_user_answer", "waiting_for_submission_approval", "pre_submit_ready", "submitting",
-    "submitted", "submission_failed", "submission_uncertain", "waiting_for_user_takeover", "closed",
+    "submitted", "submitted_by_user_unverified",
+    "submission_failed", "submission_uncertain", "waiting_for_user_takeover", "closed",
     "rejected", "recruiter_response", "screening_call", "interview", "final_interview", "offer",
     "withdrawn", "no_response",
 }
@@ -51,15 +56,32 @@ TRANSITIONS = {
     # has acquired the application: a resume bound in the wrong format or superseded before
     # filling starts must be replaceable, and rebinding already invalidates the old lock.
     # Once filling begins the state is `filling`, so this door is shut by then.
-    "ready_to_fill": {"filling", "materials_in_progress", "withdrawn", "closed"},
+    # `submitted_by_user_unverified` is what a hand-made application becomes. It is not
+    # `submitted` and must never be read as it: the user filled the employer's form in their
+    # own browser tab, Jobloom observed none of it, and no positive submission evidence
+    # exists. What the state buys is that `acquire_next` — which selects `ready_to_fill` —
+    # can no longer hand the opening to a worker that would fill a form already submitted.
+    "ready_to_fill": {"filling", "materials_in_progress", "withdrawn", "closed",
+                      "submitted_by_user_unverified"},
     "filling": {"waiting_for_user_answer", "waiting_for_submission_approval", "submission_failed", "waiting_for_user_takeover", "withdrawn"},
     "submission_failed": {"ready_to_fill", "waiting_for_user_takeover", "withdrawn"},
-    "waiting_for_user_takeover": {"ready_to_fill", "waiting_for_submission_approval", "withdrawn", "closed"},
+    # Takeover means the user finishes it themselves, which is the manual submission this
+    # names. Only these two states offer it: both have materials bound and locked, so the
+    # resume the employer received is the one Jobloom can still identify. An application that
+    # never got that far was not submitted with anything Jobloom knows about.
+    "waiting_for_user_takeover": {"ready_to_fill", "waiting_for_submission_approval",
+                                  "withdrawn", "closed", "submitted_by_user_unverified"},
     "waiting_for_submission_approval": {"pre_submit_ready", "withdrawn"},
     "pre_submit_ready": {"submitting", "waiting_for_user_answer", "withdrawn"},
     "submitting": {"submitted", "submission_failed", "submission_uncertain"},
     "submission_uncertain": {"submitted", "submission_failed"},
     "submitted": {"rejected", "recruiter_response", "withdrawn", "no_response"},
+    # The same outcomes, because an application submitted by hand gets replies like any other.
+    # What it does not get is `submitted_at`, so `outcome_core.record` still refuses to
+    # attribute a rung-3 outcome to it; those replies are recorded on the saved job, which is
+    # where rung 2's funnel lives.
+    "submitted_by_user_unverified": {"rejected", "recruiter_response", "withdrawn",
+                                     "no_response"},
     "recruiter_response": {"screening_call", "rejected", "withdrawn", "no_response"},
     "screening_call": {"interview", "rejected", "withdrawn"},
     "interview": {"final_interview", "rejected", "withdrawn"},
@@ -572,6 +594,14 @@ def _transition_uncommitted(
     metadata = metadata or {}
     if to_state == "approved" and actor != "user":
         raise ValueError("application approval requires the user actor")
+    if to_state == "submitted_by_user_unverified":
+        # Only a person can report having done something a person did. A model or the system
+        # declaring it would be manufacturing the one fact this state records.
+        if actor != "user":
+            raise ValueError("a manual submission can only be confirmed by the user")
+        if reason_code != MANUAL_SUBMISSION_REASON:
+            raise ValueError(
+                f"a manual submission must be recorded as {MANUAL_SUBMISSION_REASON}")
     if to_state == "filling":
         raise ValueError("use acquire_next to enter the filling state")
     if to_state in {"ready_to_fill", "pre_submit_ready", "submitting"}:

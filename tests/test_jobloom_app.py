@@ -1070,9 +1070,68 @@ class SubmissionSurfaceTests(PreflightFixture):
         self.assertEqual(smuggled["rung"], 2)
         self.assertIs(smuggled["evidenced"], False)
         self.assertNotIn("1999", smuggled["confirmed_at"])
-        self.assertEqual(smuggled["state"], "ready_to_fill")
+        # The state the service chose, not the one the payload named.
+        self.assertEqual(smuggled["state"], "submitted_by_user_unverified")
         self.assertEqual(
             self.db.execute("SELECT COUNT(*) FROM submission_evidence").fetchone()[0], 0)
+        row = self.db.execute(
+            "SELECT state, submitted_at FROM applications WHERE application_id='app-1'"
+        ).fetchone()
+        self.assertEqual(row["state"], "submitted_by_user_unverified")
+        self.assertIsNone(row["submitted_at"])
+
+    def test_the_application_leaves_ready_to_fill_over_http(self):
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'").fetchone()[0],
+            "ready_to_fill")
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.call("/api/submission/confirm", {"application_id": "app-1"})
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'").fetchone()[0],
+            "submitted_by_user_unverified")
+
+    def test_an_over_long_reference_is_refused_without_echoing_it(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        secret = "RQ-" + "7" * 600
+        status, payload = self.refused("/api/submission/confirm", {
+            "application_id": "app-1", "reference_kind": "confirmation_id",
+            "reference": secret})
+        self.assertEqual((status, payload), (400, {"error": "reference_too_long"}))
+        self.assertNotIn("7", json.dumps(payload))
+        # And nothing was written: not the confirmation, not the state.
+        row = self.db.execute(
+            "SELECT submitted_confirmed_at, submitted_reference FROM saved_jobs").fetchone()
+        self.assertIsNone(row["submitted_confirmed_at"])
+        self.assertIsNone(row["submitted_reference"])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM applications WHERE application_id='app-1'").fetchone()[0],
+            "ready_to_fill")
+
+    def test_a_reference_that_is_not_text_is_refused(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        status, payload = self.refused("/api/submission/confirm", {
+            "application_id": "app-1", "reference_kind": "confirmation_id",
+            "reference": ["RQ-1"]})
+        self.assertEqual((status, payload["error"]), (400, "bad_reference"))
+
+    def test_a_stored_reference_is_never_echoed_back_to_the_page(self):
+        """The page sends it once; it does not get to read it back out of the service."""
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.call("/api/submission/confirm", {
+            "application_id": "app-1", "reference_kind": "confirmation_id",
+            "reference": "RQ-SECRET-1"})
+        # It is shown back on the state screen so the user can see what they recorded, which
+        # is their own value returning to their own window over the token-guarded loopback —
+        # but it must never appear in an error, which the refusal tests above cover.
+        report = self.call("/api/submission/state", {"application_id": "app-1"})
+        self.assertEqual(report["reference"], "RQ-SECRET-1")
+
+    def test_a_mutation_cannot_be_reached_with_get(self):
+        for path in ("/api/submission/intend", "/api/submission/confirm",
+                     "/api/submission/tracker"):
+            with self.subTest(path=path):
+                status, payload = self.refused(path)
+                self.assertEqual((status, payload["error"]), (404, "unknown_endpoint"))
 
     def test_the_returned_shape_is_an_allowlist(self):
         report = self.call("/api/submission/state", {"application_id": "app-1"})

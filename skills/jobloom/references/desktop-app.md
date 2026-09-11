@@ -143,13 +143,47 @@ transitioned to `submitted`.
 rate — the number that makes a reply rate over intentions wrong — and one press would record
 both at the same instant and erase it.
 
-**No archive is made.** `archive_core.create_archive` requires an archivable state, a
-`submitted_at`, and a `use_type='submitted'` resume usage; a hand-made application has none of
-them. That is a property of the evidence, not a gap, so nothing here fabricates one.
+**No archive is made, and this task does not add one.** `archive_core.create_archive` requires
+an archivable state, a `submitted_at`, and a `use_type='submitted'` resume usage; a hand-made
+application has none of them. That is a property of the evidence, not a gap, so nothing here
+fabricates one.
 
-**The queue exclusion reads the saved job, not the state.** There is no application state
-meaning "the user submitted this themselves" and there should not be: `ready_to_fill` stays
-literally true, because nothing was filled by Jobloom.
+**Schema migration is not a read path.** `submission_record.state` and `pending` execute only
+SELECT: they do not create, alter, insert, update or commit, and a database whose schema is not
+ready is refused with a stable code rather than migrated underneath a caller who wanted to
+look. `submission_record.initialize` is the one place that writes schema, called from
+`serve()` alongside the other components.
+
+**Rung 2 now has an application state of its own: `submitted_by_user_unverified`.** The first
+version left the application at `ready_to_fill` and hid it from the window's list, which hid it
+from one reader and no others — `acquire_next` selects exactly `ready_to_fill`, so a worker
+could still have been handed an opening whose form was already submitted by hand. The state is
+reachable only from `ready_to_fill` and `waiting_for_user_takeover`, only on the user actor,
+and only with the reason code `manual_submission_confirmed_by_user`.
+
+It is still not rung 3: no `submitted_at`, no submitted resume usage, no evidence row, and
+`create_archive` still refuses. The tracker reads it as "confirmed after applying".
+
+**The confirmation and the state change land together.** Both go through their uncommitted
+cores inside one `BEGIN IMMEDIATE`, because either alone survives a crash as a half-truth — a
+rung with no state change leaves the opening acquirable, a state change with no rung leaves an
+application nobody can explain. Confirming twice keeps the first time and adds no second
+transition.
+
+**A reference is kept whole or refused.** It used to be silently truncated at 500 characters,
+which stored something nobody confirmed. The limit is now explicit, measured in code points,
+and exceeding it refuses the whole confirmation: nothing is written, not the timestamp, not the
+reference, not the state. The refusal is a bare code (`reference_too_long`) and the value never
+appears in an exception, a log line or an HTTP body.
+
+**Rung 3 is read from history, not from the current state.** `applied_evidence` says
+"tracked application" only when the application has both a `submitted_at` and an
+`application_events` row moving to `submitted`. Reading the current state instead was wrong in
+both directions: a `submitted_at` written around the engine counted, and a real submission
+later withdrawn did not — withdrawing does not un-send an application, and dropping it would
+have flattered every rate computed over that denominator. `answer_matched` is not a filling or
+submission signal either and must not appear in any funnel: it records that an answer was
+resolved, not that a field was filled.
 
 **The tracker is rebuilt from state.** `build_worksheets` writes `applied.xlsx` and its CSV
 with `worksheet_writer`, which is stdlib only — it exists because

@@ -50,6 +50,7 @@ if SCRIPT_DIR not in sys.path:
 
 import application_core  # noqa: E402
 import saved_jobs  # noqa: E402
+from _common import require_table  # noqa: E402
 
 # The rungs, named so a caller cannot accidentally describe one as another.
 RUNG_INTENDED = 1
@@ -70,6 +71,23 @@ def _application(connection: sqlite3.Connection, application_id: str) -> dict[st
     return dict(row)
 
 
+def initialize(connection: sqlite3.Connection) -> None:
+    """Bring the schema this module reads up to date. The only place here that may write it.
+
+    Split out because `state` claimed to be read-only while calling `saved_jobs.initialize`,
+    which on a first run creates a table, adds columns and commits. A migration inside a read
+    path is a write nobody asked for, at a moment nobody chose — and on a shared database it
+    is a write that can block a reader that only wanted to look.
+    """
+    saved_jobs.initialize(connection)
+
+
+def _require_schema(connection: sqlite3.Connection) -> None:
+    """Refuse a read against a database nobody has initialised, rather than migrating it."""
+    for table in ("applications", "jobs", "saved_jobs"):
+        require_table(connection, table)
+
+
 def _saved_row(connection: sqlite3.Connection, canonical_url: str) -> sqlite3.Row | None:
     url = application_core.canonicalize_url(canonical_url or "")
     return connection.execute(
@@ -79,11 +97,15 @@ def _saved_row(connection: sqlite3.Connection, canonical_url: str) -> sqlite3.Ro
 def state(connection: sqlite3.Connection, application_id: str) -> dict[str, Any]:
     """Which rung this application is on, and what the next press would record.
 
-    Read-only. The window shows this before either button so a person can see that pressing
-    records their own word — the distinction the three rungs are built on is worth putting on
-    the screen rather than only in a docstring.
+    Read-only in the strict sense: SELECT and nothing else. No statement here creates, alters,
+    inserts, updates or commits, and a database whose schema is not ready is refused rather
+    than quietly migrated — see `initialize`.
+
+    The window shows this before either button so a person can see that pressing records their
+    own word: the distinction the three rungs are built on is worth putting on the screen
+    rather than only in a docstring.
     """
-    saved_jobs.initialize(connection)
+    _require_schema(connection)
     application = _application(connection, application_id)
     saved = _saved_row(connection, application["canonical_url"])
     rung = RUNG_INTENDED - 1
@@ -119,7 +141,7 @@ def intend(connection: sqlite3.Connection, application_id: str, *, actor: str = 
     intention and the completion at the same instant and lose the gap between them, and that
     gap is the abandonment rate — the number that makes a reply rate over intentions wrong.
     """
-    saved_jobs.initialize(connection)
+    _require_schema(connection)
     application = _application(connection, application_id)
     card = json.loads(application["job_card_json"] or "{}")
     # The card is the posting as it was pulled, so the saved row describes the same opening the
@@ -135,18 +157,49 @@ def intend(connection: sqlite3.Connection, application_id: str, *, actor: str = 
 def confirm(connection: sqlite3.Connection, application_id: str, *,
             reference_kind: str | None = None, reference: str | None = None,
             at: datetime | None = None) -> dict[str, Any]:
-    """Rung 2: the user says they finished the form. Their word, recorded after the act.
+    """Rung 2, and the application state that follows from it, in one transaction.
 
-    Refuses when rung 1 was never pressed, because a confirmation with no intention behind it
-    has no `applied_at` to sit after and the gap between the two would be unmeasurable.
+    Two things have to become true together. The saved job records that the user says they
+    finished the form; the application leaves `ready_to_fill`, because `acquire_next` selects
+    exactly that state and a worker must not be handed an opening whose form has already been
+    submitted by hand. Either one alone is a half-truth that survives a crash: a rung with no
+    state change leaves the opening acquirable, and a state change with no rung leaves an
+    application nobody can explain.
+
+    So both are taken through their uncommitted cores inside one `BEGIN IMMEDIATE`. Calling
+    the committing versions and hoping would not be atomic, it would be two writes with a
+    window between them.
+
+    The state is `submitted_by_user_unverified`, never `submitted`: no `submitted_at` is
+    written, no `resume_usage` row is made, `submission_evidence` stays empty, and
+    `archive_core.create_archive` still refuses. Refuses when rung 1 was never pressed,
+    because a confirmation with no intention behind it has no `applied_at` to sit after.
     """
-    saved_jobs.initialize(connection)
+    _require_schema(connection)
     application = _application(connection, application_id)
-    result = saved_jobs.confirm_submitted(
-        connection, application["canonical_url"],
-        reference_kind=reference_kind, reference=reference, at=at)
+    # Validated before the transaction opens: a refusal here should not have taken a write
+    # lock, and the reference is the input most likely to be refused.
+    saved_jobs.check_reference(reference_kind, reference)
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = saved_jobs._confirm_submitted_uncommitted(
+            connection, application["canonical_url"],
+            reference_kind=reference_kind, reference=reference, at=at)
+        # Already confirmed: the first time stands, and the state moved with it. Re-running
+        # the transition would add a second event for one act, and from the state it is
+        # already in it would be refused anyway.
+        if not result["already_confirmed"]:
+            application_core._transition_uncommitted(
+                connection, application_id, "submitted_by_user_unverified", "user",
+                application_core.MANUAL_SUBMISSION_REASON, at=at)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     return {**result, "application_id": application_id,
-            "rung": RUNG_CONFIRMED, "evidenced": False}
+            "rung": RUNG_CONFIRMED, "evidenced": False,
+            "state": "submitted_by_user_unverified"}
 
 
 def pending(connection: sqlite3.Connection) -> dict[str, str]:

@@ -35,6 +35,24 @@ Entering `submitting` requires:
 - a real active, unrevoked, unexpired authorization in the shared local database
 - satisfaction of the selected submission policy
 
+`submitted_by_user_unverified` is where an application goes when the user fills the employer's
+form themselves and says so afterwards. It is reachable only from `ready_to_fill` and
+`waiting_for_user_takeover` — both have materials bound and locked, so the resume the employer
+received can still be identified — and only on the user actor with the reason code
+`manual_submission_confirmed_by_user`. A system or model actor is refused: the one fact the
+state records is that a person did something, and nothing else can report it.
+
+**It is not `submitted` and must never be counted as it.** No `submitted_at` is written, no
+`use_type='submitted'` resume usage is created, `submission_evidence` stays empty, and
+`archive_core.create_archive` still refuses — a hand-made application has none of the three
+things an archive is built from. What the state buys is that `acquire_next`, which selects
+`ready_to_fill`, can no longer hand a worker an opening whose form has already been submitted.
+
+It carries the same outcome transitions as `submitted`, because an application submitted by
+hand gets replies like any other. `outcome_core.record` still refuses to attribute one, since
+that path requires `submitted_at`; those replies belong on the saved job, where the second
+rung's funnel lives.
+
 Entering `submitted` requires stored positive evidence: success page, confirmation ID, account record, or confirmation email. Record evidence only while `submitting` or `submission_uncertain`.
 
 After a confirmed submission, create and verify the immutable local archive described in `submission-archive.md`. Archive state is separate from application state; an archive failure must remain visible and must not rewrite a confirmed application as unsubmitted.

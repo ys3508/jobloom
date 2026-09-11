@@ -69,6 +69,13 @@ DECISIONS = {LATER, APPLIED}
 # and an application made by hand has no row there.
 OUTCOMES = outcome_core.OUTCOME_TYPES
 MAX_TEXT = 500
+# A confirmation reference is evidence the user is pointing at, so it is kept whole or not at
+# all. `_text` truncates, which is right for a job title pulled from a posting and wrong here:
+# a confirmation number silently cut to 500 characters is not the value anybody confirmed.
+# Measured in code points, which is what `len` counts — a rule stated because "characters" is
+# ambiguous once an emoji or a combining mark is in the string, and the limit is generous
+# enough that no real confirmation number is near it.
+MAX_REFERENCE = 500
 MAX_REASON = 1_000
 
 
@@ -256,9 +263,52 @@ EMPLOYER_ORIGINATED_OUTCOMES = {
 }
 
 
+def check_reference(reference_kind: str | None, reference: Any) -> str | None:
+    """The reference as the user gave it, or a refusal. Never a shortened version of it.
+
+    Whitespace at the ends goes, because it is not part of what anybody typed. Nothing else
+    is changed and nothing is dropped: a value over the limit refuses the whole confirmation
+    rather than storing a prefix that would read, later, as the reference itself.
+
+    The refusals name no value. A message quoting the reference would put a confirmation
+    number into an exception, a log line and an HTTP body, which is three places it was never
+    meant to reach.
+    """
+    if reference is not None and not isinstance(reference, str):
+        raise ValueError("a reference must be text")
+    trimmed = reference.strip() if isinstance(reference, str) else ""
+    if reference_kind is not None:
+        if reference_kind not in application_core.SUCCESS_EVIDENCE_TYPES:
+            raise ValueError("reference kind must be one of: "
+                             + ", ".join(sorted(application_core.SUCCESS_EVIDENCE_TYPES)))
+        if not trimmed:
+            raise ValueError("a reference kind needs the reference itself")
+    elif trimmed:
+        raise ValueError("a reference needs to say what kind of thing it is")
+    if len(trimmed) > MAX_REFERENCE:
+        raise ValueError("reference is longer than this can store")
+    return trimmed or None
+
+
 def confirm_submitted(connection: sqlite3.Connection, job_url: str,
                       *, reference_kind: str | None = None, reference: str | None = None,
                       at: datetime | None = None) -> dict[str, Any]:
+    """Record the confirmation, and persist it. Always commits.
+
+    The uncommitted core is `_confirm_submitted_uncommitted`, for the caller that has to land
+    this together with an application state change: a rung recorded without the state, or a
+    state without the rung, is a half-truth that survives a crash.
+    """
+    result = _confirm_submitted_uncommitted(
+        connection, job_url, reference_kind=reference_kind, reference=reference, at=at)
+    connection.commit()
+    return result
+
+
+def _confirm_submitted_uncommitted(connection: sqlite3.Connection, job_url: str,
+                                   *, reference_kind: str | None = None,
+                                   reference: str | None = None,
+                                   at: datetime | None = None) -> dict[str, Any]:
     """The user saying they finished the employer's form, recorded after the fact.
 
     The middle rung of three, and the only one this mode can climb. `decision='applied'` is
@@ -281,14 +331,7 @@ def confirm_submitted(connection: sqlite3.Connection, job_url: str,
     optional, because a confirmation with no number is still a confirmation and demanding one
     would push people into inventing something to type.
     """
-    if reference_kind is not None:
-        if reference_kind not in application_core.SUCCESS_EVIDENCE_TYPES:
-            raise ValueError("reference kind must be one of: "
-                             + ", ".join(sorted(application_core.SUCCESS_EVIDENCE_TYPES)))
-        if not _text(reference):
-            raise ValueError("a reference kind needs the reference itself")
-    elif _text(reference):
-        raise ValueError("a reference needs to say what kind of thing it is")
+    reference = check_reference(reference_kind, reference)
     url = application_core.canonicalize_url(_text(job_url))
     row = connection.execute(
         "SELECT decision, submitted_confirmed_at FROM saved_jobs WHERE job_url=?", (url,)
@@ -304,8 +347,7 @@ def confirm_submitted(connection: sqlite3.Connection, job_url: str,
     connection.execute(
         "UPDATE saved_jobs SET submitted_confirmed_at=?, submitted_reference_kind=?, "
         "submitted_reference=?, updated_at=? WHERE job_url=?",
-        (timestamp, reference_kind, _text(reference) or None, timestamp, url))
-    connection.commit()
+        (timestamp, reference_kind, reference, timestamp, url))
     return {"job_url": url, "submitted_confirmed_at": timestamp, "already_confirmed": False,
             "reference_kind": reference_kind, "rung": 2}
 
@@ -385,20 +427,30 @@ def _evidenced_application_urls(connection: sqlite3.Connection) -> set[str]:
     application with no evidence at all started reporting as "tracked application", the label
     reserved for the one rung backed by positive employer evidence.
 
-    `submitted_at` is not enough on its own either: it is cleared by nothing, so a later
-    withdrawal keeps it. The state has to be one the application reached *through* `submitted`,
-    which is exactly `archive_core.ARCHIVABLE_STATES` minus the one that can be reached without
-    submitting.
+    **Read from the history, not from the current state.** The first version of this listed the
+    states an application can be in after submitting, which is a guess about how it got there
+    and was wrong in both directions: `submitted_at` set by hand with no transition behind it
+    counted, and a real submission later withdrawn did not. Withdrawing does not un-send an
+    application — the employer has it — so erasing it from the denominator would flatter every
+    rate computed over that denominator.
+
+    So the test is the event: `application_events` holding a move to `submitted` for this
+    application. `submitted_at` is still required alongside it, because the two are written by
+    the same transition and a row with one and not the other has been edited around the engine.
+    This is the idiom `outcome_core` already uses to check that an outcome "first appear[s] in
+    guarded application state history".
     """
-    found = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'").fetchone()
-    if not found:
-        return set()
+    for table in ("applications", "application_events"):
+        found = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if not found:
+            return set()
     return {row["canonical_url"] for row in connection.execute("""
-        SELECT j.canonical_url FROM applications a JOIN jobs j ON j.job_id=a.job_id
-        WHERE a.submitted_at IS NOT NULL AND a.state IN (
-            'submitted', 'rejected', 'recruiter_response', 'screening_call',
-            'interview', 'final_interview', 'offer', 'no_response')
+        SELECT j.canonical_url FROM applications a
+        JOIN jobs j ON j.job_id=a.job_id
+        JOIN application_events e ON e.application_id=a.application_id
+                                 AND e.to_state='submitted'
+        WHERE a.submitted_at IS NOT NULL
     """)}
 
 

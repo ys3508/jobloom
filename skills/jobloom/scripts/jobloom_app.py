@@ -199,6 +199,10 @@ def submission_state(connection: sqlite3.Connection,
         report = submission_record.state(connection, _application_id(payload))
     except ValueError:
         raise AppError("no_such_application", 404) from None
+    except RuntimeError:
+        # A required table is absent, which means this database was never initialised. Read
+        # paths say so rather than migrating underneath a caller who only wanted to look.
+        raise AppError("database_not_initialised", 409) from None
     return {key: report[key] for key in SUBMISSION_FIELDS}
 
 
@@ -243,6 +247,12 @@ def submission_confirm(connection: sqlite3.Connection,
             raise AppError("reference_incomplete", 400) from None
         if "no saved job" in text:
             raise AppError("intention_not_recorded_first", 409) from None
+        if "longer than" in text:
+            # The reference itself never reaches the response, the log or the exception; only
+            # the fact that it was too long to keep whole.
+            raise AppError("reference_too_long", 400) from None
+        if "must be text" in text:
+            raise AppError("bad_reference", 400) from None
         raise AppError("submission_refused", 409) from None
     return submission_state(connection, payload)
 
@@ -762,6 +772,10 @@ def serve(db_path: Path, private_root: Path, store: Path, port: int = 0,
     # lazily meant the screen after registering was the first thing to touch
     # `resume_migrations`, and it found no such table.
     resume_migration.initialize(connection)
+    # The submission slice's schema, brought up to date here rather than on first read.
+    # `submission_record.state` is a read path and refuses an uninitialised database instead
+    # of migrating it, so this is where the migration has to happen.
+    submission_record.initialize(connection)
     connection.close()
     Path(private_root).mkdir(parents=True, exist_ok=True)
     os.chmod(private_root, 0o700)

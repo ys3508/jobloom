@@ -173,8 +173,10 @@ const COPY = {
     refKind: "手上有什么（可不填）",
     refNone: "没有，只是我填完了",
     refValue: "确认号 / 邮件主题 / 账户里的记录",
+    refLimit: "最多 500 个字符。超过会整条拒绝——证据要么完整存下，要么不存，不会被截断。",
     refWhere: "这条只写在 saved_jobs 上，不写进 submission_evidence——那张表是第 ③ 级的闸门。",
     doneAt: "已确认于",
+    nowState: "申请状态已变为 %s —— 填写 worker 不会再取走它。这不是 submitted：没有 submitted_at，没有 archive。",
     rebuild: "重建追踪表",
     rebuilt: "已重建：%n",
     queueDone: "已确认提交",
@@ -232,8 +234,10 @@ const COPY = {
     refKind: "What you have in hand (optional)",
     refNone: "Nothing, I just finished it",
     refValue: "Confirmation number / email subject / what your account shows",
+    refLimit: "Up to 500 characters. Anything longer refuses the whole confirmation — a reference is kept whole or not at all, never shortened.",
     refWhere: "Stored on the saved job, never in submission_evidence — that table is rung ③'s gate.",
     doneAt: "Confirmed at",
+    nowState: "The application is now %s, so no fill worker can pick it up. This is not submitted: there is no submitted_at and no archive.",
     rebuild: "Rebuild the tracker",
     rebuilt: "Rebuilt: %n",
     queueDone: "submitted, confirmed",
@@ -471,13 +475,16 @@ function recordScreen() {
         </select>
       </div>
       <div class="row" id="refrow" hidden>
-        <input type="text" id="refvalue" placeholder="${t("refValue")}">
+        <input type="text" id="refvalue" maxlength="500" placeholder="${t("refValue")}">
+        <div class="origin">${t("refLimit")}</div>
         <div class="origin">${t("refWhere")}</div>
       </div>
       <p><button id="confirm">${t("pressConfirm")}</button></p>` : ""}
     ${rung === 2 ? `
       <div class="note">${t("doneAt")} ${esc((sub.confirmed_at || "").slice(0, 19))}${
         sub.reference_kind ? ` · ${esc(sub.reference_kind)}: ${esc(sub.reference)}` : ""}</div>
+      <div class="note stop">${(COPY[lang].nowState || "")
+        .replace("%s", `<span class="mono">${esc(sub.state)}</span>`)}</div>
       <p><button id="rebuild">${t("rebuild")}</button></p>
       ${app.rebuilt ? `<div class="note mono">${(COPY[lang].rebuilt || "")
         .replace("%n", app.rebuilt.map((w) => `${w.sheet} ${w.rows}`).join(" · "))}</div>` : ""}` : ""}
