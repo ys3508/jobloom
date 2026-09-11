@@ -41,6 +41,7 @@ def state(has_profile=True, answered=False):
             # What the active profile can already answer. A round that grew after the profile
             # was registered leaves the rest of it blank, which is the case that broke.
             "resolvable": asked if answered else ["contact.full_name"],
+            "round_complete": answered,
             "unresolved": {}, "open_round": None if answered else "onboarding-v1"}
 
 
@@ -77,6 +78,13 @@ class OnboardingNavigationTests(unittest.TestCase):
     def test_an_answered_round_still_goes_straight_to_the_carry(self):
         opened = open_window(state(answered=True), [STRANDED_BLOCKING_AN_APPLICATION])
         self.assertEqual(opened["screen"], "migrations")
+
+    def test_a_completed_required_floor_ignores_optional_blanks_and_stale_open_round(self):
+        profile_state = state(answered=False)
+        profile_state["round_complete"] = True
+        opened = open_window(profile_state, [STRANDED_BLOCKING_AN_APPLICATION])
+        self.assertEqual(opened["screen"], "migrations")
+        self.assertNotIn("/api/round", [request["path"] for request in opened["requests"]])
 
     def test_an_unfinished_round_with_nothing_stranded_is_the_round(self):
         opened = open_window(state(answered=False), [])
