@@ -41,10 +41,21 @@ def frame(**overrides):
 
 
 def control(**overrides):
+    """One entry as the page script returns it. `label`/`group_label` are gone: a control now
+    carries the employer's words, the normalised question, and what it took to get there."""
     base = {"tag": "input", "type": "text", "name": "name", "id": "name",
-            "selector": "#name", "label": "Full name", "group_label": "",
+            "selector": "#name", "raw_question": "Full name", "match_question": "Full name",
+            "normalization": [], "label_source": "lever_application_label",
+            "had_required_marker": False, "question_container": "1", "choice_label": "",
             "required": True, "disabled": False, "visible": True, "options": None}
     base.update(overrides)
+    # Convenience for the many tests that only care about the question text.
+    if "label" in base:
+        base["raw_question"] = base["match_question"] = base.pop("label")
+    if "group_label" in base:
+        group = base.pop("group_label")
+        if group:
+            base["raw_question"] = base["match_question"] = group
     return base
 
 
@@ -131,8 +142,8 @@ class FieldTest(unittest.TestCase):
             control(tag="textarea", type="", id="why", selector="#why", label="Why us?"),
             control(tag="select", type="", id="src", selector="#src", label="How did you hear?",
                     options=["A friend", "LinkedIn"]),
-            control(type="radio", name="auth", id="auth1", selector="#auth1", label="Yes",
-                    group_label="Are you authorized to work?"),
+            control(type="radio", name="auth", id="auth1", selector="#auth1",
+                    choice_label="Yes", label="Are you authorized to work?"),
             control(type="checkbox", id="terms", selector="#terms", label="I agree"),
             control(type="file", id="resume", selector="#resume", label="Resume"),
         ])
@@ -141,47 +152,68 @@ class FieldTest(unittest.TestCase):
 
     def test_a_radio_group_is_one_question_with_its_choices(self):
         fields = self.build([
-            control(type="radio", name="auth", id="a1", selector="#a1", label="Yes",
-                    group_label="Are you authorized to work?"),
-            control(type="radio", name="auth", id="a2", selector="#a2", label="No",
-                    group_label="Are you authorized to work?"),
+            control(type="radio", name="auth", id="a1", selector="#a1", choice_label="Yes",
+                    label="Are you authorized to work?"),
+            control(type="radio", name="auth", id="a2", selector="#a2", choice_label="No",
+                    label="Are you authorized to work?"),
         ])
         self.assertEqual(len(fields), 1)
-        self.assertEqual(fields[0]["question"], "Are you authorized to work?")
+        self.assertEqual(fields[0]["match_question"], "Are you authorized to work?")
         self.assertEqual(fields[0]["options"], ["Yes", "No"])
+        self.assertEqual(fields[0]["grouping_basis"], "lever_question_container")
 
     def test_a_checkbox_group_sharing_a_name_is_one_multi_select_question(self):
         """The 2026-09-11 acceptance run: nine `name="pronouns"` checkboxes, one question."""
         fields = self.build([
-            control(type="checkbox", name="pronouns", id="p1", selector="#p1", label="She/her",
-                    group_label="Which pronouns do you use?"),
-            control(type="checkbox", name="pronouns", id="p2", selector="#p2", label="He/him",
-                    group_label="Which pronouns do you use?"),
-            control(type="checkbox", name="pronouns", id="p3", selector="#p3", label="They/them",
-                    group_label="Which pronouns do you use?"),
+            control(type="checkbox", name="pronouns", id="p1", selector="#p1",
+                    choice_label="She/her", label="Pronouns"),
+            control(type="checkbox", name="pronouns", id="p2", selector="#p2",
+                    choice_label="He/him", label="Pronouns"),
+            control(type="checkbox", name="pronouns", id="p3", selector="#p3",
+                    choice_label="They/them", label="Pronouns"),
         ])
         self.assertEqual(len(fields), 1)
-        self.assertEqual(fields[0]["question"], "Which pronouns do you use?")
+        self.assertEqual(fields[0]["match_question"], "Pronouns")
         self.assertEqual(fields[0]["options"], ["She/her", "He/him", "They/them"])
         self.assertEqual(fields[0]["field_id"], "pronouns")
+
+    def test_a_control_beside_a_group_in_one_container_is_auxiliary_not_a_member(self):
+        """The real shape: nine `name="pronouns"` boxes plus a nameless `Custom` toggle."""
+        fields = self.build([
+            control(type="checkbox", name="pronouns", id="p1", selector="#p1",
+                    choice_label="She/her", label="Pronouns"),
+            control(type="checkbox", name="pronouns", id="p2", selector="#p2",
+                    choice_label="He/him", label="Pronouns"),
+            control(type="checkbox", name="", id="customPronounsOption",
+                    selector="#customPronounsOption", choice_label="Custom",
+                    label="Pronouns"),
+        ])
+        self.assertEqual(len(fields), 2)
+        self.assertEqual(fields[0]["automation"], "fillable")
+        self.assertEqual(fields[1]["automation"], "unsupported_auxiliary_control")
+        self.assertEqual(fields[1]["grouping_basis"], "not_in_the_container_group")
+        self.assertIsNone(fields[1]["canonical_id"], "nothing unfillable is ever matched")
 
     def test_a_lone_checkbox_keeps_its_own_label_as_the_question(self):
         """"I agree to the terms" is the question. A group of one would replace it."""
         fields = self.build([control(type="checkbox", name="terms", id="terms",
-                                     selector="#terms", label="I agree to the terms",
-                                     group_label="Legal")])
+                                     selector="#terms", label="I agree to the terms")])
         self.assertEqual(len(fields), 1)
-        self.assertEqual(fields[0]["question"], "I agree to the terms")
+        self.assertEqual(fields[0]["match_question"], "I agree to the terms")
+        self.assertEqual(fields[0]["grouping_basis"], "single_control")
         self.assertNotIn("options", fields[0])
 
-    def test_a_radio_group_with_no_heading_has_no_legible_question(self):
-        """A choice is not the question. Recording "Yes" as what a form asks is worse than
-        stopping, because the next step would look up a reviewed meaning for "Yes"."""
+    def test_a_group_whose_heading_lever_did_not_mark_is_not_guessed_at(self):
+        """No `.application-label` in the container means the question cannot be proved."""
         with self.assertRaises(OBSERVER.Paused) as caught:
             self.build([
-                control(type="radio", name="auth", id="a1", selector="#a1", label="Yes"),
-                control(type="radio", name="auth", id="a2", selector="#a2", label="No")])
-        self.assertEqual(caught.exception.code, "unlabelled_field")
+                control(type="radio", name="auth", id="a1", selector="#a1",
+                        choice_label="Yes", raw_question="", match_question="",
+                        label_source="none"),
+                control(type="radio", name="auth", id="a2", selector="#a2",
+                        choice_label="No", raw_question="", match_question="",
+                        label_source="none")])
+        self.assertEqual(caught.exception.code, "ambiguous_label")
 
     def test_required_is_carried_from_the_page(self):
         fields = self.build([control(required=False), control(id="b", selector="#b",
@@ -411,27 +443,63 @@ class ChallengeFieldTest(unittest.TestCase):
                                    "disabled": 1, "not_visible": 1})
 
 
-class HeadingIsNotAChoiceTest(unittest.TestCase):
-    """The rule the 2026-09-11 acceptance run broke twice before it held.
+class NormalizationTest(unittest.TestCase):
+    """Two strings per question: what the employer wrote, and what may be matched on.
 
-    A question is the text beside the controls. Both failures were the same mistake in
-    different clothes: first only the nearest container was searched, so the wrapper around a
-    control hid the heading one level out; then every candidate at every level was searched,
-    and a *sibling choice's* label — "She/her" — was taken as what the form asks. A candidate
-    that wraps any control is a choice, and never a heading.
+    The transformations are a finite enumeration, each provable from the DOM. There is no
+    free-text cleaning here and no model rewriting, because a question nobody can account for
+    is a question nobody may look a canonical meaning up for.
     """
 
-    def test_a_sibling_choice_label_is_never_the_question(self):
-        """Reproduces the real shape: each choice's label wraps its own checkbox."""
-        script = OBSERVER.READ_STRUCTURE
-        self.assertIn("heading.querySelector('input, select, textarea')", script)
-        self.assertIn("continue", script)
+    def test_the_employers_words_are_kept_beside_the_matchable_ones(self):
+        fields = build(page([control(raw_question="Email✱", match_question="Email",
+                                     normalization=["required_marker_removed"],
+                                     had_required_marker=True, required=False)]))
+        self.assertEqual(fields[0]["raw_question"], "Email✱")
+        self.assertEqual(fields[0]["match_question"], "Email")
+        self.assertEqual(fields[0]["normalization"], ["required_marker_removed"])
 
-    def test_the_walk_goes_far_enough_for_a_real_form(self):
-        """Seven elements wrap a checkbox in a Lever multi-select; six was one short."""
-        depth = re.search(r"depth < (\d+)", OBSERVER.READ_STRUCTURE)
-        self.assertIsNotNone(depth)
-        self.assertGreaterEqual(int(depth.group(1)), 8)
+    def test_the_marker_itself_is_the_evidence_that_the_field_is_required(self):
+        """Lever ships `<span class="required">✱</span>`. Removing the glyph is only sound
+        because requiredness survives it — recorded, with the basis that carried it."""
+        fields = build(page([control(raw_question="Resume/CV✱", match_question="Resume/CV",
+                                     normalization=["required_marker_removed"],
+                                     had_required_marker=True, required=False)]))
+        self.assertTrue(fields[0]["required"])
+        self.assertEqual(fields[0]["required_basis"], "lever_required_marker")
+
+    def test_an_attribute_is_named_as_the_basis_when_it_is_the_one(self):
+        fields = build(page([control(required=True, had_required_marker=False)]))
+        self.assertEqual(fields[0]["required_basis"], "attribute_or_aria")
+
+    def test_every_reason_code_is_one_of_the_enumerated_ones(self):
+        for field in build(page([control(normalization=["required_marker_removed",
+                                                        "lever_text_node_used"])])):
+            for reason in field["normalization"]:
+                self.assertIn(reason, OBSERVER.NORMALIZATIONS)
+
+    def test_a_label_lever_did_not_mark_is_ambiguous_rather_than_cut_down(self):
+        with self.assertRaises(OBSERVER.Paused) as caught:
+            build(page([control(label_source="none", raw_question="Resume/CV ATTACH",
+                                match_question="Resume/CV ATTACH")]))
+        self.assertEqual(caught.exception.code, "ambiguous_label")
+
+    def test_the_matchable_string_is_what_a_meaning_is_looked_up_on(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        ANSWERS.initialize(connection)
+        self.addCleanup(connection.close)
+        ANSWERS.add_question_form(connection, "contact.email", "Email", verified_by_user=True)
+        fields = build(page([control(raw_question="Email✱", match_question="Email",
+                                     normalization=["required_marker_removed"],
+                                     had_required_marker=True)]), connection)
+        self.assertEqual(fields[0]["canonical_id"], "contact.email")
+
+    def test_the_page_script_reads_leverspecific_nodes_and_not_nearby_text(self):
+        script = OBSERVER.READ_STRUCTURE
+        self.assertIn(".application-label", script)
+        self.assertIn("li.application-question", script)
+        self.assertIn("cloneNode", script)
 
 
 class AcceptanceShapeTest(unittest.TestCase):
@@ -444,14 +512,14 @@ class AcceptanceShapeTest(unittest.TestCase):
     def test_a_challenge_beside_a_form_yields_an_observation_that_demands_takeover(self):
         observed = page([
             control(id="name", selector="#name", label="Full name"),
-            control(type="radio", name="auth", id="a1", selector="#a1", label="Yes",
-                    group_label="Are you authorized to work in the US?"),
-            control(type="radio", name="auth", id="a2", selector="#a2", label="No",
-                    group_label="Are you authorized to work in the US?"),
+            control(type="radio", name="auth", id="a1", selector="#a1", choice_label="Yes",
+                    label="Are you authorized to work in the US?"),
+            control(type="radio", name="auth", id="a2", selector="#a2", choice_label="No",
+                    label="Are you authorized to work in the US?"),
             control(type="checkbox", name="pronouns", id="p1", selector="#p1",
-                    label="She/her", group_label="Pronouns"),
+                    choice_label="She/her", label="Pronouns"),
             control(type="checkbox", name="pronouns", id="p2", selector="#p2",
-                    label="He/him", group_label="Pronouns"),
+                    choice_label="He/him", label="Pronouns"),
         ], frames=[
             frame(src="https://newassets.hcaptcha.com/x", width=422, height=849),
             frame(src="about:blank", title="LinkedIn Embedded Content", width=233, height=48),
@@ -462,7 +530,7 @@ class AcceptanceShapeTest(unittest.TestCase):
         self.assertEqual(sorted(classes),
                          ["captcha_frame", "known_non_form_embed", "tracking_pixel"])
         fields = build(observed)
-        self.assertEqual([f["question"] for f in fields],
+        self.assertEqual([f["match_question"] for f in fields],
                          ["Full name", "Are you authorized to work in the US?", "Pronouns"])
         self.assertEqual([f["control"] for f in fields], ["text", "radio", "checkbox"])
 
@@ -470,24 +538,30 @@ class AcceptanceShapeTest(unittest.TestCase):
         """Two radios, because one is not a group and its own label would be the question."""
         question = "Will you require work sponsorship now or in the future?"
         fields = build(page([
-            control(type="radio", name="s", id="s1", selector="#s1", label="Yes",
-                    group_label=question),
-            control(type="radio", name="s", id="s2", selector="#s2", label="No",
-                    group_label=question)]))
-        self.assertEqual(fields[0]["question"], question)
+            control(type="radio", name="s", id="s1", selector="#s1", choice_label="Yes",
+                    label=question),
+            control(type="radio", name="s", id="s2", selector="#s2", choice_label="No",
+                    label=question)]))
+        self.assertEqual(fields[0]["match_question"], question)
         self.assertEqual(fields[0]["disposition"], "always_manual")
         self.assertEqual(fields[0]["domain"], "sponsorship")
 
 
 class DigestTest(unittest.TestCase):
     def test_the_hash_covers_the_question_and_not_the_answer(self):
-        asked = {"question": "Full name", "control": "text", "required": True}
+        asked = {"raw_question": "Full name", "control": "text", "required": True}
         self.assertEqual(OBSERVER.field_digest(asked),
                          OBSERVER.field_digest({**asked, "value": "Anyone at all"}))
 
+    def test_the_hash_is_over_the_employers_words_not_the_normalised_ones(self):
+        """A change to Jobloom's normalisation must not read as the employer changing the form."""
+        asked = {"raw_question": "Email✱", "control": "text", "required": True}
+        self.assertEqual(OBSERVER.field_digest(asked),
+                         OBSERVER.field_digest({**asked, "match_question": "Email"}))
+
     def test_changing_the_question_changes_the_hash(self):
-        asked = {"question": "Full name", "control": "text", "required": True}
-        for change in ({"question": "Legal name"}, {"control": "textarea"},
+        asked = {"raw_question": "Full name", "control": "text", "required": True}
+        for change in ({"raw_question": "Legal name"}, {"control": "textarea"},
                        {"required": False}, {"options": ["A", "B"]}):
             with self.subTest(change=change):
                 self.assertNotEqual(OBSERVER.field_digest(asked),
@@ -522,7 +596,8 @@ class OutputTest(unittest.TestCase):
 
     def test_the_summary_prints_questions_and_no_values(self):
         fields = build(page([control()]), None)
-        text = OBSERVER.summarise({"field_count": 1, "page_sha256": "a" * 64, "fields": fields})
+        text = OBSERVER.summarise({"field_count": 1, "page_sha256": "a" * 64,
+                                   "fields": fields})
         self.assertIn("Full name", text)
         self.assertIn("text", text)
 

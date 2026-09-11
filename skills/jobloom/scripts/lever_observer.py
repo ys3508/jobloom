@@ -79,7 +79,7 @@ PAUSE_CODES = (
     "origin_not_approved", "navigated_away", "page_changed_under_observation",
     "unknown_frame_present", "possible_form_frame", "captcha_gates_the_form",
     "duplicate_field_id", "conflicting_canonical_meaning", "unsupported_control",
-    "unlabelled_field", "no_fields_found",
+    "unlabelled_field", "ambiguous_label", "no_fields_found",
 )
 
 CAPTCHA_MARKERS = re.compile(
@@ -115,6 +115,35 @@ FRAME_CLASSES = ("captcha_frame", "known_non_form_embed", "tracking_pixel",
 CHALLENGE_FIELD_NAMES = re.compile(
     r"captcha|challenge[-_]?response|cf[-_]turnstile", re.IGNORECASE)
 
+# Every transformation that may stand between what the employer wrote and the string an exact
+# canonical lookup is done on. Finite, enumerated, and each one provable from the DOM. There
+# is no free-text cleaning and no model rewriting: a question nobody can account for is a
+# question nobody may match.
+NORMALIZATIONS = (
+    # A `<span class="required">✱</span>` beside the label, removed only when requiredness is
+    # independently recorded — the span is itself the evidence, and it is named as such.
+    "required_marker_removed",
+    # Lever wraps a radio group's question in `div.text` inside the label. Taking that node's
+    # text is reading the heading, not editing it.
+    "lever_text_node_used",
+    # Buttons, controls and status text that live inside the label element and are not part of
+    # the question: "ATTACH RESUME/CV", "Couldn't auto-read resume".
+    "control_and_status_excluded",
+    # Runs of whitespace folded to single spaces. The only change made to the characters.
+    "whitespace_folded",
+)
+
+# What may sit inside a Lever label element without being part of the question. Enumerated
+# rather than matched by shape, so a node type nobody listed keeps its text and the question
+# stays whole.
+LABEL_NOISE_SELECTOR = (
+    ".required, button, input, select, textarea, "
+    ".resume-upload-button, .filename, .parse-status, .application-field")
+
+# Why a control may not be planned against, beyond the dispositions `field_policy` owns.
+AUTOMATION_STATES = ("fillable", "manual_only", "unsupported_auxiliary_control",
+                     "not_visible")
+
 
 class Paused(Exception):
     """The run stopped. Carries a code and never a value read from the page."""
@@ -147,11 +176,11 @@ def _digest(value: Any) -> str:
 def field_digest(field: dict[str, Any]) -> str:
     """A hash of what the field *asks*, never of what it holds.
 
-    The inputs are the label, the control kind, requiredness and the choices offered. A page
-    that changes its question changes this; a page the user typed into does not.
+    Over `raw_question` — the employer's own words — rather than the normalised one, so a
+    change to Jobloom's normalisation rules does not read as the employer changing the form.
     """
     return _digest({key: field[key] for key in
-                    ("question", "control", "required", "options") if key in field})
+                    ("raw_question", "control", "required", "options") if key in field})
 
 
 def page_digest(fields: list[dict[str, Any]]) -> str:
@@ -188,109 +217,123 @@ def canonical_meanings(connection: sqlite3.Connection | None,
 # `value`, `files`, `textContent` of a control and `defaultValue` are deliberately absent. A
 # form somebody has already typed into returns exactly what an empty one returns.
 READ_STRUCTURE = r"""
-() => {
+(noiseSelector) => {
+  const squash = (text) => (text || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+
+  // Lever's own question container and label node. Anchoring on the nodes Lever marks as the
+  // heading — rather than walking up to whatever element happened to hold text — is the whole
+  // of the structural rule: if there is no such node the field is not legible, and that is
+  // reported instead of a string cut down to look like one.
+  const questionContainer = (el) =>
+    el.closest('li.application-question, .application-question');
+  const leverLabel = (el) => {
+    const box = questionContainer(el);
+    return box ? box.querySelector('.application-label') : null;
+  };
+
+  // The heading's text with the parts that are provably not the question removed, and a list
+  // of what was removed. Done on a clone, so the page itself is never touched.
+  const headingText = (head) => {
+    const applied = [];
+    const raw = squash(head.textContent);
+    const clone = head.cloneNode(true);
+    let source = clone;
+    // A radio group's question lives in `div.text` inside the label; a plain field's sits as
+    // the label's own text. Preferring the marked node is reading Lever's structure.
+    const textNode = clone.querySelector(':scope > .text');
+    if (textNode) { source = textNode; applied.push('lever_text_node_used'); }
+    const hadRequired = !!source.querySelector('.required');
+    let removedOther = false;
+    for (const node of source.querySelectorAll(noiseSelector)) {
+      if (!node.classList || !node.classList.contains('required')) removedOther = true;
+      node.remove();
+    }
+    if (hadRequired) applied.push('required_marker_removed');
+    if (removedOther) applied.push('control_and_status_excluded');
+    const before = source.textContent || '';
+    const match = squash(before);
+    if (match !== before.trim()) applied.push('whitespace_folded');
+    return { raw, match, applied, had_required_marker: hadRequired,
+             source: 'lever_application_label' };
+  };
+
   const labelFor = (el) => {
     const aria = el.getAttribute('aria-label');
-    if (aria && aria.trim()) return aria.trim();
-    const by = el.getAttribute('aria-labelledby');
-    if (by) {
-      const parts = by.split(/\s+/).map((id) => document.getElementById(id))
-        .filter(Boolean).map((n) => n.textContent.trim()).filter(Boolean);
-      if (parts.length) return parts.join(' ');
+    if (aria && aria.trim()) {
+      return { raw: squash(aria), match: squash(aria), applied: [],
+               had_required_marker: false, source: 'aria_label' };
     }
-    if (el.id) {
-      const tied = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (tied && tied.textContent.trim()) return tied.textContent.trim();
-    }
-    const wrapping = el.closest('label');
-    if (wrapping && wrapping.textContent.trim()) return wrapping.textContent.trim();
-    return groupLabel(el);
+    const head = leverLabel(el);
+    if (head) return headingText(head);
+    return { raw: '', match: '', applied: [], had_required_marker: false, source: 'none' };
   };
-  // The question a set of choices is asking, which is a different string from any one choice.
-  // A radio's own label is "Yes"; what is being asked sits on the fieldset or the list item
-  // around it, and losing that would record a form as asking "Yes".
-  const groupLabel = (el) => {
-    // Walked up, not `closest`. On a real Lever form the nearest container is the wrapper
-    // holding the control itself — `div.application-field` — and the heading sits one level
-    // further out on `li.application-question`. Stopping at the first container found a
-    // wrapper with no heading in it and reported the field as unreadable.
-    let node = el.parentElement;
-    for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
-      // A heading is a candidate only if it holds no form control at all. Excluding just the
-      // ones containing *this* control was not enough: on a real Lever page the level above a
-      // checkbox holds its siblings' labels too, and the rule picked "She/her" — another
-      // choice — as what the form was asking. A question is the text beside the controls, so
-      // anything wrapping a control is a choice and never a heading.
-      for (const heading of node.querySelectorAll(
-          'legend, .application-label, label, h3, h4')) {
-        if (heading.querySelector('input, select, textarea')) continue;
-        if (heading.contains(el) || !heading.textContent.trim()) continue;
-        return heading.textContent.trim();
-      }
-      if (node.tagName === 'FORM') break;
-    }
-    return '';
+
+  // The text of the choice a single control stands for: its own wrapping label, which is a
+  // different string from the question the group asks.
+  const choiceLabel = (el) => {
+    const wrap = el.closest('label');
+    if (!wrap) return '';
+    const clone = wrap.cloneNode(true);
+    for (const node of clone.querySelectorAll('input, select, textarea')) node.remove();
+    return squash(clone.textContent);
   };
-  const squash = (text) => text.replace(/\s+/g, ' ').trim().slice(0, 2000);
+
   const selectorFor = (el) => {
     if (el.id) return `#${CSS.escape(el.id)}`;
     if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
     return '';
   };
-  const out = [];
-  const nodes = document.querySelectorAll('input, textarea, select');
-  for (const el of nodes) {
-    const tag = el.tagName.toLowerCase();
-    const type = (el.getAttribute('type') || (tag === 'input' ? 'text' : '')).toLowerCase();
-    const entry = {
-      tag, type,
-      name: el.getAttribute('name') || '',
-      id: el.id || '',
-      selector: selectorFor(el),
-      label: squash(labelFor(el)),
-      group_label: squash(groupLabel(el)),
-      required: el.required === true || el.getAttribute('aria-required') === 'true',
-      disabled: el.disabled === true,
-      // Whether a person can see it. A control with no box on the page is not a question
-      // being asked, and a challenge's bookkeeping textarea is exactly that shape.
-      visible: el.getClientRects().length > 0,
-      // Choices are part of the question, not of the answer: which options exist is what the
-      // employer is asking, and none of them is marked as chosen here.
-      options: tag === 'select'
-        ? Array.from(el.options).map((o) => squash(o.textContent)).filter(Boolean).slice(0, 100)
-        : null,
-    };
-    out.push(entry);
-  }
-  // Frames are inventoried by src and title only. Neither is a value somebody typed, and
-  // both are needed to tell a CAPTCHA challenge from a share widget.
+
   const frames = Array.from(document.querySelectorAll('iframe')).map((f) => {
     let sameOrigin = false;
     let controlCount = 0;
     try {
-      // Touching `contentDocument` on a cross-origin frame throws, which is the check: a
-      // frame this cannot read is a frame this cannot classify by content. The challenge
-      // frames are cross-origin and are never entered — this only ever reads `null`.
+      // Touching `contentDocument` on a cross-origin frame throws, which is the check. The
+      // challenge frames are cross-origin and are never entered — this only reads `null`.
       const doc = f.contentDocument;
       if (doc) {
         sameOrigin = true;
         controlCount = doc.querySelectorAll('input, textarea, select').length;
       }
     } catch (e) { sameOrigin = false; }
-    return {
-      src: squash(f.getAttribute('src') || ''),
-      title: squash(f.getAttribute('title') || ''),
-      width: f.offsetWidth, height: f.offsetHeight,
-      same_origin: sameOrigin, control_count: controlCount,
-    };
+    return { src: squash(f.getAttribute('src')), title: squash(f.getAttribute('title')),
+             width: f.offsetWidth, height: f.offsetHeight,
+             same_origin: sameOrigin, control_count: controlCount };
   });
-  return {
-    controls: out,
-    iframes: frames.length,
-    frames,
-    text_markers: squash(document.body ? document.body.innerText.slice(0, 20000) : ''),
-    title: squash(document.title || ''),
-  };
+
+  const out = [];
+  let qid = 0;
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || (tag === 'input' ? 'text' : '')).toLowerCase();
+    const heading = labelFor(el);
+    const box = questionContainer(el);
+    if (box && !box.dataset.jobloomQid) box.dataset.jobloomQid = String(++qid);
+    out.push({
+      tag, type,
+      name: el.getAttribute('name') || '',
+      id: el.id || '',
+      selector: selectorFor(el),
+      raw_question: heading.raw,
+      match_question: heading.match,
+      normalization: heading.applied,
+      label_source: heading.source,
+      had_required_marker: heading.had_required_marker,
+      // Which of Lever's question containers this control sits in. An identity, not text: it
+      // is how a control is *proved* to belong to a question rather than assumed to.
+      question_container: box ? box.dataset.jobloomQid : '',
+      choice_label: choiceLabel(el),
+      required: el.required === true || el.getAttribute('aria-required') === 'true',
+      disabled: el.disabled === true,
+      visible: el.getClientRects().length > 0,
+      options: tag === 'select'
+        ? Array.from(el.options).map((o) => squash(o.textContent)).filter(Boolean).slice(0, 100)
+        : null,
+    });
+  }
+  return { controls: out, iframes: frames.length, frames,
+           text_markers: squash(document.body ? document.body.innerText.slice(0, 20000) : ''),
+           title: squash(document.title) };
 }
 """
 
@@ -341,48 +384,62 @@ def captcha_present(raw: dict[str, Any]) -> bool:
     return any(frame["class"] == "captcha_frame" for frame in classify_frames(raw))
 
 
-def _group_by_name(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Controls that share a name are one question, however many boxes the page drew.
+def _group_controls(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Controls the DOM proves are one question, grouped; anything else left alone.
 
-    Radios and checkboxes both. HTML says so for each: same-named radios are mutually
-    exclusive and same-named checkboxes submit as one list, so an employer asking "which
-    pronouns do you use" ships nine inputs and one question. The 2026-09-11 acceptance run
-    found exactly that and the first version reported nine fields colliding on one id.
+    The proof is two facts together: the same Lever question container, and the same `name`.
+    HTML makes same-named radios mutually exclusive and same-named checkboxes submit as one
+    list, so the pair is what an employer asking one question actually ships.
 
-    **Only when more than one shares the name.** A lone checkbox — "I agree to the terms" —
-    is a question whose own label is the question, and turning it into a group of one would
-    replace that label with whatever heading happened to sit above it.
+    **The container alone is not enough.** On the acceptance page the pronouns question holds
+    nine `name="pronouns"` checkboxes *and* a `customPronounsOption` with no name at all, which
+    reveals a text box. Same container, different group — so it is not folded in on the
+    strength of sitting nearby, and it is not given a fillable action either. It becomes
+    `unsupported_auxiliary_control`: the risk of answering the wrong thing is real and the
+    control is worth nothing to a production fill.
 
-    The group's question is the enclosing heading, and each control's label is a *choice*.
-    A group with no heading has no legible question and stops the run: recording "Yes" or
-    "She/her" as what a form asks would send the next step looking up its reviewed meaning.
+    Only when more than one shares the pair. A lone checkbox — "I agree to the terms" — is a
+    question whose own label is the question, and a group of one would replace it with
+    whatever heading sat above it.
     """
-    counts: dict[tuple[str, str], int] = {}
+    counts: dict[tuple[str, str, str], int] = {}
     for control in controls:
         if control["type"] in ("radio", "checkbox") and control["name"]:
-            key = (control["type"], control["name"])
+            key = (control["type"], control["name"], control["question_container"])
             counts[key] = counts.get(key, 0) + 1
 
-    grouped: list[dict[str, Any]] = []
-    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    # A container that holds a group and also holds an odd control out.
+    grouped_containers = {key[2] for key, count in counts.items() if count >= 2 and key[2]}
+
+    out: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
     for control in controls:
-        key = (control["type"], control["name"])
-        if counts.get(key, 0) < 2:
-            grouped.append(control)
+        key = (control["type"], control["name"], control["question_container"])
+        if counts.get(key, 0) >= 2:
+            existing = seen.get(key)
+            if existing is None:
+                entry = dict(control)
+                entry["options"] = [control["choice_label"]] if control["choice_label"] else []
+                entry["id"] = ""
+                entry["selector"] = f'{control["tag"]}[name="{control["name"]}"]'
+                entry["grouping_basis"] = "lever_question_container"
+                entry["automation"] = "fillable"
+                seen[key] = entry
+                out.append(entry)
+            elif control["choice_label"]:
+                existing["options"].append(control["choice_label"])
             continue
-        existing = seen.get(key)
-        if existing is None:
-            entry = dict(control)
-            entry["options"] = [control["label"]] if control["label"] else []
-            entry["label"] = control.get("group_label") or ""
-            # The shared name is the group's identity; the per-box id belongs to one choice.
-            entry["id"] = ""
-            entry["selector"] = f'{control["tag"]}[name="{control["name"]}"]'
-            seen[key] = entry
-            grouped.append(entry)
-        elif control["label"]:
-            existing["options"].append(control["label"])
-    return grouped
+        entry = dict(control)
+        if (control["type"] in ("radio", "checkbox")
+                and control["question_container"] in grouped_containers):
+            # In a container whose question is answered by a group this control is not part of.
+            entry["automation"] = "unsupported_auxiliary_control"
+            entry["grouping_basis"] = "not_in_the_container_group"
+        else:
+            entry["automation"] = "fillable"
+            entry["grouping_basis"] = "single_control"
+        out.append(entry)
+    return out
 
 
 def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
@@ -414,7 +471,7 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
 
     fields: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for control in _group_by_name(controls):
+    for control in _group_controls(controls):
         tag, type_name = control["tag"], control["type"]
         if tag == "textarea":
             kind = "textarea"
@@ -424,8 +481,13 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
             kind = CONTROL_BY_INPUT_TYPE.get(type_name)
         if kind is None:
             raise Paused("unsupported_control", f"{tag}:{type_name}")
-        if not control["label"]:
+        question = control["match_question"] or control["choice_label"]
+        if not question:
             raise Paused("unlabelled_field", control["selector"] or f"{tag}:{type_name}")
+        if control["label_source"] == "none":
+            # No node Lever marks as a heading. Rather than cutting a string out of whatever
+            # text is nearby, say the label could not be proved.
+            raise Paused("ambiguous_label", control["selector"] or f"{tag}:{type_name}")
         if not control["selector"]:
             raise Paused("unlabelled_field", "no_stable_selector")
 
@@ -437,29 +499,50 @@ def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
             raise Paused("duplicate_field_id", field_id)
         seen_ids.add(field_id)
 
+        # The required marker is Lever's own element, so its presence is DOM evidence and is
+        # recorded with the basis that carried it. Removing the glyph from `match_question` is
+        # only sound because requiredness survives independently of the glyph.
+        required = bool(control["required"]) or bool(control["had_required_marker"])
+        basis = ("attribute_or_aria" if control["required"]
+                 else "lever_required_marker" if control["had_required_marker"] else "absent")
         field: dict[str, Any] = {
             "field_id": field_id,
-            "question": control["label"],
+            # The employer's own words, never edited. What the structure hash covers.
+            "raw_question": control["raw_question"] or question,
+            # The same question with the enumerated transformations applied. The only string
+            # an exact canonical lookup is ever done on.
+            "match_question": question,
+            "normalization": list(control["normalization"]),
+            "label_source": control["label_source"],
             "selector": control["selector"],
             "control": kind,
-            "required": bool(control["required"]),
+            "required": required,
+            "required_basis": basis,
+            "automation": control.get("automation", "fillable"),
+            "grouping_basis": control.get("grouping_basis", "single_control"),
         }
         if control["options"]:
             field["options"] = control["options"]
         fields.append(field)
 
-    meanings = canonical_meanings(connection, [f["question"] for f in fields])
+    meanings = canonical_meanings(connection, [f["match_question"] for f in fields])
     claimed: dict[str, str] = {}
     for field in fields:
         # Who may answer it at all, from the module that already owns that question. The
         # observer reports the disposition; it does not act on it.
         disposition, domain, family = field_policy.disposition(
-            field_id=field["field_id"], question=field["question"],
+            field_id=field["field_id"], question=field["raw_question"],
             control=field["control"], source_kind=None)
         field["disposition"] = disposition
         field["domain"] = domain
         field["family"] = family
-        canonical_id = meanings[field["question"]]
+        if field["automation"] != "fillable" or disposition == "always_manual":
+            # Never planned against, so never matched: a meaning attached to a control nothing
+            # may fill is an invitation for something later to try.
+            field["canonical_id"] = None
+            field["field_sha256"] = field_digest(field)
+            continue
+        canonical_id = meanings[field["match_question"]]
         field["canonical_id"] = canonical_id
         if canonical_id is not None:
             if canonical_id in claimed and claimed[canonical_id] != field["field_id"]:
@@ -509,7 +592,7 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
             _guard(page, page.url)
             page.wait_for_timeout(1200)
 
-            first = page.evaluate(READ_STRUCTURE)
+            first = page.evaluate(READ_STRUCTURE, LABEL_NOISE_SELECTOR)
             frames = classify_frames(first)
             # Unknown and form-bearing frames stop the run. A challenge frame does not: it is
             # allowed to exist beside the form, and is never entered, read or operated.
@@ -528,7 +611,7 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
             digest = page_digest(fields)
 
             page.wait_for_timeout(800)
-            second_raw = page.evaluate(READ_STRUCTURE)
+            second_raw = page.evaluate(READ_STRUCTURE, LABEL_NOISE_SELECTOR)
             second, _ = build_fields(second_raw, connection)
             if page_digest(second) != digest:
                 raise Paused("page_changed_under_observation")
@@ -604,7 +687,9 @@ def summarise(observation: dict[str, Any]) -> str:
     for field in observation["fields"]:
         meaning = field["canonical_id"] or "-"
         required = "required" if field["required"] else "optional"
-        lines.append(f"  {field['control']:9} {required:8} {meaning:28} {field['question'][:58]}")
+        auto = field["automation"] if field["automation"] != "fillable" else ""
+        lines.append(f"  {field['control']:9} {required:8} {meaning:26} {auto:28}"
+                     f" {field['match_question'][:50]}")
     return "\n".join(lines)
 
 
