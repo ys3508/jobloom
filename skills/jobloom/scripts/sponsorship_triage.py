@@ -17,10 +17,15 @@ for 28 of them the answer is sitting in the card.
 So the scope is those 28, not the 323 across the wide corpus and not the 2,455 postings behind
 it. A triage page a person will actually finish is worth more than a report they will not.
 
-**Nothing here chooses.** There is no keyword scan, no suggested verdict, no pre-selected
-button. A regex over "we do not provide sponsorship" would be the defect `350dd4f` removed one
-layer down — a pattern allowed to conclude — and the whole reason the extractor stopped short
-of a verdict. The page shows the employer's own sentence and three choices, and a person picks.
+**Nothing here chooses.** A deterministic keyword scan may assign a display-only reading hint.
+It never produces, suggests, defaults, or preselects a sponsorship verdict.
+
+The distinction is the whole of it. `EMPLOYMENT_SENSE` below decides which of two senses of the
+word "sponsor" a sentence reads as, and that decides *what order the page is in*. A scan over
+"we do not provide sponsorship" that emitted a verdict would be the defect `350dd4f` removed one
+layer down — a pattern allowed to conclude — and the reason the extractor stopped short of one.
+No card is hidden by the scan, `sponsorship` stays `unknown` whatever it returns, and every card
+offers all three choices. The page shows the employer's own sentence, and a person picks.
 
 Four rules the verdict obeys, stated here because the writing path in a later version has to
 enforce them and a shape that forgets one is worse than no shape:

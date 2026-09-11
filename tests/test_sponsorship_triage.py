@@ -9,6 +9,7 @@ having said anything, or a verdict that outlived the card it was read from.
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -306,6 +307,80 @@ class DisplayBlockTest(unittest.TestCase):
         blocks = TRIAGE.display_blocks(self.description, self.statements + [orphan])
         self.assertEqual(len(blocks), 2)
         self.assertIs(blocks[-1]["located"], False)
+
+class ProseMatchesTheCodeTest(unittest.TestCase):
+    """The three places that describe this page, checked against what it actually does.
+
+    Written because they disagreed. The module and the window both said "there is no keyword
+    scan" while `EMPLOYMENT_SENSE` sat twenty lines below, scanning keywords. Nothing was
+    wrong with the behaviour — the scan only orders the page — but a file that denies a
+    mechanism it contains is worse than one that never mentioned it: the next person to read it
+    learns the wrong invariant, and the sentence is exactly the kind that gets restored by
+    someone tidying up.
+
+    So this asserts both directions. The scan exists, and no surface may deny it; and each
+    surface must carry the claim that is true — display-only, never a verdict.
+    """
+
+    SURFACES = {
+        "module": ROOT / "skills" / "jobloom" / "scripts" / "sponsorship_triage.py",
+        "window": ROOT / "skills" / "jobloom" / "assets" / "triage.html",
+        "reference": ROOT / "skills" / "jobloom" / "references" / "desktop-app.md",
+    }
+    # A denial of the mechanism, however it is phrased. Each is a negation within a short
+    # distance of the thing being denied, so "no verdict is suggested" — which is true and
+    # should stay — does not match.
+    DENIALS = (
+        re.compile(r"\b(?:no|not|never|without|nor)\b[^.\n]{0,40}"
+                   r"(?:keyword scan|keyword match|pattern scan|regex)", re.I),
+        re.compile(r"(?:keyword scan|keyword match|pattern scan|regex)[^.\n]{0,20}"
+                   r"\b(?:is|are)\s+not\b", re.I),
+    )
+
+    def test_the_keyword_scan_this_module_denies_nowhere_actually_exists(self):
+        """The premise. If the scan is ever removed, the prose rule below stops applying."""
+        self.assertTrue(hasattr(TRIAGE, "EMPLOYMENT_SENSE"))
+        self.assertTrue(TRIAGE.EMPLOYMENT_SENSE.search(SAYS_NO))
+        self.assertFalse(TRIAGE.EMPLOYMENT_SENSE.search(TRIAL_SENSE))
+
+    def test_no_surface_denies_the_scan_it_contains(self):
+        for name, path in self.SURFACES.items():
+            text = path.read_text(encoding="utf-8")
+            for pattern in self.DENIALS:
+                found = pattern.search(text)
+                with self.subTest(surface=name, pattern=pattern.pattern):
+                    self.assertIsNone(
+                        found,
+                        f"{name} denies the keyword scan it contains: "
+                        f"{found.group(0) if found else ''!r}")
+
+    def test_every_surface_says_what_the_scan_may_and_may_not_do(self):
+        """Both halves, because either alone is misleading.
+
+        "A scan assigns a hint" without the limit reads as a machine opinion about sponsorship.
+        The limit without the admission is the denial this test exists to prevent.
+        """
+        for name, path in self.SURFACES.items():
+            text = path.read_text(encoding="utf-8").casefold()
+            with self.subTest(surface=name):
+                self.assertIn("hint", text)
+                self.assertTrue(
+                    "display-only" in text or "ordering only" in text
+                    or "display only" in text,
+                    f"{name} does not say the hint is display-only")
+                self.assertTrue(
+                    "never produces, suggests, defaults, or preselects" in text
+                    or ("suggested verdict" in text and "nothing ticked by" in text),
+                    f"{name} does not say the hint is never a verdict")
+
+    def test_the_three_hint_names_appear_wherever_they_are_described(self):
+        """A surface naming two of three would read as a spectrum with an implied verdict."""
+        for name, path in self.SURFACES.items():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(surface=name):
+                for hint in TRIAGE.SIGNAL_HINTS:
+                    self.assertIn(hint, text)
+
 
 if __name__ == "__main__":
     unittest.main()
