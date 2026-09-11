@@ -150,6 +150,37 @@ def live_material_lock(connection: sqlite3.Connection,
     return dict(row) if row else None
 
 
+def _match_context(connection: sqlite3.Connection, application_id: str,
+                   snapshot_sha256: str) -> dict[str, Any]:
+    """What an answer's scope is matched against, from the snapshot the materials are bound to.
+
+    The application alone is not enough. A scope naming a country — which is how an answer
+    that is true of a person rather than of an application is stored — matches only when the
+    context carries that country, and a preview that sent just the application id reported
+    `answer_scope_mismatch` for every one of them. That is the whole class of answer this
+    exists to plan, so the omission looked like "no answer on file" when there was one.
+
+    The country comes from the candidate document the snapshot names, which is where
+    `evaluate_job` reads it from too.
+    """
+    context: dict[str, Any] = {"application_id": application_id}
+    row = connection.execute(
+        "SELECT snapshot_path FROM candidate_snapshots WHERE content_sha256=?",
+        (snapshot_sha256,)).fetchone()
+    if not row:
+        return context
+    try:
+        candidate, _ = resume_core.load_valid_candidate(Path(row["snapshot_path"]))
+    except (OSError, ValueError):
+        # A snapshot whose file cannot be read is a refusal elsewhere; here it means the
+        # context is narrower than it should be, which under-plans rather than over-plans.
+        return context
+    country = (candidate.get("work_authorization") or {}).get("country")
+    if country:
+        context["country"] = country
+    return context
+
+
 def _resolve_profile(connection: sqlite3.Connection, canonical_id: str,
                      snapshot_sha256: str, at: datetime) -> tuple[dict[str, Any] | None, str]:
     """One locked fact in the snapshot this application's materials are bound to, or why not.
@@ -218,7 +249,7 @@ def plan(connection: sqlite3.Connection, observation: dict[str, Any],
     if snapshot_sha256 is None:
         raise Refused(lock_reason or "application_materials_not_locked_to_active_profile")
     lock = live_material_lock(connection, application_id)
-    context = {"application_id": application_id}
+    context = _match_context(connection, application_id, snapshot_sha256)
 
     actions: list[dict[str, Any]] = []
     unhandled: list[dict[str, Any]] = []

@@ -320,3 +320,67 @@ class OutputTest(PreviewFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MatchContextTest(PreviewFixture):
+    """A country-scoped answer is the whole class this exists to plan, and it was invisible.
+
+    The context sent to the answer library carried only the application, so an answer scoped
+    `{country: US}` — how a fact about a person rather than about an application is stored —
+    failed its own scope check and reported as nothing on file. Found end to end: the seventh
+    action did not appear after the user had saved the answer and authorised it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        path = Path(self.temp.name) / "candidate.json"
+        candidate = {"schema_version": "0.2.0", "profile_id": "p",
+                     "work_authorization": {"country": "US", "authorized_now": True,
+                                            "sponsorship_now": False,
+                                            "sponsorship_future": False,
+                                            "employer_action_required": False,
+                                            "confirmed": True},
+                     "search": {}, "facts": []}
+        candidate["content_sha256"] = RESUMES.canonical_hash(candidate)
+        path.write_text(json.dumps(candidate), encoding="utf-8")
+        self.db.execute("UPDATE candidate_snapshots SET snapshot_path=?", (str(path),))
+        self.db.commit()
+
+    def test_the_country_reaches_the_scope_check(self):
+        context = PREVIEW._match_context(self.db, "app-1", SNAPSHOT)
+        self.assertEqual(context, {"application_id": "app-1", "country": "US"})
+
+    def test_a_country_scoped_answer_is_planned_once_it_is_authorised(self):
+        ANSWERS.add_question_form(self.db, "work_authorized_now",
+                                  "Are you authorized to work in the US?",
+                                  verified_by_user=True)
+        ANSWERS.add_answer(self.db, {
+            "answer_id": "answer-wa", "canonical_id": "work_authorized_now",
+            "canonical_meaning": "Authorized to work in this country now",
+            "question": "Are you authorized to work in the US?", "answer": "Yes",
+            "answer_type": "time_sensitive_fact", "source_type": "user_confirmed",
+            "confirmation_status": "confirmed", "confirmed_at": AT.isoformat(),
+            "validity_class": "event_driven", "scope": {"country": "US"},
+            "auto_fill_allowed": True, "auto_submit_allowed": False})
+        field_kwargs = dict(field_id="auth", control="radio",
+                            match_question="Are you authorized to work in the US?",
+                            canonical_id="work_authorized_now")
+
+        before = self.plan([field(**field_kwargs)])
+        self.assertEqual(before["actions"], [])
+        self.assertEqual(before["unhandled"][0]["detail"],
+                         "application_authorization_missing")
+
+        ANSWERS.add_answer_authorization(self.db, {
+            "authorization_id": "auth-wa", "confirmed_at": AT.isoformat(),
+            "expires_at": (AT + timedelta(days=14)).isoformat(),
+            "scope": {"application_id": "app-1", "country": "US"},
+            "canonical_id": "work_authorized_now", "answer_id": "answer-wa",
+            "answer_value_sha256": ANSWERS.answer_value_sha256(self.db, "answer-wa"),
+            "actor": "user"})
+        after = self.plan([field(**field_kwargs)])
+        action = after["actions"][0]
+        self.assertEqual((action["source_kind"], action["source_id"]), ("answer", "answer-wa"))
+        self.assertEqual(action["expected_sha256"],
+                         ANSWERS.answer_value_sha256(self.db, "answer-wa"))
+        self.assertNotIn("Yes", json.dumps(after["actions"]))
