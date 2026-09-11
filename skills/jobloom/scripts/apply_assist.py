@@ -337,10 +337,15 @@ def classify_question(connection: sqlite3.Connection, question: str, *,
         inspection = answer_library.inspect_answer(connection, question, context, at)
         if inspection.get("answer_exists"):
             lane = "answer_ready" if inspection["auto_fill_ready"] else "answer_needs_authorization"
+            # An immigration answer awaiting its per-application re-confirmation is exactly
+            # this lane: the answer is on file and a person has to look at it again. The
+            # detail says which of the four situations it is, so the screen does not report a
+            # special recheck as a routine missing permission.
             return _lane(question, lane, inspection.get("reason"), canonical_id=canonical_id,
                          source="answer_library", domain=domain, family=family,
                          answer_exists=True, auto_fill_ready=inspection["auto_fill_ready"],
-                         authorization_reason=inspection.get("authorization_reason"))
+                         authorization_reason=(inspection.get("immigration_detail")
+                                               or inspection.get("authorization_reason")))
         return _lane(question, "you_answer", inspection.get("reason"),
                      canonical_id=canonical_id, source="answer_library",
                      domain=domain, family=family)

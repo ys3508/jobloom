@@ -68,6 +68,14 @@ UNHANDLED_REASONS = (
     ("profile_gap", "no_locked_fact"),
     ("answer_gap", "no_confirmed_answer"),
     ("answer_gap", "no_standing_authorization"),
+    # The four immigration situations, kept apart from an ordinary missing permission. An
+    # answer is on file in every one of them; what is absent is the user having looked at it
+    # again for this application.
+    ("answer_gap", "application_authorization_missing"),
+    ("answer_gap", "application_authorization_expired"),
+    ("answer_gap", "application_authorization_revoked"),
+    ("answer_gap", "application_authorization_answer_changed"),
+    ("answer_gap", "application_id_absent_from_context"),
     ("not_observable", "hidden"),
     ("not_observable", "hidden_and_unreadable"),
     ("unsupported", "auxiliary_control"),
@@ -175,7 +183,9 @@ def _resolve_answer(connection: sqlite3.Connection, question: str,
     if not inspection.get("answer_exists"):
         return None, "no_confirmed_answer"
     if not inspection.get("auto_fill_ready"):
-        return None, "no_standing_authorization"
+        # An immigration meaning says which of its four situations this is; anything else is
+        # the ordinary case of nothing currently permitting a fill.
+        return None, inspection.get("immigration_detail") or "no_standing_authorization"
     row = connection.execute(
         "SELECT answer_id, answer_json FROM answers WHERE canonical_id=? "
         "AND confirmation_status='confirmed'", (inspection["canonical_id"],)).fetchone()

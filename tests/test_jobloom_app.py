@@ -1206,3 +1206,81 @@ class SubmissionSurfaceTests(PreflightFixture):
         status, payload = self.refused("/api/submission/state",
                                        {"application_id": "app-absent"})
         self.assertEqual((status, payload), (404, {"error": "no_such_application"}))
+
+
+# ---- the US work-authorization answer over HTTP -----------------------------------
+
+class ImmigrationSurfaceTests(PreflightFixture):
+    """Two presses, and what the second one is allowed to be."""
+
+    ROUTES = (("/api/immigration/state", {"application_id": "app-1"}),
+              ("/api/immigration/save-answer", {"application_id": "app-1", "answer": "Yes"}),
+              ("/api/immigration/authorize", {"application_id": "app-1",
+                                              "answer_id": "x", "answer_value_sha256": "y"}))
+
+    def setUp(self):
+        super().setUp()
+        ANSWERS.add_question_form(self.db, "work_authorized_now",
+                                  "Are you authorized to work in the US?",
+                                  verified_by_user=True)
+        self.db.commit()
+
+    def test_every_route_needs_the_token_and_this_origin(self):
+        for path, body in self.ROUTES:
+            with self.subTest(path=path):
+                self.assertEqual(self.refused(path, body, token="wrong")[1]["error"],
+                                 "bad_token")
+                self.assertEqual(
+                    self.refused(path, body, origin="https://elsewhere.invalid")[1]["error"],
+                    "bad_token")
+
+    def test_the_two_presses_are_separate(self):
+        state = self.call("/api/immigration/state", {"application_id": "app-1"})
+        self.assertFalse(state["answer_exists"])
+        self.assertEqual(state["detail"], "no_confirmed_answer")
+
+        saved = self.call("/api/immigration/save-answer",
+                          {"application_id": "app-1", "answer": "Yes, authorized"})
+        self.assertTrue(saved["answer_exists"])
+        self.assertFalse(saved["authorized"])
+        self.assertEqual(saved["detail"], "application_authorization_missing")
+
+        authorized = self.call("/api/immigration/authorize", {
+            "application_id": "app-1", "answer_id": saved["answer_id"],
+            "answer_value_sha256": saved["answer_value_sha256"]})
+        self.assertTrue(authorized["authorized"])
+
+    def test_the_state_shows_the_answer_so_the_second_press_is_about_something_seen(self):
+        saved = self.call("/api/immigration/save-answer",
+                          {"application_id": "app-1", "answer": "Yes, authorized"})
+        self.assertEqual(saved["answer"], "Yes, authorized")
+
+    def test_authorising_a_digest_that_is_not_the_stored_one_is_refused(self):
+        saved = self.call("/api/immigration/save-answer",
+                          {"application_id": "app-1", "answer": "Yes, authorized"})
+        status, payload = self.refused("/api/immigration/authorize", {
+            "application_id": "app-1", "answer_id": saved["answer_id"],
+            "answer_value_sha256": "0" * 64})
+        self.assertEqual((status, payload),
+                         (409, {"error": "answer_changed_since_it_was_shown"}))
+
+    def test_an_oversized_answer_is_refused_without_echoing_it(self):
+        secret = "Y" * 500
+        status, payload = self.refused("/api/immigration/save-answer",
+                                       {"application_id": "app-1", "answer": secret})
+        self.assertEqual((status, payload), (400, {"error": "answer_too_long"}))
+        self.assertNotIn("Y", json.dumps(payload))
+
+    def test_the_returned_shape_is_an_allowlist(self):
+        state = self.call("/api/immigration/state", {"application_id": "app-1"})
+        self.assertEqual(set(state), set(APP.US_WORK_AUTH_FIELDS))
+
+    def test_the_page_cannot_claim_the_authorisation_itself(self):
+        saved = self.call("/api/immigration/save-answer",
+                          {"application_id": "app-1", "answer": "Yes, authorized"})
+        smuggled = self.call("/api/immigration/state", {
+            "application_id": "app-1", "authorized": True, "detail": "whatever",
+            "expires_at": "2099-01-01T00:00:00+00:00"})
+        self.assertFalse(smuggled["authorized"])
+        self.assertEqual(smuggled["detail"], "application_authorization_missing")
+        self.assertEqual(smuggled["answer_id"], saved["answer_id"])

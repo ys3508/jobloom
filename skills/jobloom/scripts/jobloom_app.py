@@ -57,6 +57,7 @@ import resume_core  # noqa: E402
 import resume_migration  # noqa: E402
 import sponsorship_triage  # noqa: E402
 import submission_record  # noqa: E402
+import us_work_authorization  # noqa: E402
 from _common import require_table  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
@@ -374,6 +375,70 @@ def sponsorship_posting(private_root: Path, payload: dict[str, Any]) -> dict[str
         return sponsorship_triage.posting(Path(private_root), job_id)
     except ValueError:
         raise AppError("no_such_opening", 404) from None
+
+
+# ---- the US work-authorization answer, and its per-application re-confirmation ----
+#
+# Two presses that are not the same press. The first says what the answer is; the second says
+# it may be used in this one application, and expires. `answer_library` will not fill an
+# immigration answer on the strength of the first alone.
+
+US_WORK_AUTH_FIELDS = ("version", "question", "canonical_id", "country", "application_id",
+                       "disposition", "domain", "answer_exists", "answer_id", "answer",
+                       "answer_value_sha256", "confirmed_at", "authorized", "detail")
+
+
+def us_work_auth_state(connection: sqlite3.Connection,
+                       payload: dict[str, Any]) -> dict[str, Any]:
+    """What the window shows before either press. Carries the answer, to the window only.
+
+    The value is returned because the second confirmation is about something the user has to
+    be able to see: "allow reuse" with nothing on screen is not a re-confirmation of a
+    work-authorization answer. It reaches this window over a token-guarded loopback and goes
+    nowhere else — not to a log, not to an error, not to the CLI.
+    """
+    report = us_work_authorization.state(connection, _application_id(payload))
+    return {key: report.get(key) for key in US_WORK_AUTH_FIELDS}
+
+
+def us_work_auth_save(connection: sqlite3.Connection,
+                      payload: dict[str, Any]) -> dict[str, Any]:
+    application_id = _application_id(payload)
+    try:
+        us_work_authorization.save_answer(connection, payload.get("answer"))
+    except ValueError as error:
+        text = str(error)
+        if "longer than" in text:
+            raise AppError("answer_too_long", 400) from None
+        if "must be text" in text:
+            raise AppError("bad_answer", 400) from None
+        if "blank" in text:
+            raise AppError("answer_blank", 400) from None
+        raise AppError("answer_refused", 409) from None
+    return us_work_auth_state(connection, {"application_id": application_id})
+
+
+def us_work_auth_authorize(connection: sqlite3.Connection,
+                           payload: dict[str, Any]) -> dict[str, Any]:
+    """The page names the answer and the digest it displayed; the service checks both.
+
+    A page that could omit them would be authorising whatever is on file rather than what the
+    person looked at, which is the difference between a re-confirmation and a rubber stamp.
+    """
+    application_id = _application_id(payload)
+    answer_id, digest = payload.get("answer_id"), payload.get("answer_value_sha256")
+    if not isinstance(answer_id, str) or not isinstance(digest, str):
+        raise AppError("bad_authorization_request")
+    try:
+        us_work_authorization.authorize(connection, application_id, answer_id, digest)
+    except ValueError as error:
+        text = str(error)
+        if "value does not match" in text:
+            raise AppError("answer_changed_since_it_was_shown", 409) from None
+        if "no such confirmed answer" in text:
+            raise AppError("no_confirmed_answer", 409) from None
+        raise AppError("authorization_refused", 409) from None
+    return us_work_auth_state(connection, {"application_id": application_id})
 
 
 def _worksheet_path(private_root: Path) -> Path:
@@ -718,6 +783,12 @@ class Handler(BaseHTTPRequestHandler):
             self._run(lambda connection: submission_intend(connection, payload))
         elif path == "/api/submission/confirm":
             self._run(lambda connection: submission_confirm(connection, payload))
+        elif path == "/api/immigration/state":
+            self._run(lambda connection: us_work_auth_state(connection, payload))
+        elif path == "/api/immigration/save-answer":
+            self._run(lambda connection: us_work_auth_save(connection, payload))
+        elif path == "/api/immigration/authorize":
+            self._run(lambda connection: us_work_auth_authorize(connection, payload))
         elif path == "/api/submission/tracker":
             self._run(lambda _: submission_tracker(self.db_path, self.private_root),
                       needs_db=False)

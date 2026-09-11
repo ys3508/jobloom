@@ -30,6 +30,26 @@ IMMIGRATION_CANONICAL_IDS = {
     "sponsorship_future",
     "employer_action_required",
 }
+# Why an immigration answer that exists is still not usable. The top-level reason stays
+# `immigration_recheck_required`, because these are not ordinary missing permissions and a
+# caller that treated them as one would report a special recheck as a routine gap.
+IMMIGRATION_DETAILS = (
+    # The answer's own scope names this application — the original shape, still supported.
+    "answer_scoped_to_this_application",
+    "application_authorization_missing",
+    "application_authorization_expired",
+    "application_authorization_revoked",
+    # The authorization names an answer, or a value, that is no longer the one on file. This
+    # is how a changed answer invalidates an old authorization without any trigger having to
+    # fire: the binding simply stops matching.
+    "application_authorization_answer_changed",
+    "application_id_absent_from_context",
+)
+# What an authorization for an immigration answer has to name. A broad auto-fill permission
+# is not one of these and never satisfies the rule: re-confirming "you may fill things for
+# this application" is not re-confirming "this is still your work authorization".
+ANSWER_AUTHORIZATION_FIELDS = {"authorization_id", "confirmed_at", "expires_at", "scope",
+                               "canonical_id", "answer_id", "answer_value_sha256", "actor"}
 ANSWER_TYPES = {
     "stable_fact", "time_sensitive_fact", "conditional_preference", "company_specific",
     "role_specific", "application_specific", "voluntary_disclosure", "legal_commitment",
@@ -1071,6 +1091,133 @@ def authorization_current(
     return True, None
 
 
+def _add_authorization_columns(connection: sqlite3.Connection) -> None:
+    """The bindings an answer-level authorization carries. Added the way the others are.
+
+    Rows written before these existed stay NULL, which is honestly what they are: broad
+    auto-fill permissions, and never an immigration re-confirmation.
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(authorizations)")}
+    for column in ("canonical_id", "answer_id", "answer_value_sha256", "actor"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE authorizations ADD COLUMN {column} TEXT")
+
+
+def add_answer_authorization(connection: sqlite3.Connection, entry: dict[str, Any]) -> None:
+    """The user, looking at this answer, allowing it in this one application.
+
+    Distinct from `add_authorization` and deliberately narrower. A standing authorization says
+    Jobloom may fill things for an application; this says *this value, this answer, still
+    true, use it here*. An immigration answer is only ever auto-filled on the strength of one
+    of these, because the thing being re-confirmed is the fact and not the permission.
+
+    Binding the exact `answer_value_sha256` is what makes a changed answer drop its
+    authorizations without any trigger firing: the new value hashes differently, the binding
+    stops matching, and the field goes back to asking.
+    """
+    unknown = sorted(set(entry) - ANSWER_AUTHORIZATION_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported authorization fields: {', '.join(unknown)}")
+    missing = sorted(ANSWER_AUTHORIZATION_FIELDS - set(entry))
+    if missing:
+        raise ValueError(f"answer authorization missing fields: {', '.join(missing)}")
+    if entry["actor"] != "user":
+        raise ValueError("only the user may authorise an immigration answer")
+    confirmed, expires = parse_time(entry["confirmed_at"]), parse_time(entry["expires_at"])
+    if not confirmed or not expires or expires <= confirmed:
+        raise ValueError("authorization expiration must be after confirmation")
+    if expires - confirmed > timedelta(days=14):
+        raise ValueError("standing authorization may not exceed fourteen days")
+    scope = entry["scope"]
+    unknown_scope = sorted(set(scope) - SCOPE_FIELDS)
+    if unknown_scope:
+        raise ValueError(f"unsupported authorization scope fields: {', '.join(unknown_scope)}")
+    if not scope.get("application_id"):
+        raise ValueError("an answer authorization names one application")
+    answer = connection.execute(
+        "SELECT canonical_id, answer_json FROM answers WHERE answer_id=? "
+        "AND confirmation_status='confirmed' AND status='active'",
+        (entry["answer_id"],)).fetchone()
+    if not answer:
+        raise ValueError("no such confirmed answer")
+    if answer["canonical_id"] != entry["canonical_id"]:
+        raise ValueError("authorization names a different meaning from the answer")
+    if _digest_answer(answer["answer_json"]) != entry["answer_value_sha256"]:
+        # The value the user was shown is not the value on file. Refusing is the point: an
+        # authorization recorded against a stale display would authorise something unseen.
+        raise ValueError("authorization value does not match the stored answer")
+    _add_authorization_columns(connection)
+    connection.execute(
+        "INSERT INTO authorizations (authorization_id, confirmed_at, expires_at, scope_json,"
+        " revoked_at, status, canonical_id, answer_id, answer_value_sha256, actor)"
+        " VALUES (?, ?, ?, ?, NULL, 'active', ?, ?, ?, 'user')",
+        (entry["authorization_id"], entry["confirmed_at"], entry["expires_at"], _json(scope),
+         entry["canonical_id"], entry["answer_id"], entry["answer_value_sha256"]))
+    audit(connection, "answer_authorization_added", entry["authorization_id"],
+          {"canonical_id": entry["canonical_id"], "answer_id": entry["answer_id"],
+           "application_id": scope["application_id"], "expires_at": entry["expires_at"]})
+    connection.commit()
+
+
+def _digest_answer(answer_json: str) -> str:
+    """The hash of a stored answer's value. One place, so the two sides cannot disagree."""
+    return hashlib.sha256(answer_json.encode("utf-8")).hexdigest()
+
+
+def answer_value_sha256(connection: sqlite3.Connection, answer_id: str) -> str | None:
+    """What the window shows the user beside the question, so they authorise what they saw."""
+    row = connection.execute(
+        "SELECT answer_json FROM answers WHERE answer_id=?", (answer_id,)).fetchone()
+    return _digest_answer(row["answer_json"]) if row else None
+
+
+def immigration_authorization(connection: sqlite3.Connection, application_id: str | None,
+                              canonical_id: str, answer: sqlite3.Row,
+                              at: datetime) -> tuple[bool, str]:
+    """Is there a live, exact re-confirmation of this answer for this application.
+
+    Order matters, because the reasons are not interchangeable. An authorization naming a
+    different answer or a different value is not a missing one: it means the answer changed
+    under an authorization somebody granted in good faith, and saying so is what tells the
+    user their old yes no longer covers what the form would now receive.
+    """
+    if not application_id:
+        return False, "application_id_absent_from_context"
+    _add_authorization_columns(connection)
+    rows = connection.execute(
+        "SELECT * FROM authorizations WHERE canonical_id=? AND answer_id IS NOT NULL",
+        (canonical_id,)).fetchall()
+    expected = _digest_answer(answer["answer_json"])
+    saw_other_binding = False
+    saw_expired = False
+    saw_revoked = False
+    for row in rows:
+        scope = json.loads(row["scope_json"] or "{}")
+        if scope.get("application_id") != application_id:
+            continue
+        if row["answer_id"] != answer["answer_id"] or row["answer_value_sha256"] != expected:
+            saw_other_binding = True
+            continue
+        if row["status"] != "active" or row["revoked_at"]:
+            saw_revoked = True
+            continue
+        if at >= parse_time(row["expires_at"]):
+            saw_expired = True
+            continue
+        return True, "application_authorization_current"
+    # Signals about *this* answer come first. A revoked or expired authorization naming the
+    # current answer is what actually happened; a stale binding left behind by a superseded
+    # answer is noise beside it, and reporting the noise would send the user to re-answer a
+    # question when what they did was withdraw a permission.
+    if saw_revoked:
+        return False, "application_authorization_revoked"
+    if saw_expired:
+        return False, "application_authorization_expired"
+    if saw_other_binding:
+        return False, "application_authorization_answer_changed"
+    return False, "application_authorization_missing"
+
+
 def _add_question_form_columns(connection: sqlite3.Connection) -> None:
     """Audit columns, added the way `saved_jobs` adds its own. Rows registered before these
     existed stay NULL, which is honestly what their provenance is."""
@@ -1158,12 +1305,29 @@ def _resolve_answer(
         return {"decision": "conflict", "reason": "conflicting_active_answers", "canonical_id": canonical_id, "auto_fill_ready": False}
     selected = max(best, key=lambda row: parse_time(row["confirmed_at"]) or datetime.min.replace(tzinfo=timezone.utc))
     if canonical_id in IMMIGRATION_CANONICAL_IDS:
+        # Two ways an immigration answer can have been re-confirmed for this application, and
+        # no third. The first is the original shape: the answer's own scope names it. The
+        # second is an authorization bound to this application, this answer and this exact
+        # value — the user looking at what would be sent and saying it is still true.
+        #
+        # A broad standing authorization satisfies neither. "You may fill things for this
+        # application" is a permission; what this rule wants re-confirmed is a fact.
         application_id = context.get("application_id")
         selected_scope = json.loads(selected["scope_json"])
-        if not application_id or selected_scope.get("application_id") != application_id:
-            return {"decision": "ask", "reason": "immigration_recheck_required",
-                    "canonical_id": canonical_id, "answer_id": selected["answer_id"],
-                    "auto_fill_ready": False}
+        scoped_here = bool(application_id) and selected_scope.get("application_id") == application_id
+        if scoped_here:
+            detail = "answer_scoped_to_this_application"
+        else:
+            allowed, detail = immigration_authorization(
+                connection, application_id, canonical_id, selected, at)
+            if not allowed:
+                return {"decision": "ask", "reason": "immigration_recheck_required",
+                        "immigration_detail": detail,
+                        "canonical_id": canonical_id, "answer_id": selected["answer_id"],
+                        # The answer is on file; it is the re-confirmation that is missing.
+                        # Reporting it as absent would send the user to write it again.
+                        "answer_exists": True,
+                        "auto_fill_ready": False}
     if selected["answer_type"] == "legal_commitment":
         return {"decision": "ask", "reason": "legal_commitment_requires_review", "canonical_id": canonical_id, "answer_id": selected["answer_id"], "auto_fill_ready": False}
     if not selected["auto_fill_allowed"]:
@@ -1215,7 +1379,8 @@ def match_answer(
 # a preflight exists to say whether this question is answered, and a screen that printed the
 # value would be handing out confirmed answers to a caller that cannot fill a form with them.
 INSPECT_FIELDS = ("decision", "reason", "canonical_id", "answer_id", "match_level",
-                  "channel_b_fresh", "per_application_recheck_required")
+                  "channel_b_fresh", "per_application_recheck_required",
+                  "immigration_detail")
 
 
 def inspect_answer(
@@ -1241,8 +1406,12 @@ def inspect_answer(
     decision = _resolve_answer(connection, question, context, None, at)
     result = {key: decision[key] for key in INSPECT_FIELDS if key in decision}
     if decision["decision"] != "use":
-        result["answer_exists"] = False
+        # An immigration answer awaiting its per-application re-confirmation exists; every
+        # other refusal means nothing on file covers the question.
+        result["answer_exists"] = bool(decision.get("answer_exists"))
         result["auto_fill_ready"] = False
+        if decision.get("immigration_detail"):
+            result["immigration_detail"] = decision["immigration_detail"]
         return result
     authorized, authorization_reason = _any_current_authorization(connection, context, at)
     result["answer_exists"] = True

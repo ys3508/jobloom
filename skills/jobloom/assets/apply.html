@@ -160,6 +160,21 @@ const COPY = {
     back: "返回",
     loading: "读取中…",
     toRecord: "记录这次投递",
+    toImmigration: "美国工作授权",
+    immTitle: "美国工作授权",
+    immQ: "表单上的原题",
+    immStep1: "第一步 · 保存答案",
+    immStep2: "第二步 · 授权用于这份申请",
+    immStep1Note: "这条答案按**国家**保存（US），事件驱动。它不绑定任何一份申请——所以保存它并不等于允许在某份申请里使用。",
+    immStep2Note: "移民类答案每份申请都要你重新看一遍。下面显示的就是会被填进表单的值；确认它现在仍然成立。",
+    immSave: "保存这个答案",
+    immAuthorize: "允许在这份申请中使用这个答案",
+    immCurrent: "当前答案",
+    immNone: "还没有答案",
+    immAuthorized: "已授权,有效期最长 14 天",
+    immDetail: "状态",
+    immWhyTwo: "两次确认是分开的:第一次说这是你的工作授权,第二次说可以在**这一份**申请里用它。少了第二次,答案存在但不可填——这是移民类的硬规则,不是普通的权限缺失。",
+    immNoSponsorship: "这里不包含、也不推导任何 sponsorship 答案。那道题永久人工。",
     recordTitle: "记录投递",
     rungsTitle: "三级记录，互不代替",
     rung1: "① 打算去投 —— 按下时表单还没打开，记的是意图",
@@ -221,6 +236,21 @@ const COPY = {
     back: "Back",
     loading: "Loading…",
     toRecord: "Record this application",
+    toImmigration: "US work authorization",
+    immTitle: "US work authorization",
+    immQ: "The question as the form asks it",
+    immStep1: "Step 1 · Save the answer",
+    immStep2: "Step 2 · Allow it in this application",
+    immStep1Note: "Saved for the **country** (US), event-driven. It is bound to no application, so saving it is not permission to use it in one.",
+    immStep2Note: "An immigration answer is looked at again for every application. What is shown below is what would be filled; confirm it is still true.",
+    immSave: "Save this answer",
+    immAuthorize: "Allow this answer in this application",
+    immCurrent: "Current answer",
+    immNone: "No answer yet",
+    immAuthorized: "Authorised, for at most 14 days",
+    immDetail: "State",
+    immWhyTwo: "The two confirmations are separate: the first says this is your work authorization, the second says it may be used in *this* application. Without the second the answer exists and cannot be filled — that is the immigration rule, not an ordinary missing permission.",
+    immNoSponsorship: "Nothing here stores or derives a sponsorship answer. That question stays manual.",
     recordTitle: "Record the application",
     rungsTitle: "Three rungs, none standing in for another",
     rung1: "① Going to apply — pressed before the form opens, so it records an intention",
@@ -287,7 +317,8 @@ function render() {
     return;
   }
   ({ queue: queueScreen, readiness: readinessScreen, paste: pasteScreen,
-     split: splitScreen, result: resultScreen, record: recordScreen }[screen] || queueScreen)();
+     split: splitScreen, result: resultScreen, record: recordScreen,
+     immigration: immigrationScreen }[screen] || queueScreen)();
 }
 
 // ---- screens -------------------------------------------------------------------
@@ -442,10 +473,69 @@ function resultScreen() {
     <p class="muted">${t("checklistBody")}</p>
     <div class="note">${t("nothingWritten")}</div>
     <p><button id="record">${t("toRecord")}</button>
+      <button class="quiet" id="immigration">${t("toImmigration")}</button>
       <button class="quiet" id="back">${t("back")}</button></p>
   </div>`;
   document.getElementById("back").onclick = () => { screen = "split"; render(); };
   document.getElementById("record").onclick = openRecord;
+  document.getElementById("immigration").onclick = openImmigration;
+}
+
+// ---- the one immigration answer, and its per-application re-confirmation --------
+
+function immigrationScreen() {
+  const st = app.immigration || {};
+  view.innerHTML = `<div class="card">
+    <h2>${t("immTitle")}</h2>
+    <div class="note"><b>${t("immQ")}</b><br>${esc(st.question)}</div>
+    <div class="note">${t("immWhyTwo")}</div>
+    <h3>${t("immStep1")}</h3>
+    <div class="note">${t("immStep1Note")}</div>
+    ${st.answer_exists
+      ? `<div class="note">${t("immCurrent")}: <b>${esc(st.answer)}</b>
+           <div class="mono muted">${esc(st.answer_id)} · ${esc((st.confirmed_at||"").slice(0,19))}</div></div>`
+      : `<div class="note">${t("immNone")}</div>`}
+    <div class="row">
+      <input type="text" id="immvalue" maxlength="200" placeholder="${esc(st.question)}">
+    </div>
+    <p><button id="immsave">${t("immSave")}</button></p>
+    <h3>${t("immStep2")}</h3>
+    <div class="note">${t("immStep2Note")}</div>
+    <div class="note ${st.authorized ? "" : "stop"}">${t("immDetail")}:
+      <span class="mono">${esc(st.detail)}</span>${
+        st.authorized ? ` · ${t("immAuthorized")}` : ""}</div>
+    ${st.answer_exists && !st.authorized
+      ? `<p><button id="immauth">${t("immAuthorize")}</button></p>` : ""}
+    <div class="note">${t("immNoSponsorship")}</div>
+    <p><button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("back").onclick = () => { screen = "result"; render(); };
+  document.getElementById("immsave").onclick = async () => {
+    const value = document.getElementById("immvalue").value;
+    if (!value.trim()) return;
+    await immPost("/api/immigration/save-answer", { answer: value });
+  };
+  const auth = document.getElementById("immauth");
+  if (auth) auth.onclick = () => immPost("/api/immigration/authorize", {
+    answer_id: st.answer_id, answer_value_sha256: st.answer_value_sha256 });
+}
+
+async function immPost(path, extra) {
+  try {
+    app.immigration = await api(path,
+      { application_id: app.application.application_id, ...extra });
+  } catch (failure) { error = failure.message; }
+  render();
+}
+
+async function openImmigration() {
+  view.innerHTML = `<div class="card"><p class="muted">${t("loading")}</p></div>`;
+  try {
+    app.immigration = await api("/api/immigration/state",
+      { application_id: app.application.application_id });
+    screen = "immigration";
+  } catch (failure) { error = failure.message; }
+  render();
 }
 
 // ---- recording what the user did in the employer's own tab ----------------------

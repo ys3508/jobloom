@@ -137,7 +137,18 @@ Both channels must pass:
 - Channel A: standing authorization is current, scoped to this queue/action, and not revoked.
 - Channel B: every individual answer and dependent fact is current, applicable, and conflict-free.
 
-Channel A never extends or overrides Channel B. Immigration answers bind to real-world expiration dates and are rechecked whenever used. That recheck is enforced, not advisory: an immigration answer is auto-filled only when its scope names the application being filled, so a broadly scoped one pauses for the user at match time with `immigration_recheck_required` instead of filling and failing the pre-submit review later. Matching without an `application_id` in context pauses for the same reason.
+Channel A never extends or overrides Channel B. Immigration answers bind to real-world expiration dates and are rechecked whenever used. That recheck is enforced, not advisory, and there are exactly two ways it can have happened for the application being filled:
+
+1. **The answer's own scope names the application.** The original shape, unchanged, and what `TASK14_INTAKE_SHAPE` records.
+2. **An authorization bound to this application, this answer, and this exact value.** The user, looking at what would be sent, saying it is still true.
+
+Anything else pauses with `immigration_recheck_required`, and a detail says which situation it is: `application_authorization_missing`, `_expired`, `_revoked`, `_answer_changed`, or `application_id_absent_from_context`. The detail matters because these are not ordinary missing permissions, and a caller that reported one as a routine gap would send the user to re-answer a question when what they needed to do was re-confirm it.
+
+**A broad standing authorization is not one of the two.** "You may fill things for this application" is a permission; what the recheck wants re-confirmed is a fact, and `add_answer_authorization` is the only call that records the second kind. It requires the user actor, one application, the answer id, and the digest of the value the user was shown; it expires within fourteen days and is revocable.
+
+Binding the value digest is also what makes a changed answer drop its authorizations without any trigger firing. A new answer supersedes the old one and hashes differently, the binding stops matching, and the field goes back to asking — which is why `invalidation_triggers` can honestly stay empty for these.
+
+None of this touches sponsorship. `sponsorship_now` and `sponsorship_future` are `always_manual` in `field_policy` and never reach the answer path at all; being authorised to work is not an answer about needing sponsorship, and neither is derived from the other.
 
 Standing authorization expires no later than fourteen days after confirmation in the MVP. Revocation takes effect immediately. Authorization scope may include country, jurisdiction, company, role family, employment type, application, or approved queue.
 
