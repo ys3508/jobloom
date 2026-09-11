@@ -77,9 +77,9 @@ IGNORED_INPUT_TYPES = frozenset({"hidden", "submit", "button", "reset", "image"}
 
 PAUSE_CODES = (
     "origin_not_approved", "navigated_away", "page_changed_under_observation",
-    "iframe_present", "captcha_present", "duplicate_field_id",
-    "conflicting_canonical_meaning", "unsupported_control", "unlabelled_field",
-    "no_fields_found",
+    "unknown_frame_present", "possible_form_frame", "captcha_gates_the_form",
+    "duplicate_field_id", "conflicting_canonical_meaning", "unsupported_control",
+    "unlabelled_field", "no_fields_found",
 )
 
 CAPTCHA_MARKERS = re.compile(
@@ -92,6 +92,28 @@ CAPTCHA_MARKERS = re.compile(
 # obstacle to route around, so naming it precisely is the point — it is not a way past it.
 CAPTCHA_FRAME_HOSTS = ("hcaptcha.com", "recaptcha.net", "google.com/recaptcha",
                        "challenges.cloudflare.com", "arkoselabs.com", "funcaptcha.com")
+
+# Frames that are neither a challenge nor a place an application field could hide. Each is
+# listed because it was seen on a real Lever page, not because a class of thing sounds
+# harmless: a rule broad enough to cover "widgets" would cover a form in a widget.
+KNOWN_NON_FORM_EMBEDS = (
+    # The share button under the posting. Renders at a fixed small size and carries no form.
+    {"title": "linkedin embedded content", "max_width": 400, "max_height": 120},
+)
+# A frame too small to show a question. Kept as its own rule with the size stated, so a
+# "tracking pixel" that grows into something is no longer a tracking pixel.
+TRACKING_PIXEL_MAX = 4
+
+FRAME_CLASSES = ("captcha_frame", "known_non_form_embed", "tracking_pixel",
+                 "possible_form_frame", "unknown_frame")
+
+# What a challenge writes into the *top* document for its own bookkeeping. hCaptcha and
+# reCAPTCHA both inject a hidden textarea holding the response token. It is not a question an
+# employer is asking and Jobloom must never read, hash, carry or fill it, so it is excluded by
+# name before anything else looks at it — ahead of the unlabelled-field rule, which would
+# otherwise stop the run on a field that should simply not be there.
+CHALLENGE_FIELD_NAMES = re.compile(
+    r"captcha|challenge[-_]?response|cf[-_]turnstile", re.IGNORECASE)
 
 
 class Paused(Exception):
@@ -188,11 +210,24 @@ READ_STRUCTURE = r"""
   // A radio's own label is "Yes"; what is being asked sits on the fieldset or the list item
   // around it, and losing that would record a form as asking "Yes".
   const groupLabel = (el) => {
-    const group = el.closest('fieldset, li, .application-question, .application-field');
-    if (!group) return '';
-    const heading = group.querySelector('legend, .application-label, h3, h4, label');
-    if (heading && !heading.contains(el) && heading.textContent.trim()) {
-      return heading.textContent.trim();
+    // Walked up, not `closest`. On a real Lever form the nearest container is the wrapper
+    // holding the control itself — `div.application-field` — and the heading sits one level
+    // further out on `li.application-question`. Stopping at the first container found a
+    // wrapper with no heading in it and reported the field as unreadable.
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+      // A heading is a candidate only if it holds no form control at all. Excluding just the
+      // ones containing *this* control was not enough: on a real Lever page the level above a
+      // checkbox holds its siblings' labels too, and the rule picked "She/her" — another
+      // choice — as what the form was asking. A question is the text beside the controls, so
+      // anything wrapping a control is a choice and never a heading.
+      for (const heading of node.querySelectorAll(
+          'legend, .application-label, label, h3, h4')) {
+        if (heading.querySelector('input, select, textarea')) continue;
+        if (heading.contains(el) || !heading.textContent.trim()) continue;
+        return heading.textContent.trim();
+      }
+      if (node.tagName === 'FORM') break;
     }
     return '';
   };
@@ -216,6 +251,9 @@ READ_STRUCTURE = r"""
       group_label: squash(groupLabel(el)),
       required: el.required === true || el.getAttribute('aria-required') === 'true',
       disabled: el.disabled === true,
+      // Whether a person can see it. A control with no box on the page is not a question
+      // being asked, and a challenge's bookkeeping textarea is exactly that shape.
+      visible: el.getClientRects().length > 0,
       // Choices are part of the question, not of the answer: which options exist is what the
       // employer is asking, and none of them is marked as chosen here.
       options: tag === 'select'
@@ -226,10 +264,26 @@ READ_STRUCTURE = r"""
   }
   // Frames are inventoried by src and title only. Neither is a value somebody typed, and
   // both are needed to tell a CAPTCHA challenge from a share widget.
-  const frames = Array.from(document.querySelectorAll('iframe')).map((f) => ({
-    src: squash(f.getAttribute('src') || ''),
-    title: squash(f.getAttribute('title') || ''),
-  }));
+  const frames = Array.from(document.querySelectorAll('iframe')).map((f) => {
+    let sameOrigin = false;
+    let controlCount = 0;
+    try {
+      // Touching `contentDocument` on a cross-origin frame throws, which is the check: a
+      // frame this cannot read is a frame this cannot classify by content. The challenge
+      // frames are cross-origin and are never entered — this only ever reads `null`.
+      const doc = f.contentDocument;
+      if (doc) {
+        sameOrigin = true;
+        controlCount = doc.querySelectorAll('input, textarea, select').length;
+      }
+    } catch (e) { sameOrigin = false; }
+    return {
+      src: squash(f.getAttribute('src') || ''),
+      title: squash(f.getAttribute('title') || ''),
+      width: f.offsetWidth, height: f.offsetHeight,
+      same_origin: sameOrigin, control_count: controlCount,
+    };
+  });
   return {
     controls: out,
     iframes: frames.length,
@@ -241,54 +295,98 @@ READ_STRUCTURE = r"""
 """
 
 
-def captcha_present(raw: dict[str, Any]) -> bool:
-    """A challenge on the page, found in the top document or in a frame it embeds.
+def classify_frame(frame: dict[str, Any]) -> str:
+    """What this frame is, from its own attributes. Unknown is a class, not a default to ignore.
 
-    Fails closed on both halves. A frame from a known challenge vendor counts even if its
-    title is empty, and a title naming a challenge counts even from a host nobody listed:
-    the two are checked independently because either alone can be absent.
+    A challenge is recognised by vendor host or by a title naming one, checked independently
+    because either can be absent. Everything that is not a challenge and not one of the two
+    shapes measured on a real page is `unknown_frame`, which stops the run: a frame nobody
+    classified could be holding the form.
     """
+    source = (frame.get("src") or "").lower()
+    title = (frame.get("title") or "").strip().lower()
+    if any(host in source for host in CAPTCHA_FRAME_HOSTS):
+        return "captcha_frame"
+    if CAPTCHA_MARKERS.search(title):
+        return "captcha_frame"
+    if frame.get("same_origin") and frame.get("control_count"):
+        # Readable, and it holds controls. A form in a frame needs its own adapter, and
+        # guessing that these controls belong to the same application is exactly the guess
+        # this observer does not make.
+        return "possible_form_frame"
+    width, height = frame.get("width") or 0, frame.get("height") or 0
+    if width <= TRACKING_PIXEL_MAX and height <= TRACKING_PIXEL_MAX:
+        return "tracking_pixel"
+    for embed in KNOWN_NON_FORM_EMBEDS:
+        if (title == embed["title"] and width <= embed["max_width"]
+                and height <= embed["max_height"]):
+            return "known_non_form_embed"
+    return "unknown_frame"
+
+
+def classify_frames(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every frame, with its class. Counted and reported; none silently dropped."""
+    return [{"class": classify_frame(frame),
+             # Attributes, not content. Nothing here was typed by anybody.
+             "title": (frame.get("title") or "")[:120],
+             "host": urlparse(frame.get("src") or "").hostname or "",
+             "width": frame.get("width") or 0, "height": frame.get("height") or 0}
+            for frame in raw.get("frames") or []]
+
+
+def captcha_present(raw: dict[str, Any]) -> bool:
+    """A challenge on the page, in the top document or in a frame it embeds."""
     if CAPTCHA_MARKERS.search(raw.get("text_markers") or ""):
         return True
-    for frame in raw.get("frames") or []:
-        source = (frame.get("src") or "").lower()
-        if any(host in source for host in CAPTCHA_FRAME_HOSTS):
-            return True
-        if CAPTCHA_MARKERS.search(frame.get("title") or ""):
-            return True
-    return False
+    return any(frame["class"] == "captcha_frame" for frame in classify_frames(raw))
 
 
-def _group_radios(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One radio group is one question, however many inputs the page used to draw it.
+def _group_by_name(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Controls that share a name are one question, however many boxes the page drew.
 
-    Grouped on the `name` the page gave them, which is what the browser itself groups on. A
-    radio with no name is not a group and is left alone rather than guessed into one.
+    Radios and checkboxes both. HTML says so for each: same-named radios are mutually
+    exclusive and same-named checkboxes submit as one list, so an employer asking "which
+    pronouns do you use" ships nine inputs and one question. The 2026-09-11 acceptance run
+    found exactly that and the first version reported nine fields colliding on one id.
 
-    The group's question is the enclosing fieldset or list item's heading, and the per-radio
-    label is a *choice*. Reading a choice as the question would record a form as asking "Yes",
-    so when there is no group heading the group has no legible question and stops the run.
+    **Only when more than one shares the name.** A lone checkbox — "I agree to the terms" —
+    is a question whose own label is the question, and turning it into a group of one would
+    replace that label with whatever heading happened to sit above it.
+
+    The group's question is the enclosing heading, and each control's label is a *choice*.
+    A group with no heading has no legible question and stops the run: recording "Yes" or
+    "She/her" as what a form asks would send the next step looking up its reviewed meaning.
     """
-    grouped: list[dict[str, Any]] = []
-    seen: dict[str, dict[str, Any]] = {}
+    counts: dict[tuple[str, str], int] = {}
     for control in controls:
-        if control["type"] != "radio" or not control["name"]:
+        if control["type"] in ("radio", "checkbox") and control["name"]:
+            key = (control["type"], control["name"])
+            counts[key] = counts.get(key, 0) + 1
+
+    grouped: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for control in controls:
+        key = (control["type"], control["name"])
+        if counts.get(key, 0) < 2:
             grouped.append(control)
             continue
-        existing = seen.get(control["name"])
+        existing = seen.get(key)
         if existing is None:
             entry = dict(control)
             entry["options"] = [control["label"]] if control["label"] else []
             entry["label"] = control.get("group_label") or ""
-            seen[control["name"]] = entry
+            # The shared name is the group's identity; the per-box id belongs to one choice.
+            entry["id"] = ""
+            entry["selector"] = f'{control["tag"]}[name="{control["name"]}"]'
+            seen[key] = entry
             grouped.append(entry)
         elif control["label"]:
             existing["options"].append(control["label"])
     return grouped
 
 
-def build_fields(raw: dict[str, Any],
-                 connection: sqlite3.Connection | None) -> list[dict[str, Any]]:
+def build_fields(raw: dict[str, Any], connection: sqlite3.Connection | None
+                 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Turn what the page showed into the observation shape, or stop.
 
     Every refusal here is a stop rather than a default. A control kind nobody classified, a
@@ -296,15 +394,27 @@ def build_fields(raw: dict[str, Any],
     meaning: each is a thing a person has to look at, and recording a guess would put that
     guess into a form.
     """
-    controls = [c for c in raw["controls"]
-                if not (c["tag"] == "input" and c["type"] in IGNORED_INPUT_TYPES)]
-    controls = [c for c in controls if not c["disabled"]]
+    skipped = {"structural": 0, "challenge_field": 0, "disabled": 0, "not_visible": 0}
+    controls = []
+    for entry in raw["controls"]:
+        if entry["tag"] == "input" and entry["type"] in IGNORED_INPUT_TYPES:
+            skipped["structural"] += 1
+        elif CHALLENGE_FIELD_NAMES.search(f"{entry['name']} {entry['id']}"):
+            # The challenge's own response token. Excluded before the label rule sees it, and
+            # counted rather than dropped: never read, never hashed, never in a package.
+            skipped["challenge_field"] += 1
+        elif entry["disabled"]:
+            skipped["disabled"] += 1
+        elif not entry.get("visible", True):
+            skipped["not_visible"] += 1
+        else:
+            controls.append(entry)
     if not controls:
         raise Paused("no_fields_found")
 
     fields: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for control in _group_radios(controls):
+    for control in _group_by_name(controls):
         tag, type_name = control["tag"], control["type"]
         if tag == "textarea":
             kind = "textarea"
@@ -356,7 +466,7 @@ def build_fields(raw: dict[str, Any],
                 raise Paused("conflicting_canonical_meaning", canonical_id)
             claimed[canonical_id] = field["field_id"]
         field["field_sha256"] = field_digest(field)
-    return fields
+    return fields, skipped
 
 
 def _guard(page, expected_url: str) -> None:
@@ -400,18 +510,31 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
             page.wait_for_timeout(1200)
 
             first = page.evaluate(READ_STRUCTURE)
-            # Order matters: a page carrying a CAPTCHA must say so. Reporting the frame count
-            # first would name the symptom and hide the mandatory pause underneath it.
-            if captcha_present(first):
-                raise Paused("captcha_present")
-            if first["iframes"]:
-                raise Paused("iframe_present", str(first["iframes"]))
-            fields = build_fields(first, connection)
+            frames = classify_frames(first)
+            # Unknown and form-bearing frames stop the run. A challenge frame does not: it is
+            # allowed to exist beside the form, and is never entered, read or operated.
+            for frame in frames:
+                if frame["class"] == "possible_form_frame":
+                    raise Paused("possible_form_frame")
+                if frame["class"] == "unknown_frame":
+                    raise Paused("unknown_frame_present")
+            challenge = captcha_present(first)
+
+            fields, skipped = build_fields(first, connection)
+            if challenge and not fields:
+                # Nothing to answer beside a challenge means the challenge is the gate, and
+                # a form that appears only after it is passed is a form nobody has observed.
+                raise Paused("captcha_gates_the_form")
             digest = page_digest(fields)
 
             page.wait_for_timeout(800)
-            second = build_fields(page.evaluate(READ_STRUCTURE), connection)
+            second_raw = page.evaluate(READ_STRUCTURE)
+            second, _ = build_fields(second_raw, connection)
             if page_digest(second) != digest:
+                raise Paused("page_changed_under_observation")
+            if captcha_present(second_raw) != challenge:
+                # A challenge that appeared while the page was being read is a challenge
+                # something triggered, and the run stops rather than continuing beside it.
                 raise Paused("page_changed_under_observation")
 
             observed_url = page.url
@@ -419,7 +542,7 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
             browser.close()
 
     return {
-        "schema_version": "0.1.0",
+        "schema_version": "0.2.0",
         "observer_version": OBSERVER_VERSION,
         "page_url": observed_url,
         "page_sha256": digest,
@@ -432,6 +555,18 @@ def observe(url: str, *, connection: sqlite3.Connection | None = None,
         "restricted_requests": [],
         "values_read": False,
         "database_writes": 0,
+        # Every frame on the page and what it was taken to be. Reported even when all of them
+        # were benign, so "there were no frames" and "the frames were fine" stay different
+        # statements.
+        "frames": frames,
+        # Counted, never silently dropped: a challenge's response token, a control nobody can
+        # see, a disabled one, and the structural inputs every form carries.
+        "skipped": skipped,
+        # The three fields a later stage reads before it does anything at all.
+        "captcha_present": challenge,
+        "captcha_handling": "user_required" if challenge else "not_present",
+        "user_takeover_required": challenge,
+        "automation_scope": ("non_challenge_fields_only" if challenge else "all_observed_fields"),
     }
 
 
@@ -453,6 +588,19 @@ def write_observation(observation: dict[str, Any], output: Path) -> dict[str, An
 def summarise(observation: dict[str, Any]) -> str:
     """What to print. Questions and dispositions, and no value, because there are none."""
     lines = [f"{observation['field_count']} fields · page {observation['page_sha256'][:12]}"]
+    if observation.get("captcha_present"):
+        lines.append(f"  CAPTCHA present · handling={observation['captcha_handling']}"
+                     f" · scope={observation['automation_scope']}"
+                     f" · user_takeover_required={observation['user_takeover_required']}")
+    frames = observation.get("frames") or []
+    if frames:
+        counts: dict[str, int] = {}
+        for item in frames:
+            counts[item["class"]] = counts.get(item["class"], 0) + 1
+        lines.append("  frames: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if observation.get("skipped"):
+        lines.append("  skipped: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(observation["skipped"].items()) if v))
     for field in observation["fields"]:
         meaning = field["canonical_id"] or "-"
         required = "required" if field["required"] else "optional"
