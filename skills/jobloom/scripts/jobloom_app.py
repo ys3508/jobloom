@@ -50,11 +50,13 @@ SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import apply_assist  # noqa: E402
+import build_worksheets  # noqa: E402
 import candidate_core  # noqa: E402
 import candidate_profile  # noqa: E402
 import resume_core  # noqa: E402
 import resume_migration  # noqa: E402
 import sponsorship_triage  # noqa: E402
+import submission_record  # noqa: E402
 from _common import require_table  # noqa: E402
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
@@ -153,7 +155,114 @@ def _active_candidate(connection: sqlite3.Connection) -> tuple[dict[str, Any], s
 
 
 def apply_queue(connection: sqlite3.Connection) -> dict[str, Any]:
-    return {"applications": apply_assist.queue(connection)}
+    """The applications, with the ones the user has said they finished marked as done.
+
+    The exclusion reads the saved job rather than the application's state. There is no state
+    meaning "the user submitted this themselves" and there should not be: `ready_to_fill` is
+    still literally true of it, because nothing was filled by Jobloom and nothing will be
+    while the worker is fixture-only.
+    """
+    done = submission_record.pending(connection)
+    rows = []
+    for row in apply_assist.queue(connection):
+        confirmed = done.get(row["application_id"])
+        rows.append({**row, "submitted_confirmed_at": confirmed,
+                     "pending": confirmed is None})
+    return {"applications": rows,
+            "pending": sum(1 for row in rows if row["pending"]),
+            "confirmed": len(rows) - sum(1 for row in rows if row["pending"])}
+
+
+# ---- recording a submission the user made by hand -------------------------------
+#
+# The only write path in this vertical. It climbs two of the three rungs `saved_jobs`
+# defines and cannot reach the third: nothing here calls `application_core.transition` or
+# writes `submission_evidence`, so the user's word can never open the gate that positive
+# employer evidence guards.
+
+SUBMISSION_FIELDS = ("application_id", "employer", "title", "location", "canonical_url",
+                     "resume_version_id", "state", "rung", "intended_at", "confirmed_at",
+                     "reference_kind", "reference", "reference_kinds", "evidenced",
+                     "evidence_unreachable_reason")
+
+
+def _application_id(payload: dict[str, Any]) -> str:
+    application_id = payload.get("application_id")
+    if not isinstance(application_id, str) or not application_id:
+        raise AppError("bad_application_id")
+    return application_id
+
+
+def submission_state(connection: sqlite3.Connection,
+                     payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        report = submission_record.state(connection, _application_id(payload))
+    except ValueError:
+        raise AppError("no_such_application", 404) from None
+    return {key: report[key] for key in SUBMISSION_FIELDS}
+
+
+def submission_intend(connection: sqlite3.Connection,
+                      payload: dict[str, Any]) -> dict[str, Any]:
+    application_id = _application_id(payload)
+    try:
+        submission_record.intend(connection, application_id)
+    except ValueError:
+        raise AppError("cannot_record_intention", 409) from None
+    return submission_state(connection, payload)
+
+
+def submission_confirm(connection: sqlite3.Connection,
+                       payload: dict[str, Any]) -> dict[str, Any]:
+    """Rung 2, and the page may not claim anything beyond it.
+
+    The payload carries a reference kind and the reference itself; it cannot carry the
+    timestamp, the rung, or whether the submission is evidenced. Those are the service's, and
+    a page able to send them could record a rung-3 claim by typing one.
+    """
+    application_id = _application_id(payload)
+    kind = payload.get("reference_kind")
+    reference = payload.get("reference")
+    if kind is not None and not isinstance(kind, str):
+        raise AppError("bad_reference_kind")
+    if reference is not None and not isinstance(reference, str):
+        raise AppError("bad_reference")
+    try:
+        submission_record.confirm(connection, application_id,
+                                  reference_kind=kind or None, reference=reference or None)
+    except ValueError as error:
+        # Mapped to bare codes rather than passed through. These particular messages carry no
+        # value, but a code built by reformatting an exception is a code that changes whenever
+        # somebody rewords a `raise` — and the next message might not be as harmless.
+        text = str(error)
+        if "decided to apply" in text:
+            raise AppError("intention_not_recorded_first", 409) from None
+        if "reference kind" in text:
+            raise AppError("unknown_reference_kind", 400) from None
+        if "needs the reference" in text or "what kind of thing" in text:
+            raise AppError("reference_incomplete", 400) from None
+        if "no saved job" in text:
+            raise AppError("intention_not_recorded_first", 409) from None
+        raise AppError("submission_refused", 409) from None
+    return submission_state(connection, payload)
+
+
+def submission_tracker(db_path: Path, private_root: Path) -> dict[str, Any]:
+    """Rebuild the tracker from state, never from anything anybody typed into a spreadsheet.
+
+    `build_worksheets` writes the xlsx with `worksheet_writer`, which is stdlib only — it
+    exists because `build_application_tracker.mjs` needs a package this repository cannot
+    install. So no process is spawned and no dependency is required.
+    """
+    queues = sorted(Path(private_root).glob("review-queue-*.json"),
+                    key=lambda path: path.stat().st_mtime, reverse=True)
+    report = build_worksheets.build(queues[0] if queues else None, Path(db_path),
+                                    Path(private_root))
+    # Paths are not returned: the directory is the user's own private root and naming it
+    # back into a page is how a path reaches somewhere it was never meant to go.
+    return {"written": [{key: entry[key] for key in entry if key != "source"}
+                        for entry in report["written"]],
+            "built_at": report["built_at"]}
 
 
 # What may leave the service for each screen. Written as allowlists rather than by handing back
@@ -584,6 +693,15 @@ class Handler(BaseHTTPRequestHandler):
             self._run(lambda connection: approve_migration(connection, payload))
         elif path == "/api/apply/readiness":
             self._run(lambda connection: apply_readiness(connection, payload))
+        elif path == "/api/submission/state":
+            self._run(lambda connection: submission_state(connection, payload))
+        elif path == "/api/submission/intend":
+            self._run(lambda connection: submission_intend(connection, payload))
+        elif path == "/api/submission/confirm":
+            self._run(lambda connection: submission_confirm(connection, payload))
+        elif path == "/api/submission/tracker":
+            self._run(lambda _: submission_tracker(self.db_path, self.private_root),
+                      needs_db=False)
         elif path == "/api/sponsorship/posting":
             self._run(lambda _: sponsorship_posting(self.private_root, payload), needs_db=False)
         elif path == "/api/apply/split":

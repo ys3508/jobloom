@@ -359,14 +359,56 @@ class ApplicationJoinTests(unittest.TestCase):
         SAVED.save(self.db, card(), actor="user", at=AT)
         self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["current_status"], "Saved")
 
-    def test_a_tracked_application_is_named_apart_from_a_self_report(self):
-        SAVED.save(self.db, card(), actor="user", at=AT)
-        job = {"job_id": "job-2", "canonical_url": "https://jobs.example.com/1",
+    def _application_for_the_saved_job(self, application_id="app-2", job_id="job-2"):
+        job = {"job_id": job_id, "canonical_url": "https://jobs.example.com/1",
                "employer": "Acme Health", "title": "Clinical Data Analyst"}
         APPLICATIONS.ingest_job(self.db, job, at=AT)
-        APPLICATIONS.create_application(self.db, "app-2", "job-2", at=AT)
+        APPLICATIONS.create_application(self.db, application_id, job_id, at=AT)
+
+    def test_an_application_record_alone_does_not_earn_the_evidenced_label(self):
+        """It used to. Merely having a row meant "tracked application" — the label reserved
+        for the one rung backed by positive employer evidence — and this test asserted it.
+
+        The set behind the label was `_tracked_application_urls`, which exists to stop the
+        two sheets counting one job twice and says nothing about whether anything was sent.
+        It was safe only while no job appeared on both sides; recording a hand-made
+        application as a saved job is what put one there.
+        """
+        SAVED.save(self.db, card(), actor="user", at=AT)
+        self._application_for_the_saved_job()
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["applied_evidence"], "")
+        # Still joined for counting: the job is not reported twice.
+        self.assertEqual(row["current_status"], "Applied")
+
+    def test_a_hand_made_application_reports_as_the_users_word(self):
+        """An application row plus the user's confirmation is rung 2, never rung 3."""
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
+        row = SAVED.tracker_rows(self.db, today=TODAY)[0]
+        self.assertEqual(row["applied_evidence"], "confirmed after applying")
+
+    def test_a_submission_application_core_saw_is_named_apart_from_a_self_report(self):
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        SAVED.confirm_submitted(self.db, "https://jobs.example.com/1", at=AT)
+        # The state a real submission leaves behind. Set directly rather than driven through
+        # the transition chain, which needs evidence rows, an approved review and a lock;
+        # what is under test is how the tracker reads the result, not how it is reached.
+        self.db.execute("UPDATE applications SET state='submitted', submitted_at=? "
+                        "WHERE application_id='app-2'", (AT.isoformat(),))
         row = SAVED.tracker_rows(self.db, today=TODAY)[0]
         self.assertEqual(row["applied_evidence"], "tracked application")
+
+    def test_a_withdrawn_application_does_not_count_as_evidenced(self):
+        """`submitted_at` is cleared by nothing, so the state has to agree with it."""
+        SAVED.save(self.db, card(), actor="user", decision=SAVED.APPLIED, at=AT)
+        self._application_for_the_saved_job()
+        self.db.execute("UPDATE applications SET state='withdrawn', submitted_at=? "
+                        "WHERE application_id='app-2'", (AT.isoformat(),))
+        self.assertEqual(SAVED.tracker_rows(self.db, today=TODAY)[0]["applied_evidence"],
+                         "stated at decision")
 
     def test_a_kept_job_that_was_applied_to_says_so(self):
         SAVED.save(self.db, card(), actor="user", at=AT)

@@ -1016,3 +1016,110 @@ class TriageSurfaceTests(AppFixture):
         blob = json.dumps(self.call("/api/sponsorship/queue"))
         for key in ('"verdict"', '"suggested"', '"default"', '"eligibility"'):
             self.assertNotIn(key, blob)
+
+
+# ---- recording a submission the user made by hand --------------------------------
+
+class SubmissionSurfaceTests(PreflightFixture):
+    """The only write path in this vertical, and the rung it may not climb."""
+
+    ROUTES = (("/api/submission/state", {"application_id": "app-1"}),
+              ("/api/submission/intend", {"application_id": "app-1"}),
+              ("/api/submission/confirm", {"application_id": "app-1"}),
+              ("/api/submission/tracker", {}))
+
+    def test_every_submission_route_needs_the_token_and_this_origin(self):
+        for path, body in self.ROUTES:
+            with self.subTest(path=path):
+                self.assertEqual(self.refused(path, body, token="wrong")[1]["error"],
+                                 "bad_token")
+                self.assertEqual(
+                    self.refused(path, body, origin="https://elsewhere.invalid")[1]["error"],
+                    "bad_token")
+
+    def test_the_two_presses_climb_two_rungs_and_stop(self):
+        self.assertEqual(self.call("/api/submission/state",
+                                   {"application_id": "app-1"})["rung"], 0)
+        self.assertEqual(self.call("/api/submission/intend",
+                                   {"application_id": "app-1"})["rung"], 1)
+        confirmed = self.call("/api/submission/confirm", {
+            "application_id": "app-1", "reference_kind": "confirmation_id",
+            "reference": "RQ-1"})
+        self.assertEqual(confirmed["rung"], 2)
+        self.assertIs(confirmed["evidenced"], False)
+        self.assertEqual(confirmed["evidence_unreachable_reason"], "no_browser_worker")
+
+    def test_confirming_before_the_intention_is_refused_with_a_bare_code(self):
+        status, payload = self.refused("/api/submission/confirm",
+                                       {"application_id": "app-1"})
+        self.assertEqual((status, payload), (409, {"error": "intention_not_recorded_first"}))
+
+    def test_a_reference_the_corpus_does_not_name_is_refused(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        status, payload = self.refused("/api/submission/confirm", {
+            "application_id": "app-1", "reference_kind": "a_feeling", "reference": "sure"})
+        self.assertEqual((status, payload), (400, {"error": "unknown_reference_kind"}))
+
+    def test_the_page_cannot_claim_a_rung_a_time_or_an_evidence_row(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        smuggled = self.call("/api/submission/confirm", {
+            "application_id": "app-1", "rung": 3, "evidenced": True,
+            "submitted_confirmed_at": "1999-01-01T00:00:00+00:00",
+            "state": "submitted", "submitted_at": "1999-01-01T00:00:00+00:00",
+            "evidence_type": "confirmation_id"})
+        self.assertEqual(smuggled["rung"], 2)
+        self.assertIs(smuggled["evidenced"], False)
+        self.assertNotIn("1999", smuggled["confirmed_at"])
+        self.assertEqual(smuggled["state"], "ready_to_fill")
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM submission_evidence").fetchone()[0], 0)
+
+    def test_the_returned_shape_is_an_allowlist(self):
+        report = self.call("/api/submission/state", {"application_id": "app-1"})
+        self.assertEqual(set(report), set(APP.SUBMISSION_FIELDS))
+
+    def test_a_confirmed_opening_leaves_the_pending_queue(self):
+        queue = self.call("/api/apply/queue")
+        self.assertEqual((queue["pending"], queue["confirmed"]), (1, 0))
+        self.assertIs(queue["applications"][0]["pending"], True)
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.call("/api/submission/confirm", {"application_id": "app-1"})
+        queue = self.call("/api/apply/queue")
+        self.assertEqual((queue["pending"], queue["confirmed"]), (0, 1))
+        self.assertIsNotNone(queue["applications"][0]["submitted_confirmed_at"])
+
+    def test_an_intention_alone_does_not_leave_the_queue(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.assertEqual(self.call("/api/apply/queue")["pending"], 1)
+
+    def test_the_tracker_is_rebuilt_from_state_and_names_no_path(self):
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.call("/api/submission/confirm", {"application_id": "app-1"})
+        report = self.call("/api/submission/tracker", {})
+        sheets = {entry["sheet"]: entry for entry in report["written"]}
+        self.assertIn("applied", sheets)
+        self.assertEqual(sheets["applied"]["rows"], 1)
+        # Three rungs, carried separately to the caller rather than added together.
+        self.assertEqual(sheets["applied"]["decided_to_apply"], 1)
+        self.assertEqual(sheets["applied"]["confirmed_submitted"], 1)
+        self.assertNotIn(str(self.root), json.dumps(report))
+        self.assertTrue((self.private / "applied.xlsx").is_file())
+        self.assertTrue((self.private / "applied.csv").is_file())
+
+    def test_a_hand_made_application_is_not_reported_as_evidenced_in_the_tracker(self):
+        """The label `tracked application` belongs to the rung `application_core` witnessed."""
+        self.call("/api/submission/intend", {"application_id": "app-1"})
+        self.call("/api/submission/confirm", {"application_id": "app-1"})
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            saved = load("saved_jobs")
+            row = saved.tracker_rows(connection)[0]
+        finally:
+            connection.close()
+        self.assertEqual(row["applied_evidence"], "confirmed after applying")
+
+    def test_an_unknown_application_is_refused_with_a_bare_code(self):
+        status, payload = self.refused("/api/submission/state",
+                                       {"application_id": "app-absent"})
+        self.assertEqual((status, payload), (404, {"error": "no_such_application"}))

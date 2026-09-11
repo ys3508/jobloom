@@ -117,6 +117,22 @@ def initialize(connection: sqlite3.Connection) -> None:
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(saved_jobs)")}
     if "submitted_confirmed_at" not in columns:
         connection.execute("ALTER TABLE saved_jobs ADD COLUMN submitted_confirmed_at TEXT")
+    # What the user had in front of them when they said they had finished — a confirmation
+    # number, the subject of the employer's email, the fact that it appeared in their account.
+    # Added the same way and for the same reason: a row confirmed before these existed stays
+    # NULL, which is honestly what it is.
+    #
+    # **Deliberately not `submission_evidence`.** That table is the gate
+    # `application_core.transition` reads before it will enter `submitted`, and a row typed at
+    # a keyboard is the user's word about an employer artefact, not an observation of one.
+    # Writing there would let the third rung be climbed with the second rung's evidence, which
+    # is the one thing the three rungs exist to prevent. The vocabulary is shared with
+    # `application_core.SUCCESS_EVIDENCE_TYPES` on purpose — a second set of names for the same
+    # four things would be a second taxonomy — and the rung is which table it is in.
+    if "submitted_reference_kind" not in columns:
+        connection.execute("ALTER TABLE saved_jobs ADD COLUMN submitted_reference_kind TEXT")
+    if "submitted_reference" not in columns:
+        connection.execute("ALTER TABLE saved_jobs ADD COLUMN submitted_reference TEXT")
     connection.commit()
 
 
@@ -241,7 +257,8 @@ EMPLOYER_ORIGINATED_OUTCOMES = {
 
 
 def confirm_submitted(connection: sqlite3.Connection, job_url: str,
-                      *, at: datetime | None = None) -> dict[str, Any]:
+                      *, reference_kind: str | None = None, reference: str | None = None,
+                      at: datetime | None = None) -> dict[str, Any]:
     """The user saying they finished the employer's form, recorded after the fact.
 
     The middle rung of three, and the only one this mode can climb. `decision='applied'` is
@@ -257,7 +274,21 @@ def confirm_submitted(connection: sqlite3.Connection, job_url: str,
     Confirming twice keeps the first time. The confirmation answers "was it finished", and
     the first yes already answered it; a later press would move the date to when someone
     happened to press again, which is not a fact about the application.
+
+    An optional reference records what the user was looking at when they said so — a
+    confirmation number, an email, the application appearing in their account. It is stored
+    here and never in `submission_evidence`: see the note in `initialize`. It is also
+    optional, because a confirmation with no number is still a confirmation and demanding one
+    would push people into inventing something to type.
     """
+    if reference_kind is not None:
+        if reference_kind not in application_core.SUCCESS_EVIDENCE_TYPES:
+            raise ValueError("reference kind must be one of: "
+                             + ", ".join(sorted(application_core.SUCCESS_EVIDENCE_TYPES)))
+        if not _text(reference):
+            raise ValueError("a reference kind needs the reference itself")
+    elif _text(reference):
+        raise ValueError("a reference needs to say what kind of thing it is")
     url = application_core.canonicalize_url(_text(job_url))
     row = connection.execute(
         "SELECT decision, submitted_confirmed_at FROM saved_jobs WHERE job_url=?", (url,)
@@ -271,10 +302,12 @@ def confirm_submitted(connection: sqlite3.Connection, job_url: str,
                 "already_confirmed": True}
     timestamp = (at or now_utc()).isoformat()
     connection.execute(
-        "UPDATE saved_jobs SET submitted_confirmed_at=?, updated_at=? WHERE job_url=?",
-        (timestamp, timestamp, url))
+        "UPDATE saved_jobs SET submitted_confirmed_at=?, submitted_reference_kind=?, "
+        "submitted_reference=?, updated_at=? WHERE job_url=?",
+        (timestamp, reference_kind, _text(reference) or None, timestamp, url))
     connection.commit()
-    return {"job_url": url, "submitted_confirmed_at": timestamp, "already_confirmed": False}
+    return {"job_url": url, "submitted_confirmed_at": timestamp, "already_confirmed": False,
+            "reference_kind": reference_kind, "rung": 2}
 
 
 def record_outcome(connection: sqlite3.Connection, job_url: str, outcome: str,
@@ -341,8 +374,37 @@ def _tracked_application_urls(connection: sqlite3.Connection) -> set[str]:
     """)}
 
 
+def _evidenced_application_urls(connection: sqlite3.Connection) -> set[str]:
+    """Applications that actually reached the third rung: a submission `application_core` saw.
+
+    Split from `_tracked_application_urls`, which answers a different question. That set is
+    every job with an application row and exists so the two halves of the tracker do not count
+    one job twice; it says nothing about whether anything was sent. Using it for the evidence
+    label was safe only while no job appeared on both sides, and the moment a hand-made
+    application got a saved row — which is what the window now records — a `ready_to_fill`
+    application with no evidence at all started reporting as "tracked application", the label
+    reserved for the one rung backed by positive employer evidence.
+
+    `submitted_at` is not enough on its own either: it is cleared by nothing, so a later
+    withdrawal keeps it. The state has to be one the application reached *through* `submitted`,
+    which is exactly `archive_core.ARCHIVABLE_STATES` minus the one that can be reached without
+    submitting.
+    """
+    found = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='applications'").fetchone()
+    if not found:
+        return set()
+    return {row["canonical_url"] for row in connection.execute("""
+        SELECT j.canonical_url FROM applications a JOIN jobs j ON j.job_id=a.job_id
+        WHERE a.submitted_at IS NOT NULL AND a.state IN (
+            'submitted', 'rejected', 'recruiter_response', 'screening_call',
+            'interview', 'final_interview', 'offer', 'no_response')
+    """)}
+
+
 def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -> list[dict[str, Any]]:
     tracked = _tracked_application_urls(connection)
+    evidenced = _evidenced_application_urls(connection)
     rows = []
     for row in connection.execute("SELECT * FROM saved_jobs ORDER BY decided_at, job_url"):
         rows.append({
@@ -371,7 +433,7 @@ def tracker_rows(connection: sqlite3.Connection, *, today: date | None = None) -
             # application" is the only one backed by `application_core`, which requires
             # positive submission evidence. Anything counting real applications uses the
             # top two; using the first counts intentions.
-            "applied_evidence": ("tracked application" if row["job_url"] in tracked
+            "applied_evidence": ("tracked application" if row["job_url"] in evidenced
                                  else "confirmed after applying" if row["submitted_confirmed_at"]
                                  else "stated at decision" if row["decision"] == APPLIED else ""),
             "applied_at": row["applied_at"],

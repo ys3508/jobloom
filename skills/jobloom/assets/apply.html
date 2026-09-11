@@ -83,6 +83,12 @@
   .seg.skip .segtext { color: var(--muted); text-decoration: line-through; }
   .err { color: var(--stop); font-size: 13.5px; }
   .facts { margin: 8px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
+  .row { margin: 16px 0; }
+  label.field { display: block; font-weight: 600; margin: 0 0 4px; font-size: 14px; }
+  input[type=text] { width: 100%; font: inherit; color: inherit; padding: 10px 12px;
+                     border-radius: 8px; border: 1px solid var(--line); background: var(--bg); }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .origin { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
 </style>
 
 <main>
@@ -153,6 +159,26 @@ const COPY = {
     nothingWritten: "这个窗口没有写入任何东西。关掉它，数据库和打开前一样。",
     back: "返回",
     loading: "读取中…",
+    toRecord: "记录这次投递",
+    recordTitle: "记录投递",
+    rungsTitle: "三级记录，互不代替",
+    rung1: "① 打算去投 —— 按下时表单还没打开，记的是意图",
+    rung2: "② 你说你填完了 —— 事后你自己的话，这是当前模式能到的最高一级",
+    rung3: "③ 正向提交证据 —— 确认页/确认号 + material lock，需要浏览器 worker，现在到不了",
+    rungNow: "当前在第 %n 级",
+    pressIntend: "我要去申请了",
+    pressConfirm: "我已经提交完成了",
+    intendNote: "先记意图，再记完成。两次分开按，中间的差就是中途放弃率——合成一次按就把它抹掉了。",
+    confirmNote: "这条记的是**你的话**，不是 Jobloom 观察到的结果。它不会让这份申请进入 submitted 状态，也不会生成 archive。",
+    refKind: "手上有什么（可不填）",
+    refNone: "没有，只是我填完了",
+    refValue: "确认号 / 邮件主题 / 账户里的记录",
+    refWhere: "这条只写在 saved_jobs 上，不写进 submission_evidence——那张表是第 ③ 级的闸门。",
+    doneAt: "已确认于",
+    rebuild: "重建追踪表",
+    rebuilt: "已重建：%n",
+    queueDone: "已确认提交",
+    queuePending: "待投 %n · 已确认 %n",
   },
   en: {
     queueTitle: "Applications",
@@ -192,6 +218,26 @@ const COPY = {
     nothingWritten: "This window wrote nothing. Close it and the database is as it was.",
     back: "Back",
     loading: "Loading…",
+    toRecord: "Record this application",
+    recordTitle: "Record the application",
+    rungsTitle: "Three rungs, none standing in for another",
+    rung1: "① Going to apply — pressed before the form opens, so it records an intention",
+    rung2: "② You say you finished it — your own word afterwards, and the highest rung this mode reaches",
+    rung3: "③ Positive submission evidence — a confirmation page or id plus a material lock. Needs a browser worker; out of reach.",
+    rungNow: "Currently on rung %n",
+    pressIntend: "I am going to apply now",
+    pressConfirm: "I have finished submitting it",
+    intendNote: "The intention first, the completion second. Two presses, because the gap between them is the abandonment rate and one press would erase it.",
+    confirmNote: "This records **your word**, not something Jobloom observed. It does not move the application to submitted and it does not make an archive.",
+    refKind: "What you have in hand (optional)",
+    refNone: "Nothing, I just finished it",
+    refValue: "Confirmation number / email subject / what your account shows",
+    refWhere: "Stored on the saved job, never in submission_evidence — that table is rung ③'s gate.",
+    doneAt: "Confirmed at",
+    rebuild: "Rebuild the tracker",
+    rebuilt: "Rebuilt: %n",
+    queueDone: "submitted, confirmed",
+    queuePending: "%n to apply · %n confirmed",
   },
 };
 
@@ -237,19 +283,23 @@ function render() {
     return;
   }
   ({ queue: queueScreen, readiness: readinessScreen, paste: pasteScreen,
-     split: splitScreen, result: resultScreen }[screen] || queueScreen)();
+     split: splitScreen, result: resultScreen, record: recordScreen }[screen] || queueScreen)();
 }
 
 // ---- screens -------------------------------------------------------------------
 
 function queueScreen() {
   const rows = (app.queue || []);
+  const pending = rows.filter((row) => row.pending).length;
   view.innerHTML = `<div class="card"><h2>${t("queueTitle")}</h2>
+    <p class="muted">${(COPY[lang].queuePending || "")
+      .replace("%n", pending).replace("%n", rows.length - pending)}</p>
     ${rows.length ? `<ul class="rows">${rows.map((row, index) => `
-      <li class="click" data-index="${index}">
+      <li class="click" data-index="${index}" ${row.pending ? "" : 'style="opacity:.62"'}>
         <div class="title">${esc(row.title)}</div>
         <div class="muted">${esc(row.employer)} · ${esc(row.location || "")}</div>
-        <div class="mono muted">${esc(row.state)}</div>
+        <div class="mono muted">${row.pending ? esc(row.state)
+          : `${t("queueDone")} · ${esc((row.submitted_confirmed_at || "").slice(0, 10))}`}</div>
       </li>`).join("")}</ul>`
       : `<p class="muted">${t("queueEmpty")}</p>`}</div>`;
   view.querySelectorAll("li.click").forEach((node) => {
@@ -387,9 +437,94 @@ function resultScreen() {
     <p>${t("blocking", result.blocking)}</p>
     <p class="muted">${t("checklistBody")}</p>
     <div class="note">${t("nothingWritten")}</div>
-    <p><button class="quiet" id="back">${t("back")}</button></p>
+    <p><button id="record">${t("toRecord")}</button>
+      <button class="quiet" id="back">${t("back")}</button></p>
   </div>`;
   document.getElementById("back").onclick = () => { screen = "split"; render(); };
+  document.getElementById("record").onclick = openRecord;
+}
+
+// ---- recording what the user did in the employer's own tab ----------------------
+
+function recordScreen() {
+  const sub = app.submission || {};
+  const rung = sub.rung || 0;
+  view.innerHTML = `<div class="card">
+    <h2>${t("recordTitle")}</h2>
+    <p class="muted">${esc(sub.employer)} — ${esc(sub.title)}</p>
+    <h3>${t("rungsTitle")}</h3>
+    <div class="note" ${rung === 1 ? 'style="border-left-color:var(--accent)"' : ""}>${t("rung1")}</div>
+    <div class="note" ${rung === 2 ? 'style="border-left-color:var(--accent)"' : ""}>${t("rung2")}</div>
+    <div class="note stop">${t("rung3")}</div>
+    <p class="mono muted">${(COPY[lang].rungNow || "").replace("%n", rung)}</p>
+    ${rung === 0 ? `
+      <div class="note">${t("intendNote")}</div>
+      <p><button id="intend">${t("pressIntend")}</button></p>` : ""}
+    ${rung === 1 ? `
+      <div class="note">${t("confirmNote")}</div>
+      <div class="row">
+        <label class="field" for="refkind">${t("refKind")}</label>
+        <select id="refkind">
+          <option value="">${t("refNone")}</option>
+          ${(sub.reference_kinds || []).map((kind) =>
+            `<option value="${esc(kind)}">${esc(kind)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="row" id="refrow" hidden>
+        <input type="text" id="refvalue" placeholder="${t("refValue")}">
+        <div class="origin">${t("refWhere")}</div>
+      </div>
+      <p><button id="confirm">${t("pressConfirm")}</button></p>` : ""}
+    ${rung === 2 ? `
+      <div class="note">${t("doneAt")} ${esc((sub.confirmed_at || "").slice(0, 19))}${
+        sub.reference_kind ? ` · ${esc(sub.reference_kind)}: ${esc(sub.reference)}` : ""}</div>
+      <p><button id="rebuild">${t("rebuild")}</button></p>
+      ${app.rebuilt ? `<div class="note mono">${(COPY[lang].rebuilt || "")
+        .replace("%n", app.rebuilt.map((w) => `${w.sheet} ${w.rows}`).join(" · "))}</div>` : ""}` : ""}
+    <p><button class="quiet" id="back">${t("back")}</button></p>
+  </div>`;
+  document.getElementById("back").onclick = () => {
+    app.rebuilt = null; screen = "queue"; load();
+  };
+  const kind = document.getElementById("refkind");
+  if (kind) {
+    const row = document.getElementById("refrow");
+    kind.onchange = () => { row.hidden = !kind.value; };
+  }
+  const intend = document.getElementById("intend");
+  if (intend) intend.onclick = () => post("/api/submission/intend", {});
+  const confirm = document.getElementById("confirm");
+  if (confirm) {
+    confirm.onclick = () => post("/api/submission/confirm", {
+      reference_kind: kind.value || undefined,
+      reference: kind.value ? (document.getElementById("refvalue").value || "") : undefined,
+    });
+  }
+  const rebuild = document.getElementById("rebuild");
+  if (rebuild) rebuild.onclick = async () => {
+    try {
+      app.rebuilt = (await api("/api/submission/tracker", {})).written;
+    } catch (failure) { error = failure.message; }
+    render();
+  };
+}
+
+async function post(path, extra) {
+  try {
+    app.submission = await api(path,
+      { application_id: app.application.application_id, ...extra });
+  } catch (failure) { error = failure.message; }
+  render();
+}
+
+async function openRecord() {
+  view.innerHTML = `<div class="card"><p class="muted">${t("loading")}</p></div>`;
+  try {
+    app.submission = await api("/api/submission/state",
+      { application_id: app.application.application_id });
+    screen = "record";
+  } catch (failure) { error = failure.message; }
+  render();
 }
 
 // ---- loading -------------------------------------------------------------------

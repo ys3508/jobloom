@@ -118,6 +118,45 @@ the header of every call.
 written back — steps a person still does by hand. The window is a preflight and stops at the
 checklist.
 
+## Recording an application made by hand
+
+The third vertical, and the first that writes. `POST /api/submission/state`, `/intend`,
+`/confirm` and `/tracker`, reached from the end of the preflight.
+
+**It records the user's word, because that is all there is.** The fill worker is fixture-only,
+so the employer's form is filled in the employer's own tab and Jobloom sees none of it.
+`saved_jobs` already models this in three rungs that are never collapsed: `decision='applied'`
+is an intention pressed before the form opens, `submitted_confirmed_at` is the user saying
+afterwards that they finished, and `application_core`'s `submitted` needs positive submission
+evidence and a material lock.
+
+**This slice climbs rungs 1 and 2 and cannot reach rung 3**, by construction: it never calls
+`application_core.transition` and never writes `submission_evidence`. A reference the user
+types — a confirmation number, an employer email, what their account shows — is stored beside
+the confirmation on the saved job. The vocabulary is `application_core`'s own four types,
+shared on purpose so there is no second taxonomy; the rung is which table the reference is in.
+Letting a typed value into `submission_evidence` would let the second rung's evidence open the
+third rung's gate, and a test asserts that afterwards the application still cannot be
+transitioned to `submitted`.
+
+**Two presses, not one.** The gap between the intention and the completion is the abandonment
+rate — the number that makes a reply rate over intentions wrong — and one press would record
+both at the same instant and erase it.
+
+**No archive is made.** `archive_core.create_archive` requires an archivable state, a
+`submitted_at`, and a `use_type='submitted'` resume usage; a hand-made application has none of
+them. That is a property of the evidence, not a gap, so nothing here fabricates one.
+
+**The queue exclusion reads the saved job, not the state.** There is no application state
+meaning "the user submitted this themselves" and there should not be: `ready_to_fill` stays
+literally true, because nothing was filled by Jobloom.
+
+**The tracker is rebuilt from state.** `build_worksheets` writes `applied.xlsx` and its CSV
+with `worksheet_writer`, which is stdlib only — it exists because
+`build_application_tracker.mjs` needs a package this repository cannot install. No process is
+spawned, no dependency is required, and the three rung counts are returned separately rather
+than added together. Paths are not returned to the page.
+
 ## The sponsorship triage page
 
 `GET /triage`, served from `assets/triage.html`, over `GET /api/sponsorship/queue` and
